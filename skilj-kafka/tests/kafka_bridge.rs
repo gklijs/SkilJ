@@ -195,6 +195,8 @@ type TriggerRequest = (Value, Option<String>);
 
 #[derive(Clone, Default)]
 struct MockSkiljState {
+    /// How many batch calls (docs/architecture.md §227) this mock got.
+    batch_calls: Arc<Mutex<usize>>,
     /// Keyed by bearer credential - simulates an `EventReadToken`'s own
     /// fixed scope, the same shape `skilj-temporal`'s own mock uses.
     queues: Arc<Mutex<std::collections::HashMap<String, VecDeque<Value>>>>,
@@ -393,12 +395,83 @@ fn bearer_token(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// docs/architecture.md §227's batch routes: each item through the single
+/// route's handler, in order, its `idempotencyKey` as that route's header,
+/// stopping at the first failure as `stopAtFirstFailure` asks.
+async fn batch(state: &MockSkiljState, items: Vec<Value>, external: bool) -> Json<Value> {
+    *state.batch_calls.lock().unwrap() += 1;
+    let mut outcomes = Vec::new();
+    let mut failed = false;
+    for mut item in items {
+        if failed {
+            outcomes.push(
+                json!({ "error": { "status": 409, "code": "not_processed", "message": "" } }),
+            );
+            continue;
+        }
+        #[allow(unused_mut)]
+        let mut headers = HeaderMap::new();
+        if let Some(Value::String(key)) = item
+            .as_object_mut()
+            .and_then(|o| o.remove("idempotencyKey"))
+        {
+            headers.insert("idempotency-key", key.parse().unwrap());
+        }
+        let (status, Json(answer)) = if external {
+            post_events_external(State(state.clone()), Json(item)).await
+        } else {
+            post_commands_trigger(State(state.clone()), headers, Json(item)).await
+        };
+        if status.is_success() {
+            outcomes.push(answer);
+        } else {
+            failed = true;
+            outcomes.push(json!({ "error": { "status": status.as_u16(), "code": "mock_failure", "message": "" } }));
+        }
+    }
+    Json(json!({ "outcomes": outcomes }))
+}
+
+async fn post_events_external_batch(
+    State(state): State<MockSkiljState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_eq!(body["stopAtFirstFailure"], true);
+    batch(
+        &state,
+        body["events"].as_array().cloned().unwrap_or_default(),
+        true,
+    )
+    .await
+}
+
+async fn post_commands_trigger_batch(
+    State(state): State<MockSkiljState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_eq!(body["stopAtFirstFailure"], true);
+    batch(
+        &state,
+        body["commands"].as_array().cloned().unwrap_or_default(),
+        false,
+    )
+    .await
+}
+
 async fn serve_mock_skilj(state: MockSkiljState) -> String {
     let app = Router::new()
         .route("/v1/events/consume", get(get_events_consume))
         .route("/v1/events/consume/ack", post(post_events_consume_ack))
         .route("/v1/events/external", post(post_events_external))
         .route("/v1/commands/trigger", post(post_commands_trigger))
+        .route(
+            "/v1/events/external/batch",
+            post(post_events_external_batch),
+        )
+        .route(
+            "/v1/commands/trigger/batch",
+            post(post_commands_trigger_batch),
+        )
         .route("/v1/parked-deliveries", post(post_parked_deliveries))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1648,6 +1721,122 @@ fn a_paused_partition_resumes_without_skipping_or_repeating_messages() {
         // Anything repeated would have arrived by now as well.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(delivered(&mock_state), expected);
+        // The backlog went in batches (docs/architecture.md §227).
+        assert!(*mock_state.batch_calls.lock().unwrap() > 0);
+    });
+}
+
+/// docs/architecture.md §227: a backlog goes to skilj in batches. A
+/// message failing in the middle of one stops it there - nothing after it
+/// lands - is retried on its own until it succeeds, and the rest follow
+/// in order: every message exactly once, in offset order.
+#[test]
+fn a_message_failing_mid_batch_keeps_its_partitions_order() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-in-batched");
+        create_topic(bootstrap_servers, &topic).await;
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let expected: Vec<String> = (0..40).map(|i| format!("o-{i}")).collect();
+        for order in &expected {
+            producer
+                .send(
+                    FutureRecord::to(&topic)
+                        .payload(&format!(r#"{{"orderId":"{order}"}}"#))
+                        .key("k"),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)
+                .unwrap();
+        }
+        mock_state
+            .fail_order_ids
+            .lock()
+            .unwrap()
+            .insert("o-20".to_string());
+
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-batched")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            topic.clone(),
+            InboundMapping {
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let http = skilj_kafka::http_client();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(20),
+            1.0,
+            Duration::from_millis(20),
+            100_000,
+        );
+        // A linger, so the first messages already form a batch.
+        let batching = skilj_kafka::InboundBatching {
+            max_items: 16,
+            linger: Duration::from_millis(500),
+        };
+        tokio::spawn(async move {
+            skilj_kafka::run_inbound_until_with(
+                &consumer,
+                &http,
+                &skilj_base_url,
+                &mappings,
+                &retry_policy,
+                batching,
+                std::future::pending(),
+            )
+            .await;
+        });
+
+        let delivered = |state: &MockSkiljState| -> Vec<String> {
+            state
+                .external_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r["payload"]["orderId"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for _ in 0..200 {
+            if *mock_state.refused_order_requests.lock().unwrap() > 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // o-20 keeps failing: nothing after it has landed.
+        assert_eq!(delivered(&mock_state), expected[..20].to_vec());
+
+        mock_state.fail_order_ids.lock().unwrap().clear();
+        for _ in 0..200 {
+            if delivered(&mock_state).len() >= expected.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(delivered(&mock_state), expected);
+        assert!(*mock_state.batch_calls.lock().unwrap() > 0);
     });
 }
 

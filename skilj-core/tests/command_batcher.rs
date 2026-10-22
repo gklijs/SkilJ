@@ -1028,3 +1028,184 @@ fn a_slow_read_or_decide_before_the_lock_warns_once_per_command_type_and_interva
         assert!(decide.contains("under_lock=false"), "{decide}");
     });
 }
+
+/// docs/architecture.md §227: one `decide_and_submit_many` call with a
+/// ShipOrder command per entry of `orders`, in order, through `batcher`.
+async fn submit_many(
+    pool: &Pool,
+    batcher: &CommandBatcher,
+    command_type: &CommandType,
+    orders: &[&str],
+) -> Vec<skilj_core::error::Result<SubmitCommandOutcome>> {
+    let command_dispatcher: Arc<dyn CommandDispatcher> = Arc::new(ShipOrderDispatcher);
+    let projection_dispatcher: Arc<dyn ProjectionDispatcher> = Arc::new(NoopProjectionDispatcher);
+    let items = orders
+        .iter()
+        .map(|order| skilj_core::command_batcher::CommandBatchItem {
+            command_type: command_type.clone(),
+            payload: format!(r#"{{"order_id":"{order}"}}"#),
+            client_id: "client-1".to_string(),
+            correlation_id: None,
+            causation_id: None,
+            idempotency_key: None,
+        })
+        .collect();
+    batcher
+        .decide_and_submit_many(
+            pool,
+            &command_dispatcher,
+            &projection_dispatcher,
+            &NoSnapshots,
+            &EventBroadcaster::new(64),
+            &EventCache::new(1000),
+            None,
+            &command_type.bounded_context.name,
+            items,
+            false,
+        )
+        .await
+}
+
+#[test]
+fn a_batch_is_decided_in_the_order_given() {
+    // Order A twice: the first is accepted and the second, which read the
+    // same empty history before either was queued, is rejected under the
+    // lock - never the other way round. B in between and C after are
+    // accepted, and the events land in the order given.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+
+        let outcomes = submit_many(&pool, &CommandBatcher::new(), &ct, &["A", "B", "A", "C"]).await;
+
+        let accepted: Vec<bool> = outcomes
+            .iter()
+            .map(|o| matches!(o, Ok(SubmitCommandOutcome::Accepted { .. })))
+            .collect();
+        assert_eq!(accepted, vec![true, true, false, true]);
+        assert!(matches!(
+            &outcomes[2],
+            Ok(SubmitCommandOutcome::Rejected { kind, .. }) if kind == "already_shipped"
+        ));
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        let shipped: Vec<String> = events
+            .iter()
+            .map(|e| {
+                serde_json::from_str::<serde_json::Value>(&e.payload).unwrap()["order_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(shipped, vec!["A", "B", "C"]);
+        assert_eq!(
+            events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    });
+}
+
+#[test]
+fn a_batch_larger_than_the_max_batch_size_keeps_its_order() {
+    // Spread over four lock acquisitions of 3, the batch still decides A's
+    // second shipment after its first.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+
+        let orders = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "A"];
+        let batcher = CommandBatcher::new().with_max_batch_size(3);
+        let outcomes = submit_many(&pool, &batcher, &ct, &orders).await;
+
+        assert_eq!(outcomes.len(), orders.len());
+        for outcome in &outcomes[..9] {
+            assert!(matches!(outcome, Ok(SubmitCommandOutcome::Accepted { .. })));
+        }
+        assert!(matches!(
+            &outcomes[9],
+            Ok(SubmitCommandOutcome::Rejected { .. })
+        ));
+    });
+}
+
+#[test]
+fn an_empty_batch_answers_nothing() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+
+        let outcomes = submit_many(&pool, &CommandBatcher::new(), &ct, &[]).await;
+        assert!(outcomes.is_empty());
+    });
+}
+
+#[test]
+fn a_command_for_another_bounded_context_fails_alone() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+        let other_bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &other_bc).await;
+        let other_ct = seed_ship_order_command_type(&pool, &other_bc).await;
+
+        let command_dispatcher: Arc<dyn CommandDispatcher> = Arc::new(ShipOrderDispatcher);
+        let projection_dispatcher: Arc<dyn ProjectionDispatcher> =
+            Arc::new(NoopProjectionDispatcher);
+        let item = |command_type: &CommandType, order: &str| {
+            skilj_core::command_batcher::CommandBatchItem {
+                command_type: command_type.clone(),
+                payload: format!(r#"{{"order_id":"{order}"}}"#),
+                client_id: "client-1".to_string(),
+                correlation_id: None,
+                causation_id: None,
+                idempotency_key: None,
+            }
+        };
+        let outcomes = CommandBatcher::new()
+            .decide_and_submit_many(
+                &pool,
+                &command_dispatcher,
+                &projection_dispatcher,
+                &NoSnapshots,
+                &EventBroadcaster::new(64),
+                &EventCache::new(1000),
+                None,
+                &bc.name,
+                vec![item(&ct, "A"), item(&other_ct, "B"), item(&ct, "C")],
+                false,
+            )
+            .await;
+
+        assert!(matches!(
+            &outcomes[0],
+            Ok(SubmitCommandOutcome::Accepted { .. })
+        ));
+        assert!(outcomes[1].is_err());
+        assert!(matches!(
+            &outcomes[2],
+            Ok(SubmitCommandOutcome::Accepted { .. })
+        ));
+        assert!(db::list_events_for_bounded_context(&pool, &other_bc.name)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}

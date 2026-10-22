@@ -1041,6 +1041,7 @@ pub fn inspected_snapshot_object(n: &Naming) -> Object {
 /// as ordinary typed data here, never through GraphQL's real `errors`
 /// array (that's reserved for library-level errors, rendered through
 /// `to_graphql_error` as everywhere else in this crate).
+#[derive(Clone)]
 pub struct SubmitCommandResult {
     pub accepted: bool,
     pub triggered_event_sequences: Option<Vec<i64>>,
@@ -1117,6 +1118,63 @@ pub fn submit_command_payload_object(n: &Naming) -> Object {
             })
         },
     ))
+}
+
+/// `submitCommands`' input for one command (docs/architecture.md §227):
+/// `submitCommand`'s arguments apart from the bounded context, which the
+/// call names once.
+pub fn submit_command_input(n: &Naming) -> InputObject {
+    InputObject::new(n.ty("SubmitCommandInput"))
+        .field(InputValue::new(
+            "commandTypeName",
+            TypeRef::named_nn(TypeRef::STRING),
+        ))
+        .field(InputValue::new(
+            "payload",
+            TypeRef::named_nn(TypeRef::STRING),
+        ))
+        .field(InputValue::new(
+            "idempotencyKey",
+            TypeRef::named(TypeRef::STRING),
+        ))
+        .field(InputValue::new(
+            "correlationId",
+            TypeRef::named(TypeRef::STRING),
+        ))
+        .field(InputValue::new(
+            "causationId",
+            TypeRef::named(TypeRef::STRING),
+        ))
+}
+
+/// A command of a batch that failed on its own: the code and message
+/// `submitCommand` would have answered it with in `errors`.
+#[derive(Clone)]
+pub struct BatchItemError {
+    pub code: String,
+    pub message: String,
+}
+
+pub fn batch_item_error_object(n: &Naming) -> Object {
+    gql_object!(BatchItemError => n.ty("BatchItemError") {
+        scalar "code": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.code.clone()),
+        scalar "message": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.message.clone()),
+    })
+}
+
+/// One answer of `submitCommands`: exactly one of `result`, what
+/// `submitCommand` would have answered, and `error`, the error it would
+/// have answered with instead.
+pub struct SubmitCommandsItem {
+    pub result: Option<SubmitCommandResult>,
+    pub error: Option<BatchItemError>,
+}
+
+pub fn submit_commands_item_object(n: &Naming) -> Object {
+    gql_object!(SubmitCommandsItem => n.ty("SubmitCommandsItem") {
+        object "result": TypeRef::named(n.ty("SubmitCommandPayload")) => |i| i.result.clone(),
+        object "error": TypeRef::named(n.ty("BatchItemError")) => |i| i.error.clone(),
+    })
 }
 
 /// One pending (or decided) command proposal, with its payload already

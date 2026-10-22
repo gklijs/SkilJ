@@ -79,12 +79,42 @@ use tracing::Instrument;
 /// dropped, just processed one batch later).
 pub const DEFAULT_MAX_BATCH_SIZE: usize = 256;
 
-/// One caller's request, sitting in a per-bounded-context queue - see
-/// this module's own doc comment. Every entry carries a `reply` sender,
-/// leader's own included, but `run_as_leader` never sends to its own -
-/// it reads its own outcome directly out of the batch results instead of
-/// round-tripping through a channel to itself (see that function's own
-/// comment).
+/// How many commands of one [`CommandBatcher::decide_and_submit_many`]
+/// call read their history and run `decide()` at once before they are
+/// queued. Each takes a pooled connection for its read, so this keeps one
+/// large call from taking the whole pool.
+pub const PREPARE_CONCURRENCY: usize = 8;
+
+/// The default for [`CommandBatcher::with_max_items_per_batch`] -
+/// `config.max_items_per_batch` in specs/skilj.allium.
+pub const DEFAULT_MAX_ITEMS_PER_BATCH: usize = 100;
+
+/// One command of a [`CommandBatcher::decide_and_submit_many`] call: what
+/// a single [`CommandBatcher::decide_and_submit`] takes for one command,
+/// already authorised by the caller.
+#[derive(Debug, Clone)]
+pub struct CommandBatchItem {
+    /// The command's type; every item of one call belongs to the call's
+    /// bounded context.
+    pub command_type: CommandType,
+    /// The payload, as JSON.
+    pub payload: String,
+    /// The submitting caller - a Role's or a token's id.
+    pub client_id: String,
+    /// The caller's correlation id, or `None` to have one generated.
+    pub correlation_id: Option<String>,
+    /// The caller's causation id, if any.
+    pub causation_id: Option<String>,
+    /// The caller's idempotency key, if any.
+    pub idempotency_key: Option<String>,
+}
+
+/// One command, sitting in a per-bounded-context queue - see this
+/// module's own doc comment. Every entry is answered through its `reply`
+/// sender, the leader's own included: since a caller can queue several
+/// commands at once (`decide_and_submit_many`, docs/architecture.md
+/// §227), "the leader's command" is no longer one entry the leader can
+/// read its answer off directly.
 struct PendingCommand {
     command: BatchedCommand,
     reply: oneshot::Sender<BatchedCommandResult>,
@@ -117,6 +147,7 @@ pub struct CommandBatcher {
     leader_permits: Arc<std::sync::OnceLock<Arc<Semaphore>>>,
     max_batch_size: usize,
     max_concurrent_leaders: Option<usize>,
+    max_items_per_batch: usize,
     slow: crate::slow_command::SlowCommandWarnings,
 }
 
@@ -134,6 +165,7 @@ impl CommandBatcher {
             leader_permits: Arc::new(std::sync::OnceLock::new()),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             max_concurrent_leaders: None,
+            max_items_per_batch: DEFAULT_MAX_ITEMS_PER_BATCH,
             slow: crate::slow_command::SlowCommandWarnings::default(),
         }
     }
@@ -164,6 +196,21 @@ impl CommandBatcher {
     pub fn with_max_batch_size(mut self, max_batch_size: usize) -> Self {
         self.max_batch_size = max_batch_size.max(1);
         self
+    }
+
+    /// The most items one batch submission carries - commands to
+    /// `submitCommands` or the REST batch trigger, or external events to
+    /// the REST batch route (docs/architecture.md §227). A call with more
+    /// is refused whole. Kept here, not on the routes, because both
+    /// surfaces already share this batcher. Clamped to at least 1.
+    pub fn with_max_items_per_batch(mut self, max_items: usize) -> Self {
+        self.max_items_per_batch = max_items.max(1);
+        self
+    }
+
+    /// See [`with_max_items_per_batch`](Self::with_max_items_per_batch).
+    pub fn max_items_per_batch(&self) -> usize {
+        self.max_items_per_batch
     }
 
     /// The most batch leaders that may run at once across all bounded
@@ -254,17 +301,70 @@ impl CommandBatcher {
         idempotency_key: Option<&str>,
         covered_through: Option<i64>,
     ) -> Result<SubmitCommandOutcome> {
-        let bounded_context_name = command_type.bounded_context.name.clone();
+        let command = Self::prepare(
+            pool,
+            command_type,
+            payload,
+            client_id,
+            correlation_id,
+            causation_id,
+            bounded_context_events,
+            consistency_tags,
+            matching_events,
+            initial_decision,
+            encryption_master_key,
+            now,
+            snapshot,
+            snapshot_states,
+            idempotency_key,
+            covered_through,
+        )
+        .await?;
+        let reply = self
+            .enqueue(
+                pool,
+                dispatcher,
+                projection_dispatcher,
+                broadcaster,
+                event_cache,
+                encryption_master_key,
+                &command_type.bounded_context.name,
+                vec![command],
+            )
+            .await
+            .pop()
+            .expect("one command queued, one reply");
+        await_reply(reply).await
+    }
 
-        // Pre-lock warm-up, done here - fully in parallel across every
-        // concurrently-submitting caller, before any of them join the
-        // shared queue - rather than by whichever one becomes leader,
-        // serially, for the whole batch. See
-        // `db::warm_up_event_types_and_encryption_keys`'s own doc
-        // comment for why this is always safe.
+    /// A command as it waits in the queue. The pre-lock warm-up is done
+    /// here - fully in parallel across every concurrently-submitting
+    /// caller, before any of them join the shared queue - rather than by
+    /// whichever one becomes leader, serially, for the whole batch. See
+    /// `db::warm_up_event_types_and_encryption_keys`'s own doc comment for
+    /// why this is always safe.
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare(
+        pool: &Pool,
+        command_type: &CommandType,
+        payload: &str,
+        client_id: &str,
+        correlation_id: Option<&str>,
+        causation_id: Option<&str>,
+        bounded_context_events: &[Event],
+        consistency_tags: &[Tag],
+        matching_events: &[Event],
+        initial_decision: CommandDecision,
+        encryption_master_key: Option<&EncryptionMasterKey>,
+        now: DateTime<Utc>,
+        snapshot: Option<SnapshotContext<'_>>,
+        snapshot_states: &[crate::plugin::SnapshotState],
+        idempotency_key: Option<&str>,
+        covered_through: Option<i64>,
+    ) -> Result<BatchedCommand> {
         let (event_types_by_name, resolved) = crate::db::warm_up_event_types_and_encryption_keys(
             pool,
-            &bounded_context_name,
+            &command_type.bounded_context.name,
             command_type,
             payload,
             &initial_decision,
@@ -272,7 +372,7 @@ impl CommandBatcher {
         )
         .await?;
 
-        let command = BatchedCommand {
+        Ok(BatchedCommand {
             command_type: command_type.clone(),
             payload: payload.to_string(),
             client_id: client_id.to_string(),
@@ -292,71 +392,210 @@ impl CommandBatcher {
             idempotency_key: idempotency_key.map(str::to_string),
             event_types_by_name,
             resolved,
-        };
+        })
+    }
 
-        let queue = self.queue_for(&bounded_context_name).await;
-        let (reply_tx, reply_rx) = oneshot::channel();
+    /// Queues `commands`, in order, in one push - so nothing another
+    /// caller queues lands between them in the queue - and becomes the
+    /// leader if the queue was empty. One reply per command, in the same
+    /// order.
+    #[allow(clippy::too_many_arguments)]
+    async fn enqueue(
+        &self,
+        pool: &Pool,
+        dispatcher: &Arc<dyn CommandDispatcher>,
+        projection_dispatcher: &Arc<dyn ProjectionDispatcher>,
+        broadcaster: &EventBroadcaster,
+        event_cache: &EventCache,
+        encryption_master_key: Option<&EncryptionMasterKey>,
+        bounded_context_name: &str,
+        commands: Vec<BatchedCommand>,
+    ) -> Vec<oneshot::Receiver<BatchedCommandResult>> {
+        if commands.is_empty() {
+            return Vec::new();
+        }
+        let queue = self.queue_for(bounded_context_name).await;
+        let count = commands.len();
+        let mut replies = Vec::with_capacity(count);
         let is_leader = {
             let mut queue = lock_queue(&queue);
-            queue.push(PendingCommand {
-                command,
-                reply: reply_tx,
-            });
+            for command in commands {
+                let (reply, reply_rx) = oneshot::channel();
+                queue.push(PendingCommand { command, reply });
+                replies.push(reply_rx);
+            }
             // Exactly one pusher can ever observe the queue going from
             // empty to non-empty - the push and this check happen under
             // the same lock acquisition, so leadership for a given batch
             // is assigned unambiguously, exactly once.
-            queue.len() == 1
+            queue.len() == count
         };
 
-        if !is_leader {
-            return reply_rx.await.unwrap_or_else(|_| {
-                Err(Error::batch_failed_msg(
-                    "command batch leader task ended without producing a result",
-                ))
-            });
+        if is_leader {
+            // The batch runs on its own task, not on this caller's future:
+            // a leader whose client disconnects (axum drops the handler
+            // future) would otherwise drop the shared transaction
+            // mid-batch, failing every batch-mate's command - or, after the
+            // commit, leaving them told `BatchFailed` for a command that
+            // did commit, and its events unbroadcast (docs/architecture.md
+            // §114). Detached, the batch finishes and answers everyone; the
+            // leader's own command commits even if nobody is left to read
+            // its result, as any command already on its way into a
+            // transaction can.
+            let leader = self.clone();
+            let pool = pool.clone();
+            let dispatcher = dispatcher.clone();
+            let projection_dispatcher = projection_dispatcher.clone();
+            let broadcaster = broadcaster.clone();
+            let event_cache = event_cache.clone();
+            let encryption_master_key = encryption_master_key.cloned();
+            let bounded_context_name = bounded_context_name.to_string();
+            tokio::spawn(
+                async move {
+                    leader
+                        .run_as_leader(
+                            &pool,
+                            dispatcher.as_ref(),
+                            projection_dispatcher.as_ref(),
+                            &broadcaster,
+                            &event_cache,
+                            encryption_master_key.as_ref(),
+                            &bounded_context_name,
+                            &queue,
+                        )
+                        .await
+                }
+                .instrument(tracing::Span::current()),
+            );
         }
+        replies
+    }
 
-        // The batch runs on its own task, not on this caller's future: a
-        // leader whose client disconnects (axum drops the handler future)
-        // would otherwise drop the shared transaction mid-batch, failing
-        // every batch-mate's command - or, after the commit, leaving them
-        // told `BatchFailed` for a command that did commit, and its events
-        // unbroadcast (docs/architecture.md §114). Detached, the batch
-        // finishes and answers everyone; the leader's own command
-        // commits even if nobody is left to read its result, as any
-        // command already on its way into a transaction can.
-        let leader = self.clone();
-        let pool = pool.clone();
-        let dispatcher = dispatcher.clone();
-        let projection_dispatcher = projection_dispatcher.clone();
-        let broadcaster = broadcaster.clone();
-        let event_cache = event_cache.clone();
-        let encryption_master_key = encryption_master_key.cloned();
-        let batch = tokio::spawn(
-            async move {
-                leader
-                    .run_as_leader(
-                        &pool,
-                        dispatcher.as_ref(),
-                        projection_dispatcher.as_ref(),
-                        &broadcaster,
-                        &event_cache,
-                        encryption_master_key.as_ref(),
-                        &bounded_context_name,
-                        &queue,
-                    )
-                    .await
-            }
-            .instrument(tracing::Span::current()),
-        );
-        batch.await.unwrap_or_else(|_| {
-            // Only a panic gets here (the task is never aborted);
-            // `LeaderGuard` has already answered whoever was still queued.
-            Err(Error::batch_failed_msg(
-                "command batch leader task ended without producing a result",
-            ))
-        })
+    /// Several commands for one bounded context, decided and committed in
+    /// the order given, each with the outcome it would have had sent alone
+    /// right after the one before it - `rule SubmitCommandBatch`
+    /// (docs/architecture.md §227). One result per command, in order: a
+    /// command that fails before it is queued (its read, its decide, its
+    /// warm-up) fails alone, and the others are still submitted.
+    ///
+    /// Each command's optimistic read and `decide()` run before any is
+    /// queued, up to [`PREPARE_CONCURRENCY`] at a time, so a later command
+    /// doesn't see an earlier one's events there. It does under the lock:
+    /// the batch's commands are queued in one push, in order, and the
+    /// leader decides each against the events of the commands before it
+    /// (`extra_committed_events`), deciding again when they matter.
+    ///
+    /// With `stop_at_first_failure`, the commands after the first one
+    /// that fails before it is queued are not queued at all and answer
+    /// [`Error::NotProcessed`], so they can be sent again in order. A
+    /// command that fails under the lock - a database error in its
+    /// savepoint, a sync projection refusing its event - doesn't stop the
+    /// commands queued with it, which the leader has decided by then.
+    ///
+    /// Unlike [`decide_and_submit`](Self::decide_and_submit), a command
+    /// whose blind tags a key rotation made stale (§209) is answered with
+    /// that error rather than submitted again: submitted again, it would
+    /// land after the commands that followed it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn decide_and_submit_many(
+        &self,
+        pool: &Pool,
+        dispatcher: &Arc<dyn CommandDispatcher>,
+        projection_dispatcher: &Arc<dyn ProjectionDispatcher>,
+        snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+        broadcaster: &EventBroadcaster,
+        event_cache: &EventCache,
+        encryption_master_key: Option<&EncryptionMasterKey>,
+        bounded_context_name: &str,
+        commands: Vec<CommandBatchItem>,
+        stop_at_first_failure: bool,
+    ) -> Vec<Result<SubmitCommandOutcome>> {
+        use futures_util::StreamExt;
+
+        let prepared: Vec<Result<BatchedCommand>> = futures_util::stream::iter(commands)
+            .map(|item| async move {
+                if item.command_type.bounded_context.name != bounded_context_name {
+                    return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
+                }
+                let now = Utc::now();
+                let resolved = crate::db::resolve_command_submission(
+                    pool,
+                    dispatcher.as_ref(),
+                    snapshot_dispatcher,
+                    event_cache,
+                    &item.command_type,
+                    &item.payload,
+                    &crate::plugin::DecisionContext::at(now),
+                )
+                .await?;
+                self.slow.note_resolved(&item.command_type, &resolved);
+                Self::prepare(
+                    pool,
+                    &item.command_type,
+                    &item.payload,
+                    &item.client_id,
+                    item.correlation_id.as_deref(),
+                    item.causation_id.as_deref(),
+                    &resolved.bounded_context_events,
+                    &resolved.consistency_tags,
+                    &resolved.matching_events,
+                    resolved.decision,
+                    encryption_master_key,
+                    now,
+                    resolved
+                        .snapshot_context
+                        .as_ref()
+                        .map(|ctx| SnapshotContext {
+                            state_json: &ctx.state_json,
+                            as_of_sequence: ctx.as_of_sequence,
+                        }),
+                    &resolved.snapshot_states,
+                    item.idempotency_key.as_deref(),
+                    Some(resolved.covered_through),
+                )
+                .await
+            })
+            .buffered(PREPARE_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut queued = Vec::new();
+        let mut failed = false;
+        let mut results: Vec<Option<Result<SubmitCommandOutcome>>> = prepared
+            .into_iter()
+            .map(|command| match command {
+                Ok(_) if failed && stop_at_first_failure => Some(Err(Error::NotProcessed)),
+                Ok(command) => {
+                    queued.push(command);
+                    None
+                }
+                Err(e) => {
+                    failed = true;
+                    Some(Err(e))
+                }
+            })
+            .collect();
+        let mut replies = self
+            .enqueue(
+                pool,
+                dispatcher,
+                projection_dispatcher,
+                broadcaster,
+                event_cache,
+                encryption_master_key,
+                bounded_context_name,
+                queued,
+            )
+            .await
+            .into_iter();
+        for result in results.iter_mut().filter(|r| r.is_none()) {
+            let reply = replies.next().expect("one reply per queued command");
+            *result = Some(await_reply(reply).await);
+        }
+        results
+            .into_iter()
+            .map(|r| r.expect("every command has a result"))
+            .collect()
     }
 
     /// The batched drop-in replacement for `db::decide_and_submit_command` -
@@ -500,10 +739,10 @@ impl CommandBatcher {
     /// Two further guarantees keep that invariant true:
     /// - **Over-cap remainder**: if more than the configured max batch size commands
     ///   are queued, this leader keeps going - lock, drain, process -
-    ///   until a drain empties the queue, and only then returns its own
-    ///   (already-known) result. No one else can become leader while the
-    ///   queue is non-empty, so it must be this one.
-    /// - **Cancellation**: `submit` runs this on its own task, so a
+    ///   until a drain empties the queue, answering each batch as it
+    ///   commits. No one else can become leader while the queue is
+    ///   non-empty, so it must be this one.
+    /// - **Cancellation**: `enqueue` runs this on its own task, so a
     ///   leader's caller being dropped (client disconnect, timeout) no
     ///   longer stops it (docs/architecture.md §114). A panic still can:
     ///   a [`LeaderGuard`] stays armed until a drain empties the queue,
@@ -522,13 +761,13 @@ impl CommandBatcher {
         encryption_master_key: Option<&EncryptionMasterKey>,
         bounded_context_name: &str,
         queue: &Queue,
-    ) -> Result<SubmitCommandOutcome> {
+    ) {
         let mut guard = LeaderGuard {
             queue: queue.clone(),
             armed: true,
         };
         let permits = self.leader_permits(pool);
-        let mut own_result: Option<Result<SubmitCommandOutcome>> = None;
+        let mut first_pass = true;
 
         loop {
             // Held for the whole lock-wait-plus-batch, released at the
@@ -562,13 +801,10 @@ impl CommandBatcher {
                 // the queue is empty, so leadership is released.
                 guard.armed = false;
             }
-            let first_pass = own_result.is_none();
-            let (batch, mut replies): (
+            let (batch, replies): (
                 Vec<BatchedCommand>,
                 Vec<oneshot::Sender<BatchedCommandResult>>,
             ) = pending.into_iter().map(|p| (p.command, p.reply)).unzip();
-            // The leader is always `batch[0]` of the *first* batch only.
-            let skip = usize::from(first_pass);
 
             let outcome = match leader_tx {
                 Err(e) => Err(e),
@@ -590,15 +826,19 @@ impl CommandBatcher {
                     // Lock acquisition or the shared transaction's final
                     // commit failed - nothing in this batch is
                     // trustworthy, so every command gets an equivalent
-                    // error. `Error` isn't `Clone`, so followers get a
+                    // error. `Error` isn't `Clone`, so the others get a
                     // `BatchFailed` carrying the original's code and
-                    // message; only the leader's own return value keeps
-                    // the original typed error.
-                    for reply in replies.drain(skip..) {
+                    // message; the first command of the first batch -
+                    // the one whose caller became leader - keeps the
+                    // original typed error, as the leader's own return
+                    // value used to.
+                    let mut replies = replies.into_iter();
+                    let original = if first_pass { replies.next() } else { None };
+                    for reply in replies {
                         let _ = reply.send(Err(Error::batch_failed(&e)));
                     }
-                    if first_pass {
-                        own_result = Some(Err(e));
+                    if let Some(reply) = original {
+                        let _ = reply.send(Err(e));
                     }
                 }
                 Ok(results) => {
@@ -612,25 +852,29 @@ impl CommandBatcher {
                         results.iter().flatten(),
                     )
                     .await;
-                    let mut results = results.into_iter();
-                    if first_pass {
-                        own_result = Some(results.next().expect(
-                            "run_as_leader's own batch always has at least its own leader in it",
-                        ));
-                    }
-                    for (reply, result) in replies.into_iter().skip(skip).zip(results) {
+                    for (reply, result) in replies.into_iter().zip(results) {
                         let _ = reply.send(result);
                     }
                 }
             }
 
+            first_pass = false;
             if !more_remaining {
                 break;
             }
         }
-
-        own_result.expect("the first pass always records the leader's own result")
     }
+}
+
+/// A queued command's answer. A closed channel means the leader task
+/// ended without answering it - only a panic does that, since the task is
+/// never aborted.
+async fn await_reply(reply: oneshot::Receiver<BatchedCommandResult>) -> BatchedCommandResult {
+    reply.await.unwrap_or_else(|_| {
+        Err(Error::batch_failed_msg(
+            "command batch leader task ended without producing a result",
+        ))
+    })
 }
 
 fn lock_queue(queue: &Queue) -> std::sync::MutexGuard<'_, Vec<PendingCommand>> {

@@ -1913,6 +1913,7 @@ config {
     max_events_per_read: Integer = 1000
     idempotency_key_retention: Duration = 48.hours
     max_query_tags: Integer = 32
+    max_items_per_batch: Integer = 100
 }
 
 ------------------------------------------------------------
@@ -2408,6 +2409,41 @@ default SystemCreator skilj = { }
 -- one of the systems. These are provenance a caller asserts, not a claim
 -- this library verifies, which is the same register client_id already sits
 -- in.
+
+-- External events in batches, on the terms commands are batched on (see
+-- the note above rule SubmitCommandBatch): up to
+-- config.max_items_per_batch at once, created or answered one by one
+-- in the order given, each with exactly the outcome it would get sent on
+-- its own right after the one before it, one outcome per event back in
+-- the same order, a call over the limit refused whole, an empty batch
+-- answered with no outcomes, and no batch record. Each item carries what
+-- a single SubmitExternalEvent takes apart from the token and the event
+-- type, which the call names once: payload, source_content, and the
+-- optional source_context, dedupe_partition_key, dedupe_sequence,
+-- idempotency_key, correlation_id and causation_id. An item's dedupe cursor
+-- or key is checked against the ones recorded before it, including the
+-- earlier items of the same batch, so a batch that repeats a message
+-- answers the repeat as redelivered, as two single submissions would.
+
+rule CreateExternalEventBatch {
+    when: SubmitExternalEvents(adapter, event_type, events, stop_at_first_failure?)
+    requires: events.count <= config.max_items_per_batch
+
+    for item in events:
+        ensures:
+            SubmitExternalEvent(
+                adapter: adapter,
+                event_type: event_type,
+                payload: item.payload,
+                source_content: item.source_content,
+                source_context: item.source_context,
+                dedupe_partition_key: item.dedupe_partition_key,
+                dedupe_sequence: item.dedupe_sequence,
+                idempotency_key: item.idempotency_key,
+                correlation_id: item.correlation_id,
+                causation_id: item.causation_id
+            )
+}
 
 rule CreateExternalEvent {
     when:
@@ -4381,6 +4417,76 @@ rule DryRunTriggerCommand {
         -- admin minted for one command type, not an admin - so neither the
         -- would-be events nor the matching events are shown (see
         -- CommandTrigger's TokenScopedToCommandType).
+}
+
+-- Batch submission. A caller with many commands to send, and an order
+-- they must be decided in, could until now keep only one in flight at a
+-- time: two sent concurrently may be decided in either order. A batch
+-- hands over up to config.max_items_per_batch commands at once, in the
+-- order they must be decided in, and gets one outcome per command back,
+-- in the same order.
+--
+-- A batch is a way to send commands, not a kind of command. Each command
+-- in it goes through exactly what it would go through sent on its own -
+-- its authorisation, its payload check, its idempotency key, ProcessCommand
+-- - and gets exactly the outcome it would have got on its own, sent right
+-- after the command before it had been answered. Nothing about a batch
+-- is remembered after it is answered: there is no batch record, only the
+-- Commands and events of the commands that were accepted.
+--
+-- It is not a transaction. Each command is accepted, rejected or refused
+-- on its own, and one command's rejection or refusal does not stop the
+-- commands after it (see CommandBatchSubmission's NotATransaction).
+--
+-- The limit is checked on the whole call: a call over it is refused, and
+-- not one of its commands is processed. It is never cut down to fit. An
+-- empty batch is not over any limit and is answered with no outcomes.
+--
+-- Each item of SubmitCommands' commands carries what a single SubmitCommand
+-- takes apart from the grant, which the call supplies once: command_type,
+-- payload, and the optional idempotency_key, correlation_id and
+-- causation_id. An item of TriggerCommands' commands carries no
+-- command_type, since a CommandToken names exactly one and the call does.
+
+rule SubmitCommandBatch {
+    when: SubmitCommands(access_mapping, commands)
+    requires: commands.count <= config.max_items_per_batch
+
+    -- In the order given. A command whose type belongs to another bounded
+    -- context than the grant's, whose payload is off its schema, or that
+    -- names an owner the grant may not write for is refused by
+    -- AuthoriseCommandSubmission, exactly as it would be on its own, and
+    -- the commands after it are still processed.
+    for item in commands:
+        ensures:
+            SubmitCommand(
+                access_mapping: access_mapping,
+                command_type: item.command_type,
+                payload: item.payload,
+                idempotency_key: item.idempotency_key,
+                correlation_id: item.correlation_id,
+                causation_id: item.causation_id
+            )
+}
+
+rule TriggerCommandBatch {
+    when: TriggerCommands(token, command_type, commands, stop_at_first_failure?)
+    requires: commands.count <= config.max_items_per_batch
+
+    -- In the order given, and refused one by one where
+    -- AuthoriseCommandTrigger would refuse one sent on its own. The token
+    -- and the command type are the call's, so a token that is not active
+    -- or not for this type refuses every command in it alike.
+    for item in commands:
+        ensures:
+            TriggerCommand(
+                token: token,
+                command_type: command_type,
+                payload: item.payload,
+                idempotency_key: item.idempotency_key,
+                correlation_id: item.correlation_id,
+                causation_id: item.causation_id
+            )
 }
 
 rule FetchCommands {
@@ -7313,6 +7419,7 @@ surface ExternalEventIngestion {
             adapter, event_type, payload, source_content, source_context?,
             dedupe_partition_key?, dedupe_sequence?, idempotency_key?,
             correlation_id?, causation_id?)
+        SubmitExternalEvents(adapter, event_type, events, stop_at_first_failure?)
 
     @guarantee TokenScopedToEventType
         -- A token only authorises submitting events for the EventType it
@@ -8389,6 +8496,7 @@ surface CommandTrigger {
             token, command_type, payload, idempotency_key?,
             correlation_id?, causation_id?)
         DryRunTriggerCommand(token, command_type, payload)
+        TriggerCommands(token, command_type, commands, stop_at_first_failure?)
 
     @guarantee DryRunRevealsOnlyTheOutcome
         -- DryRunTriggerCommand persists nothing, as DryRunCommand doesn't,
@@ -8459,6 +8567,101 @@ surface CommandTrigger {
         -- is why the command type must opt in via rest_trigger_allowed:
         -- a command being submittable by a Role over GraphQL does not
         -- make it triggerable by a token.
+}
+
+surface CommandBatchSubmission {
+    facing access_mapping: WriteAccess
+
+    provides:
+        SubmitCommands(access_mapping, commands)
+
+    @guarantee DecidedInTheOrderGiven
+        -- Each command in a batch is decided against a history that holds
+        -- every event the commands before it in the batch triggered, and
+        -- none of the events the commands after it trigger: its outcome is
+        -- the one it would get if the caller had sent it on its own, right
+        -- after the outcome of the command before it arrived. Two commands
+        -- in one batch that conflict (an order shipped twice) are therefore
+        -- the first accepted and the second rejected, never the other way
+        -- round. The same holds for TriggerCommands on CommandTrigger.
+        --
+        -- Only the batch's own order is promised. Another caller's command
+        -- may be decided between two commands of the batch, and each
+        -- command's outcome takes it into account as it would for a
+        -- command sent on its own.
+
+    @guarantee AnsweredInTheOrderGiven
+        -- A batch is answered with exactly one outcome per command, in the
+        -- order the commands were given, and each outcome is the one a
+        -- single submission of that command answers: accepted with its
+        -- Command and events, rejected with its reason and kind,
+        -- deduplicated with the original outcome, or refused with the error
+        -- a single submission would get. The same holds for
+        -- TriggerCommands, whose outcomes are those of a single trigger.
+
+    @guarantee NotATransaction
+        -- A batch is not accepted or rejected as a whole. An accepted
+        -- command stays accepted whatever the commands after it get, and a
+        -- rejected or refused one does not stop the commands after it.
+        -- Commands that must all be accepted or none are one command whose
+        -- decision triggers all their events (see the note on atomicity
+        -- across command types).
+
+    @guarantee OverTheLimitIsRefusedWhole
+        -- A call carrying more than config.max_items_per_batch commands
+        -- is refused before any of them is processed. It is never cut down
+        -- to fit, and no part of it is processed.
+
+    @guarantee StopAtTheFirstFailureWhenAsked
+        -- TriggerCommands and SubmitExternalEvents take an optional
+        -- stop_at_first_failure. When it is set, every item after the first
+        -- that fails - refused, or failing before it is decided - is not
+        -- processed at all and is answered as not processed, so the caller
+        -- can deal with the failed item and send the rest again, in order.
+        -- A rejection is an answer, not a failure, and doesn't stop the
+        -- batch. It is for a caller whose order the batch must not break
+        -- across a failure: a broker bridge, whose partition is decided in
+        -- order and whose dedupe watermark would otherwise move past a
+        -- message that failed. A command that fails after the batch's
+        -- commands were decided together - its write refused under the
+        -- lock - doesn't stop the commands decided with it. Unset, which
+        -- is how submitCommands always runs, NotATransaction holds as it
+        -- stands.
+
+    @guarantee OneBoundedContextPerCall
+        -- A batch is submitted under one grant, so for one bounded context.
+        -- A command whose type belongs to another bounded context is
+        -- refused on its own, as GrantScopedToBoundedContext refuses it
+        -- sent alone, and the rest of the batch is processed.
+
+    @guarantee KeysWorkAsTheyDoAlone
+        -- Each command's idempotency_key, correlation_id and causation_id
+        -- mean what they mean on a single submission. A key that an earlier
+        -- command in the same batch was accepted under deduplicates the
+        -- later one, as it would have had the two been sent one after the
+        -- other. A caller that resends a whole batch after losing its
+        -- answer gets the original outcomes for the commands that were
+        -- accepted under a key, and a fresh decision for the rest.
+        --
+        -- That is the whole of what a caller has after a batch call is cut
+        -- off: commands already on their way into a transaction still
+        -- finish, and their outcomes are not kept anywhere to be fetched
+        -- later. A caller that must know what became of every command
+        -- sends each with a key and resends the batch.
+
+    @guarantee EachCommandHasItsOwnTime
+        -- Each command is decided at the moment it is processed, as it
+        -- would be sent on its own, not at the moment the call arrived:
+        -- two commands in one batch may see different times.
+
+    @guidance
+        -- Dry runs are not batched: DryRunCommand and DryRunTriggerCommand
+        -- take one command each.
+        --
+        -- GraphQL only, as submitCommands, for the same callers as
+        -- CommandSubmission. Its REST counterpart, for a CommandToken, is
+        -- TriggerCommands on CommandTrigger: one command type per call,
+        -- since a token names one.
 }
 
 surface CommandQuery {
@@ -9315,7 +9518,8 @@ surface FederatedSubgraph {
     @guarantee OnlyGrantFacingSurfacesArePublished
         -- The description covers only the surfaces a grant faces at read
         -- or write level - this one's projections, EventSubscription,
-        -- CommandSubmission and PrivateFieldGrantManagement - for the
+        -- CommandSubmission, CommandBatchSubmission and
+        -- PrivateFieldGrantManagement - for the
         -- published bounded contexts. Surfaces faced by an admin grant, by
         -- a superadmin or by the bootstrap secret are never in it. They
         -- stay callable directly, by the same callers as before, and are

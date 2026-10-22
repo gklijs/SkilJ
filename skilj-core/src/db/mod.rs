@@ -10964,6 +10964,303 @@ pub async fn create_and_insert_external_event(
     Ok(CreateExternalEventOutcome::Created(Box::new(event)))
 }
 
+/// The dedupe cursor or key of one item of
+/// [`create_and_insert_external_events`]: an owned
+/// [`ExternalEventDedupe`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ExternalEventBatchDedupe {
+    /// See [`ExternalEventDedupe::Watermark`].
+    Watermark {
+        /// The source's partition.
+        partition_key: String,
+        /// The message's position in it.
+        sequence: i64,
+    },
+    /// See [`ExternalEventDedupe::Key`].
+    Key(String),
+}
+
+impl ExternalEventBatchDedupe {
+    fn as_dedupe(&self) -> ExternalEventDedupe<'_> {
+        match self {
+            ExternalEventBatchDedupe::Watermark {
+                partition_key,
+                sequence,
+            } => ExternalEventDedupe::Watermark(DedupeCursor {
+                partition_key,
+                sequence: *sequence,
+            }),
+            ExternalEventBatchDedupe::Key(key) => ExternalEventDedupe::Key(key),
+        }
+    }
+}
+
+/// One external event of [`create_and_insert_external_events`]: what
+/// [`create_and_insert_external_event`] takes for one event, apart from
+/// the token, which the batch shares.
+#[derive(Debug, Clone)]
+pub struct ExternalEventBatchItem {
+    /// The payload, as JSON.
+    pub payload: String,
+    /// The message as the source sent it.
+    pub source_content: String,
+    /// Where it came from, if the adapter says.
+    pub source_context: Option<String>,
+    /// The caller's correlation id, or `None` to have one generated.
+    pub correlation_id: Option<String>,
+    /// The caller's causation id, if any.
+    pub causation_id: Option<String>,
+    /// The cursor or key that recognises a redelivery, if any.
+    pub dedupe: Option<ExternalEventBatchDedupe>,
+}
+
+/// `rule CreateExternalEventBatch` (docs/architecture.md §227): several
+/// external events through one token, created or recognised as
+/// redeliveries in the order given, each with the outcome
+/// [`create_and_insert_external_event`] would give it alone, right after
+/// the one before it. One result per item, in order.
+///
+/// One transaction takes the bounded context's sequence lock once and
+/// commits once for the whole batch. Each item runs in its own savepoint:
+/// an item that fails - its payload off the schema, an error inserting it
+/// - is rolled back alone, sequence number included, and the items after
+/// it still run - unless `stop_at_first_failure`, when every item after
+/// the first that fails answers [`crate::error::Error::NotProcessed`] and
+/// is not processed, so a source that relies on its order (a dedupe
+/// watermark, a partition's sequence) can send them again after dealing
+/// with the failed one. Because they share the transaction, an item's dedupe
+/// check sees the watermarks and keys recorded by the items before it, so
+/// a batch that repeats a message answers the repeat as redelivered. An
+/// error taking the lock or committing fails every item.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(events = items.len()))]
+pub async fn create_and_insert_external_events(
+    pool: &Pool,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    adapter: &ExternalEventToken,
+    items: Vec<ExternalEventBatchItem>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    blind: &crate::blind::BlindIndex,
+    stop_at_first_failure: bool,
+) -> Vec<crate::error::Result<CreateExternalEventOutcome>> {
+    let bounded_context_name = adapter.event_type.bounded_context.name.clone();
+    let schema = schema_ident(&bounded_context_name);
+
+    // Every `requires`, and every encryption key, before the lock - as
+    // `create_and_insert_external_event` does for one (§141).
+    let mut results: Vec<Option<crate::error::Result<CreateExternalEventOutcome>>> =
+        Vec::with_capacity(items.len());
+    let mut resolved = std::collections::HashMap::new();
+    let mut failed = false;
+    for item in &items {
+        if failed && stop_at_first_failure {
+            results.push(Some(Err(crate::error::Error::NotProcessed)));
+            continue;
+        }
+        let checked = crate::event_store::check_create_external_event(
+            adapter,
+            &item.payload,
+            item.correlation_id.as_deref(),
+            item.causation_id.as_deref(),
+            blind,
+        );
+        let checked = match checked {
+            Ok(_) => {
+                resolve_encryption_keys(
+                    pool,
+                    &bounded_context_name,
+                    &adapter.event_type.sensitive_fields,
+                    &item.payload,
+                    encryption_master_key,
+                    &mut resolved,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        failed |= checked.is_err();
+        results.push(checked.err().map(Err));
+    }
+    if results.iter().all(Option::is_some) {
+        return results.into_iter().flatten().collect();
+    }
+
+    let created = async {
+        let mut tx = pool.begin().await?;
+        lock_bounded_context_sequence(&mut tx, &bounded_context_name).await?;
+        // docs/architecture.md §209: tags are derived below, under the lock
+        // a rotation holds - of the generation stored now.
+        refresh_blind_generations(&mut tx, &bounded_context_name, blind).await?;
+        // After the lock - see `create_and_insert_external_event`.
+        let sync_projections = sync_projection_names(&mut tx, &bounded_context_name).await?;
+        let mut outcomes = Vec::new();
+        let mut failed = false;
+        for (item, result) in items.into_iter().zip(&results) {
+            if result.is_some() {
+                continue;
+            }
+            if failed && stop_at_first_failure {
+                outcomes.push(Err(crate::error::Error::NotProcessed));
+                continue;
+            }
+            // Each item its own time, as if sent alone.
+            let now = Utc::now();
+            let dedupe = item.dedupe.clone();
+            let mut savepoint = tx.begin().await?;
+            let outcome = insert_external_event_in_tx(
+                &mut savepoint,
+                &schema,
+                projection_dispatcher,
+                adapter,
+                item,
+                dedupe.as_ref().map(ExternalEventBatchDedupe::as_dedupe),
+                now,
+                &resolved,
+                &sync_projections,
+                blind,
+            )
+            .await;
+            match &outcome {
+                Ok(CreateExternalEventOutcome::Created(_)) => savepoint.commit().await?,
+                // A redelivery wrote nothing; a failure is undone alone.
+                // Awaited, not left to `Drop`: the next item reuses the
+                // connection.
+                _ => savepoint.rollback().await?,
+            }
+            failed |= outcome.is_err();
+            outcomes.push(outcome);
+        }
+        tx.commit().await?;
+        Ok::<_, crate::error::Error>(outcomes)
+    }
+    .await;
+
+    match created {
+        Ok(outcomes) => {
+            let events: Vec<&Event> = outcomes
+                .iter()
+                .filter_map(|outcome| match outcome {
+                    Ok(CreateExternalEventOutcome::Created(event)) => Some(event.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            for event in &events {
+                broadcaster.publish(event);
+                record_event_appended(event);
+                event_cache.append(event).await;
+            }
+            notify_events_appended(pool, &events, broadcaster.instance_id()).await;
+            let mut outcomes = outcomes.into_iter();
+            results
+                .into_iter()
+                .map(|result| {
+                    result.unwrap_or_else(|| outcomes.next().expect("one outcome per item"))
+                })
+                .collect()
+        }
+        // Nothing in the transaction committed: every item that reached
+        // it gets the failure. `Error` isn't `Clone`.
+        Err(e) => results
+            .into_iter()
+            .map(|result| result.unwrap_or_else(|| Err(crate::error::Error::batch_failed(&e))))
+            .collect(),
+    }
+}
+
+/// One item of [`create_and_insert_external_events`], on the batch's
+/// transaction (a savepoint of it), which already holds the sequence lock:
+/// the dedupe check, the sequence number, the event, its insert and sync
+/// projections, and the watermark or key - what
+/// `create_and_insert_external_event` does for one event under the lock.
+#[allow(clippy::too_many_arguments)]
+async fn insert_external_event_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    schema: &str,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    adapter: &ExternalEventToken,
+    item: ExternalEventBatchItem,
+    dedupe: Option<ExternalEventDedupe<'_>>,
+    now: DateTime<Utc>,
+    resolved: &std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    sync_projections: &[String],
+    blind: &crate::blind::BlindIndex,
+) -> crate::error::Result<CreateExternalEventOutcome> {
+    match &dedupe {
+        Some(ExternalEventDedupe::Watermark(cursor)) => {
+            let watermark =
+                highest_dedupe_sequence(&mut **tx, schema, &adapter.id, cursor.partition_key)
+                    .await?;
+            if watermark.is_some_and(|w| cursor.sequence <= w) {
+                return Ok(CreateExternalEventOutcome::Redelivered { sequence: None });
+            }
+        }
+        Some(ExternalEventDedupe::Key(key)) => {
+            if let Some(sequence) =
+                recorded_external_event(&mut **tx, schema, &adapter.id, key).await?
+            {
+                return Ok(CreateExternalEventOutcome::Redelivered {
+                    sequence: Some(sequence),
+                });
+            }
+        }
+        None => {}
+    }
+
+    let next_seq = next_sequence(&mut **tx, &adapter.event_type.bounded_context.name).await?;
+    let event = crate::event_store::create_external_event(
+        adapter,
+        item.payload,
+        item.source_content,
+        item.source_context,
+        item.correlation_id,
+        item.causation_id,
+        next_seq,
+        now,
+        |subject_key, subject_value| {
+            let (key, _, data_key) = resolved
+                .get(&(subject_key.to_string(), subject_value.to_string()))
+                .expect(
+                    "resolve_encryption_keys pre-resolved every subject sensitive_field_subjects \
+                     named",
+                );
+            (key.clone(), data_key.clone())
+        },
+        blind,
+    )?;
+    let encryption_key_ids = encryption_key_ids(&event.encryption_keys, resolved);
+    insert_event_and_update_sync_projections_in_tx(
+        tx,
+        &event,
+        None,
+        projection_dispatcher,
+        &encryption_key_ids,
+        sync_projections,
+    )
+    .await?;
+    match &dedupe {
+        Some(ExternalEventDedupe::Watermark(cursor)) => {
+            advance_dedupe_watermark(
+                &mut **tx,
+                schema,
+                &adapter.id,
+                cursor.partition_key,
+                cursor.sequence,
+                now,
+            )
+            .await?;
+        }
+        Some(ExternalEventDedupe::Key(key)) => {
+            record_external_message_key(&mut **tx, schema, &adapter.id, key, event.sequence, now)
+                .await?;
+        }
+        None => {}
+    }
+    Ok(CreateExternalEventOutcome::Created(Box::new(event)))
+}
+
 /// `CreateDirectEvent`'s own twin of `create_and_insert_external_event`
 /// above - same reasoning, same fix, only the adapter type and the
 /// absent `source_content`/`source_context` differ.

@@ -32,10 +32,17 @@
 //! again under the lock, and the slowest of those (docs/architecture.md
 //! §203). See
 //! docs/performance.md and docs/architecture.md §178 for the numbers.
+//!
+//! `SKILJ_BENCH_BATCH=n` adds, per workload, rows for 1 and 8 callers
+//! that send their deposits `n` at a time through
+//! `POST /v1/commands/trigger/batch` (docs/architecture.md §227); a
+//! command's latency there is its call's.
 
 mod deposit_bench;
 
-use deposit_bench::{deposit_through, latency_proxy, setup_instances, Setup};
+use deposit_bench::{
+    deposit_batch_through, deposit_through, latency_proxy, setup_instances, Setup,
+};
 use skilj_core::db;
 use skilj_core::shared::generate_token_id;
 use std::sync::{Arc, Mutex};
@@ -170,6 +177,7 @@ async fn scenario(
     workload: Workload,
     workers: usize,
     commands: usize,
+    batch: usize,
 ) {
     let run = generate_token_id();
     let per_worker = (commands / workers).max(1);
@@ -179,20 +187,32 @@ async fn scenario(
         let run = run.clone();
         async move {
             let mut latencies = Vec::with_capacity(per_worker);
-            for n in 0..per_worker {
-                let account = match workload {
+            let accounts: Vec<String> = (0..per_worker)
+                .map(|n| match workload {
                     Workload::Spread => format!("{run}-{worker}-{n}"),
                     Workload::Hot | Workload::HotSnapshot | Workload::HotNothing => {
                         format!("{run}-hot")
                     }
-                };
-                let credential = match workload {
-                    Workload::HotSnapshot => &setup.fast_credential,
-                    Workload::HotNothing => &setup.blind_credential,
-                    _ => &setup.credential,
-                };
-                latencies
-                    .push(deposit_through(setup.router_for(worker), credential, &account).await);
+                })
+                .collect();
+            let credential = match workload {
+                Workload::HotSnapshot => &setup.fast_credential,
+                Workload::HotNothing => &setup.blind_credential,
+                _ => &setup.credential,
+            };
+            if batch > 1 {
+                // docs/architecture.md §227: `batch` deposits a call, each
+                // command's latency that of its call.
+                for chunk in accounts.chunks(batch) {
+                    let latency =
+                        deposit_batch_through(setup.router_for(worker), credential, chunk).await;
+                    latencies.extend(std::iter::repeat_n(latency, chunk.len()));
+                }
+            } else {
+                for account in &accounts {
+                    latencies
+                        .push(deposit_through(setup.router_for(worker), credential, account).await);
+                }
             }
             latencies
         }
@@ -208,7 +228,7 @@ async fn scenario(
     let s = stats.0.lock().unwrap().clone();
     let per_command = |us: u64| us as f64 / s.commands.max(1) as f64;
     println!(
-        "{:<8} {:>3} workers {:>6.0} cmd/s  p50 {:>6.1} ms  p99 {:>6.1} ms | batch {:>5.1}  \
+        "{:<8} {:>3} workers {:>3} a call {:>6.0} cmd/s  p50 {:>6.1} ms  p99 {:>6.1} ms | batch {:>5.1}  \
          lock wait {:>6.1} ms | per cmd in lock: decide {:>5.0} us (delta query {:>5.0} us, {:>3.0}%)  \
          seq {:>4.0} us  persist {:>5.0} us  commit {:>5.0} us | before lock: read {:>5.0} us \
          ({:>5.0} events)  decide {:>5.0} us  slowest read {:>6.1} ms  slowest decide {:>6.2} ms | \
@@ -220,6 +240,7 @@ async fn scenario(
             Workload::HotNothing => "hot-none",
         },
         workers,
+        batch.max(1),
         latencies.len() as f64 / elapsed.as_secs_f64(),
         pct(0.50).as_secs_f64() * 1000.0,
         pct(0.99).as_secs_f64() * 1000.0,
@@ -271,6 +292,9 @@ fn command_throughput() {
         let latency_ms = env_setting("SKILJ_BENCH_LATENCY_MS", 0);
         let instances = env_setting("SKILJ_BENCH_INSTANCES", 1);
         let commands = env_setting("SKILJ_BENCH_COMMANDS", COMMANDS);
+        // docs/architecture.md §227: also 1 and 8 callers sending this many
+        // deposits per `POST /v1/commands/trigger/batch` call.
+        let batch = env_setting("SKILJ_BENCH_BATCH", 0);
         let skilj_url = if latency_ms > 0 {
             latency_proxy(&database_url, Duration::from_millis(latency_ms as u64)).await
         } else {
@@ -283,7 +307,7 @@ fn command_throughput() {
         );
 
         // Warm-up: caches, prepared statements, pool connections.
-        scenario(&setup, &stats, Workload::Spread, 8, commands).await;
+        scenario(&setup, &stats, Workload::Spread, 8, commands, 1).await;
 
         for round in 1..=2 {
             println!("--- round {round} ---");
@@ -294,7 +318,12 @@ fn command_throughput() {
                 Workload::HotNothing,
             ] {
                 for workers in [1, 8, 32, 80] {
-                    scenario(&setup, &stats, workload, workers, commands).await;
+                    scenario(&setup, &stats, workload, workers, commands, 1).await;
+                }
+                if batch > 1 {
+                    for workers in [1, 8] {
+                        scenario(&setup, &stats, workload, workers, commands, batch).await;
+                    }
                 }
             }
         }

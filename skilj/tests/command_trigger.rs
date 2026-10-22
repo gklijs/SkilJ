@@ -447,8 +447,10 @@ fn commands_and_direct_writes_beyond_the_pool_size_all_complete() {
                 assert_eq!(actual, status, "{uri}: {}", String::from_utf8_lossy(&body));
             }
         });
+        // Longer than the pool's acquire timeout: a stall shows up as
+        // an acquire error in a response, a slow runner just finishes.
         tokio::time::timeout(
-            std::time::Duration::from_secs(8),
+            std::time::Duration::from_secs(30),
             futures_util::future::join_all(requests),
         )
         .await
@@ -1262,5 +1264,275 @@ fn command_dry_run_answers_the_outcome_only_and_persists_nothing() {
         // The schema is checked as for a trigger.
         let (status, _) = post("/v1/commands/dry-run", r#"{"payload":{"amount":"x"}}"#).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    });
+}
+
+/// `POST /v1/commands/trigger/batch` with `body`, answered as JSON.
+async fn trigger_batch(
+    router: &axum::Router,
+    credential: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/commands/trigger/batch")
+        .header("authorization", format!("Bearer {credential}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// docs/architecture.md §227: every command answered in order, each as a
+/// single trigger would answer it - an acceptance, a rejection, and a
+/// payload off the schema refused with the status a single trigger gets -
+/// and the refused one doesn't stop the command after it.
+#[test]
+fn a_trigger_batch_answers_each_command_in_order() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
+        let router = skilj.rest_router();
+
+        let (status, json) = trigger_batch(
+            &router,
+            &credential,
+            serde_json::json!({ "commands": [
+                { "payload": { "amount": 20 } },
+                { "payload": { "amount": 5000 } },
+                { "payload": { "amount": "twenty" } },
+                { "payload": { "amount": 30 }, "correlationId": "batch-corr" },
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let outcomes = json["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 4, "{json}");
+        assert_eq!(outcomes[0]["accepted"], true);
+        assert_eq!(outcomes[1]["accepted"], false);
+        assert_eq!(outcomes[1]["rejectionKind"], "insufficient_funds");
+        assert_eq!(outcomes[2]["error"]["status"], 400, "{json}");
+        assert!(outcomes[2]["error"]["code"].is_string());
+        assert_eq!(outcomes[3]["accepted"], true);
+        assert_eq!(outcomes[3]["correlationId"], "batch-corr");
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        let amounts: Vec<String> = events.iter().map(|e| e.payload.clone()).collect();
+        assert_eq!(amounts, vec![r#"{"amount":20}"#, r#"{"amount":30}"#]);
+        assert_eq!(
+            outcomes[0]["triggeredEventSequences"][0],
+            events[0].sequence
+        );
+        assert_eq!(
+            outcomes[3]["triggeredEventSequences"][0],
+            events[1].sequence
+        );
+    });
+}
+
+/// A key an earlier command of the same batch was accepted under
+/// deduplicates the later one, as two single triggers would; resending
+/// the batch deduplicates both.
+#[test]
+fn a_trigger_batch_deduplicates_keys_within_and_across_batches() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
+        let router = skilj.rest_router();
+        let body = serde_json::json!({ "commands": [
+            { "payload": { "amount": 20 }, "idempotencyKey": "k-1" },
+            { "payload": { "amount": 20 }, "idempotencyKey": "k-1" },
+        ]});
+
+        let (status, first) = trigger_batch(&router, &credential, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["outcomes"][0]["deduplicated"], false);
+        assert_eq!(first["outcomes"][1]["deduplicated"], true);
+        assert_eq!(
+            first["outcomes"][1]["triggeredEventSequences"],
+            first["outcomes"][0]["triggeredEventSequences"]
+        );
+
+        let (_, again) = trigger_batch(&router, &credential, body).await;
+        assert_eq!(again["outcomes"][0]["deduplicated"], true);
+        assert_eq!(again["outcomes"][1]["deduplicated"], true);
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    });
+}
+
+/// Over `max_items_per_batch` (100 by default) the batch is refused
+/// whole, nothing processed; an empty one is answered with no outcomes;
+/// a reserved key is refused for its own command only.
+#[test]
+fn a_trigger_batch_over_the_limit_is_refused_whole() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
+        let router = skilj.rest_router();
+
+        let commands: Vec<_> = (0..101)
+            .map(|_| serde_json::json!({ "payload": { "amount": 1 } }))
+            .collect();
+        let (status, json) = trigger_batch(
+            &router,
+            &credential,
+            serde_json::json!({ "commands": commands }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "batch_too_large");
+
+        let (status, json) =
+            trigger_batch(&router, &credential, serde_json::json!({ "commands": [] })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["outcomes"], serde_json::json!([]));
+
+        let (_, json) = trigger_batch(
+            &router,
+            &credential,
+            serde_json::json!({ "commands": [
+                { "payload": { "amount": 1 }, "idempotencyKey": "skilj-cross-context-route:x" },
+                { "payload": { "amount": 2 } },
+            ]}),
+        )
+        .await;
+        assert_eq!(json["outcomes"][0]["error"]["status"], 400, "{json}");
+        assert_eq!(json["outcomes"][1]["accepted"], true, "{json}");
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    });
+}
+
+/// docs/architecture.md §227: with `stopAtFirstFailure`, the commands after
+/// the first refused one answer `not_processed` (409) and are not
+/// triggered; sent again, they are.
+#[test]
+fn a_trigger_batch_can_stop_at_its_first_failure() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
+        let router = skilj.rest_router();
+
+        let (status, json) = trigger_batch(
+            &router,
+            &credential,
+            serde_json::json!({ "stopAtFirstFailure": true, "commands": [
+                { "payload": { "amount": 20 } },
+                { "payload": { "amount": 5000 } },
+                { "payload": { "amount": "twenty" } },
+                { "payload": { "amount": 30 } },
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let outcomes = json["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes[0]["accepted"], true);
+        // A rejection is an answer, not a failure: it doesn't stop the batch.
+        assert_eq!(outcomes[1]["accepted"], false);
+        assert_eq!(outcomes[2]["error"]["status"], 400, "{json}");
+        assert_eq!(outcomes[3]["error"]["status"], 409, "{json}");
+        assert_eq!(outcomes[3]["error"]["code"], "not_processed");
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    });
+}
+
+/// `rest_router()` served on a local port, for an HTTP client.
+async fn serve_rest(skilj: &Skilj) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = skilj.rest_router();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    url
+}
+
+/// docs/architecture.md §227: the bridges' batch client against the real
+/// route - a rejection is done, the first refused command stops the count,
+/// and nothing after it was triggered.
+#[test]
+fn the_bridges_batch_client_counts_what_the_trigger_route_got_done() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
+        let url = serve_rest(&skilj).await;
+        let mapping = skilj_bridge::InboundMapping {
+            credential,
+            action: skilj_bridge::InboundAction::Trigger {
+                command_type: "WithdrawMoney".to_string(),
+            },
+        };
+        let bodies = [
+            serde_json::json!({ "payload": { "amount": 20 } }),
+            serde_json::json!({ "payload": { "amount": 5000 } }),
+            serde_json::json!({ "payload": { "amount": "twenty" } }),
+            serde_json::json!({ "payload": { "amount": 30 } }),
+        ];
+        let keys = ["m-1", "m-2", "m-3", "m-4"];
+        let items: Vec<_> = bodies
+            .iter()
+            .zip(keys)
+            .map(|(body, key)| skilj_bridge::InboundItem {
+                body,
+                idempotency_key: Some(key),
+            })
+            .collect();
+        let batcher = skilj_bridge::InboundBatcher::new(skilj_bridge::InboundBatching::default());
+        let done = skilj_bridge::post_inbound_batch(
+            &reqwest::Client::new(),
+            &url,
+            &mapping,
+            &batcher,
+            &items,
+        )
+        .await;
+        assert_eq!(done, 2);
+        assert_eq!(batcher.max_items(), 100);
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+
+        // Sent again from the start: the keyed one is a duplicate, still done.
+        let done = skilj_bridge::post_inbound_batch(
+            &reqwest::Client::new(),
+            &url,
+            &mapping,
+            &batcher,
+            &items[..2],
+        )
+        .await;
+        assert_eq!(done, 2);
+        assert_eq!(
+            db::list_events_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     });
 }

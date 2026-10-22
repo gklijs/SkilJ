@@ -32,7 +32,7 @@ if (apollo.errors) {
     .flatMap((type) => Object.keys(type.getFields()));
   for (const { name } of services.filter((s) => s.name !== 'other')) {
     const published = [
-      'Projection', 'ProjectionSchema', 'Epoch', 'ListPrivateFieldGrants', 'SubmitCommand',
+      'Projection', 'ProjectionSchema', 'Epoch', 'ListPrivateFieldGrants', 'SubmitCommand', 'SubmitCommands',
       'GrantPrivateFieldAccessForEvent', 'GrantPrivateFieldAccessForCommand',
       'RevokePrivateFieldAccess', 'AllEvents', 'EventsByType', 'ProjectionUpdates',
     ].map((field) => `${name}${field}`);

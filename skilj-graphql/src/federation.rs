@@ -72,7 +72,8 @@ impl FederationOptions {
 /// grant faces at read or write level (`@guarantee
 /// OnlyGrantFacingSurfacesArePublished`) - `ProjectionQuery`,
 /// `EventSubscription` (with `epoch`, which resuming one needs),
-/// `CommandSubmission`'s `submitCommand` and `PrivateFieldGrantManagement`.
+/// `CommandSubmission`'s `submitCommand`, `CommandBatchSubmission`'s
+/// `submitCommands` and `PrivateFieldGrantManagement`.
 /// Every other root field is `@inaccessible`.
 pub const PUBLISHED_ROOT_FIELDS: &[&str] = &[
     "projection",
@@ -80,6 +81,7 @@ pub const PUBLISHED_ROOT_FIELDS: &[&str] = &[
     "epoch",
     "listPrivateFieldGrants",
     "submitCommand",
+    "submitCommands",
     "grantPrivateFieldAccessForEvent",
     "grantPrivateFieldAccessForCommand",
     "revokePrivateFieldAccess",

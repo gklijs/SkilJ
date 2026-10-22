@@ -38,7 +38,12 @@ an uncapped deposit whose query reads nothing, docs/architecture.md §201).
 
 Measured on a 22-core development machine against the embedded Postgres 18,
 shared with other work - the load average moved between 6 and 15 during the
-runs, so the absolute rates moved by up to 2x between rounds. Per-command time
+runs, so the absolute rates moved by up to 2x between rounds. The test harness's
+Postgres runs with fsync off, so these figures leave out the cost of
+flushing each commit to disk. With fsync on, on a disk where one fsync takes
+about 2.4 ms, spread with one caller ran at about 150 commands/s instead of
+290, and with 80 callers at 1,600-1,900 instead of about 2,050
+(docs/architecture.md §226). Per-command time
 inside the lock is the steadier figure. After the fix in docs/architecture.md
 §178:
 
@@ -130,6 +135,27 @@ it is a fixed handful per batch. A single caller's command takes about
 lists the statements one command sends. With the batch this cheap, one
 instance comes close to the bounded context's ceiling, and three add
 little.
+
+## Batches from one caller
+
+A caller with one command in flight is held back by its own round trip. The
+batch routes (GraphQL `submitCommands`, `POST /v1/commands/trigger/batch`,
+`POST /v1/events/external/batch`) take up to `max_items_per_batch` (100)
+items per call and decide them in the order given (docs/architecture.md
+§227). `SKILJ_BENCH_BATCH=100` adds those rows to the benchmark. Against
+Postgres with fsync on (about 2.4 ms per fsync), commands/s:
+
+| workload | 1 caller, one at a time | 80 callers, one at a time | 1 caller, 100 a call |
+|---|---|---|---|
+| spread | 139-148 | 1,909-2,105 | 2,786-2,830 |
+| hot | 62-67 | 103-135 | 169-170 |
+| hot-snap | 125-136 | 391-410 | 571-648 |
+| hot-none | 147-150 | 2,230-2,879 | 4,031-4,883 |
+
+When your commands must be decided in order, send them in a batch rather
+than one by one. When order doesn't matter, concurrent single calls get
+most of the same gain. Hot keys gain the least: every item after the first
+is decided again under the lock.
 
 ## Async projection catch-up
 

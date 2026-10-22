@@ -11,6 +11,11 @@ enum LedgerAccessTokenStatus {
 	REVOKED
 }
 
+type LedgerBatchItemError {
+	code: String!
+	message: String!
+}
+
 type LedgerBoundedContext @inaccessible {
 	name: String!
 	status: LedgerBoundedContextStatus!
@@ -378,6 +383,14 @@ input LedgerSensitiveFieldInput @inaccessible {
 	subjectField: String! @inaccessible
 }
 
+input LedgerSubmitCommandInput {
+	commandTypeName: String!
+	payload: String!
+	idempotencyKey: String
+	correlationId: String
+	causationId: String
+}
+
 type LedgerSubmitCommandPayload {
 	accepted: Boolean!
 	rejectionReason: String
@@ -389,6 +402,11 @@ type LedgerSubmitCommandPayload {
 	matchingEventsTruncated: Boolean
 	triggeredEventSequences: [Int]
 	matchingEvents: [LedgerMatchingEvent]
+}
+
+type LedgerSubmitCommandsItem {
+	result: LedgerSubmitCommandPayload
+	error: LedgerBatchItemError
 }
 
 input LedgerTagInput @inaccessible {
@@ -443,6 +461,7 @@ type Mutation {
 	ledgerCreateCommandToken(boundedContext: String!, commandTypeName: String!, scope: String): LedgerCommandToken! @inaccessible
 	ledgerRevokeToken(tokenId: ID!): LedgerAccessToken! @inaccessible
 	ledgerSubmitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String, correlationId: String, causationId: String): LedgerSubmitCommandPayload!
+	ledgerSubmitCommands(boundedContext: String!, commands: [LedgerSubmitCommandInput!]!): [LedgerSubmitCommandsItem!]!
 	ledgerApproveCommand(boundedContext: String!, proposalId: ID!): LedgerCommandProposalDecisionPayload! @inaccessible
 	ledgerRejectCommand(boundedContext: String!, proposalId: ID!, reason: String): LedgerCommandProposalDecisionPayload! @inaccessible
 	ledgerForgetSubject(boundedContext: String!, subjectKey: String!, subjectValue: String!): LedgerEncryptionKey! @inaccessible

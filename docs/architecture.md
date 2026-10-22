@@ -1324,11 +1324,13 @@ read or written:
 
 ```
 POST /v1/events/external        -- ExternalEventIngestion (ExternalEventToken)
+POST /v1/events/external/batch  -- ExternalEventIngestion's SubmitExternalEvents (ExternalEventToken, §227)
 POST /v1/events/direct          -- DirectEventCreation (DirectCreationToken)
 GET  /v1/events                 -- EventFetch's FetchEvents (EventReadToken, client-tracked)
 GET  /v1/events/consume         -- EventFetch's ConsumeEvents (EventReadToken, server-tracked)
 POST /v1/events/consume/ack     -- EventFetch's AcknowledgeEvents (EventReadToken, manual_ack only)
 POST /v1/commands/trigger       -- CommandTrigger (CommandToken)
+POST /v1/commands/trigger/batch -- CommandTrigger's TriggerCommands (CommandToken, §227)
 POST /v1/commands/dry-run       -- CommandTrigger's DryRunTriggerCommand (CommandToken, §185)
 ```
 
@@ -12961,3 +12963,61 @@ Two of local mode's start failures named the wrong thing.
 **No UTC time zone** surfaced as Postgres refusing the first connection: `invalid value for parameter "TimeZone": "UTC"` - from sqlx's and `postgresql_embedded`'s own `TimeZone=UTC` - which names neither the file nor the fix. With 18.6.0 pinned (§224) local mode reads the system's tzdata, so a minimal container without `tzdata` hits this. After installing, before starting, `start()` now checks the file the server would read and answers `local::Error::MissingTimezoneData` with its path and the fix. A build with its own `share/timezone` reads only that, so it needs `UTC` there (the 18.6.1 bug, fixed by deleting the install); any other build needs `/usr/share/zoneinfo/UTC` (fixed by installing `tzdata`). Checking the build's layout rather than the pinned version keeps the check right once the pin is relaxed.
 
 Tests: `a_bundled_time_zone_database_needs_its_own_utc` and `any_other_build_needs_the_system_utc` (`skilj/src/local.rs`), plus a run of the template's server in an Ubuntu 24.04 container without `tzdata`, as root without `postgresql`, and as a normal user with both.
+
+<a id="local-mode-fsync"></a>
+## 226. Local mode runs with fsync on
+
+`postgresql_embedded` starts its server with `-F`, which is `fsync = off`. That suits the test harness, whose databases are thrown away. Local mode (§216) uses the same crate for a data directory that is kept. With fsync off, a process crash loses nothing, since the OS still holds the pages, but an OS crash or a power loss can lose committed transactions and can leave the cluster corrupt. A WSL virtual machine that stops counts as an OS crash. The embedded path now passes `fsync=on` in `Settings::configuration`. Those `-c` options come after `-F` on the command line, so they win. The root path (`pg_ctl` with the system's binaries) passed `-F` itself, in its `-o` server options; it no longer does.
+
+Test: `local_mode_starts_migrates_and_persists_across_restarts` (`skilj/tests/local_mode.rs`) checks `SHOW fsync` after the restart.
+
+The benchmarks in `docs/performance.md` still run against the test harness's server with fsync off, so they leave out the cost of flushing a commit. Measured against a server with fsync on, on a disk where one fsync takes about 2.4 ms: spread with one caller went from about 290 to about 150 commands/s, and with 80 callers from about 2,050 to 1,600-1,900. Group commit (§58) pays one flush per batch, so the more callers there are, the less of the gap remains.
+
+<a id="batch-submission"></a>
+## 227. Ordered batch submission for commands and external events
+
+issue #116. A client keeping one command in flight is held back by its own round trip, not by skilj. Against Postgres with fsync on (about 2.4 ms per fsync), one caller got ~150 spread commands/s on a bounded context that 80 concurrent callers drove to ~1,600-2,100. Group commit (§58) already shares the lock and the flush across concurrent callers. What a client couldn't do was keep many commands in flight *and* have them decided in order: two requests sent at once may be decided either way round. That is why the broker bridges keep one message in flight per partition (§172, §174).
+
+**Options turned down.**
+- Answering before processing, with the command kept only in memory. That doesn't raise the ceiling, only moves the waiting. A crash loses commands that were already acknowledged, rejections have nowhere to go (they aren't stored), and a bridge can't commit its offset against such an answer.
+- `synchronous_commit = off`. Measured against the same server: about 2× for one caller, nothing at 32 callers or more, since group commit already shares the flush. It is also unsafe here. A crash-restart keeps the database epoch (§176), so commits that were answered and broadcast, and then lost, would go unnoticed.
+
+**The design, with the user's choices** (specs/skilj.allium: rules `SubmitCommandBatch`, `TriggerCommandBatch`, `CreateExternalEventBatch`; surface `CommandBatchSubmission`):
+- GraphQL `submitCommands(boundedContext, commands: [SubmitCommandInput!]!)`: one bounded context per call, command types may differ. `POST /v1/commands/trigger/batch`: one command type per call, since a token names one. `POST /v1/events/external/batch` for the broker bridges' record path.
+- Each item is decided after the ones before it in the batch, as if sent one by one, and gets its own time. Only the batch's own order is promised: another caller's command may land between two of its items.
+- One answer per item, in order, each what that item would get sent alone. A refused item (payload off its schema, owner scope, unknown type, reserved key) gets its own error, and the items after it are still processed. GraphQL answers `{ result, error { code message } }` per item. REST answers the single route's body, or `{"error": {"status", "code", "message"}}` with the status a single request would have had, so a bridge can still tell a 4xx from a 5xx.
+- It is not a transaction (§48 covers commands that must stand or fall together).
+- `max_items_per_batch`, default 100 (`SkiljBuilder::max_items_per_batch`). A call over it is refused whole with `batch_too_large`, never cut down to fit. An empty batch gets an empty answer.
+- Idempotency keys travel per item, in the body, and mean what they mean alone. A key that an earlier item of the batch was accepted under deduplicates the later one. A request-level `Idempotency-Key` header on a batch route is ignored (§195). A cut-off call is resent with keys; no batch outcomes are stored.
+- Dry runs are not batched.
+
+**Commands.** `CommandBatcher::decide_and_submit_many` reads and decides each command before the lock, up to `PREPARE_CONCURRENCY` (8) at a time, then queues them all in one push. Nothing another caller queues can land between them, and the leader drains the queue in order. A later item's read before the lock doesn't see an earlier item's events. Under the lock it does: the leader already hands each command the events of the commands before it in the batch (`extra_committed_events`, §58) and decides again when they matter. So two items shipping the same order are accepted and then rejected, never the other way round (`a_batch_is_decided_in_the_order_given`). A batch larger than `command_batch_max_size` spans several lock acquisitions by the same leader, still in order (`a_batch_larger_than_the_max_batch_size_keeps_its_order`).
+
+To queue several commands at once, the leader now answers every queued command through its channel, its own included. When the lock or the commit fails, the first command of the first batch keeps the original typed error, as the leader's own return value used to, and the others get `BatchFailed`. A command whose blind tags a key rotation made stale (§209) is answered with that error rather than resubmitted: resubmitted, it would land after the commands that followed it.
+
+The limit lives on `CommandBatcher` (`with_max_items_per_batch`) and not on the routes, because both surfaces already share the batcher. That keeps `skilj_rest::router`'s signature and `GraphqlState`'s fields unchanged.
+
+**External events.** `db::create_and_insert_external_events` checks every item and provisions its encryption keys before the lock, as the single route does (§141). It then takes the sequence lock once, runs each item in its own savepoint and commits once. An item that fails inside the transaction is rolled back alone, sequence number included. Because the items share the transaction, an item's dedupe check sees the watermarks and keys of the items before it, so a batch that repeats a message answers the repeat as a redelivery (`an_external_event_batch_answers_each_event_in_order`). Each item still costs several statements under the lock; writing a batch as a set, as §196 does for commands, is left for when it's measured to matter.
+
+**Federation.** `submitCommands` faces a write grant, as `submitCommand` does, so it is a published root field (`OnlyGrantFacingSurfacesArePublished`). The fixtures are re-recorded, and `scripts/federation/compose.mjs` lists it.
+
+**Measured.** `SKILJ_BENCH_BATCH=100` adds rows to `command_throughput.rs` for 1 and 8 callers sending 100 deposits per `POST /v1/commands/trigger/batch` call. Against Postgres 18 with fsync on (about 2.4 ms per fsync), 800 commands per scenario, two rounds, commands/s:
+
+| workload | 1 caller, one at a time | 80 callers, one at a time | 1 caller, 100 a call | 8 callers, 100 a call |
+|---|---|---|---|---|
+| spread | 139-148 | 1,909-2,105 | 2,786-2,830 | 2,631-2,794 |
+| hot | 62-67 | 103-135 | 169-170 | 508-576 |
+| hot-snap | 125-136 | 391-410 | 571-648 | 699-827 |
+| hot-none | 147-150 | 2,230-2,879 | 4,031-4,883 | 3,054-5,886 |
+
+One caller sending batches of 100 outruns 80 concurrent single callers. Hot keys gain the least: every item of a hot batch read the same history before the lock, so under the lock each one after the first is decided again over the events before it. A snapshot (§19) or `nothing()` (§201) is still the lever there. A call's latency is that of its whole batch: 30-35 ms for 100 spread commands, about half a second for 100 hot ones.
+
+**Stopping at the first failure, for the bridges.** A batch that goes on past a failed item breaks a broker bridge. Say message 37 of a Kafka partition fails transiently - a pool timeout - while 38-100 are recorded. The partition's dedupe watermark (§39) is then past 37, so the bridge's retry of 37 is answered `redelivered` and the message is lost. For triggers, 38-100 are decided before 37, where the bridge promises partition order. With the user's choice, the two REST batch routes take an optional `stopAtFirstFailure` (default off, so the API above is unchanged; `submitCommands` doesn't take it). When it is set, every item after the first that fails answers `not_processed` (`Error::NotProcessed`, 409) and is not processed at all: not checked, not queued, not written. A rejection is an answer, not a failure, and doesn't stop the batch. For external events this holds throughout, since one transaction runs the items in order. For commands, it holds for every failure before the batch's commands are queued: refusals, reads, `decide()`. A command whose write fails under the lock (§196's replay isolates it) doesn't stop the commands decided with it. Those are permanent failures, which a bridge parks and moves past anyway (spec: `StopAtTheFirstFailureWhenAsked`). Tests: `a_trigger_batch_can_stop_at_its_first_failure`, and `an_external_event_batch_can_stop_at_its_first_failure`, where the event answered `not_processed` is created when sent again under the cursor the watermark would otherwise have passed.
+
+**The bridges use the batch routes.** `skilj_bridge::post_inbound_batch` sends consecutive messages - one Kafka partition's, one JetStream consumer's, one AMQP receiver's - with `stopAtFirstFailure`, and reports how many from the first are done: recorded, triggered (a rejection included), or recognised as redeliveries. Each bridge acknowledges or commits those. It hands the first message not done to its unchanged single-message path, which retries, parks or halts it exactly as before, and then batches the rest. Batching is a fast path on top of the proven one, and every failure takes the proven one. So order, dedupe, parking (§97, §173, §175) and halting on values this build predates (§219) are as they were. A failed batch call - a timeout, a 5xx - answers zero done, and the single path retries the first message. A call that was processed but whose answer was lost is harmless: every message is sent again under its cursor or key. An older skilj without the routes (404) turns batching off for the loop; `batch_too_large` halves the batch until skilj takes it. A lone message uses the single route, so a quiet source sees no change.
+
+`skilj_bridge::InboundBatching { max_items, linger }`, re-exported by each bridge and passed to its new `run_inbound_until_with`, is configurable as the user asked. `max_items` defaults to 100, skilj's default limit; `InboundBatching::off()` is one message a call. `linger` defaults to zero: what has arrived is sent at once, and batches grow by themselves when messages arrive faster than skilj answers. With a linger, the bridge waits that long after a message for more to join it - per partition for Kafka, which starts an idle partition's first call after it. `run_inbound`/`run_inbound_until` use the defaults, so existing callers batch without a code change. What is ready to batch depends on the broker side as well: Kafka's per-partition queue, which `INBOUND_PARTITION_BUFFER` (64) bounds; JetStream's pull batch; AMQP link credit.
+
+Tests: `skilj-bridge/tests/inbound_batch.rs` (batches of at most `max_items`, stopping at a failed item, a lone message, batching off, a skilj without the routes, halving on `batch_too_large`, an unreachable skilj). Against the real routes: `the_bridges_batch_client_counts_what_the_trigger_route_got_done` and `..._external_route_got_done`. Each bridge's mock skilj gained the batch routes, built on its single handlers, so the existing suites run through batches wherever messages queue. New per bridge: `a_message_failing_mid_batch_keeps_its_partitions_order` (Kafka: o-20 of 40 keeps failing, nothing after it lands, then all 40 arrive once, in order), and `a_backlog_is_recorded_in_batches_in_stream_order` / `..._in_order` (NATS, AMQP: 30 messages behind a first one that fails twice, every key in order).
+
+Tests: `skilj-core/tests/command_batcher.rs` (order, a batch larger than one lock acquisition, empty, another bounded context's command failing alone); `skilj/tests/command_trigger.rs` (each command answered in order, keys within and across batches, the limit, a reserved key); `skilj/tests/graphql_business_surfaces.rs` (`submitCommands` in order with an unknown type, the limit); `skilj/tests/external_event_dedup.rs` (cursor and key repeats within a batch, a refused payload leaving no sequence gap, the limit).
