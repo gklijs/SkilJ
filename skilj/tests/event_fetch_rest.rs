@@ -1074,8 +1074,10 @@ fn more_concurrent_writes_than_pool_connections_all_complete() {
             let credential = direct_credential.clone();
             async move { deposit(&router, &credential, amount).await }
         });
+        // Longer than the pool's acquire timeout: a stall shows up as
+        // an acquire error in a response, a slow runner just finishes.
         tokio::time::timeout(
-            std::time::Duration::from_secs(8),
+            std::time::Duration::from_secs(30),
             futures_util::future::join_all(writes),
         )
         .await

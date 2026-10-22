@@ -360,6 +360,47 @@ pub async fn deposit_through(
     started.elapsed()
 }
 
+/// One deposit per entry of `account_ids`, in one
+/// `POST /v1/commands/trigger/batch` call (docs/architecture.md §227).
+/// Returns the call's latency.
+#[allow(dead_code)] // command_throughput.rs only
+pub async fn deposit_batch_through(
+    router: &axum::Router,
+    credential: &str,
+    account_ids: &[String],
+) -> Duration {
+    let commands: Vec<_> = account_ids
+        .iter()
+        .map(|account_id| {
+            serde_json::json!({ "payload": { "account_id": account_id, "amount": 1 } })
+        })
+        .collect();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/commands/trigger/batch")
+        .header("authorization", format!("Bearer {credential}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "commands": commands }).to_string(),
+        ))
+        .unwrap();
+    let started = Instant::now();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    for outcome in body["outcomes"].as_array().unwrap() {
+        assert_eq!(outcome["accepted"], true, "{outcome}");
+    }
+    started.elapsed()
+}
+
 /// A TCP proxy in front of `database_url`'s server that delays every
 /// chunk by half of `round_trip` in each direction, so a request and its
 /// answer take `round_trip` longer, as across a network

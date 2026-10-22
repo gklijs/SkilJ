@@ -261,3 +261,257 @@ fn a_redelivered_message_is_accepted_but_creates_nothing() {
         );
     });
 }
+
+/// `POST /v1/events/external/batch` with `events`, answered as JSON.
+async fn submit_batch(
+    router: &axum::Router,
+    credential: &str,
+    events: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/events/external/batch")
+        .header("authorization", format!("Bearer {credential}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "events": events }).to_string(),
+        ))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// docs/architecture.md §227: a batch creates its events in the order
+/// given, each answered as a single request would be. A message repeated
+/// within the batch - by its cursor or by its key - is a redelivery, as
+/// it would be sent twice; a payload off the schema is refused on its own
+/// with a single request's status, and the events after it are created.
+#[test]
+fn an_external_event_batch_answers_each_event_in_order() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name) = setup().await;
+        let router = skilj.rest_router();
+
+        let event = |order: &str| {
+            serde_json::json!({ "payload": { "order_id": order }, "sourceContent": "kafka" })
+        };
+        let with_cursor = |order: &str, sequence: i64| {
+            serde_json::json!({
+                "payload": { "order_id": order },
+                "sourceContent": "kafka",
+                "dedupe": { "partitionKey": "orders-topic:0", "sequence": sequence },
+            })
+        };
+        let with_key = |order: &str, key: &str| {
+            serde_json::json!({
+                "payload": { "order_id": order },
+                "sourceContent": "nats",
+                "idempotencyKey": key,
+            })
+        };
+        let (status, json) = submit_batch(
+            &router,
+            &credential,
+            serde_json::json!([
+                with_cursor("A", 1),
+                with_cursor("A", 1),
+                serde_json::json!({ "payload": { "order_id": 7 }, "sourceContent": "kafka" }),
+                with_key("B", "stream:5"),
+                with_key("B", "stream:5"),
+                event("C"),
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let outcomes = json["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 6, "{json}");
+        assert_eq!(outcomes[0]["redelivered"], false);
+        assert_eq!(outcomes[1]["redelivered"], true);
+        assert!(outcomes[1]["sequence"].is_null());
+        assert_eq!(outcomes[2]["error"]["status"], 400, "{json}");
+        assert_eq!(outcomes[3]["redelivered"], false);
+        assert_eq!(outcomes[4]["redelivered"], true);
+        assert_eq!(outcomes[4]["sequence"], outcomes[3]["sequence"]);
+        assert_eq!(outcomes[5]["redelivered"], false);
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        let orders: Vec<String> = events
+            .iter()
+            .map(|e| {
+                serde_json::from_str::<serde_json::Value>(&e.payload).unwrap()["order_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(orders, vec!["A", "B", "C"]);
+        // Gapless: the refused event took no sequence number.
+        let sequences: Vec<i64> = events.iter().map(|e| e.sequence).collect();
+        assert_eq!(sequences, vec![sequences[0], sequences[0] + 1, sequences[0] + 2]);
+        assert_eq!(outcomes[0]["sequence"], sequences[0]);
+        assert_eq!(outcomes[5]["sequence"], sequences[2]);
+
+        // The cursor recorded by the batch dedupes a later single request.
+        let (status, body) = submit(&router, &credential, "A", Some(("orders-topic:0", 1))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["redelivered"], true);
+    });
+}
+
+/// Over `max_items_per_batch` (100 by default) the batch is refused whole;
+/// an empty one is answered with no outcomes.
+#[test]
+fn an_external_event_batch_over_the_limit_is_refused_whole() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name) = setup().await;
+        let router = skilj.rest_router();
+
+        let events: Vec<_> = (0..101)
+            .map(|i| {
+                serde_json::json!({ "payload": { "order_id": format!("o-{i}") }, "sourceContent": "kafka" })
+            })
+            .collect();
+        let (status, json) = submit_batch(&router, &credential, serde_json::json!(events)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "batch_too_large");
+
+        let (status, json) = submit_batch(&router, &credential, serde_json::json!([])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["outcomes"], serde_json::json!([]));
+
+        assert!(db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}
+
+/// docs/architecture.md §227: with `stopAtFirstFailure`, nothing after a
+/// failed event is recorded, so the partition's watermark stays below the
+/// events answered `not_processed`, and sending them again creates them.
+#[test]
+fn an_external_event_batch_can_stop_at_its_first_failure() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name) = setup().await;
+        let router = skilj.rest_router();
+        let with_cursor = |order: serde_json::Value, sequence: i64| {
+            serde_json::json!({
+                "payload": { "order_id": order },
+                "sourceContent": "kafka",
+                "dedupe": { "partitionKey": "orders-topic:0", "sequence": sequence },
+            })
+        };
+
+        let request = |events: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/events/external/batch")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "stopAtFirstFailure": true, "events": events }).to_string(),
+                ))
+                .unwrap()
+        };
+        let response = router
+            .clone()
+            .oneshot(request(serde_json::json!([
+                with_cursor(serde_json::json!("A"), 1),
+                with_cursor(serde_json::json!(7), 2),
+                with_cursor(serde_json::json!("C"), 3),
+            ])))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let outcomes = json["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes[0]["redelivered"], false, "{json}");
+        assert_eq!(outcomes[1]["error"]["status"], 400, "{json}");
+        assert_eq!(outcomes[2]["error"]["code"], "not_processed", "{json}");
+
+        // C again, on its own: below the watermark it would be dropped.
+        let (status, body) = submit(&router, &credential, "C", Some(("orders-topic:0", 3))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["redelivered"], false, "{body}");
+        assert_eq!(
+            db::list_events_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    });
+}
+
+/// docs/architecture.md §227: the bridges' batch client against the real
+/// route - a redelivery is done, the first refused event stops the count,
+/// and the partition's watermark stays below the events after it.
+#[test]
+fn the_bridges_batch_client_counts_what_the_external_route_got_done() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name) = setup().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = skilj.rest_router();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mapping = skilj_bridge::InboundMapping {
+            credential,
+            action: skilj_bridge::InboundAction::Record {
+                event_type: "OrderPlaced".to_string(),
+            },
+        };
+        let with_cursor = |order: serde_json::Value, sequence: i64| {
+            serde_json::json!({
+                "payload": { "order_id": order },
+                "sourceContent": "kafka",
+                "dedupe": { "partitionKey": "orders-topic:0", "sequence": sequence },
+            })
+        };
+        let bodies = [
+            with_cursor(serde_json::json!("A"), 1),
+            with_cursor(serde_json::json!("A"), 1),
+            with_cursor(serde_json::json!(7), 2),
+            with_cursor(serde_json::json!("C"), 3),
+        ];
+        let items: Vec<_> = bodies
+            .iter()
+            .map(|body| skilj_bridge::InboundItem {
+                body,
+                idempotency_key: None,
+            })
+            .collect();
+        let batcher = skilj_bridge::InboundBatcher::new(skilj_bridge::InboundBatching::default());
+        let done = skilj_bridge::post_inbound_batch(
+            &reqwest::Client::new(),
+            &url,
+            &mapping,
+            &batcher,
+            &items,
+        )
+        .await;
+        assert_eq!(done, 2);
+        assert_eq!(
+            db::list_events_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    });
+}

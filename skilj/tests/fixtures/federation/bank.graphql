@@ -11,6 +11,11 @@ enum BankAccessTokenStatus {
 	REVOKED
 }
 
+type BankBatchItemError {
+	code: String!
+	message: String!
+}
+
 type BankBoundedContext @inaccessible {
 	name: String!
 	status: BankBoundedContextStatus!
@@ -378,6 +383,14 @@ input BankSensitiveFieldInput @inaccessible {
 	subjectField: String! @inaccessible
 }
 
+input BankSubmitCommandInput {
+	commandTypeName: String!
+	payload: String!
+	idempotencyKey: String
+	correlationId: String
+	causationId: String
+}
+
 type BankSubmitCommandPayload {
 	accepted: Boolean!
 	rejectionReason: String
@@ -389,6 +402,11 @@ type BankSubmitCommandPayload {
 	matchingEventsTruncated: Boolean
 	triggeredEventSequences: [Int]
 	matchingEvents: [BankMatchingEvent]
+}
+
+type BankSubmitCommandsItem {
+	result: BankSubmitCommandPayload
+	error: BankBatchItemError
 }
 
 input BankTagInput @inaccessible {
@@ -443,6 +461,7 @@ type Mutation {
 	bankCreateCommandToken(boundedContext: String!, commandTypeName: String!, scope: String): BankCommandToken! @inaccessible
 	bankRevokeToken(tokenId: ID!): BankAccessToken! @inaccessible
 	bankSubmitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String, correlationId: String, causationId: String): BankSubmitCommandPayload!
+	bankSubmitCommands(boundedContext: String!, commands: [BankSubmitCommandInput!]!): [BankSubmitCommandsItem!]!
 	bankApproveCommand(boundedContext: String!, proposalId: ID!): BankCommandProposalDecisionPayload! @inaccessible
 	bankRejectCommand(boundedContext: String!, proposalId: ID!, reason: String): BankCommandProposalDecisionPayload! @inaccessible
 	bankForgetSubject(boundedContext: String!, subjectKey: String!, subjectValue: String!): BankEncryptionKey! @inaccessible

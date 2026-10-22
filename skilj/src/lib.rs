@@ -902,6 +902,7 @@ impl Skilj {
             // `command_batcher::DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT`.
             command_batch_idle_in_transaction_timeout: std::time::Duration::from_secs(30),
             command_batch_max_size: skilj_core::command_batcher::DEFAULT_MAX_BATCH_SIZE,
+            max_items_per_batch: skilj_core::command_batcher::DEFAULT_MAX_ITEMS_PER_BATCH,
             command_batch_max_concurrent_leaders: None,
             encryption_master_key: None,
             event_broadcast_capacity: 1024,
@@ -2287,6 +2288,7 @@ pub struct SkiljBuilder {
     graphql_federation: Option<skilj_graphql::federation::FederationOptions>,
     command_batch_idle_in_transaction_timeout: std::time::Duration,
     command_batch_max_size: usize,
+    max_items_per_batch: usize,
     command_batch_max_concurrent_leaders: Option<usize>,
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcast_capacity: usize,
@@ -2684,6 +2686,17 @@ impl SkiljBuilder {
     /// docs/performance.md.
     pub fn command_batch_max_size(mut self, max_size: usize) -> Self {
         self.command_batch_max_size = max_size;
+        self
+    }
+
+    /// The most items one batch submission carries: commands to GraphQL
+    /// `submitCommands` or `POST /v1/commands/trigger/batch`, or external
+    /// events to `POST /v1/events/external/batch` -
+    /// `config.max_items_per_batch` in specs/skilj.allium. A call with
+    /// more is refused whole, before any item is processed. Defaults to
+    /// 100; clamped to at least 1 (docs/architecture.md §227).
+    pub fn max_items_per_batch(mut self, max_items: usize) -> Self {
+        self.max_items_per_batch = max_items.max(1);
         self
     }
 
@@ -3087,6 +3100,7 @@ impl SkiljBuilder {
         let command_batcher = skilj_core::command_batcher::CommandBatcher::new()
             .with_idle_in_transaction_timeout(self.command_batch_idle_in_transaction_timeout)
             .with_max_batch_size(self.command_batch_max_size)
+            .with_max_items_per_batch(self.max_items_per_batch)
             .with_slow_read_warning(self.slow_command_read_warning)
             .with_slow_decide_warning(self.slow_command_decide_warning);
         let command_batcher = match self.command_batch_max_concurrent_leaders {

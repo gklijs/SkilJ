@@ -74,11 +74,38 @@
 //!   nothing wrong with the *message*, only (temporarily) with reaching
 //!   the broker.
 //!
+//! # Inbound batching
+//!
+//! Messages that are already received go to skilj together, in one call
+//! to its batch route (`POST /v1/events/external/batch` or `POST
+//! /v1/commands/trigger/batch`, docs/architecture.md §227), still in the
+//! order received and decided in that order. A lone message still goes
+//! through the single route, so a quiet source pays nothing extra.
+//! [`InboundBatching`] sets the most messages a call (`max_items`, 100 by
+//! default, skilj's own default limit) and how long to wait for more
+//! before sending a batch that isn't full (`linger`, zero by default: what
+//! has arrived is sent at once, and batches grow by themselves when
+//! messages arrive faster than skilj answers). Pass it to
+//! `run_inbound_until_with`; [`InboundBatching::off`] sends one message a
+//! call. A partition's messages that wait behind the call in flight form its
+//! next batch; once [`INBOUND_PARTITION_BUFFER`] wait, fetching it pauses,
+//! so that bounds a batch too.
+//!
+//! A batch is sent with `stopAtFirstFailure`, so nothing after a message
+//! that fails is processed. That message is retried and finally parked on
+//! its own, exactly as without batching, and the rest follow it - the
+//! order and the redelivery safety below hold unchanged. An older skilj
+//! without the batch routes answers 404, and the bridge goes on one
+//! message at a time; a skilj whose `max_items_per_batch` is lower
+//! refuses the batch as too large, and the bridge halves its batch until
+//! skilj takes it.
+//!
 //! # Inbound concurrency
 //!
-//! [`run_inbound`] dispatches one message at a time *per partition*, in
-//! offset order, and the partitions it is assigned concurrently
-//! (docs/architecture.md §174). Kafka only orders messages within a
+//! [`run_inbound`] has one call to skilj in flight *per partition* - one
+//! message, or a batch of them (see *Inbound batching*) - in offset order,
+//! and the partitions it is assigned concurrently (docs/architecture.md
+//! §174). Kafka only orders messages within a
 //! partition, and that is all the `dedupe` watermark and `decide()` rely
 //! on, so this is as much concurrency as stays safe. A message that keeps
 //! failing holds up its own partition only.
@@ -167,7 +194,8 @@ use skilj_bridge::parked_payload;
 use skilj_bridge::BridgeError as _;
 pub use skilj_bridge::{
     correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
-    InboundMapping, OutboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
+    InboundBatching, InboundMapping, OutboundMapping, OutboundRetryState, Tag,
+    HTTP_REQUEST_TIMEOUT,
 };
 
 /// Header names for the two issue #18 ids this bridge carries
@@ -631,6 +659,23 @@ struct PartitionQueue<'m> {
     next_offset: i64,
 }
 
+/// The next messages of a partition, up to `max`, in order, with their
+/// mapping - one partition is one topic, so one mapping. `None` when none
+/// are waiting.
+fn take_batch<'m>(
+    state: &mut PartitionQueue<'m>,
+    max: usize,
+) -> Option<(Vec<OwnedMessage>, &'m InboundMapping)> {
+    let count = state.queue.len().min(max.max(1));
+    let mut msgs = Vec::with_capacity(count);
+    let mut mapping = None;
+    for (msg, m) in state.queue.drain(..count) {
+        msgs.push(msg);
+        mapping = Some(m);
+    }
+    mapping.map(|mapping| (msgs, mapping))
+}
+
 fn partition_list(topic: &str, partition: i32) -> TopicPartitionList {
     let mut list = TopicPartitionList::new();
     list.add_partition(topic, partition);
@@ -660,21 +705,89 @@ async fn stopping(mut stop: tokio::sync::watch::Receiver<bool>) {
     let _ = stop.wait_for(|stopping| *stopping).await;
 }
 
-/// Dispatches one message, retrying and finally parking it per
-/// `retry_policy` - everything [`run_inbound`] does for a message before
-/// its offset is committed. Returns `msg` so the caller can commit it
-/// and move its partition on.
-async fn handle_inbound_message(
+/// The batch body and `Idempotency-Key` of `msg` (docs/architecture.md
+/// §227) - `None` for a message only the single-message path can handle:
+/// an action this build predates (it halts) or a payload that isn't JSON
+/// (it is parked).
+fn batch_item(
+    mapping: &InboundMapping,
+    msg: &OwnedMessage,
+) -> Option<(serde_json::Value, Option<String>)> {
+    if !action_supported(&mapping.action) {
+        return None;
+    }
+    let payload_json: serde_json::Value =
+        serde_json::from_slice(msg.payload().unwrap_or_default()).ok()?;
+    let partition_key = format!("{}:{}", msg.topic(), msg.partition());
+    let headers = msg.headers();
+    let body = inbound_request_body(
+        mapping,
+        &payload_json,
+        &partition_key,
+        msg.offset(),
+        header_str(headers, CORRELATION_ID_HEADER),
+        header_str(headers, CAUSATION_ID_HEADER),
+    );
+    Some((
+        body,
+        inbound_idempotency_key(mapping, &partition_key, msg.offset()),
+    ))
+}
+
+/// Dispatches consecutive messages of one partition, in offset order -
+/// everything [`run_inbound`] does for them before their offsets are
+/// committed. As many as possible go to skilj together
+/// ([`skilj_bridge::post_inbound_batch`], docs/architecture.md §227); the
+/// first that the batch didn't get done goes through
+/// [`dispatch_with_retry`] alone, retried and finally parked as before,
+/// and the rest are batched again after it. Returns the messages it
+/// handled, in order, so the caller can commit them; once one is
+/// `Stopped`, the rest are left out, uncommitted.
+async fn handle_inbound_messages(
     http: &reqwest::Client,
     skilj_base_url: &str,
     mapping: &InboundMapping,
     retry_policy: &skilj_retry::RetryPolicy,
-    msg: OwnedMessage,
+    batcher: &skilj_bridge::InboundBatcher,
+    msgs: Vec<OwnedMessage>,
     stop: tokio::sync::watch::Receiver<bool>,
-) -> (OwnedMessage, Handled) {
-    let handled =
-        dispatch_with_retry(http, skilj_base_url, mapping, retry_policy, &msg, stop).await;
-    (msg, handled)
+) -> Vec<(OwnedMessage, Handled)> {
+    let mut handled = Vec::with_capacity(msgs.len());
+    let mut rest: VecDeque<OwnedMessage> = msgs.into();
+    while !rest.is_empty() {
+        let built: Vec<(serde_json::Value, Option<String>)> = rest
+            .iter()
+            .map_while(|msg| batch_item(mapping, msg))
+            .collect();
+        let items: Vec<skilj_bridge::InboundItem<'_>> = built
+            .iter()
+            .map(|(body, key)| skilj_bridge::InboundItem {
+                body,
+                idempotency_key: key.as_deref(),
+            })
+            .collect();
+        let done =
+            skilj_bridge::post_inbound_batch(http, skilj_base_url, mapping, batcher, &items).await;
+        handled.extend(rest.drain(..done).map(|msg| (msg, Handled::Commit)));
+        let Some(msg) = rest.pop_front() else {
+            break;
+        };
+        let outcome = dispatch_with_retry(
+            http,
+            skilj_base_url,
+            mapping,
+            retry_policy,
+            &msg,
+            stop.clone(),
+        )
+        .await;
+        let stopped = matches!(outcome, Handled::Stopped);
+        handled.push((msg, outcome));
+        if stopped {
+            break;
+        }
+    }
+    handled
 }
 
 async fn dispatch_with_retry(
@@ -832,9 +945,10 @@ async fn dispatch_with_retry(
 /// `enable.auto.commit = false` for this to be the only thing that ever
 /// advances it) once that call succeeds.
 ///
-/// Messages of one partition are dispatched one at a time, in offset
-/// order; different partitions are dispatched concurrently, one message
-/// in flight each (docs/architecture.md §174, issue #60). So
+/// Messages of one partition are dispatched in offset order, one call in
+/// flight - one message, or the ones that waited behind the previous
+/// call, as a batch (docs/architecture.md §227); different partitions
+/// are dispatched concurrently (docs/architecture.md §174, issue #60). So
 /// this instance has as many requests to skilj in flight as it has
 /// assigned partitions with work. Messages received for a partition
 /// while one of its messages is in flight wait in a queue; once
@@ -899,7 +1013,37 @@ pub async fn run_inbound_until(
     retry_policy: &skilj_retry::RetryPolicy,
     stop: impl std::future::Future<Output = ()>,
 ) {
+    run_inbound_until_with(
+        consumer,
+        http,
+        skilj_base_url,
+        mappings,
+        retry_policy,
+        InboundBatching::default(),
+        stop,
+    )
+    .await
+}
+
+/// [`run_inbound_until`] with its batching chosen (docs/architecture.md
+/// §227). A partition's messages that wait behind the ones in flight go
+/// to skilj together, up to `batching.max_items` a call, still in offset
+/// order and still one call in flight per partition; with
+/// `batching.linger`, a partition that was idle waits that long after a
+/// message arrives for more to join it. [`run_inbound`] and
+/// [`run_inbound_until`] use [`InboundBatching::default`];
+/// [`InboundBatching::off`] sends one message a call, as before batching.
+pub async fn run_inbound_until_with(
+    consumer: &StreamConsumer,
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mappings: &HashMap<String, InboundMapping>,
+    retry_policy: &skilj_retry::RetryPolicy,
+    batching: InboundBatching,
+    stop: impl std::future::Future<Output = ()>,
+) {
     let mut stop = std::pin::pin!(stop);
+    let batcher = skilj_bridge::InboundBatcher::new(batching);
     // Said once up front rather than first on a message: each partition
     // of such a topic halts on its first message, while the other topics
     // carry on (docs/architecture.md §219).
@@ -914,31 +1058,42 @@ pub async fn run_inbound_until(
         }
     }
     let (stopping_tx, stopping_rx) = tokio::sync::watch::channel(false);
-    let start = |msg: OwnedMessage, mapping| {
-        handle_inbound_message(
+    let start = |msgs: Vec<OwnedMessage>, mapping| {
+        handle_inbound_messages(
             http,
             skilj_base_url,
             mapping,
             retry_policy,
-            msg,
+            &batcher,
+            msgs,
             stopping_rx.clone(),
         )
     };
     let mut partitions: HashMap<(String, i32), PartitionQueue<'_>> = HashMap::new();
     let mut in_flight = FuturesUnordered::new();
+    // Idle partitions waiting out `batching.linger` before they start.
+    let mut lingering = FuturesUnordered::new();
     loop {
         tokio::select! {
             biased;
             () = &mut stop => break,
-            Some((msg, handled)) = in_flight.next() => {
-                if let Handled::Commit = handled {
-                    commit(consumer, &msg);
+            Some(handled) = in_flight.next() => {
+                let handled: Vec<(OwnedMessage, Handled)> = handled;
+                let Some(key) = handled
+                    .first()
+                    .map(|(msg, _)| (msg.topic().to_string(), msg.partition()))
+                else {
+                    continue;
+                };
+                for (msg, handled) in &handled {
+                    if let Handled::Commit = handled {
+                        commit(consumer, msg);
+                    }
                 }
-                let key = (msg.topic().to_string(), msg.partition());
                 let Some(state) = partitions.get_mut(&key) else {
                     continue;
                 };
-                match state.queue.pop_front() {
+                match take_batch(state, batcher.max_items()) {
                     Some((next, mapping)) => in_flight.push(start(next, mapping)),
                     None => state.busy = false,
                 }
@@ -949,6 +1104,15 @@ pub async fn run_inbound_until(
                         // starts unpaused.
                         tracing::debug!(topic = key.0, partition = key.1, "resuming failed: {e}");
                     }
+                }
+            }
+            Some(key) = lingering.next() => {
+                let Some(state) = partitions.get_mut(&key) else {
+                    continue;
+                };
+                match take_batch(state, batcher.max_items()) {
+                    Some((msgs, mapping)) => in_flight.push(start(msgs, mapping)),
+                    None => state.busy = false,
                 }
             }
             received = consumer.recv() => {
@@ -1002,7 +1166,17 @@ pub async fn run_inbound_until(
                 let msg = msg.detach();
                 if !state.busy {
                     state.busy = true;
-                    in_flight.push(start(msg, mapping));
+                    if batcher.linger().is_zero() || batcher.max_items() <= 1 {
+                        in_flight.push(start(vec![msg], mapping));
+                    } else {
+                        state.queue.push_back((msg, mapping));
+                        let key = (topic.to_string(), partition);
+                        let linger = batcher.linger();
+                        lingering.push(async move {
+                            tokio::time::sleep(linger).await;
+                            key
+                        });
+                    }
                     continue;
                 }
                 state.queue.push_back((msg, mapping));
@@ -1016,9 +1190,11 @@ pub async fn run_inbound_until(
         }
     }
     let _ = stopping_tx.send(true);
-    while let Some((msg, handled)) = in_flight.next().await {
-        if let Handled::Commit = handled {
-            commit(consumer, &msg);
+    while let Some(handled) = in_flight.next().await {
+        for (msg, handled) in &handled {
+            if let Handled::Commit = handled {
+                commit(consumer, msg);
+            }
         }
     }
 }

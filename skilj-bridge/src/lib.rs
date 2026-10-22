@@ -357,6 +357,201 @@ pub async fn post_inbound(
     Ok(())
 }
 
+/// How a bridge's inbound loop combines messages into batch calls (`POST
+/// /v1/events/external/batch`, `POST /v1/commands/trigger/batch`,
+/// docs/architecture.md §227). Messages that are already received go to
+/// skilj together, up to `max_items` a call, decided in the order
+/// received. A lone message still goes through the single route, as
+/// before batching, so a quiet source pays nothing extra.
+#[derive(Debug, Clone, Copy)]
+pub struct InboundBatching {
+    /// The most messages one call carries. Keep it at or below skilj's
+    /// `max_items_per_batch` (100 by default); a bridge that is refused
+    /// with `batch_too_large` halves it until skilj takes the call. `1`
+    /// turns batching off.
+    pub max_items: usize,
+    /// How long to wait for more messages once one has arrived, before
+    /// sending a batch that isn't full. Zero, the default, sends what has
+    /// already arrived: no added latency, and batches grow by themselves
+    /// when messages arrive faster than skilj answers.
+    pub linger: std::time::Duration,
+}
+
+impl Default for InboundBatching {
+    fn default() -> Self {
+        InboundBatching {
+            max_items: 100,
+            linger: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl InboundBatching {
+    /// One message per call, the single routes only - every bridge's
+    /// behaviour before batching.
+    pub fn off() -> Self {
+        InboundBatching {
+            max_items: 1,
+            ..Self::default()
+        }
+    }
+}
+
+/// An inbound loop's batching as it runs: [`InboundBatching`], with the
+/// batch size halved after a `batch_too_large` refusal, and batching off
+/// for good once skilj turns out not to have the batch routes (an older
+/// skilj answers 404).
+#[derive(Debug)]
+pub struct InboundBatcher {
+    linger: std::time::Duration,
+    max_items: std::sync::atomic::AtomicUsize,
+}
+
+impl InboundBatcher {
+    pub fn new(batching: InboundBatching) -> Self {
+        InboundBatcher {
+            linger: batching.linger,
+            max_items: std::sync::atomic::AtomicUsize::new(batching.max_items.max(1)),
+        }
+    }
+
+    /// The most messages to gather for one call now; `1` when batching
+    /// is off.
+    pub fn max_items(&self) -> usize {
+        self.max_items.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// See [`InboundBatching::linger`].
+    pub fn linger(&self) -> std::time::Duration {
+        self.linger
+    }
+
+    fn shrink(&self, to: usize) {
+        self.max_items
+            .fetch_min(to.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One message of a batch: the body [`post_inbound`] would send for it
+/// alone, and the `Idempotency-Key` it would carry.
+pub struct InboundItem<'a> {
+    pub body: &'a serde_json::Value,
+    pub idempotency_key: Option<&'a str>,
+}
+
+/// Sends `items` - consecutive messages of one partition or stream, in
+/// order - to skilj in batch calls with `stopAtFirstFailure`, and returns
+/// how many of them, from the first, are done: recorded or triggered (a
+/// rejection is done, as with [`post_inbound`]), or recognised as
+/// redeliveries. Nothing after the first message that isn't done was
+/// processed, so the caller hands that message to its single-message
+/// retry and park handling and then sends the rest again, in order - a
+/// dedupe watermark and a partition's order hold as with one message at a
+/// time (docs/architecture.md §227).
+///
+/// Never an error: a failed call - a timeout, skilj unreachable, a 5xx -
+/// answers how many were done before it, and the single-message path
+/// that follows retries and, in the end, reports, as it always has. A
+/// call that was processed but whose answer was lost is harmless: the
+/// messages are sent again under the same dedupe cursor or key. Fewer than
+/// two items are left to that path at once.
+pub async fn post_inbound_batch(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    batcher: &InboundBatcher,
+    items: &[InboundItem<'_>],
+) -> usize {
+    let (url, list) = match &mapping.action {
+        InboundAction::Record { .. } => ("/v1/events/external/batch", "events"),
+        InboundAction::Trigger { .. } => ("/v1/commands/trigger/batch", "commands"),
+    };
+    let mut done = 0;
+    while items.len() - done > 1 && batcher.max_items() > 1 {
+        let chunk = &items[done..items.len().min(done + batcher.max_items())];
+        let bodies: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|item| {
+                let mut body = item.body.clone();
+                if let (Some(key), Some(object)) = (item.idempotency_key, body.as_object_mut()) {
+                    object.insert(
+                        "idempotencyKey".to_string(),
+                        serde_json::Value::String(wire_idempotency_key(key).into_owned()),
+                    );
+                }
+                body
+            })
+            .collect();
+        let sent = http
+            .post(format!("{skilj_base_url}{url}"))
+            .bearer_auth(&mapping.credential)
+            .json(&serde_json::json!({ list: bodies, "stopAtFirstFailure": true }))
+            .send()
+            .await;
+        let answer = match sent {
+            Ok(response) => match require_success(response).await {
+                Ok(response) => response
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(SkiljError::from),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(SkiljError::from(e)),
+        };
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(SkiljError::SkiljStatus { status, body })
+                if status == reqwest::StatusCode::NOT_FOUND
+                    || status == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
+            {
+                tracing::warn!(
+                    url,
+                    "skilj has no batch route - sending one message at a time from now on \
+                     ({status}: {body})"
+                );
+                batcher.shrink(1);
+                return done;
+            }
+            Err(SkiljError::SkiljStatus { status, body })
+                if error_code(&body).as_deref() == Some("batch_too_large") =>
+            {
+                let to = chunk.len() / 2;
+                tracing::warn!(
+                    url,
+                    to,
+                    "skilj refused a batch of {} as too large ({status}) - sending at most {to} \
+                     a call; raise skilj's max_items_per_batch or lower this bridge's \
+                     InboundBatching::max_items",
+                    chunk.len()
+                );
+                batcher.shrink(to);
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    url,
+                    "a batch call failed - going on one message at a time: {e}"
+                );
+                return done;
+            }
+        };
+        let outcomes = answer["outcomes"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let processed = outcomes
+            .iter()
+            .take(chunk.len())
+            .take_while(|outcome| outcome.get("error").is_none())
+            .count();
+        done += processed;
+        if processed < chunk.len() {
+            return done;
+        }
+    }
+    done
+}
+
 /// issue #21 - reports a message a bridge's `run_inbound` gave
 /// up retrying to skilj's own `POST /v1/parked-deliveries`, with the
 /// credential `mapping` already carries (that route resolves the bounded

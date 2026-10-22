@@ -124,6 +124,13 @@ pub enum Error {
         /// The enum's name.
         what: &'static str,
     },
+
+    /// An item of a batch submitted with "stop at the first failure" that
+    /// came after the batch's first failed item, and so was not processed
+    /// at all (docs/architecture.md §227). Sending it again is the same as
+    /// sending it for the first time.
+    #[error("not processed: an earlier item of the batch failed")]
+    NotProcessed,
 }
 
 impl Error {
@@ -182,6 +189,7 @@ impl SkiljRejection for Error {
             Error::Migration(_) => "migration_error",
             Error::BatchFailed { code, .. } => code,
             Error::Unsupported { .. } => "unsupported",
+            Error::NotProcessed => "not_processed",
         }
     }
 
@@ -211,6 +219,7 @@ impl SkiljRejection for Error {
             Error::Migration(_) => "an internal database migration error occurred".to_string(),
             Error::BatchFailed { message, .. } => message.clone(),
             Error::Unsupported { .. } => self.to_string(),
+            Error::NotProcessed => self.to_string(),
         }
     }
 

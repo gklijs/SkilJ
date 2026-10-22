@@ -266,6 +266,14 @@ impl LocalPostgres {
         settings
             .configuration
             .insert("listen_addresses".to_string(), "127.0.0.1".to_string());
+        // `postgresql_embedded` starts the server with `-F` (fsync off),
+        // fine for a test fixture and not for a data directory that is
+        // kept: an OS crash could lose committed data or corrupt the
+        // cluster. `-c` options come after `-F`, so this one wins
+        // (docs/architecture.md §226).
+        settings
+            .configuration
+            .insert("fsync".to_string(), "on".to_string());
         settings.port = config.port.unwrap_or(0);
         settings.username = LOCAL_USER.to_string();
         settings.password = password.clone();
@@ -385,8 +393,10 @@ impl LocalPostgres {
             Some(port) if port != 0 => port,
             _ => free_port()?,
         };
+        // No `-F`: the data directory is kept, so fsync stays on
+        // (docs/architecture.md §226).
         let options = format!(
-            "-F -p {port} -k {} -c listen_addresses=127.0.0.1",
+            "-p {port} -k {} -c listen_addresses=127.0.0.1",
             socket_dir.display()
         );
         let log = config.data_dir.with_extension("log");

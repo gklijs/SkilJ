@@ -72,6 +72,31 @@
 //! (`skilj_bridge::wire_idempotency_key`, [§195](../../docs/architecture.md#review-since-0-0-9)),
 //! for the message and its parked-delivery report alike.
 //!
+//! # Inbound batching
+//!
+//! Messages that are already received go to skilj together, in one call
+//! to its batch route (`POST /v1/events/external/batch` or `POST
+//! /v1/commands/trigger/batch`, docs/architecture.md §227), still in the
+//! order received and decided in that order. A lone message still goes
+//! through the single route, so a quiet source pays nothing extra.
+//! [`InboundBatching`] sets the most messages a call (`max_items`, 100 by
+//! default, skilj's own default limit) and how long to wait for more
+//! before sending a batch that isn't full (`linger`, zero by default: what
+//! has arrived is sent at once, and batches grow by themselves when
+//! messages arrive faster than skilj answers). Pass it to
+//! `run_inbound_until_with`; [`InboundBatching::off`] sends one message a
+//! call. How many are ready at once also depends on the pull consumer's own
+//! batch.
+//!
+//! A batch is sent with `stopAtFirstFailure`, so nothing after a message
+//! that fails is processed. That message is retried and finally parked on
+//! its own, exactly as without batching, and the rest follow it - the
+//! order and the redelivery safety below hold unchanged. An older skilj
+//! without the batch routes answers 404, and the bridge goes on one
+//! message at a time; a skilj whose `max_items_per_batch` is lower
+//! refuses the batch as too large, and the bridge halves its batch until
+//! skilj takes it.
+//!
 //! # Dead-letter/parking (issue #21)
 //!
 //! Both directions apply a [`skilj_retry::RetryPolicy`], but to different
@@ -112,7 +137,8 @@ use chrono::{DateTime, Utc};
 /// [`run_inbound`] doesn't need a lookup table keyed by address the way
 /// `skilj_kafka::run_inbound` does.
 pub type PullConsumer = Consumer<PullConfig>;
-use futures_util::TryStreamExt;
+use futures_util::{FutureExt, TryStreamExt};
+use std::collections::VecDeque;
 
 // docs/architecture.md §165: the skilj side every bridge shares.
 use skilj_bridge::parked_payload;
@@ -123,7 +149,8 @@ use skilj_bridge::parked_payload;
 use skilj_bridge::BridgeError as _;
 pub use skilj_bridge::{
     correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
-    InboundMapping, OutboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
+    InboundBatching, InboundMapping, OutboundMapping, OutboundRetryState, Tag,
+    HTTP_REQUEST_TIMEOUT,
 };
 
 /// Header names for the two issue #18 ids this bridge carries,
@@ -641,7 +668,39 @@ pub async fn run_inbound_until(
     retry_policy: &skilj_retry::RetryPolicy,
     stop: impl std::future::Future<Output = ()>,
 ) {
+    run_inbound_until_with(
+        consumer,
+        http,
+        skilj_base_url,
+        mapping,
+        retry_policy,
+        InboundBatching::default(),
+        stop,
+    )
+    .await
+}
+
+/// [`run_inbound_until`] with its batching chosen (docs/architecture.md
+/// §227). Messages already pulled go to skilj together, up to
+/// `batching.max_items` a call, in stream order; with `batching.linger`,
+/// the loop waits that long after a message for more to join it. How many
+/// are ready at once also depends on the consumer's own pull batch. Each
+/// done message is acknowledged; the first one a batch didn't get done is
+/// retried and finally parked on its own, as before batching, and the
+/// rest are batched again after it. [`run_inbound`] and
+/// [`run_inbound_until`] use [`InboundBatching::default`];
+/// [`InboundBatching::off`] sends one message a call.
+pub async fn run_inbound_until_with(
+    consumer: &PullConsumer,
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    retry_policy: &skilj_retry::RetryPolicy,
+    batching: InboundBatching,
+    stop: impl std::future::Future<Output = ()>,
+) {
     let mut stop = std::pin::pin!(stop);
+    let batcher = skilj_bridge::InboundBatcher::new(batching);
     // docs/architecture.md §100: how often a message being retried is
     // re-claimed - half the consumer's own `ack_wait`, so JetStream never
     // sees it go unacknowledged long enough to redeliver it underneath us.
@@ -673,7 +732,8 @@ pub async fn run_inbound_until(
                 continue;
             }
         };
-        loop {
+        let mut ended = false;
+        while !ended {
             let next = tokio::select! {
                 biased;
                 () = &mut stop => return,
@@ -682,130 +742,243 @@ pub async fn run_inbound_until(
             let Ok(Some(message)) = next else {
                 break;
             };
-            let meta = match InboundMessageMeta::from_message(&message) {
-                Ok(meta) => meta,
-                Err(e) => {
-                    tracing::error!("reading a JetStream message's own metadata failed: {e}");
-                    continue;
-                }
-            };
-
-            let mut retry = skilj_retry::MessageRetry::default();
-            loop {
-                match dispatch_inbound_message(
-                    http,
-                    skilj_base_url,
-                    mapping,
-                    &meta,
-                    &message.payload,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if let Err(e) = message.ack().await {
-                            tracing::error!("acking a JetStream message failed: {e}");
-                        }
-                        break;
+            let mut pending = VecDeque::new();
+            push_with_meta(&mut pending, message);
+            // More that are ready, or arrive within the linger, up to a
+            // batch.
+            let deadline = tokio::time::Instant::now() + batcher.linger();
+            while pending.len() < batcher.max_items() {
+                let next = if batcher.linger().is_zero() {
+                    match messages.try_next().now_or_never() {
+                        Some(next) => next,
+                        None => break,
                     }
-                    Err(e) => {
-                        if let BridgeError::Unsupported { what } = &e {
-                            tracing::error!(
-                                stream = meta.stream,
-                                stream_sequence = meta.stream_sequence,
-                                what,
-                                "message has a value this build predates - halting this \
-                                 consumer with the message claimed until the bridge is \
-                                 updated (docs/architecture.md §219)"
-                            );
-                            drop(messages);
-                            halt_holding_claim(&message, claim_heartbeat, stop.as_mut()).await;
-                            return;
-                        }
-                        let backoff = match retry.on_failure(
-                            retry_policy,
-                            Utc::now(),
-                            |at| (Utc::now() - at).to_std().unwrap_or_default(),
-                            // docs/architecture.md §161: no attempt spent, never parked.
-                            e.another_instance_can_do_it(),
-                            // Not JSON: no retry can change that (§144).
-                            e.is_permanent(),
-                        ) {
-                            skilj_retry::RetryDecision::Park {
-                                attempt,
-                                first_failed_at: failed_at,
-                            } => {
-                                tracing::error!(
-                                    stream = meta.stream,
-                                    stream_sequence = meta.stream_sequence,
-                                    attempt,
-                                    error = %e,
-                                    "dispatch failed repeatedly - parking and acking so this \
-                                     message doesn't get redelivered forever"
-                                );
-                                let payload_json = parked_payload(&message.payload);
-                                let body = inbound_request_body(mapping, &meta, &payload_json);
-                                let identifier =
-                                    format!("{}:{}", meta.stream, meta.stream_sequence);
-                                let idempotency_key = inbound_idempotency_key(mapping, &meta);
-                                if let Err(report_err) = report_parked_delivery(
-                                    http,
-                                    skilj_base_url,
-                                    mapping,
-                                    &identifier,
-                                    &body,
-                                    idempotency_key.as_deref(),
-                                    &e.to_string(),
-                                    attempt,
-                                    failed_at,
-                                )
-                                .await
-                                {
-                                    tracing::error!(
-                                        stream = meta.stream,
-                                        stream_sequence = meta.stream_sequence,
-                                        "reporting this parked delivery failed - not acking, \
-                                     will redeliver: {report_err}"
-                                    );
-                                    break;
-                                }
-                                if let Err(ack_err) = message.ack().await {
-                                    tracing::error!("acking a JetStream message failed: {ack_err}");
-                                }
-                                break;
-                            }
-                            skilj_retry::RetryDecision::Wait(backoff) => backoff,
-                            _ => {
-                                tracing::error!(
-                                    stream = meta.stream,
-                                    stream_sequence = meta.stream_sequence,
-                                    error = %e,
-                                    "retry decision this build predates - halting this consumer \
-                                     with the message claimed until the bridge is updated \
-                                     (docs/architecture.md §219)"
-                                );
-                                drop(messages);
-                                halt_holding_claim(&message, claim_heartbeat, stop.as_mut()).await;
-                                return;
-                            }
-                        };
-                        tracing::warn!(
-                            stream = meta.stream,
-                            stream_sequence = meta.stream_sequence,
-                            attempt = retry.attempt(),
-                            error = %e,
-                            "dispatch failed - retrying after backoff"
-                        );
-                        // Stopping here leaves the message unacknowledged:
-                        // JetStream redelivers it after `ack_wait`, as after
-                        // a crash (docs/architecture.md §129).
-                        tokio::select! {
-                            biased;
-                            () = &mut stop => return,
-                            () = wait_keeping_claim(&message, backoff, claim_heartbeat) => {}
-                        }
+                } else {
+                    match tokio::time::timeout_at(deadline, messages.try_next()).await {
+                        Ok(next) => next,
+                        Err(_) => break,
+                    }
+                };
+                match next {
+                    Ok(Some(message)) => push_with_meta(&mut pending, message),
+                    _ => {
+                        ended = true;
+                        break;
                     }
                 }
             }
+
+            while !pending.is_empty() {
+                let built: Vec<serde_json::Value> = pending
+                    .iter()
+                    .map_while(|(message, meta)| batch_body(mapping, meta, message))
+                    .collect();
+                let keys: Vec<Option<String>> = pending
+                    .iter()
+                    .take(built.len())
+                    .map(|(_, meta)| inbound_idempotency_key(mapping, meta))
+                    .collect();
+                let items: Vec<skilj_bridge::InboundItem<'_>> = built
+                    .iter()
+                    .zip(&keys)
+                    .map(|(body, key)| skilj_bridge::InboundItem {
+                        body,
+                        idempotency_key: key.as_deref(),
+                    })
+                    .collect();
+                let done = skilj_bridge::post_inbound_batch(
+                    http,
+                    skilj_base_url,
+                    mapping,
+                    &batcher,
+                    &items,
+                )
+                .await;
+                for (message, _) in pending.drain(..done) {
+                    if let Err(e) = message.ack().await {
+                        tracing::error!("acking a JetStream message failed: {e}");
+                    }
+                }
+                let Some((message, meta)) = pending.pop_front() else {
+                    break;
+                };
+                match handle_one(
+                    http,
+                    skilj_base_url,
+                    mapping,
+                    retry_policy,
+                    &message,
+                    &meta,
+                    claim_heartbeat,
+                    stop.as_mut(),
+                )
+                .await
+                {
+                    One::Handled => {}
+                    One::Stopped => return,
+                    One::Halt => {
+                        drop(messages);
+                        halt_holding_claim(&message, claim_heartbeat, stop.as_mut()).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `message` with its metadata onto `pending` - or, when its metadata
+/// can't be read, logged and skipped, as before batching.
+fn push_with_meta(
+    pending: &mut VecDeque<(JetstreamMessage, InboundMessageMeta)>,
+    message: JetstreamMessage,
+) {
+    match InboundMessageMeta::from_message(&message) {
+        Ok(meta) => pending.push_back((message, meta)),
+        Err(e) => tracing::error!("reading a JetStream message's own metadata failed: {e}"),
+    }
+}
+
+/// The batch body of `message` (docs/architecture.md §227) - `None` for a
+/// payload that isn't JSON, which only the single-message path handles
+/// (it is parked).
+fn batch_body(
+    mapping: &InboundMapping,
+    meta: &InboundMessageMeta,
+    message: &JetstreamMessage,
+) -> Option<serde_json::Value> {
+    let payload_json: serde_json::Value = serde_json::from_slice(&message.payload).ok()?;
+    Some(inbound_request_body(mapping, meta, &payload_json))
+}
+
+/// How [`handle_one`] ended.
+enum One {
+    /// Dispatched, or parked and reported, and acknowledged - or left
+    /// unacknowledged for redelivery when the report failed.
+    Handled,
+    /// Asked to stop while waiting to retry.
+    Stopped,
+    /// A value this build predates: the caller halts holding the claim.
+    Halt,
+}
+
+/// One message on its own: dispatched, retried per `retry_policy` and
+/// finally parked - everything [`run_inbound`] does for a message a batch
+/// didn't get done.
+#[allow(clippy::too_many_arguments)]
+async fn handle_one<S: std::future::Future<Output = ()>>(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    retry_policy: &skilj_retry::RetryPolicy,
+    message: &JetstreamMessage,
+    meta: &InboundMessageMeta,
+    claim_heartbeat: std::time::Duration,
+    mut stop: std::pin::Pin<&mut S>,
+) -> One {
+    let mut retry = skilj_retry::MessageRetry::default();
+    loop {
+        let e =
+            match dispatch_inbound_message(http, skilj_base_url, mapping, meta, &message.payload)
+                .await
+            {
+                Ok(()) => {
+                    if let Err(e) = message.ack().await {
+                        tracing::error!("acking a JetStream message failed: {e}");
+                    }
+                    return One::Handled;
+                }
+                Err(e) => e,
+            };
+        if let BridgeError::Unsupported { what } = &e {
+            tracing::error!(
+                stream = meta.stream,
+                stream_sequence = meta.stream_sequence,
+                what,
+                "message has a value this build predates - halting this \
+                 consumer with the message claimed until the bridge is \
+                 updated (docs/architecture.md §219)"
+            );
+            return One::Halt;
+        }
+        let backoff = match retry.on_failure(
+            retry_policy,
+            Utc::now(),
+            |at| (Utc::now() - at).to_std().unwrap_or_default(),
+            // docs/architecture.md §161: no attempt spent, never parked.
+            e.another_instance_can_do_it(),
+            // Not JSON: no retry can change that (§144).
+            e.is_permanent(),
+        ) {
+            skilj_retry::RetryDecision::Park {
+                attempt,
+                first_failed_at: failed_at,
+            } => {
+                tracing::error!(
+                    stream = meta.stream,
+                    stream_sequence = meta.stream_sequence,
+                    attempt,
+                    error = %e,
+                    "dispatch failed repeatedly - parking and acking so this \
+                     message doesn't get redelivered forever"
+                );
+                let payload_json = parked_payload(&message.payload);
+                let body = inbound_request_body(mapping, meta, &payload_json);
+                let identifier = format!("{}:{}", meta.stream, meta.stream_sequence);
+                let idempotency_key = inbound_idempotency_key(mapping, meta);
+                if let Err(report_err) = report_parked_delivery(
+                    http,
+                    skilj_base_url,
+                    mapping,
+                    &identifier,
+                    &body,
+                    idempotency_key.as_deref(),
+                    &e.to_string(),
+                    attempt,
+                    failed_at,
+                )
+                .await
+                {
+                    tracing::error!(
+                        stream = meta.stream,
+                        stream_sequence = meta.stream_sequence,
+                        "reporting this parked delivery failed - not acking, \
+                         will redeliver: {report_err}"
+                    );
+                    return One::Handled;
+                }
+                if let Err(ack_err) = message.ack().await {
+                    tracing::error!("acking a JetStream message failed: {ack_err}");
+                }
+                return One::Handled;
+            }
+            skilj_retry::RetryDecision::Wait(backoff) => backoff,
+            _ => {
+                tracing::error!(
+                    stream = meta.stream,
+                    stream_sequence = meta.stream_sequence,
+                    error = %e,
+                    "retry decision this build predates - halting this consumer \
+                     with the message claimed until the bridge is updated \
+                     (docs/architecture.md §219)"
+                );
+                return One::Halt;
+            }
+        };
+        tracing::warn!(
+            stream = meta.stream,
+            stream_sequence = meta.stream_sequence,
+            attempt = retry.attempt(),
+            error = %e,
+            "dispatch failed - retrying after backoff"
+        );
+        // Stopping here leaves the message unacknowledged: JetStream
+        // redelivers it after `ack_wait`, as after a crash
+        // (docs/architecture.md §129).
+        tokio::select! {
+            biased;
+            () = stop.as_mut() => return One::Stopped,
+            () = wait_keeping_claim(message, backoff, claim_heartbeat) => {}
         }
     }
 }

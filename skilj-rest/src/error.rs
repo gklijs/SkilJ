@@ -90,6 +90,15 @@ pub enum RestError {
     /// already proves the `CommandType` exists), so 500 - a server-side
     /// configuration problem, not anything the caller did wrong.
     NoDeciderRegistered,
+    /// A batch carrying more items than `max_items_per_batch` allows,
+    /// refused whole before any item is processed (docs/architecture.md
+    /// §227).
+    BatchTooLarge {
+        /// The configured limit.
+        max: usize,
+        /// How many items the batch carried.
+        items: usize,
+    },
 }
 
 impl From<CoreError> for RestError {
@@ -231,6 +240,9 @@ fn status_for(err: &CoreError) -> StatusCode {
         // already gets.
         CoreError::BatchFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         CoreError::Unsupported { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        // Not attempted: nothing about it was refused, and it can be sent
+        // again once the item before it is dealt with (§227).
+        CoreError::NotProcessed => StatusCode::CONFLICT,
         // `skilj_core::Error` is `#[non_exhaustive]`; a variant added
         // without a rule here answers 500 until it gets one.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -239,7 +251,47 @@ fn status_for(err: &CoreError) -> StatusCode {
 
 impl IntoResponse for RestError {
     fn into_response(self) -> Response {
-        let (status, code, message) = match self {
+        let (status, code, message) = self.parts();
+        (
+            status,
+            Json(ErrorBody {
+                code,
+                message,
+                trace_id: current_trace_id(),
+            }),
+        )
+            .into_response()
+    }
+}
+
+/// One item of a batch that failed on its own: the status, code and
+/// message the same request would have been answered with sent alone
+/// (docs/architecture.md §227). The status says what a caller may do
+/// about it, as it would for a single request: a 4xx won't succeed
+/// unchanged, a 5xx may on a retry.
+#[derive(Debug, Serialize)]
+pub struct ItemErrorBody {
+    /// The HTTP status a single request would have been answered with.
+    pub status: u16,
+    /// The machine-readable error code.
+    pub code: String,
+    /// The human-readable message.
+    pub message: String,
+}
+
+impl RestError {
+    /// This error as one failed item of a batch.
+    pub fn into_item_error(self) -> ItemErrorBody {
+        let (status, code, message) = self.parts();
+        ItemErrorBody {
+            status: status.as_u16(),
+            code,
+            message,
+        }
+    }
+
+    fn parts(self) -> (StatusCode, String, String) {
+        match self {
             RestError::Core(e) => {
                 // docs/architecture.md §93: the raw cause stays server-side,
                 // in this request's span, findable by the returned trace id.
@@ -279,16 +331,12 @@ impl IntoResponse for RestError {
                 "no_decider_registered".to_string(),
                 "this CommandType has no decide() registered in the running process".to_string(),
             ),
-        };
-        (
-            status,
-            Json(ErrorBody {
-                code,
-                message,
-                trace_id: current_trace_id(),
-            }),
-        )
-            .into_response()
+            RestError::BatchTooLarge { max, items } => (
+                StatusCode::BAD_REQUEST,
+                "batch_too_large".to_string(),
+                format!("a batch carries at most {max} items, this one {items}"),
+            ),
+        }
     }
 }
 

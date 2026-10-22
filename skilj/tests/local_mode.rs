@@ -64,6 +64,13 @@ fn local_mode_starts_migrates_and_persists_across_restarts() {
             .await
             .unwrap();
         assert!(applied.0 > 0);
+        // docs/architecture.md §226: `postgresql_embedded` turns fsync
+        // off; a kept data directory must not run that way.
+        let fsync: String = sqlx::query_scalar("SHOW fsync")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(fsync, "on");
         pool.close().await;
         second.shutdown().await.expect("it stops");
         let _ = std::fs::remove_dir_all(data_dir);

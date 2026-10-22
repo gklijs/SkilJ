@@ -1655,8 +1655,10 @@ fn more_concurrent_retries_than_pool_connections_all_complete() {
                 .await
             }
         });
+        // Longer than the pool's acquire timeout: a stall shows up as
+        // an acquire error in a response, a slow runner just finishes.
         let responses = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
+            std::time::Duration::from_secs(30),
             futures_util::future::join_all(retries),
         )
         .await

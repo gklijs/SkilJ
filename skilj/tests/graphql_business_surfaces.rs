@@ -4083,3 +4083,104 @@ fn command_proposals_are_served_in_bounded_stable_pages() {
         );
     });
 }
+
+const SUBMIT_COMMANDS_MUTATION: &str = "\
+    mutation($bc: String!, $commands: [SubmitCommandInput!]!) { \
+        submitCommands(boundedContext: $bc, commands: $commands) { \
+            result { accepted triggeredEventSequences rejectionKind deduplicated correlationId } \
+            error { code message } \
+        } \
+    }";
+
+/// docs/architecture.md §227: `submitCommands` answers each command in
+/// order as `submitCommand` would - accepted, rejected, refused for an
+/// unknown type, deduplicated by a key an earlier command of the batch
+/// was accepted under - and a refused command doesn't stop the rest.
+#[test]
+fn submit_commands_answers_each_command_in_order() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _admin_role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMANDS_MUTATION,
+            json!({ "bc": bc_name, "commands": [
+                { "commandTypeName": "WithdrawMoney", "payload": r#"{"amount":20}"#, "idempotencyKey": "g-1" },
+                { "commandTypeName": "WithdrawMoney", "payload": r#"{"amount":5000}"# },
+                { "commandTypeName": "NoSuchCommand", "payload": "{}" },
+                { "commandTypeName": "WithdrawMoney", "payload": r#"{"amount":20}"#, "idempotencyKey": "g-1" },
+                { "commandTypeName": "WithdrawMoney", "payload": r#"{"amount":30}"#, "correlationId": "g-corr" },
+            ]}),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response}");
+        let items = response["data"]["submitCommands"].as_array().unwrap();
+        assert_eq!(items.len(), 5, "{response}");
+        assert_eq!(items[0]["result"]["accepted"], true);
+        assert_eq!(items[0]["error"], serde_json::Value::Null);
+        assert_eq!(items[1]["result"]["rejectionKind"], "insufficient_funds");
+        assert_eq!(items[2]["result"], serde_json::Value::Null);
+        assert_eq!(items[2]["error"]["code"], "CommandType_not_found", "{response}");
+        assert_eq!(items[3]["result"]["deduplicated"], true);
+        assert_eq!(
+            items[3]["result"]["triggeredEventSequences"],
+            items[0]["result"]["triggeredEventSequences"]
+        );
+        assert_eq!(items[4]["result"]["accepted"], true);
+        assert_eq!(items[4]["result"]["correlationId"], "g-corr");
+
+        let events = skilj_core::db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        let payloads: Vec<&str> = events.iter().map(|e| e.payload.as_str()).collect();
+        assert_eq!(payloads, vec![r#"{"amount":20}"#, r#"{"amount":30}"#]);
+    });
+}
+
+/// Over `max_items_per_batch` the call is refused whole and nothing is
+/// processed; an empty batch is answered with no items.
+#[test]
+fn submit_commands_over_the_limit_is_refused_whole() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _admin_role) =
+            setup_with(|builder| builder.max_items_per_batch(2)).await;
+        let router = skilj.graphql_router().await.unwrap();
+        let command = json!({ "commandTypeName": "WithdrawMoney", "payload": r#"{"amount":1}"# });
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMANDS_MUTATION,
+            json!({ "bc": bc_name, "commands": [command, command, command] }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "batch_too_large",
+            "{response}"
+        );
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMANDS_MUTATION,
+            json!({ "bc": bc_name, "commands": [] }),
+        )
+        .await;
+        assert_eq!(response["data"]["submitCommands"], json!([]), "{response}");
+
+        assert!(
+            skilj_core::db::list_events_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+}

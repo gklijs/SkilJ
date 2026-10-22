@@ -318,6 +318,7 @@ fn root_types(
         ))
         .field(admin(resolvers::token_revocation::revoke_token_field(n)))
         .field(resolvers::command_submission::submit_command_field(n))
+        .field(resolvers::command_submission::submit_commands_field(n))
         .field(admin(resolvers::command_approval::approve_command_field(n)))
         .field(admin(resolvers::command_approval::reject_command_field(n)))
         .field(admin(resolvers::subject_erasure::field(n)))
@@ -392,6 +393,9 @@ fn static_types(n: &Naming) -> Vec<Type> {
         gql_types::inspected_event_object(n).into(),
         gql_types::inspected_snapshot_object(n).into(),
         gql_types::submit_command_payload_object(n).into(),
+        gql_types::submit_command_input(n).into(),
+        gql_types::batch_item_error_object(n).into(),
+        gql_types::submit_commands_item_object(n).into(),
         gql_types::dry_run_command_payload_object(n).into(),
         gql_types::would_be_event_object(n).into(),
         gql_types::encryption_key_object(n).into(),

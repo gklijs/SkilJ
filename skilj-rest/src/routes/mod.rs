@@ -33,7 +33,7 @@
 //! (see `crate::error::RestError::WrongTokenVariant`).
 
 use crate::auth::BearerCredential;
-use crate::error::RestError;
+use crate::error::{ItemErrorBody, RestError};
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
@@ -208,11 +208,19 @@ pub fn router(
 ) -> Router {
     Router::new()
         .route("/v1/events/external", post(post_events_external))
+        .route(
+            "/v1/events/external/batch",
+            post(post_events_external_batch),
+        )
         .route("/v1/events/direct", post(post_events_direct))
         .route("/v1/events", get(get_events))
         .route("/v1/events/consume", get(get_events_consume))
         .route("/v1/events/consume/ack", post(post_events_consume_ack))
         .route("/v1/commands/trigger", post(post_commands_trigger))
+        .route(
+            "/v1/commands/trigger/batch",
+            post(post_commands_trigger_batch),
+        )
         .route("/v1/commands/dry-run", post(post_commands_dry_run))
         .route("/v1/parked-deliveries", post(post_parked_deliveries))
         .layer(middleware::from_fn(trace_request))
@@ -392,6 +400,40 @@ struct ExternalEventResponse {
     // the `dedupe` watermark, which can't say (docs/architecture.md §175).
     sequence: Option<i64>,
     redelivered: bool,
+}
+
+/// `POST /v1/events/external/batch` (docs/architecture.md §227): the
+/// events to create, in the order they must be created in.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalEventBatchRequest {
+    events: Vec<ExternalEventBatchRequestItem>,
+    /// See `CommandTriggerBatchRequest::stop_at_first_failure`. A bridge
+    /// whose dedupe is a watermark needs it: an event recorded after a
+    /// failed one would move the watermark past it (§227).
+    #[serde(default)]
+    stop_at_first_failure: bool,
+}
+
+/// One event of a batch: an `ExternalEventRequest` plus the
+/// `Idempotency-Key` a single request sends as a header. As there, a
+/// `dedupe` cursor wins and the key is ignored (§195).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalEventBatchRequestItem {
+    payload: serde_json::Value,
+    source_content: String,
+    source_context: Option<String>,
+    dedupe: Option<DedupeRequest>,
+    idempotency_key: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
+}
+
+/// One answer per event, in the order given.
+#[derive(Serialize)]
+struct ExternalEventBatchResponse {
+    outcomes: Vec<BatchItemOutcome<ExternalEventResponse>>,
 }
 
 #[derive(Deserialize)]
@@ -737,6 +779,58 @@ struct CommandTriggerRequest {
     causation_id: Option<String>,
 }
 
+/// `POST /v1/commands/trigger/batch` (docs/architecture.md §227): the
+/// commands to trigger, in the order they must be decided in.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandTriggerBatchRequest {
+    commands: Vec<CommandTriggerBatchItem>,
+    /// Answer every command after the first that fails `not_processed`
+    /// (409), without processing it - for a caller that relies on its
+    /// commands' order, a broker bridge (docs/architecture.md §227).
+    #[serde(default)]
+    stop_at_first_failure: bool,
+}
+
+/// One command of a batch: a `CommandTriggerRequest` plus the
+/// `Idempotency-Key` that a single trigger sends as a header, since one
+/// header can't key several commands.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandTriggerBatchItem {
+    payload: serde_json::Value,
+    idempotency_key: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
+}
+
+/// One answer per command, in the order given.
+#[derive(Serialize)]
+struct CommandTriggerBatchResponse {
+    outcomes: Vec<BatchItemOutcome<CommandTriggerResponse>>,
+}
+
+/// An item of a batch answer: what the same request alone would have been
+/// answered with - its success body, or `{"error": {...}}` with the
+/// status, code and message of its error.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum BatchItemOutcome<T> {
+    Done(T),
+    Failed { error: ItemErrorBody },
+}
+
+impl<T> From<Result<T, RestError>> for BatchItemOutcome<T> {
+    fn from(result: Result<T, RestError>) -> Self {
+        match result {
+            Ok(done) => BatchItemOutcome::Done(done),
+            Err(e) => BatchItemOutcome::Failed {
+                error: e.into_item_error(),
+            },
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct CommandDryRunRequest {
     payload: serde_json::Value,
@@ -906,12 +1000,106 @@ async fn post_events_external(
     )
     .await?;
 
-    // A redelivery is still a 201 - the submission was accepted, exactly
-    // as specs/skilj.allium's own ARedeliveryProducesNoEventAndNoOutcome
-    // guarantee describes; it's just that nothing was created. Neither
-    // outcome is an error, so both share this one success response shape,
-    // distinguished by `redelivered` rather than by status code.
-    // A key hit names the event the message became; a watermark hit can't.
+    // A redelivery is still a 201: see `external_event_response`.
+    Ok((StatusCode::CREATED, Json(external_event_response(outcome)?)))
+}
+
+/// `rule CreateExternalEventBatch` (docs/architecture.md §227): up to
+/// `max_items_per_batch` external events through one token, created (or
+/// recognised as redeliveries) in the order given, each answered as
+/// `POST /v1/events/external` would answer it alone. Not a transaction: an
+/// event that is refused doesn't stop the ones after it. A request over
+/// the limit is refused whole. Answered `200`, not the single route's
+/// `201`, since items may have failed.
+///
+/// Each event's `Idempotency-Key` travels in its item; a request-level
+/// header is ignored, as on `POST /v1/commands/trigger/batch`.
+async fn post_events_external_batch(
+    State(state): State<AppState>,
+    credential: BearerCredential,
+    Json(body): Json<ExternalEventBatchRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let max = state.command_batcher.max_items_per_batch();
+    if body.events.len() > max {
+        return Err(RestError::BatchTooLarge {
+            max,
+            items: body.events.len(),
+        });
+    }
+    let token = resolve_token::<ExternalEventToken>(&state, &credential).await?;
+
+    let stop_at_first_failure = body.stop_at_first_failure;
+    let mut outcomes: Vec<Option<Result<ExternalEventResponse, RestError>>> = Vec::new();
+    let mut items = Vec::new();
+    for event in body.events {
+        if stop_at_first_failure && outcomes.iter().any(|o| matches!(o, Some(Err(_)))) {
+            outcomes.push(Some(Err(skilj_core::error::Error::NotProcessed.into())));
+            continue;
+        }
+        let dedupe = match (event.dedupe, event.idempotency_key) {
+            (Some(d), _) => Some(db::ExternalEventBatchDedupe::Watermark {
+                partition_key: d.partition_key,
+                sequence: d.sequence,
+            }),
+            (None, Some(key)) => match event_store::reject_reserved_idempotency_key(Some(&key)) {
+                Ok(()) => Some(db::ExternalEventBatchDedupe::Key(key)),
+                Err(e) => {
+                    outcomes.push(Some(Err(e.into())));
+                    continue;
+                }
+            },
+            (None, None) => None,
+        };
+        items.push(db::ExternalEventBatchItem {
+            payload: serde_json::to_string(&event.payload)
+                .expect("serde_json::Value serialization is infallible"),
+            source_content: event.source_content,
+            source_context: event.source_context,
+            correlation_id: event.correlation_id,
+            causation_id: event.causation_id,
+            dedupe,
+        });
+        outcomes.push(None);
+    }
+
+    let mut created = db::create_and_insert_external_events(
+        &state.pool,
+        state.projection_dispatcher.as_ref(),
+        &state.event_broadcaster,
+        &state.event_cache,
+        &token,
+        items,
+        state.encryption_master_key.as_ref(),
+        &state.dispatcher.blind_index(),
+        stop_at_first_failure,
+    )
+    .await
+    .into_iter();
+    let outcomes = outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome
+                .unwrap_or_else(|| {
+                    created
+                        .next()
+                        .expect("one outcome per item")
+                        .map_err(RestError::from)
+                        .and_then(external_event_response)
+                })
+                .into()
+        })
+        .collect();
+    Ok(Json(ExternalEventBatchResponse { outcomes }))
+}
+
+/// What `POST /v1/events/external` answers for one event's outcome. A
+/// redelivery is still a success - the submission was accepted, exactly as
+/// specs/skilj.allium's own ARedeliveryProducesNoEventAndNoOutcome
+/// guarantee describes; it's just that nothing was created. A key hit
+/// names the event the message became; a watermark hit can't.
+fn external_event_response(
+    outcome: db::CreateExternalEventOutcome,
+) -> Result<ExternalEventResponse, RestError> {
     let (sequence, redelivered) = match outcome {
         db::CreateExternalEventOutcome::Created(event) => (Some(event.sequence), false),
         db::CreateExternalEventOutcome::Redelivered { sequence } => (sequence, true),
@@ -922,14 +1110,10 @@ async fn post_events_external(
             .into())
         }
     };
-
-    Ok((
-        StatusCode::CREATED,
-        Json(ExternalEventResponse {
-            sequence,
-            redelivered,
-        }),
-    ))
+    Ok(ExternalEventResponse {
+        sequence,
+        redelivered,
+    })
 }
 
 async fn post_events_direct(
@@ -1292,40 +1476,10 @@ async fn post_commands_trigger(
     )
     .await?
     {
-        let key_already_used = match idempotency_key {
-            Some(key) => {
-                db::idempotency_key_already_used(
-                    &state.pool,
-                    &bounded_context_name,
-                    &authorised.command_type.name,
-                    &authorised.client_id,
-                    key,
-                )
-                .await?
-            }
-            None => false,
-        };
-        if !key_already_used {
-            let proposal = db::propose_command(
-                &state.pool,
-                &authorised.command_type,
-                &authorised,
-                &policy,
-                idempotency_key,
-                state.encryption_master_key.as_ref(),
-                Utc::now(),
-            )
-            .await?;
-            return Ok(Json(CommandTriggerResponse {
-                accepted: false,
-                triggered_event_sequences: None,
-                rejection_reason: None,
-                rejection_kind: None,
-                deduplicated: false,
-                correlation_id: None,
-                pending_approval: true,
-                proposal_id: Some(proposal.id),
-            }));
+        if let Some(proposed) =
+            propose_unless_key_used(&state, &authorised, &policy, idempotency_key).await?
+        {
+            return Ok(Json(proposed));
         }
     }
 
@@ -1360,7 +1514,198 @@ async fn post_commands_trigger(
         )
         .await?;
 
-    Ok(Json(match outcome {
+    Ok(Json(trigger_response(outcome)?))
+}
+
+/// `rule TriggerCommandBatch` (docs/architecture.md §227): up to
+/// `max_items_per_batch` commands of the token's one command type,
+/// decided and committed in the order given, each answered as
+/// `POST /v1/commands/trigger` would answer it alone. Not a transaction:
+/// a command that is rejected or refused doesn't stop the ones after it.
+/// A request over the limit is refused whole.
+///
+/// Each command's `Idempotency-Key` travels in its item. A request-level
+/// `Idempotency-Key` header is ignored: gateways add one to every POST
+/// (§195), and one key can't stand for several commands.
+#[tracing::instrument(
+    skip_all,
+    fields(
+        bounded_context = tracing::field::Empty,
+        command_type = tracing::field::Empty,
+        commands = tracing::field::Empty
+    )
+)]
+async fn post_commands_trigger_batch(
+    State(state): State<AppState>,
+    credential: BearerCredential,
+    Json(body): Json<CommandTriggerBatchRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let max = state.command_batcher.max_items_per_batch();
+    if body.commands.len() > max {
+        return Err(RestError::BatchTooLarge {
+            max,
+            items: body.commands.len(),
+        });
+    }
+    let token = resolve_token::<CommandToken>(&state, &credential).await?;
+    let command_type = &token.command_type;
+    let bounded_context_name = command_type.bounded_context.name.clone();
+    let span = tracing::Span::current();
+    span.record("bounded_context", bounded_context_name.as_str());
+    span.record("command_type", command_type.name.as_str());
+    span.record("commands", body.commands.len());
+
+    // One command type per call, so one policy for every command in it.
+    let approval_policy = if body.commands.is_empty() {
+        None
+    } else {
+        db::get_command_approval_policy(&state.pool, &bounded_context_name, &command_type.name)
+            .await?
+    };
+
+    // Each command authorised as a single trigger would be, in order. A
+    // refused one is answered with its error; an approval-required one
+    // becomes its proposal; the rest go to the batcher together.
+    let stop_at_first_failure = body.stop_at_first_failure;
+    let mut outcomes: Vec<Option<Result<CommandTriggerResponse, RestError>>> = Vec::new();
+    let mut queued = Vec::new();
+    for item in body.commands {
+        if stop_at_first_failure && outcomes.iter().any(|o| matches!(o, Some(Err(_)))) {
+            outcomes.push(Some(Err(skilj_core::error::Error::NotProcessed.into())));
+            continue;
+        }
+        let payload = serde_json::to_string(&item.payload)
+            .expect("serde_json::Value serialization is infallible");
+        let authorised = event_store::reject_reserved_idempotency_key(
+            item.idempotency_key.as_deref(),
+        )
+        .and_then(|()| {
+            event_store::authorise_command_trigger(
+                &token,
+                payload,
+                item.correlation_id,
+                item.causation_id,
+            )
+        });
+        let authorised = match authorised {
+            Ok(authorised) => authorised,
+            Err(e) => {
+                outcomes.push(Some(Err(e.into())));
+                continue;
+            }
+        };
+        if let Some(policy) = &approval_policy {
+            match propose_unless_key_used(
+                &state,
+                &authorised,
+                policy,
+                item.idempotency_key.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(proposed)) => {
+                    outcomes.push(Some(Ok(proposed)));
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    outcomes.push(Some(Err(e)));
+                    continue;
+                }
+            }
+        }
+        queued.push(skilj_core::command_batcher::CommandBatchItem {
+            command_type: authorised.command_type,
+            payload: authorised.payload,
+            client_id: authorised.client_id,
+            correlation_id: authorised.correlation_id,
+            causation_id: authorised.causation_id,
+            idempotency_key: item.idempotency_key,
+        });
+        outcomes.push(None);
+    }
+
+    let mut submitted = state
+        .command_batcher
+        .decide_and_submit_many(
+            &state.pool,
+            &state.dispatcher,
+            &state.projection_dispatcher,
+            state.snapshot_dispatcher.as_ref(),
+            &state.event_broadcaster,
+            &state.event_cache,
+            state.encryption_master_key.as_ref(),
+            &bounded_context_name,
+            queued,
+            stop_at_first_failure,
+        )
+        .await
+        .into_iter();
+    let outcomes = outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome
+                .unwrap_or_else(|| {
+                    let outcome = submitted.next().expect("one outcome per queued command");
+                    outcome.map_err(RestError::from).and_then(trigger_response)
+                })
+                .into()
+        })
+        .collect();
+    Ok(Json(CommandTriggerBatchResponse { outcomes }))
+}
+
+/// issue #98 for one command: a pending proposal for an approval-required
+/// command, unless its key already produced an accepted command (an
+/// earlier proposal was approved), which then goes to the batcher for
+/// its deduplicated outcome - `None`.
+async fn propose_unless_key_used(
+    state: &AppState,
+    authorised: &event_store::CommandAuthorised,
+    policy: &skilj_core::approvals::CommandApprovalPolicy,
+    idempotency_key: Option<&str>,
+) -> Result<Option<CommandTriggerResponse>, RestError> {
+    if let Some(key) = idempotency_key {
+        if db::idempotency_key_already_used(
+            &state.pool,
+            &authorised.command_type.bounded_context.name,
+            &authorised.command_type.name,
+            &authorised.client_id,
+            key,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+    }
+    let proposal = db::propose_command(
+        &state.pool,
+        &authorised.command_type,
+        authorised,
+        policy,
+        idempotency_key,
+        state.encryption_master_key.as_ref(),
+        Utc::now(),
+    )
+    .await?;
+    Ok(Some(CommandTriggerResponse {
+        accepted: false,
+        triggered_event_sequences: None,
+        rejection_reason: None,
+        rejection_kind: None,
+        deduplicated: false,
+        correlation_id: None,
+        pending_approval: true,
+        proposal_id: Some(proposal.id),
+    }))
+}
+
+/// What `POST /v1/commands/trigger` answers for one command's outcome,
+/// alone or as an item of a batch.
+fn trigger_response(
+    outcome: db::SubmitCommandOutcome,
+) -> Result<CommandTriggerResponse, RestError> {
+    Ok(match outcome {
         // §5.4/§7.3: a legitimate business outcome, not an HTTP error -
         // whether this was the first decision or a DCB-conflict retry
         // inside submit_command, a rejection renders identically either
@@ -1409,7 +1754,7 @@ async fn post_commands_trigger(
             }
             .into())
         }
-    }))
+    })
 }
 
 /// `DryRunTriggerCommand` (issue #47): `post_commands_trigger`'s

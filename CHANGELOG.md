@@ -10,6 +10,41 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Added
+
+- Ordered batch submission (#116, docs/architecture.md §227): GraphQL
+  `submitCommands`, `POST /v1/commands/trigger/batch` and
+  `POST /v1/events/external/batch`. Up to `max_items_per_batch` (100 by
+  default, `SkiljBuilder::max_items_per_batch`) commands or external events
+  in one call, decided or created in the order given, each answered as it
+  would be sent alone, one answer per item in order. Not a transaction: a
+  rejected or refused item doesn't stop the items after it. A call over the
+  limit is refused whole (`batch_too_large`). A client that needs its
+  commands in order no longer has to wait for each answer before sending
+  the next: from one caller, a batch reaches the throughput of many
+  concurrent ones.
+- `CommandBatcher::decide_and_submit_many` and
+  `db::create_and_insert_external_events`, the core of both.
+- `stopAtFirstFailure` on the two REST batch routes: every item after the
+  first that fails answers `not_processed` (409) and is not processed, so a
+  caller that relies on order - a broker bridge, a dedupe watermark - can
+  send the rest again after dealing with it (docs/architecture.md §227).
+- The Kafka, AMQP and NATS bridges send the messages they have already
+  received through the batch routes, in order, with `stopAtFirstFailure`; a
+  message that fails is retried and parked on its own as before. Configure
+  it with `InboundBatching { max_items, linger }` (100 and zero by default)
+  through the new `run_inbound_until_with`; `InboundBatching::off()` sends
+  one message a call. `run_inbound` and `run_inbound_until` batch with the
+  defaults. Against an older skilj without the batch routes, a bridge goes
+  on one message at a time.
+
+### Fixed
+
+- Local mode ran its Postgres with fsync off - `postgresql_embedded` always
+  starts the server with `-F`, and the root path passed `-F` too - so an operating-system crash or power loss
+  could lose committed data or corrupt the data directory. It now runs with
+  fsync on (docs/architecture.md §226).
+
 ## [0.1.1] - 2026-10-22
 
 ### Fixed
