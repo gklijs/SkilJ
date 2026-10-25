@@ -55,6 +55,8 @@ let mapping = RoleAccessMapping {
     level: AccessLevel::Admin,
     can_read_sensitive: false,
     scope: None,
+    capabilities: Default::default(),
+    delegable: Default::default(),
     status: RoleStatus::Active,
     created_at: Utc::now(),
     revoked_at: None,

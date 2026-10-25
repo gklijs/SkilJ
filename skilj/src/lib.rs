@@ -3319,6 +3319,19 @@ impl SkiljBuilder {
             .try_collect::<Vec<()>>()
             .await?;
 
+        // The access trail (docs/architecture.md §229): after the patches
+        // above, whose columns the admin context's event types need, and
+        // before anything can change a grant. The baseline covers every
+        // grant made before the trail existed, or by a writer that
+        // records none (local mode's seed).
+        let baselined = skilj_core::db::ensure_access_trail(&pool).await?;
+        if baselined > 0 {
+            tracing::info!(
+                grants = baselined,
+                "access trail: recorded the starting state of grants that had no history"
+            );
+        }
+
         // After the schema patches above (docs/architecture.md §159):
         // reconciliation reads each declared bounded context's
         // registration tables, which a bounded context from an older

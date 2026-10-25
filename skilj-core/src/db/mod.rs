@@ -35,6 +35,7 @@ use crate::access_control::{
     AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
     ExternalEventToken, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
+use crate::access_trail::{AccessChange, AccessEventKind, AccessEventRecord};
 use crate::approvals::{CommandApprovalPolicy, CommandProposal, CommandProposalStatus};
 use crate::bootstrap::ContextCreator;
 use crate::encryption::{self, DataKey, EncryptionMasterKey};
@@ -8384,8 +8385,8 @@ const ROLE_ACCESS_MAPPING_COLUMNS: &str =
      status, created_at, revoked_at";
 
 #[tracing::instrument(skip_all)]
-pub async fn insert_role_access_mapping(
-    pool: &Pool,
+pub async fn insert_role_access_mapping<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     mapping: &RoleAccessMapping,
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -8402,7 +8403,7 @@ pub async fn insert_role_access_mapping(
     .bind(role_status_to_str(mapping.status))
     .bind(mapping.created_at)
     .bind(mapping.revoked_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -8445,8 +8446,8 @@ pub const MAX_CAPABILITIES_PER_MAPPING: usize = 16;
 /// gone or revoked, already holds it, or already holds
 /// [`MAX_CAPABILITIES_PER_MAPPING`].
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
-pub async fn add_mapping_capability(
-    pool: &Pool,
+pub async fn add_mapping_capability<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     role_id: &str,
     bounded_context: &str,
     capability: &str,
@@ -8460,7 +8461,7 @@ pub async fn add_mapping_capability(
     .bind(role_id)
     .bind(bounded_context)
     .bind(MAX_CAPABILITIES_PER_MAPPING as i32)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(done.rows_affected() == 1)
 }
@@ -8468,8 +8469,8 @@ pub async fn add_mapping_capability(
 /// Remove `capability` from the active mapping's `capabilities`: `true`
 /// when it was held and is now gone.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
-pub async fn remove_mapping_capability(
-    pool: &Pool,
+pub async fn remove_mapping_capability<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     role_id: &str,
     bounded_context: &str,
     capability: &str,
@@ -8482,7 +8483,7 @@ pub async fn remove_mapping_capability(
     .bind(capability)
     .bind(role_id)
     .bind(bounded_context)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(done.rows_affected() == 1)
 }
@@ -8494,8 +8495,8 @@ pub async fn remove_mapping_capability(
 /// refused even if the caller's own check were bypassed - the same
 /// defense-in-depth [`add_mapping_capability`] takes.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
-pub async fn set_mapping_delegable(
-    pool: &Pool,
+pub async fn set_mapping_delegable<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     role_id: &str,
     bounded_context: &str,
     delegable: &std::collections::BTreeSet<String>,
@@ -8509,9 +8510,318 @@ pub async fn set_mapping_delegable(
     .bind(role_id)
     .bind(bounded_context)
     .bind(MAX_CAPABILITIES_PER_MAPPING as i32)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(done.rows_affected() == 1)
+}
+
+// --- the access trail (docs/architecture.md §229) ---
+
+/// The `admin` bounded context, which every trail event is written to.
+/// An error rather than a skipped write when it is missing: a change that
+/// cannot be recorded is not made.
+#[tracing::instrument(skip_all)]
+pub async fn require_admin_bounded_context(pool: &Pool) -> crate::error::Result<BoundedContext> {
+    require_bounded_context(pool, crate::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME).await
+}
+
+/// `rule RecordAccessEvent`: appends `change` to the admin bounded
+/// context on `tx`, so it commits or rolls back with the change it
+/// describes. The admin context's `sequence` row lock is held until `tx`
+/// ends, which is what keeps its log gapless. Not broadcast and not put in
+/// the event cache: nothing subscribes to these, and a read that misses
+/// the cache falls back to the database.
+#[tracing::instrument(skip_all, fields(kind = change.kind.name()))]
+pub async fn record_access_event(
+    tx: &mut Transaction<'_, Postgres>,
+    admin: &BoundedContext,
+    change: AccessChange,
+) -> crate::error::Result<()> {
+    let sequence = next_sequence(&mut **tx, &admin.name).await?;
+    let event = change.into_event(admin, sequence, Utc::now());
+    insert_event(&mut **tx, &event, None).await
+}
+
+/// `GrantRoleAccessMapping`/`CreateBoundedContextFromTemplate`'s write:
+/// inserts the mapping and records `AccessGranted` in one transaction.
+/// `actor_role_id` is the granting Role, `None` for a grant no Role made
+/// (local mode's seed). `insert_role_access_mapping` alone writes no
+/// trail; startup's baseline (`baseline_access_events`) covers a row made
+/// that way.
+#[tracing::instrument(skip_all)]
+pub async fn grant_role_access_mapping_with_trail(
+    pool: &Pool,
+    mapping: &RoleAccessMapping,
+    actor_role_id: Option<&str>,
+) -> crate::error::Result<()> {
+    let admin = require_admin_bounded_context(pool).await?;
+    let mut tx = pool.begin().await?;
+    insert_role_access_mapping(&mut *tx, mapping).await?;
+    record_access_event(
+        &mut tx,
+        &admin,
+        AccessChange::granted(
+            &mapping.role.id,
+            &mapping.bounded_context.name,
+            actor_role_id,
+            mapping.level,
+            mapping.can_read_sensitive,
+            mapping.scope.as_deref(),
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `RevokeRoleAccessMapping`'s write: revokes the active mapping and
+/// records `AccessRevoked` in one transaction.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn revoke_role_access_mapping_with_trail(
+    pool: &Pool,
+    role_id: &str,
+    bounded_context: &str,
+    revoked_at: DateTime<Utc>,
+    actor_role_id: &str,
+) -> crate::error::Result<()> {
+    let admin = require_admin_bounded_context(pool).await?;
+    let mut tx = pool.begin().await?;
+    revoke_active_role_access_mapping(&mut *tx, role_id, bounded_context, revoked_at).await?;
+    record_access_event(
+        &mut tx,
+        &admin,
+        AccessChange::revoked(role_id, bounded_context, actor_role_id, false),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The capability mutations' write: applies the grant or revoke and, only
+/// when it applied, records the event in the same transaction. `false`
+/// when a concurrent change got there first (nothing is recorded).
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn change_mapping_capability_with_trail(
+    pool: &Pool,
+    role_id: &str,
+    bounded_context: &str,
+    capability: &str,
+    grant: bool,
+    actor_role_id: &str,
+    via_admin: bool,
+) -> crate::error::Result<bool> {
+    let admin = require_admin_bounded_context(pool).await?;
+    let mut tx = pool.begin().await?;
+    let applied = if grant {
+        add_mapping_capability(&mut *tx, role_id, bounded_context, capability).await?
+    } else {
+        remove_mapping_capability(&mut *tx, role_id, bounded_context, capability).await?
+    };
+    if !applied {
+        return Ok(false);
+    }
+    record_access_event(
+        &mut tx,
+        &admin,
+        AccessChange::capability(
+            grant,
+            role_id,
+            bounded_context,
+            actor_role_id,
+            capability,
+            via_admin,
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// `SetDelegableCapabilities`' write, with its `DelegableCapabilitiesSet`
+/// event in the same transaction.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn set_mapping_delegable_with_trail(
+    pool: &Pool,
+    role_id: &str,
+    bounded_context: &str,
+    delegable: &std::collections::BTreeSet<String>,
+    actor_role_id: &str,
+) -> crate::error::Result<bool> {
+    let admin = require_admin_bounded_context(pool).await?;
+    let mut tx = pool.begin().await?;
+    if !set_mapping_delegable(&mut *tx, role_id, bounded_context, delegable).await? {
+        return Ok(false);
+    }
+    record_access_event(
+        &mut tx,
+        &admin,
+        AccessChange::delegable_set(role_id, bounded_context, actor_role_id, delegable),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Registers the six access event types in the admin bounded context
+/// (`rule RegisterAccessEventTypes`), each only if it is not registered
+/// yet: a restart changes nothing. Must run after the per-context startup
+/// patches, since the rows carry columns they add.
+#[tracing::instrument(skip_all)]
+pub async fn register_access_event_types(pool: &Pool) -> crate::error::Result<()> {
+    let admin = require_admin_bounded_context(pool).await?;
+    for kind in AccessEventKind::ALL {
+        if get_event_type(pool, &admin.name, kind.name())
+            .await?
+            .is_none()
+        {
+            upsert_event_type(pool, &crate::access_trail::access_event_type(&admin, kind)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The admin context's `events.origin_kind` check, widened to accept
+/// `skilj_recorded`. Only the admin context's table is changed: it is the
+/// only one that holds such events, and leaving every other context's
+/// check as it was keeps a large events table from being rescanned. Runs
+/// the `ALTER` only while the check lacks the value (docs/architecture.md
+/// §158).
+#[tracing::instrument(skip_all)]
+pub async fn ensure_admin_events_origin_kind(pool: &Pool) -> crate::error::Result<()> {
+    let schema = schema_ident(crate::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME);
+    let mut tx = pool.begin().await?;
+    // Instances starting together take turns: the second finds the check
+    // already widened. (Without the lock a constraint dropped by the first
+    // reads back as NULL to the second's catalog query.)
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('skilj_admin_events_origin_kind'))")
+        .execute(&mut *tx)
+        .await?;
+    let current: Option<(String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT conname::text, pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conrelid = '{schema}.events'::regclass AND contype = 'c' \
+         AND pg_get_constraintdef(oid) LIKE '%origin_kind%'"
+    )))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((name, definition)) = current else {
+        return Ok(());
+    };
+    if definition.is_some_and(|definition| definition.contains("skilj_recorded")) {
+        return Ok(());
+    }
+    let name = name.replace('"', "\"\"");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.events DROP CONSTRAINT \"{name}\""
+    )))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.events ADD CONSTRAINT events_origin_kind_check CHECK (\
+         origin_kind IN ('external_triggered', 'directly_created', 'command_triggered', \
+         'system_triggered', 'skilj_recorded'))"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The whole of the trail's startup: the admin events table accepts
+/// `skilj_recorded`, the six event types are registered, and every grant
+/// without history is baselined. Returns how many it baselined. Needs the
+/// admin bounded context to exist.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_access_trail(pool: &Pool) -> crate::error::Result<usize> {
+    ensure_admin_events_origin_kind(pool).await?;
+    register_access_event_types(pool).await?;
+    baseline_access_events(pool).await
+}
+
+/// `rule BaselineAccessEvents`: one `AccessBaselined` event for each
+/// active mapping that has no access event yet, recording what it holds
+/// now. Safe to repeat and safe to run on several instances at once: each
+/// baseline re-checks under the admin context's `sequence` row lock, so
+/// the loser finds the winner's event and writes nothing. Returns how many
+/// it wrote.
+#[tracing::instrument(skip_all)]
+pub async fn baseline_access_events(pool: &Pool) -> crate::error::Result<usize> {
+    let admin = require_admin_bounded_context(pool).await?;
+    let schema = schema_ident(&admin.name);
+    let mut written = 0;
+    for mapping in list_role_access_mappings(pool).await? {
+        if mapping.status != RoleStatus::Active {
+            continue;
+        }
+        let mut tx = pool.begin().await?;
+        // The lock `next_sequence` takes, taken first: the existence check
+        // below then cannot race another instance's baseline.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT next_value FROM {schema}.sequence FOR UPDATE"
+        )))
+        .execute(&mut *tx)
+        .await?;
+        let has_events: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {schema}.events \
+             WHERE event_type_name = ANY($1) \
+             AND payload::jsonb ->> 'role_id' = $2 \
+             AND payload::jsonb ->> 'bounded_context' = $3)"
+        )))
+        .bind(
+            AccessEventKind::ALL
+                .iter()
+                .map(|kind| kind.name())
+                .collect::<Vec<_>>(),
+        )
+        .bind(&mapping.role.id)
+        .bind(&mapping.bounded_context.name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_events {
+            continue;
+        }
+        record_access_event(&mut tx, &admin, AccessChange::baselined(&mapping)).await?;
+        tx.commit().await?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// Every access event for one grant, oldest first (`AccessHistory` folds
+/// them).
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_access_event_records(
+    pool: &Pool,
+    role_id: &str,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<AccessEventRecord>> {
+    let schema = schema_ident(crate::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME);
+    let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT event_type_name, payload, metadata_created_at FROM {schema}.events \
+         WHERE event_type_name = ANY($1) \
+         AND payload::jsonb ->> 'role_id' = $2 \
+         AND payload::jsonb ->> 'bounded_context' = $3 \
+         ORDER BY sequence"
+    )))
+    .bind(
+        AccessEventKind::ALL
+            .iter()
+            .map(|kind| kind.name())
+            .collect::<Vec<_>>(),
+    )
+    .bind(role_id)
+    .bind(bounded_context)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(name, payload, created_at)| {
+            Some(AccessEventRecord {
+                kind: AccessEventKind::from_name(&name)?,
+                payload: serde_json::from_str(&payload).ok()?,
+                created_at,
+            })
+        })
+        .collect())
 }
 
 /// Every `RoleAccessMapping` this engine currently knows of, active or
@@ -8707,7 +9017,9 @@ pub async fn revoke_role_and_mappings(
     pool: &Pool,
     role: &Role,
     mappings: &[RoleAccessMapping],
+    actor_role_id: &str,
 ) -> crate::error::Result<()> {
+    let admin = require_admin_bounded_context(pool).await?;
     let mut tx = pool.begin().await?;
     update_role(&mut *tx, role).await?;
     for mapping in mappings {
@@ -8719,6 +9031,12 @@ pub async fn revoke_role_and_mappings(
             &role.id,
             &mapping.bounded_context.name,
             revoked_at,
+        )
+        .await?;
+        record_access_event(
+            &mut tx,
+            &admin,
+            AccessChange::revoked(&role.id, &mapping.bounded_context.name, actor_role_id, true),
         )
         .await?;
     }
@@ -9039,6 +9357,7 @@ async fn event_origin_from_row(
         },
         "directly_created" => EventOrigin::DirectlyCreated,
         "system_triggered" => EventOrigin::SystemTriggered,
+        "skilj_recorded" => EventOrigin::SkiljRecorded,
         "command_triggered" => {
             let command_id =
                 command_id.expect("command_triggered event row without origin_command_id");
@@ -9854,6 +10173,7 @@ async fn events_from_rows(
             },
             "directly_created" => EventOrigin::DirectlyCreated,
             "system_triggered" => EventOrigin::SystemTriggered,
+            "skilj_recorded" => EventOrigin::SkiljRecorded,
             "command_triggered" => {
                 let command_id = row
                     .origin_command_id
@@ -10501,6 +10821,10 @@ pub async fn insert_event<'e>(
         EventOrigin::SystemTriggered => {
             debug_assert!(command_id.is_none());
             ("system_triggered", None, None)
+        }
+        EventOrigin::SkiljRecorded => {
+            debug_assert!(command_id.is_none());
+            ("skilj_recorded", None, None)
         }
         EventOrigin::CommandTriggered { .. } => {
             debug_assert!(

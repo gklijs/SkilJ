@@ -40,6 +40,16 @@ type BankCapabilityGrant @inaccessible {
 	capabilities: [String!]!
 }
 
+type BankCapabilityHistory @inaccessible {
+	known: Boolean!
+	held: Boolean!
+	level: String
+	canReadSensitive: Boolean!
+	scope: String
+	capabilities: [String!]!
+	delegable: [String!]!
+}
+
 type BankCapabilityOverviewEntry @inaccessible {
 	boundedContext: String!
 	required: [String!]!
@@ -498,6 +508,7 @@ type Mutation {
 type Query {
 	bankBoundedContexts: [BankBoundedContext!]! @inaccessible
 	bankCapabilityOverview: [BankCapabilityOverviewEntry!]! @inaccessible
+	bankCapabilityHistory(roleId: ID!, boundedContext: String!, asOf: String): BankCapabilityHistory! @inaccessible
 	bankCapabilityDelegation(boundedContext: String!): BankCapabilityDelegation! @inaccessible
 	bankProjections(boundedContext: String!): [BankProjection!]! @inaccessible
 	bankScheduledEventTypes(boundedContext: String!): [BankEventType!]! @inaccessible

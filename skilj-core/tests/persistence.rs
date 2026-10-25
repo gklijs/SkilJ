@@ -97,6 +97,19 @@ async fn provision() -> Option<TestDb> {
         eprintln!("skipping: migrating the test database failed: {e}");
         return None;
     }
+    // The admin context and its access trail, which the grant writers
+    // that record history (`revoke_role_and_mappings` and friends) append to.
+    let admin = skilj_core::bootstrap::stamp_admin_bounded_context(
+        db::get_bounded_context(&pool, skilj_core::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME)
+            .await
+            .ok()?
+            .as_ref(),
+        Utc::now(),
+    );
+    if let Some(admin) = admin {
+        db::insert_bounded_context(&pool, &admin).await.ok()?;
+    }
+    db::ensure_access_trail(&pool).await.ok()?;
     Some(TestDb { pool })
 }
 
@@ -1101,7 +1114,7 @@ fn revoke_role_and_mappings_revokes_the_role_and_every_active_mapping_together()
             })
             .collect();
 
-        db::revoke_role_and_mappings(&pool, &revoked_role, &revoked_mappings)
+        db::revoke_role_and_mappings(&pool, &revoked_role, &revoked_mappings, &role.id)
             .await
             .unwrap();
 

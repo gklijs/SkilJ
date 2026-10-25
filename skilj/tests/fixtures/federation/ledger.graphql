@@ -40,6 +40,16 @@ type LedgerCapabilityGrant @inaccessible {
 	capabilities: [String!]!
 }
 
+type LedgerCapabilityHistory @inaccessible {
+	known: Boolean!
+	held: Boolean!
+	level: String
+	canReadSensitive: Boolean!
+	scope: String
+	capabilities: [String!]!
+	delegable: [String!]!
+}
+
 type LedgerCapabilityOverviewEntry @inaccessible {
 	boundedContext: String!
 	required: [String!]!
@@ -498,6 +508,7 @@ type Mutation {
 type Query {
 	ledgerBoundedContexts: [LedgerBoundedContext!]! @inaccessible
 	ledgerCapabilityOverview: [LedgerCapabilityOverviewEntry!]! @inaccessible
+	ledgerCapabilityHistory(roleId: ID!, boundedContext: String!, asOf: String): LedgerCapabilityHistory! @inaccessible
 	ledgerCapabilityDelegation(boundedContext: String!): LedgerCapabilityDelegation! @inaccessible
 	ledgerProjections(boundedContext: String!): [LedgerProjection!]! @inaccessible
 	ledgerScheduledEventTypes(boundedContext: String!): [LedgerEventType!]! @inaccessible

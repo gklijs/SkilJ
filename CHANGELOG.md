@@ -27,6 +27,30 @@ README.md, "Status and stability").
   caller's next request. `registerProjection` takes `requiresCapability`
   and the `Projection` type exposes it.
 
+### Upgrading from 0.1
+
+- Startup widens the `admin` bounded context's `events.origin_kind` check,
+  registers six access event types there and baselines existing grants. A
+  grant made by writing `role_access_mappings` directly (as local mode's
+  seed does) has no history until the next start baselines it.
+- Run the new migration (`0007`, applied at startup); existing grants get
+  empty `capabilities` and `delegable`.
+- In Rust: rename `Projection::TEAM_ONLY = Some("x")` to
+  `REQUIRES_CAPABILITY = Some("x")`, `PrivateFieldKind::Team` to
+  `Capability` and `PrivateField.team` to `capability`. Code that builds
+  a `RoleAccessMapping` by hand needs `capabilities` and `delegable`
+  (`Default::default()` for none).
+- Grant the capability to every grant that used to match the team's Role
+  name: `grantCapability(roleId, boundedContext, capability)`. Until then
+  the gated projection is absent from their schema and reads as
+  "not found" - it fails closed. `capabilityOverview` lists what is
+  required against what is held.
+- GraphQL clients: `PrivateFieldKind` `TEAM` is now `CAPABILITY`, the
+  private field's `team` is now `capability`, and the error code
+  `not_on_required_team` is gone.
+- Superadmins no longer pass a gate by being superadmin; grant them the
+  capability like anyone else.
+
 ### Added
 
 - Capability management (docs/architecture.md §228): GraphQL
@@ -35,6 +59,15 @@ README.md, "Status and stability").
   exposes `capabilities` and `delegable`. A context admin can hand out the
   capabilities a superadmin allowed it to (`delegable`) to other grants in
   its context, never to its own.
+
+- The access trail (docs/architecture.md §229): every grant, revoke, capability
+  change and `delegable` change is also an event in the `admin` bounded
+  context, written in the same transaction as the change, with the acting
+  Role in the payload. GraphQL `capabilityHistory(roleId, boundedContext,
+  asOf)` (superadmin) answers what a grant held at a past instant. Grants
+  from before the upgrade get one `AccessBaselined` event at startup, so
+  history begins at the upgrade and says so for earlier times. Events carry
+  a new origin, `SKILJ_RECORDED`.
 
 - Ordered batch submission (#116, docs/architecture.md §227): GraphQL
   `submitCommands`, `POST /v1/commands/trigger/batch` and

@@ -289,6 +289,20 @@ pub fn capability_overview_entry_object(n: &Naming) -> Object {
     })
 }
 
+/// `rule CapabilityHistory`'s answer: what one grant held at a past
+/// instant (`known: false` when the trail had not begun by then).
+pub fn capability_history_object(n: &Naming) -> Object {
+    gql_object!(skilj_core::access_trail::AccessHistory => n.ty("CapabilityHistory") {
+        scalar "known": TypeRef::named_nn(TypeRef::BOOLEAN) => |h| Value::from(h.known),
+        scalar "held": TypeRef::named_nn(TypeRef::BOOLEAN) => |h| Value::from(h.held),
+        scalar "level": TypeRef::named(TypeRef::STRING) => |h| optional_string(h.level.clone()),
+        scalar "canReadSensitive": TypeRef::named_nn(TypeRef::BOOLEAN) => |h| Value::from(h.can_read_sensitive),
+        scalar "scope": TypeRef::named(TypeRef::STRING) => |h| optional_string(h.scope.clone()),
+        scalar "capabilities": TypeRef::named_nn_list_nn(TypeRef::STRING) => |h| string_list(h.capabilities.iter().cloned()),
+        scalar "delegable": TypeRef::named_nn_list_nn(TypeRef::STRING) => |h| string_list(h.delegable.iter().cloned()),
+    })
+}
+
 /// `entity ContextCreator`. `kind` stands in for the Rust sum type's own
 /// variant tag (the same "the enum variant tag is the field" treatment
 /// the Rust side already gives it - see `ContextCreator`'s own doc
@@ -988,6 +1002,7 @@ pub fn event_origin_object(n: &Naming) -> Object {
                 EventOrigin::ExternalTriggered { .. } => "EXTERNAL_TRIGGERED",
                 EventOrigin::DirectlyCreated => "DIRECTLY_CREATED",
                 EventOrigin::SystemTriggered => "SYSTEM_TRIGGERED",
+                EventOrigin::SkiljRecorded => "SKILJ_RECORDED",
                 EventOrigin::CommandTriggered { .. } => "COMMAND_TRIGGERED",
                 _ => UNSUPPORTED_VALUE,
             })

@@ -3835,9 +3835,14 @@ fn self_approval_is_refused_by_default() {
                 ..m
             })
             .collect();
-        skilj_core::db::revoke_role_and_mappings(&pool, &revoked_role, &revoked_mappings)
-            .await
-            .unwrap();
+        skilj_core::db::revoke_role_and_mappings(
+            &pool,
+            &revoked_role,
+            &revoked_mappings,
+            &revoked_role.id,
+        )
+        .await
+        .unwrap();
         let laundered =
             second_admin_with_subject(&pool, &bc_name, proposer_role.external_subject.clone())
                 .await;
