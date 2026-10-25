@@ -5208,6 +5208,8 @@ write alike.
 <a id="private-fields-third-protection"></a>
 ## 31. Private fields: a third field-level protection, alongside `sensitive_fields` and the owner-tag `scope` series
 
+> Partly superseded by [§228](#capabilities): the `team` private-field kind described here is replaced by the `capability` kind, which names a capability a grant must hold rather than a `Role.name` to match. The `own` and `addressed` kinds and the rest of the mechanism are unchanged. Kept as the history of the design.
+
 A genuinely new mechanism, not a bugfix - user-initiated, prompted by a
 issue proposing a whole-*projection* staff-only gate
 (`Projection::PRIVATE`/`can_read_private`, a single bounded-context-wide

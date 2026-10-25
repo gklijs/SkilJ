@@ -8488,7 +8488,11 @@ pub async fn remove_mapping_capability(
 }
 
 /// Replace the active mapping's `delegable` set: `true` when the mapping
-/// was active and so changed.
+/// was active and so changed, `false` when the mapping is gone or revoked
+/// or the set is over [`MAX_CAPABILITIES_PER_MAPPING`]. The size guard is
+/// enforced again here, in the statement itself, so an oversized set is
+/// refused even if the caller's own check were bypassed - the same
+/// defense-in-depth [`add_mapping_capability`] takes.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn set_mapping_delegable(
     pool: &Pool,
@@ -8498,11 +8502,13 @@ pub async fn set_mapping_delegable(
 ) -> crate::error::Result<bool> {
     let done = sqlx::query(
         "UPDATE role_access_mappings SET delegable = $1 \
-         WHERE role_id = $2 AND bounded_context = $3 AND status = 'active'",
+         WHERE role_id = $2 AND bounded_context = $3 AND status = 'active' \
+         AND cardinality($1) <= $4",
     )
     .bind(delegable.iter().collect::<Vec<_>>())
     .bind(role_id)
     .bind(bounded_context)
+    .bind(MAX_CAPABILITIES_PER_MAPPING as i32)
     .execute(pool)
     .await?;
     Ok(done.rows_affected() == 1)
@@ -20395,6 +20401,18 @@ mod tests {
         assert_eq!(
             schema_ident("x\"; DROP SCHEMA public; --"),
             "\"bc_x\"\"; DROP SCHEMA public; --\""
+        );
+    }
+
+    #[test]
+    fn the_capability_limit_is_one_number() {
+        // `access_control::MAX_CAPABILITIES` (the pure check) and
+        // `MAX_CAPABILITIES_PER_MAPPING` (the atomic SQL guard) are the one
+        // `invariant CapabilitiesAreWellFormed` limit stated in two places;
+        // this keeps them from drifting apart.
+        assert_eq!(
+            crate::access_control::MAX_CAPABILITIES,
+            super::MAX_CAPABILITIES_PER_MAPPING
         );
     }
 }

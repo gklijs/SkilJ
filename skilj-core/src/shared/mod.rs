@@ -325,8 +325,8 @@ impl SensitiveField {
 /// See `value PrivateField` in the spec - the private-field mechanism's
 /// own three-way visibility rule, standing beside `SensitiveField` rather
 /// than inside it: a plain read-time redaction, no `EncryptionKey`
-/// anywhere behind it. `team`/`addressee_field` are each set exactly when
-/// `kind` calls for them, checked by `event_store::valid_private_fields`
+/// anywhere behind it. `capability`/`addressee_field` are each set exactly
+/// when `kind` calls for them, checked by `event_store::valid_private_fields`
 /// at registration - `None` for whichever the other two kinds leave
 /// unused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
