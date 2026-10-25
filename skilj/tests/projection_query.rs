@@ -236,7 +236,7 @@ impl Projection for AccountBalance {
     }
 }
 
-/// Identical to `AccountBalance` in every way except `TEAM_ONLY` -
+/// Identical to `AccountBalance` in every way except `REQUIRES_CAPABILITY` -
 /// exists purely to exercise issue #17's whole-projection team
 /// gate end to end, on both the `projection` field and (the fix itself)
 /// `projectionSchema`.
@@ -246,7 +246,7 @@ impl Projection for StaffOnlyBalance {
     type State = AccountBalanceState;
     type Event = BankingEvent;
     const NAME: &'static str = "StaffOnlyBalance";
-    const TEAM_ONLY: Option<&'static str> = Some("support");
+    const REQUIRES_CAPABILITY: Option<&'static str> = Some("support");
     fn consumed_event_types() -> Vec<&'static str> {
         vec!["MoneyDeposited"]
     }
@@ -507,6 +507,8 @@ fn projection_query_end_to_end() {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -662,6 +664,8 @@ fn projection_query_end_to_end() {
             level: AccessLevel::Read,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -801,6 +805,8 @@ fn projection_schema_end_to_end() {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -880,6 +886,8 @@ fn projection_schema_end_to_end() {
             level: AccessLevel::Read,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -949,7 +957,7 @@ fn projection_schema_end_to_end() {
 }
 
 /// issue #17's own gap and fix, end to end over real HTTP: a
-/// `TEAM_ONLY`-declaring projection rejects a Role not carrying the
+/// `REQUIRES_CAPABILITY`-declaring projection rejects a Role not carrying the
 /// required name on *both* `projection` and `projectionSchema`. Before
 /// the fix, `projectionSchema` skipped this check entirely while
 /// `projection` enforced it - a wrong-team caller could still learn the
@@ -958,7 +966,7 @@ fn projection_schema_end_to_end() {
 /// `TeamGatedWhenDeclared`'s "invisible, not merely unreadable" promise
 /// for one field on the same surface.
 #[test]
-fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end() {
+fn capability_gated_projection_gates_both_projection_and_projection_schema_end_to_end() {
     runtime().block_on(async {
         if test_database_url().await.is_none() {
             return;
@@ -999,6 +1007,8 @@ fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end()
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -1075,6 +1085,8 @@ fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end()
             level: AccessLevel::Read,
             can_read_sensitive: false,
             scope: None,
+            capabilities: ["support".to_string()].into(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -1113,8 +1125,8 @@ fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end()
             "StaffOnlyBalance"
         );
 
-        // A read-level Role with any other name: rejected on both
-        // fields - `projectionSchema` is the fix this test exists to pin
+        // A read-level grant without the capability: refused on both
+        // fields, as a projection that does not exist is - `projectionSchema` is the fix this test exists to pin
         // down, `projection` is the pre-existing behaviour it must not
         // regress.
         let reader_subject = unique_name("reader");
@@ -1130,12 +1142,15 @@ fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end()
         skilj_core::db::insert_role(&pool, &reader_role)
             .await
             .unwrap();
+        let reader_role_id = reader_role.id.clone();
         let reader_mapping = RoleAccessMapping {
             role: reader_role,
             bounded_context: bc.clone(),
             level: AccessLevel::Read,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -1145,6 +1160,9 @@ fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end()
             .unwrap();
         let reader_jwt = sign_jwt(&reader_subject);
 
+        // The type is not in this caller's schema at all, so the query
+        // fails validation - with exactly the message a query naming a
+        // type that does not exist gets.
         let response = graphql_request(
             &router,
             Some(&reader_jwt),
@@ -1152,14 +1170,23 @@ fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end()
             json!({ "bc": bc_name, "name": "StaffOnlyBalance" }),
         )
         .await;
+        let nothing_there = data_query.replace(&type_name, "Nothing_there");
+        let missing = graphql_request(
+            &router,
+            Some(&reader_jwt),
+            &nothing_there,
+            json!({ "bc": bc_name, "name": "StaffOnlyBalance" }),
+        )
+        .await;
+        // With the only projection gated, the reader's schema has no
+        // `projection` field at all; either way the answer is the one a
+        // query for something that does not exist gets.
         assert_eq!(
-            response["errors"][0]["extensions"]["code"],
-            "not_on_required_team"
+            response["errors"][0]["message"], missing["errors"][0]["message"],
+            "a gated type must look exactly like one that does not exist"
         );
 
-        // The fix itself: before it, this query still reached
-        // `get_projection` and returned the schema regardless of team
-        // membership.
+        // `projectionSchema` is the fix this test exists to pin down.
         let response = graphql_request(
             &router,
             Some(&reader_jwt),
@@ -1169,8 +1196,31 @@ fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end()
         .await;
         assert_eq!(
             response["errors"][0]["extensions"]["code"],
-            "not_on_required_team"
+            "Projection_not_found"
         );
+
+        // Granting the capability takes effect on the next request, with
+        // no rebuild: the reader's schema now carries the type.
+        assert!(skilj_core::db::add_mapping_capability(
+            &pool,
+            &reader_role_id,
+            &bc_name,
+            "support"
+        )
+        .await
+        .unwrap());
+        let response = graphql_request(
+            &router,
+            Some(&reader_jwt),
+            &data_query,
+            json!({ "bc": bc_name, "name": "StaffOnlyBalance" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "after the grant: {response:?}"
+        );
+        assert_eq!(response["data"]["projection"]["total"], 30);
     });
 }
 
@@ -1222,6 +1272,8 @@ fn keyed_projection_end_to_end() {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -1429,6 +1481,8 @@ fn keyed_projection_decrypt_on_read_end_to_end() {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -1459,6 +1513,8 @@ fn keyed_projection_decrypt_on_read_end_to_end() {
                 level: AccessLevel::Read,
                 can_read_sensitive: true,
                 scope: None,
+                capabilities: Default::default(),
+                delegable: Default::default(),
                 status: RoleStatus::Active,
                 created_at: test_now(),
                 revoked_at: None,
@@ -1489,6 +1545,8 @@ fn keyed_projection_decrypt_on_read_end_to_end() {
                 level: AccessLevel::Read,
                 can_read_sensitive: false,
                 scope: None,
+                capabilities: Default::default(),
+                delegable: Default::default(),
                 status: RoleStatus::Active,
                 created_at: test_now(),
                 revoked_at: None,
@@ -1692,6 +1750,8 @@ fn colliding_projection_type_names_serve_one_and_refuse_the_other() {
                     level: AccessLevel::Admin,
                     can_read_sensitive: false,
                     scope: None,
+                    capabilities: Default::default(),
+                    delegable: Default::default(),
                     status: RoleStatus::Active,
                     created_at: test_now(),
                     revoked_at: None,
@@ -1710,6 +1770,7 @@ fn colliding_projection_type_names_serve_one_and_refuse_the_other() {
                     consumed_event_types: Vec::new(),
                     sync: false,
                     caught_up_to: None,
+                    requires_capability: None,
                 },
             )
             .await
@@ -1819,6 +1880,8 @@ fn each_caller_sees_only_its_own_bounded_contexts_in_the_schema() {
             level,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -1928,5 +1991,294 @@ fn each_caller_sees_only_its_own_bounded_contexts_in_the_schema() {
         )
         .await;
         assert!(type_names(&as_reader).contains(&theirs_type), "{as_reader}");
+    });
+}
+
+/// `grantCapability`/`revokeCapability`/`setDelegableCapabilities`,
+/// `capabilityDelegation` and `capabilityOverview` end to end
+/// (docs/architecture.md §228): a superadmin delegates `support` to a
+/// context admin, who hands it to an agent and takes it back, never to
+/// itself; a grant takes effect on the agent's next request, and what a
+/// caller may not do is refused with the answer the rule gives.
+#[test]
+fn capability_mutations_and_reads_end_to_end() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let database_url = test_database_url().await.unwrap();
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let new_role = |prefix: &str, name: &str, superadmin: bool| Role {
+            id: generate_token_id(),
+            external_subject: unique_name(prefix),
+            name: name.to_string(),
+            superadmin,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        let admin_role = new_role("admin", "Admin", false);
+        let root_role = new_role("root", "Root", true);
+        let agent_role = new_role("agent", "Agent", false);
+        for role in [&admin_role, &root_role, &agent_role] {
+            skilj_core::db::insert_role(&pool, role).await.unwrap();
+        }
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        for (role, level) in [
+            (&admin_role, AccessLevel::Admin),
+            (&agent_role, AccessLevel::Read),
+        ] {
+            skilj_core::db::insert_role_access_mapping(
+                &pool,
+                &RoleAccessMapping {
+                    role: role.clone(),
+                    bounded_context: bc.clone(),
+                    level,
+                    can_read_sensitive: false,
+                    scope: None,
+                    capabilities: Default::default(),
+                    delegable: Default::default(),
+                    status: RoleStatus::Active,
+                    created_at: test_now(),
+                    revoked_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<WithdrawMoney>()
+            .projection::<StaffOnlyBalance>()
+            .reconciliation_role(admin_role.external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+        let router = skilj.graphql_router().await.unwrap();
+        let admin_jwt = sign_jwt(&admin_role.external_subject);
+        let root_jwt = sign_jwt(&root_role.external_subject);
+        let agent_jwt = sign_jwt(&agent_role.external_subject);
+
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({ "bc": bc_name, "payload": r#"{"amount":30}"# }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+
+        let code = |response: &serde_json::Value| {
+            response["errors"][0]["extensions"]["code"]
+                .as_str()
+                .map(str::to_string)
+        };
+        const GRANT: &str = "mutation($r: ID!, $bc: String!, $c: String!) { \
+            grantCapability(roleId: $r, boundedContext: $bc, capability: $c) \
+            { capabilities delegable } }";
+        const REVOKE: &str = "mutation($r: ID!, $bc: String!, $c: String!) { \
+            revokeCapability(roleId: $r, boundedContext: $bc, capability: $c) \
+            { capabilities } }";
+        const DELEGATE: &str = "mutation($r: ID!, $bc: String!, $d: [String!]!) { \
+            setDelegableCapabilities(roleId: $r, boundedContext: $bc, delegable: $d) \
+            { delegable } }";
+        let vars =
+            |role: &Role, capability: &str| json!({ "r": role.id, "bc": bc_name, "c": capability });
+
+        // Nothing to hand out until a superadmin says so.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            GRANT,
+            vars(&agent_role, "support"),
+        )
+        .await;
+        assert_eq!(code(&response).as_deref(), Some("capability_not_delegable"));
+
+        // The agent is no admin; a stranger in the context learns nothing.
+        let response = graphql_request(
+            &router,
+            Some(&agent_jwt),
+            GRANT,
+            vars(&agent_role, "support"),
+        )
+        .await;
+        assert_eq!(code(&response).as_deref(), Some("grant_not_active"));
+
+        // Only a superadmin delegates.
+        let delegate_vars = json!({ "r": admin_role.id, "bc": bc_name, "d": ["support"] });
+        let response =
+            graphql_request(&router, Some(&admin_jwt), DELEGATE, delegate_vars.clone()).await;
+        assert_eq!(code(&response).as_deref(), Some("not_superadmin"));
+        let response =
+            graphql_request(&router, Some(&root_jwt), DELEGATE, delegate_vars.clone()).await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        assert_eq!(
+            response["data"]["setDelegableCapabilities"]["delegable"],
+            json!(["support"])
+        );
+
+        // The admin sees what it may hand out, and who holds what.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            "query($bc: String!) { capabilityDelegation(boundedContext: $bc) \
+             { delegable grants { roleId capabilities } } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            response["data"]["capabilityDelegation"]["delegable"],
+            json!(["support"])
+        );
+        assert_eq!(
+            response["data"]["capabilityDelegation"]["grants"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Handing it to itself is refused; to the agent is not.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            GRANT,
+            vars(&admin_role, "support"),
+        )
+        .await;
+        assert_eq!(code(&response).as_deref(), Some("self_grant_refused"));
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            GRANT,
+            vars(&agent_role, "finance"),
+        )
+        .await;
+        assert_eq!(code(&response).as_deref(), Some("capability_not_delegable"));
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            GRANT,
+            vars(&agent_role, "support"),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        assert_eq!(
+            response["data"]["grantCapability"]["capabilities"],
+            json!(["support"])
+        );
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            GRANT,
+            vars(&agent_role, "support"),
+        )
+        .await;
+        assert_eq!(code(&response).as_deref(), Some("capability_not_added"));
+
+        // On the agent's very next request the projection is there.
+        let type_name =
+            skilj_graphql::projection_types::graphql_type_name(&bc_name, "StaffOnlyBalance");
+        let data_query = format!(
+            "query($bc: String!, $name: String!) {{ \
+                projection(boundedContext: $bc, name: $name) {{ \
+                    ... on {type_name} {{ total }} \
+                }} \
+            }}"
+        );
+        let read = json!({ "bc": bc_name, "name": "StaffOnlyBalance" });
+        let response = graphql_request(&router, Some(&agent_jwt), &data_query, read.clone()).await;
+        assert_eq!(response["data"]["projection"]["total"], 30, "{response:?}");
+
+        // The overview shows the requirement met.
+        let overview = "{ capabilityOverview { boundedContext required held \
+                         requiredButNotHeld heldButNotRequired } }";
+        let response = graphql_request(&router, Some(&agent_jwt), overview, json!({})).await;
+        assert_eq!(code(&response).as_deref(), Some("not_superadmin"));
+        let entry_for_bc = |response: &serde_json::Value| {
+            response["data"]["capabilityOverview"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["boundedContext"] == bc_name.as_str())
+                .cloned()
+                .unwrap()
+        };
+        let response = graphql_request(&router, Some(&root_jwt), overview, json!({})).await;
+        let entry = entry_for_bc(&response);
+        assert_eq!(entry["required"], json!(["support"]));
+        assert_eq!(entry["held"], json!(["support"]));
+        assert_eq!(entry["requiredButNotHeld"], json!([]));
+
+        // The admin takes it back: the agent loses the type again, and
+        // the overview now flags the requirement as held by nobody.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            REVOKE,
+            vars(&agent_role, "support"),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        let response = graphql_request(&router, Some(&agent_jwt), &data_query, read).await;
+        assert!(response["errors"][0]["message"].is_string(), "{response:?}");
+        assert!(response["data"].is_null() || response["data"]["projection"].is_null());
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            REVOKE,
+            vars(&agent_role, "support"),
+        )
+        .await;
+        assert_eq!(code(&response).as_deref(), Some("capability_not_revoked"));
+        let response = graphql_request(&router, Some(&root_jwt), overview, json!({})).await;
+        let entry = entry_for_bc(&response);
+        assert_eq!(entry["requiredButNotHeld"], json!(["support"]));
+
+        // A malformed name is refused; an undeclared one is not.
+        let response = graphql_request(
+            &router,
+            Some(&root_jwt),
+            GRANT,
+            vars(&agent_role, "Not Valid"),
+        )
+        .await;
+        assert_eq!(code(&response).as_deref(), Some("invalid_capability_name"));
+        let response = graphql_request(
+            &router,
+            Some(&root_jwt),
+            GRANT,
+            vars(&agent_role, "never-required"),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        let response = graphql_request(&router, Some(&root_jwt), overview, json!({})).await;
+        assert_eq!(
+            entry_for_bc(&response)["heldButNotRequired"],
+            json!(["never-required"])
+        );
     });
 }

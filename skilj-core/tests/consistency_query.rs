@@ -175,7 +175,7 @@ impl ProjectionDispatcher for NoProjections {
         None
     }
 
-    fn team_only(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+    fn requires_capability(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
         None
     }
 }

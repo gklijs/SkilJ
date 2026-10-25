@@ -335,6 +335,8 @@ mod tests {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
             revoked_at: None,

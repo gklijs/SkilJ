@@ -115,6 +115,17 @@ pub struct RoleAccessMapping {
     /// `projections::query_projection`'s own enforcement and
     /// specs/skilj.allium's `owner_scope_satisfied`.
     pub scope: Option<String>,
+    /// Named privileges this grant holds within `bounded_context`
+    /// (`RoleAccessMapping.capabilities` in the spec). A projection or a
+    /// capability-kind private field names the one it needs, and a grant
+    /// opens it only by holding that exact name: no `level` implies one,
+    /// and neither does `Role::superadmin`. Changed in place by
+    /// [`grant_capability`] and [`revoke_capability`].
+    pub capabilities: std::collections::BTreeSet<String>,
+    /// The capabilities this grant may hand out to other grants in its
+    /// own bounded context, meaningful only at `level` `Admin`. Set by a
+    /// superadmin alone ([`set_delegable_capabilities`]).
+    pub delegable: std::collections::BTreeSet<String>,
     /// Whether the grant is in force.
     pub status: RoleStatus,
     /// When it was granted.
@@ -428,20 +439,45 @@ pub enum Error {
     #[error("this grant is scoped to a value that does not match this record's own owner")]
     GrantScopeMismatch,
 
-    /// `projections::query_projection`'s own whole-instance team gate
-    /// (issue #17, docs/architecture.md's own write-up of this
-    /// pass): a projection declares `Projection::TEAM_ONLY` and the
-    /// querying `access_mapping.role.name` doesn't match it. Kept
-    /// distinct from `GrantScopeMismatch` above even though both reject
-    /// a `query_projection` call - that one is about tenant ownership of
-    /// one instance, this one is about team membership to query the
-    /// projection at all, and the two are independent, composable checks
-    /// (a projection may declare both). `ProjectionQuery` is GraphQL-only,
-    /// so unlike `GrantScopeMismatch` this never needed a
-    /// `skilj-rest::error::status_for` arm - `to_graphql_error` renders
-    /// any `SkiljRejection` generically via `code()`/`message()`.
-    #[error("this grant's Role is not on the team this projection requires to query it")]
-    NotOnRequiredTeam,
+    /// `projections::query_projection`'s own whole-instance capability
+    /// gate (`Projection::REQUIRES_CAPABILITY`, docs/architecture.md's
+    /// write-up of capabilities, replacing issue #17's `Role.name` team
+    /// gate): a projection requires a capability and the querying
+    /// `access_mapping.capabilities` does not hold it. Kept distinct
+    /// from `GrantScopeMismatch` above even though both reject a
+    /// `query_projection` call - that one is about tenant ownership of
+    /// one instance, this one is about holding the capability to query
+    /// the projection at all, and the two are independent, composable
+    /// checks (a projection may declare both). A caller-facing surface
+    /// must not hand this back as it is: it answers exactly as for a
+    /// projection that does not exist, so the refusal is no oracle for the
+    /// projection's existence.
+    #[error("this grant does not hold the capability this projection requires to query it")]
+    CapabilityNotHeld,
+
+    /// A capability name that is not well formed
+    /// ([`valid_capability_name`]).
+    #[error("a capability name is lowercase letters, digits, '_' and '-', 1 to 64 characters")]
+    InvalidCapabilityName,
+
+    /// The grant already holds this capability, or the change would give
+    /// it more than [`MAX_CAPABILITIES`].
+    #[error("this grant already holds this capability, or holds the most capabilities allowed")]
+    CapabilityNotAdded,
+
+    /// The grant does not hold the capability being revoked.
+    #[error("this grant does not hold this capability")]
+    CapabilityNotRevoked,
+
+    /// An admin may only hand out, or take back, a capability in its own
+    /// `delegable` set, on another grant in its own bounded context.
+    #[error("this capability is not one this admin grant may delegate here")]
+    CapabilityNotDelegable,
+
+    /// An admin may not change the capabilities of its own grant, even
+    /// one it may delegate (`SelfGrantRefused`).
+    #[error("an admin grant cannot change its own capabilities")]
+    SelfGrantRefused,
 
     /// The private-field mechanism's own grant-time check: `event =
     /// null or is_default_private_reader(event, access_mapping)` (and the
@@ -557,7 +593,12 @@ impl SkiljRejection for Error {
             Error::GrantBoundedContextMismatch => "grant_bounded_context_mismatch",
             Error::GrantScopeMismatch => "grant_scope_mismatch",
             Error::TokenScopeBeyondGrant => "token_scope_beyond_grant",
-            Error::NotOnRequiredTeam => "not_on_required_team",
+            Error::CapabilityNotHeld => "capability_not_held",
+            Error::InvalidCapabilityName => "invalid_capability_name",
+            Error::CapabilityNotAdded => "capability_not_added",
+            Error::CapabilityNotRevoked => "capability_not_revoked",
+            Error::CapabilityNotDelegable => "capability_not_delegable",
+            Error::SelfGrantRefused => "self_grant_refused",
             Error::NotDefaultPrivateReader => "not_default_private_reader",
             Error::NotGrantor => "not_grantor",
             Error::PrivateFieldGrantNotActive => "private_field_grant_not_active",
@@ -608,22 +649,135 @@ pub fn scope_matches_owner(owner: Option<&str>, scope: Option<&str>) -> bool {
     }
 }
 
-/// The one `Role.name` equality test "does this Role belong to the
-/// required team" ever comes down to, shared by two independently-arrived-at
-/// call sites that both needed it: `event_store::entitled_to_read_private_field`'s
-/// `PrivateFieldKind::Team` arm (a `PrivateField`'s own declared `team`)
-/// and `projections::query_projection`'s `team_only` check
-/// (`Projection::TEAM_ONLY`, issue #17). Kept as one function
-/// specifically so a future change to what "matching a team" means
-/// (case-insensitive names, multiple teams per Role, team hierarchies)
-/// has exactly one definition to update rather than two that could drift
-/// apart. Vacuously true when `required` is `None` - no team named, no
-/// membership to hold.
-pub fn role_matches_required_team(role: &Role, required: Option<&str>) -> bool {
+/// Most capabilities one grant may hold, and most it may delegate
+/// (`invariant CapabilitiesAreWellFormed`); the same number the database
+/// statement that adds one enforces
+/// ([`crate::db::MAX_CAPABILITIES_PER_MAPPING`]).
+pub const MAX_CAPABILITIES: usize = 16;
+
+/// `valid_capability_name` in the spec: lowercase ASCII letters, digits,
+/// `_` and `-`, one to sixty-four characters.
+pub fn valid_capability_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// "Does this grant hold the capability a projection or a private field
+/// requires": the one test `projections::query_projection`'s whole-
+/// projection gate and `event_store::entitled_to_read_private_field`'s
+/// `Capability` arm both come down to. Kept as one function so a change
+/// to what holding a capability means has exactly one definition to
+/// update. Vacuously true when `required` is `None`. Deliberately looks
+/// at nothing but the grant's own `capabilities`: not its `level`, not
+/// its `delegable` set, not its Role's `superadmin` flag.
+pub fn mapping_holds_capability(mapping: &RoleAccessMapping, required: Option<&str>) -> bool {
     match required {
         None => true,
-        Some(name) => role.name == name,
+        Some(name) => mapping.capabilities.contains(name),
     }
+}
+
+/// Who is changing a grant's capabilities (`rule GrantCapabilityAsSuperadmin`
+/// and `rule GrantCapabilityAsAdmin`, and their revoke twins).
+#[derive(Debug, Clone, Copy)]
+pub enum CapabilityActor<'a> {
+    /// A superadmin Role: any grant, any well-formed name, its own grant
+    /// included.
+    Superadmin(&'a Role),
+    /// A context admin's own grant: only another grant of its own bounded
+    /// context, only a name in its own `delegable` set.
+    Admin(&'a RoleAccessMapping),
+}
+
+fn check_capability_actor(
+    actor: CapabilityActor<'_>,
+    target: &RoleAccessMapping,
+    capability: &str,
+) -> crate::error::Result<()> {
+    if target.status != RoleStatus::Active {
+        return Err(Error::GrantNotActive.into());
+    }
+    match actor {
+        CapabilityActor::Superadmin(caller) => require_active_superadmin(caller),
+        CapabilityActor::Admin(admin) => {
+            if admin.status != RoleStatus::Active {
+                return Err(Error::GrantNotActive.into());
+            }
+            if admin.level != AccessLevel::Admin {
+                return Err(Error::InsufficientAccessLevel.into());
+            }
+            if admin.bounded_context != target.bounded_context {
+                return Err(Error::GrantBoundedContextMismatch.into());
+            }
+            if admin.role == target.role {
+                return Err(Error::SelfGrantRefused.into());
+            }
+            if !admin.delegable.contains(capability) {
+                return Err(Error::CapabilityNotDelegable.into());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// See `rule GrantCapabilityAsSuperadmin` and `rule GrantCapabilityAsAdmin`.
+/// Returns the mapping as it should be stored; persisting it is
+/// [`crate::db::add_mapping_capability`], which makes the same two
+/// checks (not already held, under the limit) atomically.
+pub fn grant_capability(
+    actor: CapabilityActor<'_>,
+    target: &RoleAccessMapping,
+    capability: &str,
+) -> crate::error::Result<RoleAccessMapping> {
+    check_capability_actor(actor, target, capability)?;
+    if !valid_capability_name(capability) {
+        return Err(Error::InvalidCapabilityName.into());
+    }
+    if target.capabilities.contains(capability) || target.capabilities.len() >= MAX_CAPABILITIES {
+        return Err(Error::CapabilityNotAdded.into());
+    }
+    let mut updated = target.clone();
+    updated.capabilities.insert(capability.to_owned());
+    Ok(updated)
+}
+
+/// See `rule RevokeCapabilityAsSuperadmin` and `rule RevokeCapabilityAsAdmin`.
+pub fn revoke_capability(
+    actor: CapabilityActor<'_>,
+    target: &RoleAccessMapping,
+    capability: &str,
+) -> crate::error::Result<RoleAccessMapping> {
+    check_capability_actor(actor, target, capability)?;
+    if !target.capabilities.contains(capability) {
+        return Err(Error::CapabilityNotRevoked.into());
+    }
+    let mut updated = target.clone();
+    updated.capabilities.remove(capability);
+    Ok(updated)
+}
+
+/// See `rule SetDelegableCapabilities`. Lowering the set does not reach
+/// back: capabilities the admin already granted stay where they are.
+pub fn set_delegable_capabilities(
+    caller: &Role,
+    target: &RoleAccessMapping,
+    delegable: std::collections::BTreeSet<String>,
+) -> crate::error::Result<RoleAccessMapping> {
+    require_active_superadmin(caller)?;
+    if target.status != RoleStatus::Active {
+        return Err(Error::GrantNotActive.into());
+    }
+    if target.level != AccessLevel::Admin {
+        return Err(Error::InsufficientAccessLevel.into());
+    }
+    if delegable.len() > MAX_CAPABILITIES || !delegable.iter().all(|c| valid_capability_name(c)) {
+        return Err(Error::InvalidCapabilityName.into());
+    }
+    let mut updated = target.clone();
+    updated.delegable = delegable;
+    Ok(updated)
 }
 
 /// Reused by `bootstrap::add_bounded_context`/
@@ -1091,6 +1245,8 @@ pub fn grant_role_access_mapping(
         level,
         can_read_sensitive,
         scope,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: now,
         revoked_at: None,

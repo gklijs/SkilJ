@@ -88,7 +88,7 @@ pub(crate) async fn wait_until_caught_up(
 /// fails closed on (cross-tenant projection read fix,
 /// docs/architecture.md's own write-up of this pass).
 /// `field()`/`resolvers::projection_subscription`'s shared read path -
-/// `team_only` gate, `get_projection`, `wait_until_caught_up`,
+/// `requires_capability` gate, `get_projection`, `wait_until_caught_up`,
 /// `get_projection_state_and_owner`, decrypt-on-read, and
 /// `projections::query_projection`, all as `field()` used to have them
 /// inlined. Pulled out so the new `projectionUpdates` subscription
@@ -112,7 +112,7 @@ pub(crate) async fn fetch_projection_result(
     key: &str,
     wait_for_sequence: Option<i64>,
 ) -> async_graphql::Result<(crate::projection_types::ProjectionInstance, String)> {
-    // `team_only` is a plain in-memory `ProjectionDispatcher` lookup, no
+    // `requires_capability` is a plain in-memory `ProjectionDispatcher` lookup, no
     // DB round trip - checked first and rejected outright before any of
     // the DB work below runs, rather than waiting for `query_projection`'s
     // own copy of this same check at the very end. A caller who was never
@@ -120,14 +120,14 @@ pub(crate) async fn fetch_projection_result(
     // `waitForSequence` poll loop (up to `state.
     // projection_query_wait_timeout`), the state fetch, or a
     // sensitive-field decrypt just to be told no.
-    let team_only = state
+    let requires_capability = state
         .projection_dispatcher
-        .team_only(bounded_context_name, name)
+        .requires_capability(bounded_context_name, name)
         .flatten();
-    if !skilj_core::access_control::role_matches_required_team(&access_mapping.role, team_only) {
-        return Err(to_graphql_error(
-            skilj_core::access_control::Error::NotOnRequiredTeam,
-        ));
+    // Answered exactly as for a projection that does not exist, so the
+    // refusal is no oracle for the projection's existence.
+    if !skilj_core::access_control::mapping_holds_capability(access_mapping, requires_capability) {
+        return Err(not_found("Projection", name));
     }
 
     let projection = skilj_core::db::get_projection(&state.pool, bounded_context_name, name)
@@ -183,7 +183,7 @@ pub(crate) async fn fetch_projection_result(
         key,
         wait_for_sequence,
         caught_up,
-        team_only,
+        requires_capability,
         stored,
     )
     .await
@@ -205,7 +205,7 @@ async fn projection_instance(
     key: &str,
     wait_for_sequence: Option<i64>,
     caught_up: bool,
-    team_only: Option<&str>,
+    requires_capability: Option<&str>,
     stored: Option<(String, Option<String>)>,
 ) -> async_graphql::Result<(crate::projection_types::ProjectionInstance, String)> {
     // Cross-tenant projection read fix (docs/architecture.md's own
@@ -254,7 +254,7 @@ async fn projection_instance(
         skilj_core::projections::ProjectionAccessScope {
             declares_owner: owner_tag_key.is_some(),
             instance_owner: instance_owner.as_deref(),
-            team_only,
+            requires_capability,
         },
         state_json,
     )
@@ -411,17 +411,15 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
                     mapping
                 }
             };
-            let team_only = state
+            let requires_capability = state
                 .projection_dispatcher
-                .team_only(&bounded_context_name, &name)
+                .requires_capability(&bounded_context_name, &name)
                 .flatten();
-            if !skilj_core::access_control::role_matches_required_team(
-                &access_mapping.role,
-                team_only,
+            if !skilj_core::access_control::mapping_holds_capability(
+                &access_mapping,
+                requires_capability,
             ) {
-                return Err(to_graphql_error(
-                    skilj_core::access_control::Error::NotOnRequiredTeam,
-                ));
+                return Err(not_found("Projection", &name));
             }
             let projection =
                 skilj_core::db::get_projection(&state.pool, &bounded_context_name, &name)
@@ -446,7 +444,7 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
                     &key,
                     None,
                     true,
-                    team_only,
+                    requires_capability,
                     stored.remove(&key),
                 )
                 .await?;
@@ -487,7 +485,7 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
 /// rather than a second, narrower gate response readers would have to
 /// reason about differently from `projections`' own.
 ///
-/// `TEAM_ONLY`-gated exactly like the `projection` field above (
+/// `REQUIRES_CAPABILITY`-gated exactly like the `projection` field above (
 /// issue #17): a projection's own declared schema is whole-projection
 /// data, the same thing the gate protects there, so a Role not on the
 /// required team gets the identical rejection here rather than being
@@ -508,17 +506,15 @@ pub fn schema_field(n: &Naming) -> Field {
                     require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
                 let name = ctx.args.try_get("name")?.string()?.to_string();
 
-                let team_only = state
+                let requires_capability = state
                     .projection_dispatcher
-                    .team_only(&bounded_context_name, &name)
+                    .requires_capability(&bounded_context_name, &name)
                     .flatten();
-                if !skilj_core::access_control::role_matches_required_team(
-                    &access_mapping.role,
-                    team_only,
+                if !skilj_core::access_control::mapping_holds_capability(
+                    &access_mapping,
+                    requires_capability,
                 ) {
-                    return Err(to_graphql_error(
-                        skilj_core::access_control::Error::NotOnRequiredTeam,
-                    ));
+                    return Err(not_found("Projection", &name));
                 }
 
                 let projection =

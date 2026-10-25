@@ -41,7 +41,7 @@ use skilj_core::shared::{generate_token_id, Metadata, Tag, TagMapping};
 /// an owner already established survives a fold from an event that
 /// carries none): `"TicketSummary"` declares no required team - the
 /// pre-issue-#17 baseline every test above this line exercises unchanged
-/// - and `"StaffTicketSummary"` additionally declares `TEAM_ONLY =
+/// - and `"StaffTicketSummary"` additionally declares `REQUIRES_CAPABILITY =
 /// Some("staff")`, for the composability tests below.
 struct TestDispatcher;
 
@@ -100,7 +100,7 @@ impl ProjectionDispatcher for TestDispatcher {
         }
     }
 
-    fn team_only(
+    fn requires_capability(
         &self,
         _bounded_context: &str,
         projection_name: &str,
@@ -231,7 +231,7 @@ async fn seed_ticket_commented(pool: &Pool, bc: &BoundedContext) -> EventType {
 
 /// Parametrized by `name` so the same helper seeds either
 /// `"TicketSummary"` (no required team) or `"StaffTicketSummary"`
-/// (`TEAM_ONLY = Some("staff")`, resolved via `TestDispatcher::team_only`).
+/// (`REQUIRES_CAPABILITY = Some("staff")`, resolved via `TestDispatcher::requires_capability`).
 /// There's no field on `Projection` itself to set, exactly as
 /// `owner_tag_key` already isn't.
 async fn seed_projection(
@@ -248,6 +248,7 @@ async fn seed_projection(
         consumed_event_types: consumed,
         sync: true,
         caught_up_to: None,
+        requires_capability: None,
     };
     db::upsert_projection(pool, &projection).await.unwrap();
     projection
@@ -333,19 +334,23 @@ async fn insert_ticket_commented(
 }
 
 fn scoped_mapping(bc: &BoundedContext, scope: Option<&str>) -> RoleAccessMapping {
-    named_mapping(bc, "Reader", scope)
+    mapping_with(bc, &[], scope)
 }
 
 /// `scoped_mapping`'s own general form - a `Role.name` lever, for the
 /// team-gate tests below (`scoped_mapping` keeps its own signature, still
 /// always naming its Role `"Reader"`, since no test before this pass
 /// cared what it was called).
-fn named_mapping(bc: &BoundedContext, role_name: &str, scope: Option<&str>) -> RoleAccessMapping {
+fn mapping_with(
+    bc: &BoundedContext,
+    capabilities: &[&str],
+    scope: Option<&str>,
+) -> RoleAccessMapping {
     RoleAccessMapping {
         role: Role {
             id: unique_name("role"),
             external_subject: unique_name("subject"),
-            name: role_name.to_string(),
+            name: "Reader".to_string(),
             superadmin: false,
             status: RoleStatus::Active,
             created_at: test_now(),
@@ -355,6 +360,8 @@ fn named_mapping(bc: &BoundedContext, role_name: &str, scope: Option<&str>) -> R
         level: AccessLevel::Read,
         can_read_sensitive: false,
         scope: scope.map(str::to_string),
+        capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,
@@ -478,7 +485,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
             ProjectionAccessScope {
                 declares_owner: true,
                 instance_owner: owner_t1.as_deref(),
-                team_only: None,
+                requires_capability: None,
             },
             "ok".into(),
         )
@@ -495,7 +502,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
             ProjectionAccessScope {
                 declares_owner: true,
                 instance_owner: owner_t2.as_deref(),
-                team_only: None,
+                requires_capability: None,
             },
             "leaked".into(),
         )
@@ -518,7 +525,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
             ProjectionAccessScope {
                 declares_owner: true,
                 instance_owner: owner_t3.as_deref(),
-                team_only: None,
+                requires_capability: None,
             },
             "leaked".into(),
         )
@@ -538,7 +545,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
                 ProjectionAccessScope {
                     declares_owner: true,
                     instance_owner: owner,
-                    team_only: None,
+                    requires_capability: None,
                 },
                 "ok".into(),
             )
@@ -555,7 +562,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
 /// team (`"staff"`) and an owner dimension (`"company"`) - independent
 /// checks, both of which must hold.
 #[test]
-fn a_team_only_projection_rejects_a_role_not_on_the_team() {
+fn a_capability_gated_projection_rejects_a_grant_without_the_capability() {
     runtime().block_on(async {
         let Some(pool) = test_pool().await else {
             return;
@@ -575,7 +582,7 @@ fn a_team_only_projection_rejects_a_role_not_on_the_team() {
 
         // A staff Role, unscoped: reads fine - on the team, and no owner
         // restriction narrows it further.
-        let staff = named_mapping(&bc, "staff", None);
+        let staff = mapping_with(&bc, &["staff"], None);
         projections::query_projection(
             &staff,
             &projection,
@@ -585,15 +592,36 @@ fn a_team_only_projection_rejects_a_role_not_on_the_team() {
             ProjectionAccessScope {
                 declares_owner: true,
                 instance_owner: owner_t1.as_deref(),
-                team_only: Some("staff"),
+                requires_capability: Some("staff"),
             },
             "ok".into(),
         )
         .unwrap();
 
-        // A Role with any other name: rejected outright, regardless of
-        // scope - team membership, not ownership, is what failed.
-        let customer = named_mapping(&bc, "Reader", Some("company-a"));
+        // A grant without the capability: rejected outright, regardless of
+        // scope - the capability, not ownership, is what failed. Naming
+        // the Role "staff" does not help: only the capability opens it.
+        let mut named_staff = mapping_with(&bc, &[], Some("company-a"));
+        named_staff.role.name = "staff".to_string();
+        named_staff.level = AccessLevel::Admin;
+        named_staff.role.superadmin = true;
+        let err = projections::query_projection(
+            &named_staff,
+            &projection,
+            "t1",
+            None,
+            false,
+            ProjectionAccessScope {
+                declares_owner: true,
+                instance_owner: owner_t1.as_deref(),
+                requires_capability: Some("staff"),
+            },
+            "leaked".into(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), access_control::Error::CapabilityNotHeld.code());
+
+        let customer = mapping_with(&bc, &[], Some("company-a"));
         let err = projections::query_projection(
             &customer,
             &projection,
@@ -603,21 +631,21 @@ fn a_team_only_projection_rejects_a_role_not_on_the_team() {
             ProjectionAccessScope {
                 declares_owner: true,
                 instance_owner: owner_t1.as_deref(),
-                team_only: Some("staff"),
+                requires_capability: Some("staff"),
             },
             "leaked".into(),
         )
         .unwrap_err();
-        assert_eq!(err.code(), access_control::Error::NotOnRequiredTeam.code());
+        assert_eq!(err.code(), access_control::Error::CapabilityNotHeld.code());
     });
 }
 
-/// Composability: `TEAM_ONLY` and `OWNER_TAG_KEY` are independent checks
+/// Composability: `REQUIRES_CAPABILITY` and `OWNER_TAG_KEY` are independent checks
 /// on the same projection, and both must hold - neither substitutes for
 /// the other (`docs/architecture.md`'s own write-up of this pass, and
-/// `Projection::TEAM_ONLY`'s own doc comment).
+/// `Projection::REQUIRES_CAPABILITY`'s own doc comment).
 #[test]
-fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
+fn a_capability_gated_projection_also_enforces_its_own_owner_scope_independently() {
     runtime().block_on(async {
         let Some(pool) = test_pool().await else {
             return;
@@ -643,7 +671,7 @@ fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
 
         // A staff Role scoped to company-a: on the team AND owns t1 -
         // both checks hold, reads fine.
-        let staff_company_a = named_mapping(&bc, "staff", Some("company-a"));
+        let staff_company_a = mapping_with(&bc, &["staff"], Some("company-a"));
         projections::query_projection(
             &staff_company_a,
             &projection,
@@ -653,7 +681,7 @@ fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
             ProjectionAccessScope {
                 declares_owner: true,
                 instance_owner: owner_t1.as_deref(),
-                team_only: Some("staff"),
+                requires_capability: Some("staff"),
             },
             "ok".into(),
         )
@@ -671,7 +699,7 @@ fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
             ProjectionAccessScope {
                 declares_owner: true,
                 instance_owner: owner_t2.as_deref(),
-                team_only: Some("staff"),
+                requires_capability: Some("staff"),
             },
             "leaked".into(),
         )
@@ -681,7 +709,7 @@ fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
         // A non-staff Role scoped to company-a, querying its own
         // company's ticket: owns t1, but the team check alone rejects it
         // - ownership was never in question here either.
-        let customer_company_a = named_mapping(&bc, "Reader", Some("company-a"));
+        let customer_company_a = mapping_with(&bc, &[], Some("company-a"));
         let err = projections::query_projection(
             &customer_company_a,
             &projection,
@@ -691,11 +719,11 @@ fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
             ProjectionAccessScope {
                 declares_owner: true,
                 instance_owner: owner_t1.as_deref(),
-                team_only: Some("staff"),
+                requires_capability: Some("staff"),
             },
             "leaked".into(),
         )
         .unwrap_err();
-        assert_eq!(err.code(), access_control::Error::NotOnRequiredTeam.code());
+        assert_eq!(err.code(), access_control::Error::CapabilityNotHeld.code());
     });
 }

@@ -295,6 +295,8 @@ fn a_recurring_deadline_fires_until_its_window_ends_and_a_cancel_stops_the_chain
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,

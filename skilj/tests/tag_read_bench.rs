@@ -145,6 +145,8 @@ async fn bounded_context(database_url: &str, pool: &Pool) -> (Skilj, String) {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: now(),
             revoked_at: None,

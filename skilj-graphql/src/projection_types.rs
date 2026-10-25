@@ -131,9 +131,34 @@ impl AdmittedProjections {
 /// `visible`: only these bounded contexts' projections, for a caller who
 /// may not learn that the others exist (docs/architecture.md §138);
 /// `None` for all of them.
+/// Who a schema is built for: the bounded contexts whose projection types
+/// it carries, and the capabilities held in them. A projection requiring
+/// a capability is in the schema only for a caller holding it, so one
+/// without it validates a query naming the type exactly as it would for a
+/// type that does not exist (docs/architecture.md §138, §228). Also the
+/// key the per-caller schemas are cached under.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Visibility {
+    /// Bounded contexts whose projection types are served.
+    pub contexts: std::collections::BTreeSet<String>,
+    /// `(bounded context, capability)` pairs the caller holds.
+    pub capabilities: std::collections::BTreeSet<(String, String)>,
+}
+
+impl Visibility {
+    /// Whether `projection`, registered in `bounded_context`, is served.
+    pub fn admits(&self, bounded_context: &str, requires_capability: Option<&str>) -> bool {
+        self.contexts.contains(bounded_context)
+            && requires_capability.is_none_or(|c| {
+                self.capabilities
+                    .contains(&(bounded_context.to_owned(), c.to_owned()))
+            })
+    }
+}
+
 pub async fn build(
     pool: &Pool,
-    visible: Option<&std::collections::BTreeSet<String>>,
+    visible: Option<&Visibility>,
     naming: &crate::naming::Naming,
     federated: bool,
 ) -> skilj_core::error::Result<Option<(Vec<Object>, Vec<Enum>, Union, AdmittedProjections)>> {
@@ -145,7 +170,7 @@ pub async fn build(
     let mut admitted = AdmittedProjections::default();
 
     for bc in db::list_bounded_contexts(pool).await? {
-        if visible.is_some_and(|visible| !visible.contains(&bc.name)) {
+        if visible.is_some_and(|visible| !visible.contexts.contains(&bc.name)) {
             continue;
         }
         let projections = match db::list_projections_for_bounded_context(pool, &bc.name).await {
@@ -155,6 +180,11 @@ pub async fn build(
             Err(err) => return Err(err),
         };
         for projection in projections {
+            if visible
+                .is_some_and(|v| !v.admits(&bc.name, projection.requires_capability.as_deref()))
+            {
+                continue;
+            }
             let type_name = naming.ty(&graphql_type_name(&bc.name, &projection.name));
             let Some(root): Option<serde_json::Value> =
                 serde_json::from_str(&projection.schema).ok()

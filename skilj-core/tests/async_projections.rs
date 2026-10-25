@@ -123,7 +123,7 @@ impl ProjectionDispatcher for TestDispatcher {
         }
     }
 
-    fn team_only(
+    fn requires_capability(
         &self,
         _bounded_context: &str,
         projection_name: &str,
@@ -253,6 +253,7 @@ async fn seed_async_projection(
         consumed_event_types: consumed,
         sync: false,
         caught_up_to: None,
+        requires_capability: None,
     };
     db::upsert_projection(pool, &projection).await.unwrap();
     projection
@@ -966,6 +967,7 @@ fn two_concurrent_first_time_registrations_never_double_fold_history() {
             consumed_event_types: vec![et.clone()],
             sync: true,
             caught_up_to: None,
+            requires_capability: None,
         };
 
         // `projection_state.projection_name` is a foreign key into
@@ -1461,6 +1463,7 @@ fn registering_a_sync_projection_during_live_writes_folds_every_event_once() {
             consumed_event_types: vec![et.clone()],
             sync: true,
             caught_up_to: None,
+            requires_capability: None,
         };
 
         let writes = async {
@@ -1514,6 +1517,7 @@ fn registering_a_sync_projection_with_no_history_misses_no_concurrent_event() {
             consumed_event_types: vec![et.clone()],
             sync: true,
             caught_up_to: None,
+            requires_capability: None,
         };
         // As the caller found it: no matching event yet, so no fold.
         let writes = async {
@@ -1568,6 +1572,7 @@ fn registering_a_sync_projection_needs_no_second_connection_under_the_lock() {
             consumed_event_types: vec![et.clone()],
             sync: true,
             caught_up_to: None,
+            requires_capability: None,
         };
 
         let mut blocker = pool.begin().await.unwrap();

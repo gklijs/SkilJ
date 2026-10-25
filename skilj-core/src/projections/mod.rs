@@ -105,6 +105,13 @@ pub struct Projection {
     pub sync: bool,
     /// The last sequence it has processed; `None` before any.
     pub caught_up_to: Option<i64>,
+    /// The capability a grant must hold to query it at all
+    /// (`Projection.requires_capability` in the spec), registered from
+    /// `plugin::Projection::REQUIRES_CAPABILITY` so an admin can read it
+    /// back. Takes effect at once on re-registration: it neither
+    /// rebuilds the projection nor bumps `schema_version`, since it
+    /// changes who may read, not what is folded.
+    pub requires_capability: Option<String>,
 }
 
 /// See `entity ProjectionRebuild`'s `status` field/transition graph.
@@ -211,7 +218,7 @@ pub fn check_consumed_event_type_names<'a>(
 /// not before a projection folds it: whatever of them a projection keeps
 /// in its state, every reader of that projection sees, whatever their
 /// private-field grants. Nothing here refuses that - a projection may need
-/// one (a staff view behind `team_only`, say) - but `SkiljBuilder::build`
+/// one (a staff view behind `requires_capability`, say) - but `SkiljBuilder::build`
 /// reports each one, so it is a choice rather than an accident.
 pub fn private_fields_consumed(
     consumed_event_types: &[crate::event_store::EventType],
@@ -245,6 +252,7 @@ pub fn register_projection(
     schema: String,
     consumed_event_types: Vec<EventType>,
     sync: bool,
+    requires_capability: Option<String>,
     existing: Option<&Projection>,
     staged: Option<&ProjectionRebuild>,
     bounded_context_events: &[Event],
@@ -277,6 +285,12 @@ pub fn register_projection(
     if !crate::event_store::valid_schema(&schema) {
         return Err(crate::event_store::Error::InvalidSchema.into());
     }
+    if requires_capability
+        .as_deref()
+        .is_some_and(|c| !crate::access_control::valid_capability_name(c))
+    {
+        return Err(crate::access_control::Error::InvalidCapabilityName.into());
+    }
     if !consumed_event_types
         .iter()
         .all(|et| et.bounded_context.same_as(bounded_context))
@@ -299,6 +313,7 @@ pub fn register_projection(
                 consumed_event_types,
                 sync,
                 caught_up_to: None,
+                requires_capability,
             },
             needs_history_fold,
         });
@@ -337,6 +352,7 @@ pub fn register_projection(
         return Ok(ProjectionRegistration::ReconciledTrivially(Projection {
             consumed_event_types,
             sync,
+            requires_capability,
             ..existing.clone()
         }));
     }
@@ -482,10 +498,10 @@ pub fn read_projection(state_json: &str, data_keys: &[crate::encryption::DataKey
 ///
 /// `owner_scope_satisfied(projection, key, access_mapping)`'s three
 /// caller-resolved inputs (cross-tenant projection read fix,
-/// docs/architecture.md's own write-up of this pass) plus `team_only`
+/// docs/architecture.md's own write-up of this pass) plus `requires_capability`
 /// (issue #17), grouped into one value rather than three/four
 /// adjacent positional parameters on `query_projection` itself -
-/// `instance_owner`/`team_only` are both `Option<&str>` and answer
+/// `instance_owner`/`requires_capability` are both `Option<&str>` and answer
 /// unrelated questions, so left as bare positional arguments they could
 /// be silently transposed at a call site with no compile error; named
 /// fields on a struct rule that out.
@@ -494,9 +510,9 @@ pub fn read_projection(state_json: &str, data_keys: &[crate::encryption::DataKey
 /// `OWNER_TAG_KEY` at all (from `ProjectionDispatcher::owner_tag_key`,
 /// the caller's own already-resolved lookup); `instance_owner` is the
 /// queried instance's own stored `owner` column, or `None` for a row
-/// that doesn't exist yet or has never had one derived. `team_only` is
-/// the projection's own `Projection::TEAM_ONLY` (`ProjectionDispatcher::
-/// team_only`, likewise already resolved), or `None` when it declares no
+/// that doesn't exist yet or has never had one derived. `requires_capability` is
+/// the projection's own `Projection::REQUIRES_CAPABILITY` (`ProjectionDispatcher::
+/// requires_capability`, likewise already resolved), or `None` when it declares no
 /// required team - every projection before this pass, and most after
 /// it.
 pub struct ProjectionAccessScope<'a> {
@@ -505,7 +521,7 @@ pub struct ProjectionAccessScope<'a> {
     /// The queried instance's stored owner; `None` for none.
     pub instance_owner: Option<&'a str>,
     /// The team the projection is restricted to; `None` for no restriction.
-    pub team_only: Option<&'a str>,
+    pub requires_capability: Option<&'a str>,
 }
 
 /// When the projection declares no owner dimension, `access_mapping.scope`
@@ -517,7 +533,7 @@ pub struct ProjectionAccessScope<'a> {
 /// nothing has touched yet) is treated the same as a proven mismatch,
 /// not the same as a proven match.
 ///
-/// `access.team_only` (issue #17's own gap, docs/architecture.md's
+/// `access.requires_capability` (issue #17's own gap, docs/architecture.md's
 /// own write-up of this pass): vacuously satisfied when `None`,
 /// regardless of the caller's own Role. When `Some`, the query is
 /// rejected unless `access_mapping.role.name` equals it exactly
@@ -529,10 +545,10 @@ pub struct ProjectionAccessScope<'a> {
 /// team names no dimension to derive per instance, just one fixed
 /// membership test every instance shares. Independent of and composable
 /// with the owner-scope check: a projection may declare both
-/// `OWNER_TAG_KEY` and `TEAM_ONLY` (company-scoped *and* staff-only),
+/// `OWNER_TAG_KEY` and `REQUIRES_CAPABILITY` (company-scoped *and* staff-only),
 /// and a query must satisfy both, the same way `sensitive_fields` and
 /// `scope` already coexist without one subsuming the other. See
-/// specs/skilj.allium's `team_only_satisfied`.
+/// specs/skilj.allium's `QueryProjection` capability check.
 pub fn query_projection(
     access_mapping: &RoleAccessMapping,
     projection: &Projection,
@@ -558,12 +574,13 @@ pub fn query_projection(
             }
         }
     }
-    // Whole-instance team gate (issue #17, docs/architecture.md's
-    // own write-up of this pass) - independent from the owner-scope check
+    // Whole-instance capability gate (`Projection::REQUIRES_CAPABILITY`,
+    // formerly issue #17's `Role.name` team gate) - independent from the owner-scope check
     // just above, not a replacement for it: a projection may declare
     // both, and both must hold. See this function's own doc comment.
-    if !crate::access_control::role_matches_required_team(&access_mapping.role, access.team_only) {
-        return Err(crate::access_control::Error::NotOnRequiredTeam.into());
+    if !crate::access_control::mapping_holds_capability(access_mapping, access.requires_capability)
+    {
+        return Err(crate::access_control::Error::CapabilityNotHeld.into());
     }
     if wait_for_sequence.is_some() && !caught_up {
         return Err(Error::ProjectionCaughtUpTimedOut.into());

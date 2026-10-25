@@ -163,7 +163,7 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
     ) -> Option<Option<&'static str>> {
         None
     }
-    fn team_only(
+    fn requires_capability(
         &self,
         _bounded_context: &str,
         _projection_name: &str,

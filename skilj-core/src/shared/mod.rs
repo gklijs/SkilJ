@@ -335,9 +335,9 @@ pub struct PrivateField {
     pub field: FieldPath,
     /// Who may read it.
     pub kind: PrivateFieldKind,
-    /// The role name that may read it, for [`PrivateFieldKind::Team`]; `None`
-    /// otherwise.
-    pub team: Option<String>,
+    /// The capability a grant must hold to read it, for
+    /// [`PrivateFieldKind::Capability`]; `None` otherwise.
+    pub capability: Option<String>,
     /// The payload field naming the reader, for
     /// [`PrivateFieldKind::Addressed`]; `None` otherwise.
     pub addressee_field: Option<FieldPath>,
@@ -345,7 +345,7 @@ pub struct PrivateField {
 
 /// See `enum PrivateFieldKind` in the spec for what each variant means in
 /// full - `Own` (default reader: the record's own creator),
-/// `Team` (default reader: any `Role` named `PrivateField.team`),
+/// `Capability` (default reader: any grant holding `PrivateField.capability`),
 /// `Addressed` (default reader: the party `PrivateField.addressee_field`
 /// names in the payload). A fourth kind, `Draft` - visible only until an
 /// external status changes - is a real, deliberately deferred future
@@ -359,8 +359,8 @@ pub struct PrivateField {
 pub enum PrivateFieldKind {
     /// Readable by the record's creator.
     Own,
-    /// Readable by any role named [`PrivateField::team`].
-    Team,
+    /// Readable by any grant holding [`PrivateField::capability`].
+    Capability,
     /// Readable by the party [`PrivateField::addressee_field`] names in the
     /// payload.
     Addressed,

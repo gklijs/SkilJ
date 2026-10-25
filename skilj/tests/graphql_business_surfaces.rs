@@ -195,7 +195,7 @@ impl EventType for TicketNoteAdded {
         vec![skilj_core::shared::PrivateField {
             field: "note".to_string(),
             kind: skilj_core::shared::PrivateFieldKind::Own,
-            team: None,
+            capability: None,
             addressee_field: None,
         }]
     }
@@ -527,7 +527,7 @@ impl EventType for CaseNoteAdded {
         vec![skilj_core::shared::PrivateField {
             field: "note".to_string(),
             kind: skilj_core::shared::PrivateFieldKind::Own,
-            team: None,
+            capability: None,
             addressee_field: None,
         }]
     }
@@ -562,7 +562,7 @@ impl CommandType for AddCaseNote {
         vec![skilj_core::shared::PrivateField {
             field: "note".to_string(),
             kind: skilj_core::shared::PrivateFieldKind::Own,
-            team: None,
+            capability: None,
             addressee_field: None,
         }]
     }
@@ -678,7 +678,7 @@ impl EventType for LedgerCredited {
         vec![skilj_core::shared::PrivateField {
             field: "memo".to_string(),
             kind: skilj_core::shared::PrivateFieldKind::Own,
-            team: None,
+            capability: None,
             addressee_field: None,
         }]
     }
@@ -897,6 +897,8 @@ async fn setup_with(
         level: AccessLevel::Admin,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,
@@ -1058,6 +1060,8 @@ fn full_business_surfaces_lifecycle_end_to_end() {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -1785,6 +1789,8 @@ fn matching_events_is_only_returned_to_an_admin_level_caller() {
             level: AccessLevel::Write,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -1920,6 +1926,8 @@ fn inspect_snapshot_is_admin_gated_null_when_cold_and_a_real_error_when_unregist
             level: AccessLevel::Write,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -2011,6 +2019,8 @@ fn inspect_snapshot_scopes_by_owner_tag_and_fails_closed_on_an_unproven_one() {
                 level: AccessLevel::Admin,
                 can_read_sensitive: false,
                 scope: scope.map(str::to_string),
+                capabilities: Default::default(),
+                delegable: Default::default(),
                 status: RoleStatus::Active,
                 created_at: test_now(),
                 revoked_at: None,
@@ -2123,6 +2133,8 @@ fn private_field_grant_lifecycle_end_to_end() {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -2713,6 +2725,8 @@ fn matching_events_are_scoped_redacted_and_capped() {
                         level: AccessLevel::Admin,
                         can_read_sensitive: false,
                         scope,
+                        capabilities: Default::default(),
+                        delegable: Default::default(),
                         status: RoleStatus::Active,
                         created_at: test_now(),
                         revoked_at: None,
@@ -2825,6 +2839,8 @@ fn an_inspected_events_originating_command_is_rendered_for_the_caller() {
                 level: AccessLevel::Admin,
                 can_read_sensitive: false,
                 scope: None,
+                capabilities: Default::default(),
+                delegable: Default::default(),
                 status: RoleStatus::Active,
                 created_at: test_now(),
                 revoked_at: None,
@@ -3061,6 +3077,8 @@ fn a_contexts_grants_are_read_for_that_context_alone() {
                     level: AccessLevel::Read,
                     can_read_sensitive: i == 1,
                     scope: (i == 0).then(|| "acme".to_string()),
+                    capabilities: Default::default(),
+                    delegable: Default::default(),
                     status: RoleStatus::Active,
                     created_at: test_now(),
                     revoked_at: None,
@@ -3372,6 +3390,8 @@ fn dry_run_command_requires_admin_level_and_the_command_types_checks() {
                 level: AccessLevel::Write,
                 can_read_sensitive: false,
                 scope: None,
+                capabilities: Default::default(),
+                delegable: Default::default(),
                 status: RoleStatus::Active,
                 created_at: test_now(),
                 revoked_at: None,
@@ -3700,6 +3720,8 @@ async fn second_admin_with_subject(pool: &Pool, bc_name: &str, subject: String) 
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -3874,6 +3896,8 @@ async fn scoped_admin_jwt(pool: &Pool, bc_name: &str, scope: &str) -> String {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: Some(scope.to_string()),
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,

@@ -19,7 +19,7 @@
 
 use crate::gql_types;
 use crate::naming::Naming;
-use crate::projection_types;
+use crate::projection_types::{self, Visibility};
 use crate::resolvers;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, Object, Schema, Subscription, Type};
@@ -29,12 +29,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Most per-caller schemas kept at once (one per distinct set of
-/// accessible bounded contexts); past it the cache starts over.
+/// accessible bounded contexts and held capabilities); past it the cache starts over.
 const MAX_SCOPED_SCHEMAS: usize = 1024;
 
-/// Per-caller schemas by the bounded contexts they include, each with
+/// Per-caller schemas by the bounded contexts and capabilities they were built for, each with
 /// the generation it was built under.
-type ScopedSchemas = HashMap<BTreeSet<String>, (u64, Arc<Schema>)>;
+type ScopedSchemas = HashMap<Visibility, (u64, Arc<Schema>)>;
 
 /// Holds the live schema behind an `RwLock<Arc<Schema>>`, so a request in
 /// flight keeps using whichever `Arc<Schema>` it already cloned out even
@@ -110,9 +110,20 @@ impl SchemaRegistry {
         let visible = match caller {
             Some(role) if role.superadmin => return Ok(self.current()),
             Some(role) => {
-                skilj_core::db::list_accessible_bounded_context_names(&state.pool, &role.id).await?
+                let mut visible = Visibility::default();
+                for (bounded_context, capabilities) in
+                    skilj_core::db::list_accessible_grants(&state.pool, &role.id).await?
+                {
+                    visible.capabilities.extend(
+                        capabilities
+                            .into_iter()
+                            .map(|c| (bounded_context.clone(), c)),
+                    );
+                    visible.contexts.insert(bounded_context);
+                }
+                visible
             }
-            None => BTreeSet::new(),
+            None => Visibility::default(),
         };
         self.scoped(state, visible).await
     }
@@ -122,7 +133,7 @@ impl SchemaRegistry {
     async fn scoped(
         &self,
         state: &GraphqlState,
-        visible: BTreeSet<String>,
+        visible: Visibility,
     ) -> skilj_core::error::Result<Arc<Schema>> {
         let generation = self.generation.load(Ordering::Acquire);
         if let Some((built_at, schema)) = self.scoped.lock().unwrap().get(&visible) {
@@ -175,12 +186,17 @@ impl SchemaRegistry {
         if let Some(published) = cached(generation) {
             return Ok(Some(published));
         }
-        let visible: BTreeSet<String> = skilj_core::db::list_bounded_contexts(&state.pool)
-            .await?
-            .into_iter()
-            .filter(|bc| bc.template.is_none() && options.published().contains(&bc.name))
-            .map(|bc| bc.name)
-            .collect();
+        // Nobody is asked for a capability here: a projection requiring
+        // one is not published.
+        let visible = Visibility {
+            contexts: skilj_core::db::list_bounded_contexts(&state.pool)
+                .await?
+                .into_iter()
+                .filter(|bc| bc.template.is_none() && options.published().contains(&bc.name))
+                .map(|bc| bc.name)
+                .collect(),
+            capabilities: BTreeSet::new(),
+        };
         let schema = self.scoped(state, visible).await?;
         let sdl = Arc::new(crate::federation::published_sdl(&schema));
         let published = Arc::new(PublishedDescription {
@@ -238,6 +254,12 @@ fn root_types(
 
     let mut query = Object::new("Query")
         .field(admin(resolvers::bounded_context_directory::field(n)))
+        .field(admin(
+            resolvers::capability_management::capability_overview_field(n),
+        ))
+        .field(admin(
+            resolvers::capability_management::capability_delegation_field(n),
+        ))
         .field(admin(resolvers::type_registration::projections_field(n)))
         .field(admin(
             resolvers::type_registration::scheduled_event_types_field(n),
@@ -273,6 +295,15 @@ fn root_types(
         ))
         .field(admin(
             resolvers::access_management::revoke_role_access_mapping_field(n),
+        ))
+        .field(admin(
+            resolvers::capability_management::grant_capability_field(n),
+        ))
+        .field(admin(
+            resolvers::capability_management::revoke_capability_field(n),
+        ))
+        .field(admin(
+            resolvers::capability_management::set_delegable_capabilities_field(n),
         ))
         .field(admin(resolvers::bounded_context_creation::field(n)))
         .field(admin(
@@ -352,6 +383,9 @@ fn static_types(n: &Naming) -> Vec<Type> {
         gql_types::role_object(n).into(),
         gql_types::created_superadmin_object(n).into(),
         gql_types::role_access_mapping_object(n).into(),
+        gql_types::capability_grant_object(n).into(),
+        gql_types::capability_delegation_object(n).into(),
+        gql_types::capability_overview_entry_object(n).into(),
         gql_types::context_creator_object(n).into(),
         gql_types::bounded_context_object(n).into(),
         gql_types::role_status_enum(n).into(),
@@ -458,7 +492,7 @@ fn admin_only_types() -> &'static HashSet<String> {
 /// (docs/architecture.md §138); `None` includes all of them.
 async fn build(
     state: GraphqlState,
-    visible: Option<&BTreeSet<String>>,
+    visible: Option<&Visibility>,
 ) -> skilj_core::error::Result<Schema> {
     let federated = state.federation.is_some();
     let n = &state.naming.clone();

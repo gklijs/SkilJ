@@ -10,7 +10,31 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- Capabilities replace the `Role.name` team gate (issue #17,
+  docs/architecture.md §228). `RoleAccessMapping` gains `capabilities` and
+  `delegable`; `Projection::TEAM_ONLY` becomes `REQUIRES_CAPABILITY`, the
+  `team` private-field kind becomes `capability` (GraphQL `PrivateFieldKind`
+  `TEAM` is now `CAPABILITY`, `PrivateField.team` is now `capability`), and
+  a grant opens a gate only by holding the capability: not by its level,
+  not by being a superadmin, and no longer by its Role's name. Anything
+  that required a team name now fails closed until the capability is
+  granted. A caller without the capability gets `Projection_not_found`, not
+  `not_on_required_team`. Migration `0007` adds the two columns.
+- A projection requiring a capability is left out of a caller's GraphQL
+  schema unless the caller holds it, and a grant or revoke applies on the
+  caller's next request. `registerProjection` takes `requiresCapability`
+  and the `Projection` type exposes it.
+
 ### Added
+
+- Capability management (docs/architecture.md §228): GraphQL
+  `grantCapability`, `revokeCapability`, `setDelegableCapabilities`,
+  `capabilityDelegation` and `capabilityOverview`; `RoleAccessMapping`
+  exposes `capabilities` and `delegable`. A context admin can hand out the
+  capabilities a superadmin allowed it to (`delegable`) to other grants in
+  its context, never to its own.
 
 - Ordered batch submission (#116, docs/architecture.md §227): GraphQL
   `submitCommands`, `POST /v1/commands/trigger/batch` and

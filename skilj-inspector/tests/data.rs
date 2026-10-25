@@ -113,7 +113,7 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
         None
     }
 
-    // `team_only` intentionally not overridden - the trait's own default
+    // `requires_capability` intentionally not overridden - the trait's own default
     // (`None`) already reads identically to what a plain-`None` override
     // here would return.
 }
@@ -154,6 +154,8 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -223,6 +225,7 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
                 .to_string(),
             vec![event_type.clone()],
             false,
+            None,
             None,
             None,
             &[],

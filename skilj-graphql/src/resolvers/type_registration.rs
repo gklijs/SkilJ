@@ -342,7 +342,7 @@ pub fn register_command_type_field(n: &Naming) -> Field {
     ))
 }
 
-/// `registerProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): ProjectionRegistrationResult!`
+/// `registerProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, requiresCapability: String): ProjectionRegistrationResult!`
 pub fn register_projection_field(n: &Naming) -> Field {
     Field::new(
         n.root("registerProjection"),
@@ -357,6 +357,12 @@ pub fn register_projection_field(n: &Naming) -> Field {
                 let name = ctx.args.try_get("name")?.string()?.to_string();
                 let schema = ctx.args.try_get("schema")?.string()?.to_string();
                 let sync = ctx.args.try_get("sync")?.boolean()?;
+                let requires_capability = ctx
+                    .args
+                    .get("requiresCapability")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
 
                 // A repeated name is refused before any is looked up
                 // (docs/architecture.md §145).
@@ -416,6 +422,7 @@ pub fn register_projection_field(n: &Naming) -> Field {
                     schema,
                     consumed_event_types,
                     sync,
+                    requires_capability.clone(),
                     existing.as_ref(),
                     staged.as_ref(),
                     &bounded_context_events,
@@ -463,6 +470,14 @@ pub fn register_projection_field(n: &Naming) -> Field {
                         }
                     }
                     ProjectionRegistration::RebuildStaged(rebuild) => {
+                        skilj_core::db::set_projection_requires_capability(
+                            &state.pool,
+                            &bounded_context_name,
+                            &name,
+                            requires_capability.as_deref(),
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
                         skilj_core::db::upsert_projection_rebuild(&state.pool, &rebuild)
                             .await
                             .map_err(to_graphql_error)?;
@@ -497,6 +512,10 @@ pub fn register_projection_field(n: &Naming) -> Field {
         TypeRef::named_nn_list_nn(TypeRef::STRING),
     ))
     .argument(InputValue::new("sync", TypeRef::named_nn(TypeRef::BOOLEAN)))
+    .argument(InputValue::new(
+        "requiresCapability",
+        TypeRef::named(TypeRef::STRING),
+    ))
 }
 
 /// `rebuildProjection(boundedContext: String!, name: String!): ProjectionRebuild!`

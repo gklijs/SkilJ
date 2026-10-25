@@ -48,6 +48,8 @@ fn synthetic_admin_mapping(
         level: AccessLevel::Admin,
         can_read_sensitive: true,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: now,
         revoked_at: None,
@@ -193,6 +195,7 @@ async fn apply_template_registrations(
             source.schema.clone(),
             consumed_event_types,
             source.sync,
+            source.requires_capability.clone(),
             existing.as_ref(),
             staged.as_ref(),
             &tenant_events,
@@ -220,6 +223,14 @@ async fn apply_template_registrations(
                     .map_err(to_graphql_error)?;
             }
             ProjectionRegistration::RebuildStaged(rebuild) => {
+                skilj_core::db::set_projection_requires_capability(
+                    pool,
+                    &tenant.name,
+                    &source.name,
+                    source.requires_capability.as_deref(),
+                )
+                .await
+                .map_err(to_graphql_error)?;
                 skilj_core::db::upsert_projection_rebuild(pool, &rebuild)
                     .await
                     .map_err(to_graphql_error)?;

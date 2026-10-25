@@ -84,6 +84,8 @@ fn mapping(role: Role, status: RoleStatus) -> RoleAccessMapping {
         level: AccessLevel::Write,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status,
         created_at: timestamp(0),
         revoked_at: None,

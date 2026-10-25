@@ -59,6 +59,7 @@ pub mod bounded_context_creation;
 pub mod bounded_context_deletion;
 pub mod bounded_context_directory;
 pub mod bounded_context_templating;
+pub mod capability_management;
 pub mod command_approval;
 pub mod command_query;
 pub mod command_submission;
@@ -285,12 +286,12 @@ pub fn parse_private_fields(value: &ValueAccessor) -> async_graphql::Result<Vec<
     for item in value.list()?.iter() {
         let obj = item.object()?;
         let kind = match obj.try_get("kind")?.enum_name()? {
-            "TEAM" => PrivateFieldKind::Team,
+            "CAPABILITY" => PrivateFieldKind::Capability,
             "ADDRESSED" => PrivateFieldKind::Addressed,
             _ => PrivateFieldKind::Own,
         };
-        let team = obj
-            .get("team")
+        let capability = obj
+            .get("capability")
             .filter(|v| !v.is_null())
             .map(|v| v.string().map(str::to_string))
             .transpose()?;
@@ -302,7 +303,7 @@ pub fn parse_private_fields(value: &ValueAccessor) -> async_graphql::Result<Vec<
         fields.push(PrivateField {
             field: obj.try_get("field")?.string()?.to_string(),
             kind,
-            team,
+            capability,
             addressee_field,
         });
     }

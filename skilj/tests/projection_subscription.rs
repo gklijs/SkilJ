@@ -234,18 +234,18 @@ impl Projection for AsyncAccountBalance {
     }
 }
 
-/// Identical to `AccountBalance` except `TEAM_ONLY` - exercises
+/// Identical to `AccountBalance` except `REQUIRES_CAPABILITY` - exercises
 /// `fetch_projection_result`'s team gate as reached through
 /// `projectionUpdates` specifically (rejecting the subscription attempt
 /// itself, before any stream is ever created - see this file's own
-/// `team_only_projection_rejects_subscription_before_any_push` test).
+/// `capability_gated_projection_rejects_subscription_before_any_push` test).
 struct StaffOnlyBalance;
 
 impl Projection for StaffOnlyBalance {
     type State = AccountBalanceState;
     type Event = BankingEvent;
     const NAME: &'static str = "StaffOnlyBalance";
-    const TEAM_ONLY: Option<&'static str> = Some("support");
+    const REQUIRES_CAPABILITY: Option<&'static str> = Some("support");
     fn consumed_event_types() -> Vec<&'static str> {
         vec!["MoneyDeposited"]
     }
@@ -531,6 +531,8 @@ async fn setup(pool: skilj_core::db::Pool, bc_name: String) -> Fixture {
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -576,6 +578,8 @@ async fn grant_reader(fixture: &Fixture) {
             level: AccessLevel::Read,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -891,7 +895,7 @@ fn projection_updates_only_fires_for_the_subscribed_key() {
 /// `state.event_broadcaster.subscribe()` rather than only gating pushes.
 /// A Role that *does* carry the team name subscribes normally.
 #[test]
-fn team_only_projection_rejects_subscription_before_any_push() {
+fn capability_gated_projection_rejects_subscription_before_any_push() {
     runtime().block_on(async {
         if test_database_url().await.is_none() {
             return;
@@ -929,6 +933,8 @@ fn team_only_projection_rejects_subscription_before_any_push() {
                 level: AccessLevel::Read,
                 can_read_sensitive: false,
                 scope: None,
+                capabilities: ["support".to_string()].into(),
+                delegable: Default::default(),
                 status: RoleStatus::Active,
                 created_at: test_now(),
                 revoked_at: None,
@@ -994,10 +1000,14 @@ fn team_only_projection_rejects_subscription_before_any_push() {
         let rejected = ws_recv_json(&mut ws).await;
         assert_eq!(rejected["id"], "1");
         assert_eq!(rejected["type"], "next");
-        assert_eq!(
-            rejected["payload"]["errors"][0]["extensions"]["code"],
-            "not_on_required_team"
-        );
+        // The gated type is not in this reader's schema, so the
+        // subscription fails validation like one for a field that does not
+        // exist - before any stream is opened.
+        let message = rejected["payload"]["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(message.starts_with("Unknown field"), "{rejected:?}");
+        assert!(rejected["payload"]["data"].is_null(), "{rejected:?}");
 
         let complete = ws_recv_json(&mut ws).await;
         assert_eq!(complete["id"], "1");

@@ -129,7 +129,7 @@ impl ProjectionDispatcher for TestDispatcher {
         }
     }
 
-    fn team_only(
+    fn requires_capability(
         &self,
         _bounded_context: &str,
         projection_name: &str,
@@ -244,6 +244,7 @@ async fn seed_sync_projection(
         consumed_event_types: consumed,
         sync: true,
         caught_up_to: None,
+        requires_capability: None,
     };
     db::upsert_projection(pool, &projection).await.unwrap();
     projection

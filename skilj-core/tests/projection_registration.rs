@@ -61,6 +61,8 @@ fn access_mapping(status: RoleStatus, level: AccessLevel) -> RoleAccessMapping {
         level,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status,
         created_at: timestamp(0),
         revoked_at: None,
@@ -129,6 +131,7 @@ fn existing_projection(consumed_event_types: Vec<EventType>, sync: bool) -> Proj
         consumed_event_types,
         sync,
         caught_up_to: Some(5),
+        requires_capability: None,
     }
 }
 
@@ -155,6 +158,7 @@ fn projection_caught_up_to_accepts_null_and_non_null() {
 
     let never_processed = Projection {
         caught_up_to: None,
+        requires_capability: None,
         ..fresh
     };
     assert_eq!(never_processed.caught_up_to, None);
@@ -189,6 +193,7 @@ fn register_projection_creates_a_new_projection_when_none_exists() {
         "{}".into(),
         consumed.clone(),
         false,
+        None,
         None,
         None,
         &[],
@@ -234,6 +239,7 @@ fn register_projection_flags_a_history_fold_for_a_first_time_sync_registration_w
         true,
         None,
         None,
+        None,
         &history,
     )
     .unwrap();
@@ -270,6 +276,7 @@ fn register_projection_does_not_flag_a_history_fold_when_sync_but_no_matching_hi
         true,
         None,
         None,
+        None,
         &unrelated_history,
     )
     .unwrap();
@@ -299,6 +306,7 @@ fn register_projection_rejects_a_revoked_mapping() {
         false,
         None,
         None,
+        None,
         &[],
     )
     .unwrap_err();
@@ -319,6 +327,7 @@ fn register_projection_rejects_a_write_level_mapping() {
         "{}".into(),
         Vec::new(),
         false,
+        None,
         None,
         None,
         &[],
@@ -349,6 +358,7 @@ fn register_projection_rejects_a_bounded_context_the_mapping_is_not_scoped_to() 
         false,
         None,
         None,
+        None,
         &[],
     )
     .unwrap_err();
@@ -375,6 +385,7 @@ fn register_projection_rejects_an_archived_bounded_context() {
         "{}".into(),
         Vec::new(),
         false,
+        None,
         None,
         None,
         &[],
@@ -404,6 +415,7 @@ fn register_projection_rejects_a_malformed_schema() {
         "not json at all".into(),
         Vec::new(),
         false,
+        None,
         None,
         None,
         &[],
@@ -436,6 +448,7 @@ fn register_projection_rejects_a_consumed_event_type_from_another_bounded_contex
         false,
         None,
         None,
+        None,
         &[],
     )
     .unwrap_err();
@@ -466,6 +479,7 @@ fn register_projection_rejects_a_repeated_consumed_event_type() {
         false,
         None,
         None,
+        None,
         &[],
     )
     .unwrap_err();
@@ -489,7 +503,8 @@ fn register_projection_reconciles_trivially_when_flipping_sync_true_to_false() {
         "OrderSummary".into(),
         base_schema(), // unchanged schema
         Vec::new(),
-        false, // sync: true -> false, always trivial
+        false,
+        None, // sync: true -> false, always trivial
         Some(&existing),
         None,
         &[],
@@ -521,6 +536,7 @@ fn register_projection_reconciles_trivially_when_adding_a_consumed_type_with_no_
         base_schema(),
         vec![new_type.clone()],
         false,
+        None,
         Some(&existing),
         None,
         &[], // no committed events at all
@@ -532,6 +548,102 @@ fn register_projection_reconciles_trivially_when_adding_a_consumed_type_with_no_
             assert_eq!(p.consumed_event_types, vec![new_type]);
         }
         other => panic!("expected ReconciledTrivially, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Projection.requires_capability (docs/architecture.md §228)
+// ---------------------------------------------------------------------
+
+#[test]
+fn register_projection_carries_the_required_capability_on_creation() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    let result = projections::register_projection(
+        &mapping,
+        &bc,
+        "OrderSummary".into(),
+        "{}".into(),
+        vec![event_type("OrderPlaced")],
+        false,
+        Some("staff".into()),
+        None,
+        None,
+        &[],
+    )
+    .unwrap();
+
+    match result {
+        ProjectionRegistration::Created { projection, .. } => {
+            assert_eq!(projection.requires_capability.as_deref(), Some("staff"));
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+}
+
+#[test]
+fn register_projection_refuses_a_malformed_capability_name() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    for bad in ["", "Staff", "staff team", &"a".repeat(65)] {
+        let err = projections::register_projection(
+            &mapping,
+            &bc,
+            "OrderSummary".into(),
+            "{}".into(),
+            vec![event_type("OrderPlaced")],
+            false,
+            Some(bad.into()),
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "invalid_capability_name", "{bad:?}");
+    }
+}
+
+/// Who may read is not what is folded: changing it, adding it or dropping
+/// it is a trivial reconciliation, never a rebuild, and `schema_version`
+/// stays.
+#[test]
+fn register_projection_changes_the_required_capability_without_a_rebuild() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let existing = existing_projection(Vec::new(), false);
+    assert_eq!(existing.requires_capability, None);
+
+    for (from, to) in [
+        (None, Some("staff")),
+        (Some("staff"), Some("audit")),
+        (Some("audit"), None),
+    ] {
+        let existing = Projection {
+            requires_capability: from.map(str::to_owned),
+            ..existing.clone()
+        };
+        let result = projections::register_projection(
+            &mapping,
+            &bc,
+            "OrderSummary".into(),
+            base_schema(),
+            Vec::new(),
+            false,
+            to.map(str::to_owned),
+            Some(&existing),
+            None,
+            &[],
+        )
+        .unwrap();
+        match result {
+            ProjectionRegistration::ReconciledTrivially(p) => {
+                assert_eq!(p.requires_capability.as_deref(), to);
+                assert_eq!(p.schema_version, 1);
+            }
+            other => panic!("expected ReconciledTrivially for {from:?} -> {to:?}, got {other:?}"),
+        }
     }
 }
 
@@ -552,6 +664,7 @@ fn register_projection_stages_a_new_rebuild_when_schema_changes() {
         r#"{"type":"object","properties":{"total":{"type":"integer"}}}"#.into(), // schema changed
         Vec::new(),
         false,
+        None,
         Some(&existing),
         None, // nothing staged yet
         &[],
@@ -586,6 +699,7 @@ fn register_projection_restages_an_already_pending_rebuild_in_place() {
         r#"{"type":"object","properties":{"total":{"type":"integer"}}}"#.into(),
         Vec::new(),
         false,
+        None,
         Some(&existing),
         Some(&already_staged),
         &[],
@@ -621,6 +735,7 @@ fn register_projection_stages_a_rebuild_when_adding_a_consumed_type_with_history
         base_schema(),
         vec![new_type],
         false,
+        None,
         Some(&existing),
         None,
         &events,
@@ -647,6 +762,7 @@ fn register_projection_stages_a_rebuild_when_dropping_a_consumed_type_with_histo
         base_schema(),
         Vec::new(), // dropped
         false,
+        None,
         Some(&existing),
         None,
         &events,
@@ -670,7 +786,8 @@ fn register_projection_stages_a_rebuild_when_becoming_sync() {
         "OrderSummary".into(),
         base_schema(),
         Vec::new(),
-        true, // async -> sync
+        true,
+        None, // async -> sync
         Some(&existing),
         None,
         &[],
@@ -711,6 +828,7 @@ fn register_projection_never_creates_a_second_pending_rebuild_when_one_is_alread
         r#"{"type":"object","properties":{"total":{"type":"integer"}}}"#.into(),
         Vec::new(),
         false,
+        None,
         Some(&existing),
         Some(&already_staged), // the one existing pending row
         &[],
@@ -961,13 +1079,13 @@ fn private_fields_consumed_names_every_private_field_by_event_type() {
         skilj_core::shared::PrivateField {
             field: "note".to_string(),
             kind: skilj_core::shared::PrivateFieldKind::Own,
-            team: None,
+            capability: None,
             addressee_field: None,
         },
         skilj_core::shared::PrivateField {
             field: "staff_remark".to_string(),
-            kind: skilj_core::shared::PrivateFieldKind::Team,
-            team: Some("staff".to_string()),
+            kind: skilj_core::shared::PrivateFieldKind::Capability,
+            capability: Some("staff".to_string()),
             addressee_field: None,
         },
     ];

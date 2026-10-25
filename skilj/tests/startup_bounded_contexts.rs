@@ -340,6 +340,8 @@ fn reconciliation_runs_on_a_patched_bounded_context() {
                 level: skilj_core::access_control::AccessLevel::Admin,
                 can_read_sensitive: false,
                 scope: None,
+                capabilities: Default::default(),
+                delegable: Default::default(),
                 status: skilj_core::access_control::RoleStatus::Active,
                 created_at: Utc::now().trunc_subsecs(6),
                 revoked_at: None,

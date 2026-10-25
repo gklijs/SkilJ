@@ -55,6 +55,8 @@ fn access_mapping(status: RoleStatus, level: AccessLevel) -> RoleAccessMapping {
         level,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status,
         created_at: timestamp(0),
         revoked_at: None,
@@ -70,6 +72,7 @@ fn projection() -> Projection {
         consumed_event_types: Vec::new(),
         sync: false,
         caught_up_to: Some(5),
+        requires_capability: None,
     }
 }
 
@@ -80,7 +83,7 @@ fn no_access_restriction() -> ProjectionAccessScope<'static> {
     ProjectionAccessScope {
         declares_owner: false,
         instance_owner: None,
-        team_only: None,
+        requires_capability: None,
     }
 }
 
@@ -272,7 +275,7 @@ fn query_projection_succeeds_when_the_grant_has_no_scope() {
         ProjectionAccessScope {
             declares_owner: true, // projection declares an owner dimension
             instance_owner: Some("company-b"),
-            team_only: None,
+            requires_capability: None,
         },
         "x".into(),
     )
@@ -287,6 +290,8 @@ fn query_projection_succeeds_when_the_grant_has_no_scope() {
 fn query_projection_succeeds_when_the_projection_declares_no_owner_dimension() {
     let mapping = RoleAccessMapping {
         scope: Some("company-a".into()),
+        capabilities: Default::default(),
+        delegable: Default::default(),
         ..access_mapping(RoleStatus::Active, AccessLevel::Read)
     };
     let p = projection();
@@ -311,6 +316,8 @@ fn query_projection_succeeds_when_the_projection_declares_no_owner_dimension() {
 fn query_projection_succeeds_when_the_instance_owner_matches_the_grants_scope() {
     let mapping = RoleAccessMapping {
         scope: Some("company-a".into()),
+        capabilities: Default::default(),
+        delegable: Default::default(),
         ..access_mapping(RoleStatus::Active, AccessLevel::Read)
     };
     let p = projection();
@@ -324,7 +331,7 @@ fn query_projection_succeeds_when_the_instance_owner_matches_the_grants_scope() 
         ProjectionAccessScope {
             declares_owner: true,
             instance_owner: Some("company-a"),
-            team_only: None,
+            requires_capability: None,
         },
         "x".into(),
     )
@@ -342,6 +349,8 @@ fn query_projection_succeeds_when_the_instance_owner_matches_the_grants_scope() 
 fn query_projection_rejects_an_instance_owned_by_a_different_scope() {
     let mapping = RoleAccessMapping {
         scope: Some("company-a".into()),
+        capabilities: Default::default(),
+        delegable: Default::default(),
         ..access_mapping(RoleStatus::Active, AccessLevel::Read)
     };
     let p = projection();
@@ -355,7 +364,7 @@ fn query_projection_rejects_an_instance_owned_by_a_different_scope() {
         ProjectionAccessScope {
             declares_owner: true,
             instance_owner: Some("company-b"),
-            team_only: None,
+            requires_capability: None,
         },
         "x".into(),
     )
@@ -373,6 +382,8 @@ fn query_projection_rejects_an_instance_owned_by_a_different_scope() {
 fn query_projection_rejects_an_unestablished_owner_for_a_scoped_grant() {
     let mapping = RoleAccessMapping {
         scope: Some("company-a".into()),
+        capabilities: Default::default(),
+        delegable: Default::default(),
         ..access_mapping(RoleStatus::Active, AccessLevel::Read)
     };
     let p = projection();
@@ -386,7 +397,7 @@ fn query_projection_rejects_an_unestablished_owner_for_a_scoped_grant() {
         ProjectionAccessScope {
             declares_owner: true,
             instance_owner: None, // no owner established yet
-            team_only: None,
+            requires_capability: None,
         },
         "x".into(),
     )
