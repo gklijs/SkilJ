@@ -1879,9 +1879,10 @@ entity ReadCursor {
 -- One Role letting another read the private fields of a record it is
 -- itself the default reader of. The only entity the private-field
 -- mechanism needs, and only two of the three kinds ever produce one: own
--- and addressed are shareable, team is not, because a team field has
--- nothing to share - a Role either carries the name or it does not, and
--- no grant could change that either way (see enum PrivateFieldKind).
+-- and addressed are shareable, capability is not, because a capability
+-- field has nothing to share - holding the capability is itself the
+-- entitlement, and no per-record grant could add to that either way (see
+-- enum PrivateFieldKind).
 --
 -- Self-service, and that is the defining difference from every other
 -- grant in this file. A RoleAccessMapping is made for a Role by a
@@ -4423,8 +4424,9 @@ rule DryRunCommand {
         -- decide() emitted it; one it is not granted is null, where a
         -- stored event would show ciphertext. A private field is redacted
         -- unless this Role is entitled to it as the record's creator, its
-        -- addressee or a member of its team. No PrivateFieldGrant can name
-        -- an event that has no sequence yet, so only blanket grants apply.
+        -- addressee or a grant holding the field's declared capability.
+        -- No PrivateFieldGrant can name an event that has no sequence yet,
+        -- so only blanket grants apply.
         --
         -- An accepted decision naming an event type the bounded context
         -- has not registered is refused, as ProcessCommand refuses it.
@@ -4616,9 +4618,9 @@ rule FetchCommands {
         -- caller is not entitled to comes back as null rather than as
         -- ciphertext, because a private field was never encrypted in the
         -- first place. Which callers are entitled - the record's own
-        -- creator or addressee, a Role a grant names, a Role carrying a
-        -- team field's declared name - is stated there in full and is not
-        -- restated here. An admin grant is not one of those entitlements
+        -- creator or addressee, a Role a grant names, a grant holding a
+        -- capability field's declared capability - is stated there in full
+        -- and is not restated here. An admin grant is not one of those entitlements
         -- either: this is the same orthogonality can_read_sensitive has to
         -- level, applied to a mechanism that has no level of its own at
         -- all.
@@ -6891,11 +6893,11 @@ rule ForgetSubject {
 -- Two of the three kinds are shareable and one is not, which is why there
 -- are two minting rules rather than three: own and addressed each have a
 -- determinate default reader who can decide to let someone else in, while
--- a team field has nobody to do the deciding - the team's name is the
--- grant, and a Role either carries it or does not (see enum
--- PrivateFieldKind). ListPrivateFieldGrants therefore never has anything
--- to list for a team field, and that is a property of the mechanism
--- rather than a gap in the listing.
+-- a capability field has nobody to do the deciding - holding the
+-- capability is itself the entitlement, and a grant either holds it or
+-- does not (see enum PrivateFieldKind). ListPrivateFieldGrants therefore
+-- never has anything to list for a capability field, and that is a
+-- property of the mechanism rather than a gap in the listing.
 --
 -- Events and commands get a rule each rather than one polymorphic rule
 -- over both, the same shape and for the same reason CreateExternalEvent
@@ -9648,10 +9650,11 @@ surface PrivateFieldGrantManagement {
     @guidance
         -- GraphQL only, and by construction rather than by policy: all
         -- three visibility rules a private field can follow are stated in
-        -- terms of a Role - its id as a record's creator, its name as a
-        -- team, its external_subject as an addressee - so a REST bearer
-        -- token has no identity for any of them to test, and there is
-        -- nothing for a REST counterpart to this surface to authenticate.
+        -- terms of a Role - its id as a record's creator, a capability its
+        -- grant holds, its external_subject as an addressee - so a REST
+        -- bearer token has no identity for any of them to test, and there
+        -- is nothing for a REST counterpart to this surface to
+        -- authenticate.
         --
         -- Faced by ReadAccess - any active mapping, at any level - rather
         -- than by a write-level one, and that is a deliberate choice

@@ -1410,10 +1410,11 @@ pub fn valid_sensitive_fields(schema: &str, sensitive_fields: &[SensitiveField])
 /// restriction on `field` itself - a private field is redacted to `null`
 /// at read time, not encrypted, so any scalar leaf works. The
 /// kind-specific presence rule is `value PrivateField`'s own contract,
-/// checked here rather than by the type system alone: `team` set and
-/// `addressee_field` absent iff `kind = Team`; `addressee_field` set (and
-/// itself a real schema leaf) and `team` absent iff `kind = Addressed`;
-/// both absent iff `kind = Own`.
+/// checked here rather than by the type system alone: `capability` set (to
+/// a well-formed capability name) and `addressee_field` absent iff
+/// `kind = Capability`; `addressee_field` set (and itself a real schema
+/// leaf) and `capability` absent iff `kind = Addressed`; both absent iff
+/// `kind = Own`.
 pub fn valid_private_fields(schema: &str, private_fields: &[PrivateField]) -> bool {
     if private_fields.is_empty() {
         return true;
@@ -2486,7 +2487,7 @@ impl PrivateFieldRecord for Command {
 ///     gets in `render_event`/`render_command`, resolved against a
 ///     payload field rather than an `EncryptionKey`'s subject value.
 ///
-/// Does not hold for a record whose type declares only `Team`-kind
+/// Does not hold for a record whose type declares only `Capability`-kind
 /// private fields, or none at all - there is no default reader to be.
 /// Generic over `Event`/`Command` alike via `PrivateFieldRecord` above -
 /// used both here and at grant time (`grant_private_field_access_for_event`/
@@ -2522,8 +2523,8 @@ pub fn is_default_private_reader<R: PrivateFieldRecord>(record: &R, role: &Role)
 
 /// Whether `access_mapping.role` may read one `PrivateField` entry on
 /// `record` - the one decision the redaction pass below makes per field.
-/// `Team`-kind needs no `record`/grant lookup at all: membership is the
-/// grant. `Own`/`Addressed` hold when `is_default_private_reader` holds
+/// `Capability`-kind needs no `record`/grant lookup at all: holding the
+/// capability is the entitlement. `Own`/`Addressed` hold when `is_default_private_reader` holds
 /// directly, or an active `PrivateFieldGrant` reaches this caller -
 /// either a per-record one `matches_this_record` identifies, or a
 /// blanket one (naming neither an event nor a command) whose own
@@ -2589,8 +2590,8 @@ fn entitled_to_read_private_field<R: PrivateFieldRecord>(
 /// before the call" split every other rule in this module already
 /// follows for `resolve_data_key`. Empty for a caller with no such
 /// grants, which is every caller before this mechanism existed - the
-/// third pass below is then just `is_default_private_reader`/`Team`
-/// membership, unchanged from a `private_fields`-free type's own
+/// third pass below is then just `is_default_private_reader`/capability
+/// holding, unchanged from a `private_fields`-free type's own
 /// behaviour.
 pub fn render_event(
     event: &Event,

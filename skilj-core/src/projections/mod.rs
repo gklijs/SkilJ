@@ -513,14 +513,14 @@ pub fn read_projection(state_json: &str, data_keys: &[crate::encryption::DataKey
 /// that doesn't exist yet or has never had one derived. `requires_capability` is
 /// the projection's own `Projection::REQUIRES_CAPABILITY` (`ProjectionDispatcher::
 /// requires_capability`, likewise already resolved), or `None` when it declares no
-/// required team - every projection before this pass, and most after
+/// required capability - every projection before this pass, and most after
 /// it.
 pub struct ProjectionAccessScope<'a> {
     /// Whether the projection declares an owner tag key.
     pub declares_owner: bool,
     /// The queried instance's stored owner; `None` for none.
     pub instance_owner: Option<&'a str>,
-    /// The team the projection is restricted to; `None` for no restriction.
+    /// The capability the projection is restricted to; `None` for no restriction.
     pub requires_capability: Option<&'a str>,
 }
 
@@ -535,15 +535,15 @@ pub struct ProjectionAccessScope<'a> {
 ///
 /// `access.requires_capability` (issue #17's own gap, docs/architecture.md's
 /// own write-up of this pass): vacuously satisfied when `None`,
-/// regardless of the caller's own Role. When `Some`, the query is
-/// rejected unless `access_mapping.role.name` equals it exactly
-/// (`access_control::role_matches_required_team` - the identical test
-/// a `team`-kind private field's own entitlement check already uses).
+/// regardless of the caller's own grant. When `Some`, the query is
+/// rejected unless `access_mapping.capabilities` holds it
+/// (`access_control::mapping_holds_capability` - the identical test
+/// a `Capability`-kind private field's own entitlement check already uses).
 /// Unlike the owner-scope check above, this is a whole-*projection*
-/// gate, not a per-*instance* one - there is no `team` column on a
+/// gate, not a per-*instance* one - there is no `capability` column on a
 /// stored instance the way there is an `owner` one, since a required
-/// team names no dimension to derive per instance, just one fixed
-/// membership test every instance shares. Independent of and composable
+/// capability names no dimension to derive per instance, just one fixed
+/// test every instance shares. Independent of and composable
 /// with the owner-scope check: a projection may declare both
 /// `OWNER_TAG_KEY` and `REQUIRES_CAPABILITY` (company-scoped *and* staff-only),
 /// and a query must satisfy both, the same way `sensitive_fields` and
