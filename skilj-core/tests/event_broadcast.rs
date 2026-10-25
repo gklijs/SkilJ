@@ -68,6 +68,8 @@ fn access_mapping() -> RoleAccessMapping {
         level: AccessLevel::Read,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: timestamp(0),
         revoked_at: None,

@@ -563,7 +563,7 @@ fn a_re_registration_applies_to_events_already_cached() {
             private_fields: vec![PrivateField {
                 field: "note".to_string(),
                 kind: PrivateFieldKind::Own,
-                team: None,
+                capability: None,
                 addressee_field: None,
             }],
             ..et.clone()

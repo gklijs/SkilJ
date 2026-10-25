@@ -24,6 +24,9 @@
 //! here ever needs `ctx.data::<Pool>()` for itself.
 
 use crate::naming::Naming;
+use crate::resolvers::capability_management::{
+    CapabilityDelegation, CapabilityOverviewEntry, DelegationGrant,
+};
 use async_graphql::dynamic::{
     Enum, Field, FieldFuture, FieldValue, InputObject, InputValue, Object, ResolverContext,
     TypeRef, Union,
@@ -245,7 +248,44 @@ pub fn role_access_mapping_object(n: &Naming) -> Object {
         scalar "level": TypeRef::named_nn(n.ty("AccessLevel")) => |m| Value::from(access_level_name(m.level)),
         scalar "canReadSensitive": TypeRef::named_nn(TypeRef::BOOLEAN) => |m| Value::from(m.can_read_sensitive),
         scalar "scope": TypeRef::named(TypeRef::STRING) => |m| optional_string(m.scope.clone()),
+        scalar "capabilities": TypeRef::named_nn_list_nn(TypeRef::STRING) => |m| string_list(m.capabilities.iter().cloned()),
+        scalar "delegable": TypeRef::named_nn_list_nn(TypeRef::STRING) => |m| string_list(m.delegable.iter().cloned()),
         scalar "status": TypeRef::named_nn(n.ty("RoleStatus")) => |m| Value::from(role_status_name(m.status)),
+    })
+}
+
+fn string_list(items: impl IntoIterator<Item = String>) -> Value {
+    Value::List(items.into_iter().map(Value::from).collect())
+}
+
+/// One grant as a context admin sees it in `surface CapabilityDelegation`
+/// (`RoleAccessMapping.capabilities`/`delegable` themselves are on
+/// `RoleAccessMapping`).
+pub fn capability_grant_object(n: &Naming) -> Object {
+    gql_object!(DelegationGrant => n.ty("CapabilityGrant") {
+        scalar "roleId": TypeRef::named_nn(TypeRef::ID) => |g| Value::from(g.role_id.clone()),
+        scalar "roleName": TypeRef::named_nn(TypeRef::STRING) => |g| Value::from(g.role_name.clone()),
+        scalar "capabilities": TypeRef::named_nn_list_nn(TypeRef::STRING) => |g| string_list(g.capabilities.iter().cloned()),
+    })
+}
+
+/// `surface CapabilityDelegation`.
+pub fn capability_delegation_object(n: &Naming) -> Object {
+    gql_object!(CapabilityDelegation => n.ty("CapabilityDelegation") {
+        scalar "delegable": TypeRef::named_nn_list_nn(TypeRef::STRING) => |d| string_list(d.delegable.iter().cloned()),
+        list "grants": TypeRef::named_nn_list_nn(n.ty("CapabilityGrant")) => |d| d.grants.clone(),
+    })
+}
+
+/// `surface CapabilityOverview`: per bounded context, what is required
+/// and held, and the two differences - the lists to read for a typo.
+pub fn capability_overview_entry_object(n: &Naming) -> Object {
+    gql_object!(CapabilityOverviewEntry => n.ty("CapabilityOverviewEntry") {
+        scalar "boundedContext": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.bounded_context.clone()),
+        scalar "required": TypeRef::named_nn_list_nn(TypeRef::STRING) => |e| string_list(e.required.iter().cloned()),
+        scalar "held": TypeRef::named_nn_list_nn(TypeRef::STRING) => |e| string_list(e.held.iter().cloned()),
+        scalar "requiredButNotHeld": TypeRef::named_nn_list_nn(TypeRef::STRING) => |e| string_list(e.required.difference(&e.held).cloned()),
+        scalar "heldButNotRequired": TypeRef::named_nn_list_nn(TypeRef::STRING) => |e| string_list(e.held.difference(&e.required).cloned()),
     })
 }
 
@@ -378,14 +418,14 @@ pub fn sensitive_field_input(n: &Naming) -> InputObject {
 pub fn private_field_kind_enum(n: &Naming) -> Enum {
     Enum::new(n.ty("PrivateFieldKind"))
         .item("OWN")
-        .item("TEAM")
+        .item("CAPABILITY")
         .item("ADDRESSED")
 }
 
 fn private_field_kind_name(kind: PrivateFieldKind) -> &'static str {
     match kind {
         PrivateFieldKind::Own => "OWN",
-        PrivateFieldKind::Team => "TEAM",
+        PrivateFieldKind::Capability => "CAPABILITY",
         PrivateFieldKind::Addressed => "ADDRESSED",
         _ => UNSUPPORTED_VALUE,
     }
@@ -397,7 +437,7 @@ pub fn private_field_object(n: &Naming) -> Object {
     gql_object!(PrivateField => n.ty("PrivateField") {
         scalar "field": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.field.clone()),
         scalar "kind": TypeRef::named_nn(n.ty("PrivateFieldKind")) => |p| Value::from(private_field_kind_name(p.kind)),
-        scalar "team": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.team.clone()),
+        scalar "capability": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.capability.clone()),
         scalar "addresseeField": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.addressee_field.clone()),
     })
 }
@@ -409,7 +449,10 @@ pub fn private_field_input(n: &Naming) -> InputObject {
             "kind",
             TypeRef::named_nn(n.ty("PrivateFieldKind")),
         ))
-        .field(InputValue::new("team", TypeRef::named(TypeRef::STRING)))
+        .field(InputValue::new(
+            "capability",
+            TypeRef::named(TypeRef::STRING),
+        ))
         .field(InputValue::new(
             "addresseeField",
             TypeRef::named(TypeRef::STRING),
@@ -655,6 +698,7 @@ pub fn projection_object(n: &Naming) -> Object {
         scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |p| Value::from(p.projection.schema_version),
         list "consumedEventTypes": TypeRef::named_nn_list_nn(n.ty("EventType")) => |p| p.projection.consumed_event_types.clone(),
         scalar "sync": TypeRef::named_nn(TypeRef::BOOLEAN) => |p| Value::from(p.projection.sync),
+        scalar "requiresCapability": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.projection.requires_capability.clone()),
         scalar "caughtUpTo": TypeRef::named(TypeRef::INT) => |p| match p.projection.caught_up_to {
             Some(seq) => Value::from(seq),
             None => Value::Null,

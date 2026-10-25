@@ -110,3 +110,37 @@ disturbs what it's already serving, whichever `sync` setting - a change
 that can't honestly be applied to already-folded content is staged,
 waiting for an explicit `RebuildProjection` call, never triggered
 automatically by a deploy.
+
+## Restricting who may read a projection: `REQUIRES_CAPABILITY`
+
+```rust
+impl Projection for TicketInternalNotes {
+    const REQUIRES_CAPABILITY: Option<&'static str> = Some("staff");
+    // ...
+}
+```
+
+A grant opens the projection only by *holding* the capability `"staff"`
+in that bounded context (`RoleAccessMapping.capabilities`). Nothing
+implies it: not an admin level, not a superadmin Role, and not a Role
+that happens to be named `staff`. A caller without it is served a
+schema that does not contain the projection, and `projectionSchema`
+answers `Projection_not_found`, exactly as for a name that does not
+exist. Composes with `OWNER_TAG_KEY` (company-scoped *and* staff-only):
+both must hold.
+
+Granting is not done in Rust. A superadmin runs
+`grantCapability(roleId, boundedContext, capability)` (or
+`revokeCapability`), and can let a context admin hand out chosen names
+with `setDelegableCapabilities` - an admin may then grant and revoke
+those on *other* grants in its bounded context, never on its own. A
+name is lowercase letters, digits, `_` and `-`, up to 64 characters.
+`capabilityOverview` (superadmin) lists, per bounded context, what is
+required and what is held: a name in `requiredButNotHeld` is a
+projection nobody can read yet, and one in `heldButNotRequired` is
+usually a typo.
+
+The same names gate a private field: `PrivateField { kind:
+PrivateFieldKind::Capability, capability: Some("staff".into()), .. }`.
+This replaces `TEAM_ONLY` and the `team` private-field kind, which
+matched `Role.name`.

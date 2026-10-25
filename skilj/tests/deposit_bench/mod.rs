@@ -251,6 +251,8 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
         level: AccessLevel::Admin,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: now(),
         revoked_at: None,

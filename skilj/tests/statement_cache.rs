@@ -126,6 +126,8 @@ async fn setup(database_url: &str, pool: &Pool, contexts: usize, capacity: usize
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: now(),
             revoked_at: None,

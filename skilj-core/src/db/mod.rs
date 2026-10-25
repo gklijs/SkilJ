@@ -711,7 +711,8 @@ async fn provision_bounded_context_schema(
             schema TEXT NOT NULL,
             schema_version BIGINT NOT NULL,
             sync BOOLEAN NOT NULL,
-            caught_up_to BIGINT
+            caught_up_to BIGINT,
+            requires_capability TEXT
         )"
     )))
     .execute(&mut **tx)
@@ -3227,6 +3228,51 @@ pub async fn ensure_private_field_columns(
         &["private_fields"],
         format!("ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"),
     )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `projections.requires_capability` (docs/architecture.md §228,
+/// `Projection.requires_capability` in the spec), following
+/// `ensure_private_field_columns`'s own pattern for a bounded context
+/// provisioned before this column existed. Null for every projection
+/// registered before it: nothing was required, and the next
+/// registration writes what the compiled projection declares.
+pub async fn ensure_projection_requires_capability_column(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "projections",
+        &["requires_capability"],
+        format!(
+            "ALTER TABLE {schema}.projections ADD COLUMN IF NOT EXISTS requires_capability TEXT"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Set a registered projection's `requires_capability` on its own, for a
+/// re-registration that staged a rebuild: who may read applies at once,
+/// while the rest of the new definition waits for the rebuild.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn set_projection_requires_capability(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+    requires_capability: Option<&str>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.projections SET requires_capability = $1 WHERE name = $2"
+    )))
+    .bind(requires_capability)
+    .bind(name)
     .execute(pool)
     .await?;
     Ok(())
@@ -7191,6 +7237,7 @@ struct ProjectionRow {
     schema_version: i64,
     sync: bool,
     caught_up_to: Option<i64>,
+    requires_capability: Option<String>,
 }
 
 /// Every `EventType` a `projection_consumed_event_types`-style join table
@@ -7249,7 +7296,8 @@ async fn replace_consumed_event_types(
     Ok(())
 }
 
-const PROJECTION_COLUMNS: &str = "name, schema, schema_version, sync, caught_up_to";
+const PROJECTION_COLUMNS: &str =
+    "name, schema, schema_version, sync, caught_up_to, requires_capability";
 
 /// See `upsert_event_type` above - same upsert shape, plus replacing this
 /// projection's `projection_consumed_event_types` join rows wholesale
@@ -7289,16 +7337,18 @@ async fn upsert_projection_in_tx(
     let schema = schema_ident(&projection.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projections ({PROJECTION_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5) \
+         VALUES ($1,$2,$3,$4,$5,$6) \
          ON CONFLICT (name) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
-            sync = EXCLUDED.sync, caught_up_to = EXCLUDED.caught_up_to"
+            sync = EXCLUDED.sync, caught_up_to = EXCLUDED.caught_up_to, \
+            requires_capability = EXCLUDED.requires_capability"
     )))
     .bind(&projection.name)
     .bind(&projection.schema)
     .bind(projection.schema_version)
     .bind(projection.sync)
     .bind(projection.caught_up_to)
+    .bind(&projection.requires_capability)
     .execute(&mut **tx)
     .await?;
     replace_consumed_event_types(
@@ -7872,6 +7922,7 @@ pub async fn get_projection(
         consumed_event_types: consumed,
         sync: row.sync,
         caught_up_to: row.caught_up_to,
+        requires_capability: row.requires_capability,
     }))
 }
 
@@ -7912,6 +7963,7 @@ pub async fn list_projections_for_bounded_context(
             consumed_event_types: consumed,
             sync: row.sync,
             caught_up_to: row.caught_up_to,
+            requires_capability: row.requires_capability,
         });
     }
     // Name order, and part of the contract for the same reason
@@ -8277,6 +8329,8 @@ struct RoleAccessMappingRow {
     level: String,
     can_read_sensitive: bool,
     scope: Option<String>,
+    capabilities: Vec<String>,
+    delegable: Vec<String>,
     status: String,
     created_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
@@ -8316,6 +8370,8 @@ impl RoleAccessMappingRow {
             level: access_level_from_str(&self.level),
             can_read_sensitive: self.can_read_sensitive,
             scope: self.scope,
+            capabilities: self.capabilities.into_iter().collect(),
+            delegable: self.delegable.into_iter().collect(),
             status: role_status_from_str(&self.status),
             created_at: self.created_at,
             revoked_at: self.revoked_at,
@@ -8324,7 +8380,8 @@ impl RoleAccessMappingRow {
 }
 
 const ROLE_ACCESS_MAPPING_COLUMNS: &str =
-    "role_id, bounded_context, level, can_read_sensitive, scope, status, created_at, revoked_at";
+    "role_id, bounded_context, level, can_read_sensitive, scope, capabilities, delegable, \
+     status, created_at, revoked_at";
 
 #[tracing::instrument(skip_all)]
 pub async fn insert_role_access_mapping(
@@ -8333,13 +8390,15 @@ pub async fn insert_role_access_mapping(
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO role_access_mappings ({ROLE_ACCESS_MAPPING_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"
     )))
     .bind(&mapping.role.id)
     .bind(&mapping.bounded_context.name)
     .bind(access_level_to_str(mapping.level))
     .bind(mapping.can_read_sensitive)
     .bind(&mapping.scope)
+    .bind(mapping.capabilities.iter().collect::<Vec<_>>())
+    .bind(mapping.delegable.iter().collect::<Vec<_>>())
     .bind(role_status_to_str(mapping.status))
     .bind(mapping.created_at)
     .bind(mapping.revoked_at)
@@ -8373,6 +8432,80 @@ pub async fn get_active_role_access_mapping(
         Some(row) => row.into_domain(pool).await,
         None => Ok(None),
     }
+}
+
+/// Most capabilities one grant may hold, and most it may delegate
+/// (`invariant CapabilitiesAreWellFormed`). Enforced here too, in the
+/// statement that adds one, so two concurrent grants cannot both pass a
+/// count each read before the other wrote.
+pub const MAX_CAPABILITIES_PER_MAPPING: usize = 16;
+
+/// Add `capability` to the active mapping's `capabilities`, in one
+/// statement: `true` when it was added, `false` when the mapping is
+/// gone or revoked, already holds it, or already holds
+/// [`MAX_CAPABILITIES_PER_MAPPING`].
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn add_mapping_capability(
+    pool: &Pool,
+    role_id: &str,
+    bounded_context: &str,
+    capability: &str,
+) -> crate::error::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE role_access_mappings SET capabilities = array_append(capabilities, $1) \
+         WHERE role_id = $2 AND bounded_context = $3 AND status = 'active' \
+         AND NOT ($1 = ANY(capabilities)) AND cardinality(capabilities) < $4",
+    )
+    .bind(capability)
+    .bind(role_id)
+    .bind(bounded_context)
+    .bind(MAX_CAPABILITIES_PER_MAPPING as i32)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// Remove `capability` from the active mapping's `capabilities`: `true`
+/// when it was held and is now gone.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn remove_mapping_capability(
+    pool: &Pool,
+    role_id: &str,
+    bounded_context: &str,
+    capability: &str,
+) -> crate::error::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE role_access_mappings SET capabilities = array_remove(capabilities, $1) \
+         WHERE role_id = $2 AND bounded_context = $3 AND status = 'active' \
+         AND $1 = ANY(capabilities)",
+    )
+    .bind(capability)
+    .bind(role_id)
+    .bind(bounded_context)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// Replace the active mapping's `delegable` set: `true` when the mapping
+/// was active and so changed.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn set_mapping_delegable(
+    pool: &Pool,
+    role_id: &str,
+    bounded_context: &str,
+    delegable: &std::collections::BTreeSet<String>,
+) -> crate::error::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE role_access_mappings SET delegable = $1 \
+         WHERE role_id = $2 AND bounded_context = $3 AND status = 'active'",
+    )
+    .bind(delegable.iter().collect::<Vec<_>>())
+    .bind(role_id)
+    .bind(bounded_context)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
 }
 
 /// Every `RoleAccessMapping` this engine currently knows of, active or
@@ -8466,6 +8599,8 @@ async fn mappings_from_rows(
                 level: access_level_from_str(&row.level),
                 can_read_sensitive: row.can_read_sensitive,
                 scope: row.scope,
+                capabilities: row.capabilities.into_iter().collect(),
+                delegable: row.delegable.into_iter().collect(),
                 status: role_status_from_str(&row.status),
                 created_at: row.created_at,
                 revoked_at: row.revoked_at,
@@ -8489,6 +8624,23 @@ pub async fn list_accessible_bounded_context_names(
     .fetch_all(pool)
     .await?;
     Ok(names.into_iter().collect())
+}
+
+/// What `role_id` may see of each bounded context it has an active
+/// mapping to: the name and the capabilities that mapping holds. For the
+/// per-caller GraphQL schema, which leaves a projection out for a caller
+/// not holding the capability it requires (docs/architecture.md §228).
+pub async fn list_accessible_grants(
+    pool: &Pool,
+    role_id: &str,
+) -> crate::error::Result<Vec<(String, Vec<String>)>> {
+    Ok(sqlx::query_as(
+        "SELECT bounded_context, capabilities FROM role_access_mappings \
+         WHERE role_id = $1 AND status = 'active'",
+    )
+    .bind(role_id)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// Every currently-*active* `RoleAccessMapping` for one `Role` - the

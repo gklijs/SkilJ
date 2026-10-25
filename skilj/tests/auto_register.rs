@@ -254,6 +254,8 @@ async fn admin_role_on(pool: &Pool, bc: &BoundedContext) -> String {
         level: AccessLevel::Admin,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,

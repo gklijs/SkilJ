@@ -29,6 +29,25 @@ enum BankBoundedContextStatus @inaccessible {
 	ARCHIVED
 }
 
+type BankCapabilityDelegation @inaccessible {
+	delegable: [String!]!
+	grants: [BankCapabilityGrant!]!
+}
+
+type BankCapabilityGrant @inaccessible {
+	roleId: ID!
+	roleName: String!
+	capabilities: [String!]!
+}
+
+type BankCapabilityOverviewEntry @inaccessible {
+	boundedContext: String!
+	required: [String!]!
+	held: [String!]!
+	requiredButNotHeld: [String!]!
+	heldButNotRequired: [String!]!
+}
+
 type BankCommandApprovalPolicy @inaccessible {
 	approverRole: String
 	deadlineSeconds: Int
@@ -269,7 +288,7 @@ enum BankParkedDeliveryKind @inaccessible {
 type BankPrivateField {
 	field: String!
 	kind: BankPrivateFieldKind!
-	team: String
+	capability: String
 	addresseeField: String
 }
 
@@ -287,13 +306,13 @@ type BankPrivateFieldGrant {
 input BankPrivateFieldInput @inaccessible {
 	field: String! @inaccessible
 	kind: BankPrivateFieldKind! @inaccessible
-	team: String @inaccessible
+	capability: String @inaccessible
 	addresseeField: String @inaccessible
 }
 
 enum BankPrivateFieldKind {
 	OWN
-	TEAM
+	CAPABILITY
 	ADDRESSED
 }
 
@@ -303,6 +322,7 @@ type BankProjection {
 	schemaVersion: Int!
 	consumedEventTypes: [BankEventType!]!
 	sync: Boolean!
+	requiresCapability: String
 	caughtUpTo: Int
 	pendingRebuild: BankProjectionRebuild
 	buildingRebuild: BankProjectionRebuild
@@ -363,6 +383,8 @@ type BankRoleAccessMapping @inaccessible {
 	level: BankAccessLevel!
 	canReadSensitive: Boolean!
 	scope: String
+	capabilities: [String!]!
+	delegable: [String!]!
 	status: BankRoleStatus!
 }
 
@@ -443,6 +465,9 @@ type Mutation {
 	bankRevokeRole(roleId: ID!): BankRole! @inaccessible
 	bankGrantRoleAccessMapping(roleId: ID!, boundedContext: String!, level: BankAccessLevel!, canReadSensitive: Boolean!, scope: String): BankRoleAccessMapping! @inaccessible
 	bankRevokeRoleAccessMapping(roleId: ID!, boundedContext: String!): BankRoleAccessMapping! @inaccessible
+	bankGrantCapability(roleId: ID!, boundedContext: String!, capability: String!): BankRoleAccessMapping! @inaccessible
+	bankRevokeCapability(roleId: ID!, boundedContext: String!, capability: String!): BankRoleAccessMapping! @inaccessible
+	bankSetDelegableCapabilities(roleId: ID!, boundedContext: String!, delegable: [String!]!): BankRoleAccessMapping! @inaccessible
 	bankAddBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankCreateBoundedContextFromTemplate(template: String!, name: String!, roleId: ID!, level: BankAccessLevel!, canReadSensitive: Boolean!, scope: String): BankBoundedContext! @inaccessible
 	bankResyncBoundedContextFromTemplate(boundedContext: String!): BankBoundedContext! @inaccessible
@@ -450,7 +475,7 @@ type Mutation {
 	bankDeleteBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: BankMissedOccurrencePolicy): BankEventType! @inaccessible
 	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): BankCommandType! @inaccessible
-	bankRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): BankProjectionRegistrationResult! @inaccessible
+	bankRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, requiresCapability: String): BankProjectionRegistrationResult! @inaccessible
 	bankRebuildProjection(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
 	bankDiscardProjectionRebuild(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
 	bankRetryParkedDelivery(boundedContext: String!, id: String!): BankParkedDelivery! @inaccessible
@@ -472,6 +497,8 @@ type Mutation {
 
 type Query {
 	bankBoundedContexts: [BankBoundedContext!]! @inaccessible
+	bankCapabilityOverview: [BankCapabilityOverviewEntry!]! @inaccessible
+	bankCapabilityDelegation(boundedContext: String!): BankCapabilityDelegation! @inaccessible
 	bankProjections(boundedContext: String!): [BankProjection!]! @inaccessible
 	bankScheduledEventTypes(boundedContext: String!): [BankEventType!]! @inaccessible
 	bankEventTypes(boundedContext: String!): [BankEventType!]! @inaccessible

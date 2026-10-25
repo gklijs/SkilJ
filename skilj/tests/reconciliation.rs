@@ -224,6 +224,8 @@ async fn seed_admin_context(pool: &Pool) -> (String, String) {
         level: AccessLevel::Admin,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,
@@ -446,6 +448,8 @@ fn reconciliation_folds_pre_existing_history_into_a_first_time_sync_projection()
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -673,7 +677,7 @@ impl EventType for AccountOpenedProtected {
         vec![skilj_core::shared::PrivateField {
             field: "note".to_string(),
             kind: skilj_core::shared::PrivateFieldKind::Own,
-            team: None,
+            capability: None,
             addressee_field: None,
         }]
     }

@@ -29,6 +29,25 @@ enum LedgerBoundedContextStatus @inaccessible {
 	ARCHIVED
 }
 
+type LedgerCapabilityDelegation @inaccessible {
+	delegable: [String!]!
+	grants: [LedgerCapabilityGrant!]!
+}
+
+type LedgerCapabilityGrant @inaccessible {
+	roleId: ID!
+	roleName: String!
+	capabilities: [String!]!
+}
+
+type LedgerCapabilityOverviewEntry @inaccessible {
+	boundedContext: String!
+	required: [String!]!
+	held: [String!]!
+	requiredButNotHeld: [String!]!
+	heldButNotRequired: [String!]!
+}
+
 type LedgerCommandApprovalPolicy @inaccessible {
 	approverRole: String
 	deadlineSeconds: Int
@@ -269,7 +288,7 @@ enum LedgerParkedDeliveryKind @inaccessible {
 type LedgerPrivateField {
 	field: String!
 	kind: LedgerPrivateFieldKind!
-	team: String
+	capability: String
 	addresseeField: String
 }
 
@@ -287,13 +306,13 @@ type LedgerPrivateFieldGrant {
 input LedgerPrivateFieldInput @inaccessible {
 	field: String! @inaccessible
 	kind: LedgerPrivateFieldKind! @inaccessible
-	team: String @inaccessible
+	capability: String @inaccessible
 	addresseeField: String @inaccessible
 }
 
 enum LedgerPrivateFieldKind {
 	OWN
-	TEAM
+	CAPABILITY
 	ADDRESSED
 }
 
@@ -303,6 +322,7 @@ type LedgerProjection {
 	schemaVersion: Int!
 	consumedEventTypes: [LedgerEventType!]!
 	sync: Boolean!
+	requiresCapability: String
 	caughtUpTo: Int
 	pendingRebuild: LedgerProjectionRebuild
 	buildingRebuild: LedgerProjectionRebuild
@@ -363,6 +383,8 @@ type LedgerRoleAccessMapping @inaccessible {
 	level: LedgerAccessLevel!
 	canReadSensitive: Boolean!
 	scope: String
+	capabilities: [String!]!
+	delegable: [String!]!
 	status: LedgerRoleStatus!
 }
 
@@ -443,6 +465,9 @@ type Mutation {
 	ledgerRevokeRole(roleId: ID!): LedgerRole! @inaccessible
 	ledgerGrantRoleAccessMapping(roleId: ID!, boundedContext: String!, level: LedgerAccessLevel!, canReadSensitive: Boolean!, scope: String): LedgerRoleAccessMapping! @inaccessible
 	ledgerRevokeRoleAccessMapping(roleId: ID!, boundedContext: String!): LedgerRoleAccessMapping! @inaccessible
+	ledgerGrantCapability(roleId: ID!, boundedContext: String!, capability: String!): LedgerRoleAccessMapping! @inaccessible
+	ledgerRevokeCapability(roleId: ID!, boundedContext: String!, capability: String!): LedgerRoleAccessMapping! @inaccessible
+	ledgerSetDelegableCapabilities(roleId: ID!, boundedContext: String!, delegable: [String!]!): LedgerRoleAccessMapping! @inaccessible
 	ledgerAddBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerCreateBoundedContextFromTemplate(template: String!, name: String!, roleId: ID!, level: LedgerAccessLevel!, canReadSensitive: Boolean!, scope: String): LedgerBoundedContext! @inaccessible
 	ledgerResyncBoundedContextFromTemplate(boundedContext: String!): LedgerBoundedContext! @inaccessible
@@ -450,7 +475,7 @@ type Mutation {
 	ledgerDeleteBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: LedgerMissedOccurrencePolicy): LedgerEventType! @inaccessible
 	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): LedgerCommandType! @inaccessible
-	ledgerRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): LedgerProjectionRegistrationResult! @inaccessible
+	ledgerRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, requiresCapability: String): LedgerProjectionRegistrationResult! @inaccessible
 	ledgerRebuildProjection(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
 	ledgerDiscardProjectionRebuild(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
 	ledgerRetryParkedDelivery(boundedContext: String!, id: String!): LedgerParkedDelivery! @inaccessible
@@ -472,6 +497,8 @@ type Mutation {
 
 type Query {
 	ledgerBoundedContexts: [LedgerBoundedContext!]! @inaccessible
+	ledgerCapabilityOverview: [LedgerCapabilityOverviewEntry!]! @inaccessible
+	ledgerCapabilityDelegation(boundedContext: String!): LedgerCapabilityDelegation! @inaccessible
 	ledgerProjections(boundedContext: String!): [LedgerProjection!]! @inaccessible
 	ledgerScheduledEventTypes(boundedContext: String!): [LedgerEventType!]! @inaccessible
 	ledgerEventTypes(boundedContext: String!): [LedgerEventType!]! @inaccessible

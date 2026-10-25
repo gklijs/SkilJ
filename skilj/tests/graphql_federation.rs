@@ -279,6 +279,8 @@ async fn grant(pool: &Pool, role: &Role, bounded_context: &BoundedContext, level
         level,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,

@@ -219,6 +219,8 @@ fn access_mapping(can_read_sensitive: bool, external_subject: &str) -> RoleAcces
         level: AccessLevel::Read,
         can_read_sensitive,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: Utc::now(),
         revoked_at: None,

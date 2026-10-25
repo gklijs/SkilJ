@@ -83,7 +83,7 @@ impl ProjectionDispatcher for BenchDispatcher {
         self.default_state(bc, projection_name).map(|_| None)
     }
 
-    fn team_only(&self, bc: &str, projection_name: &str) -> Option<Option<&'static str>> {
+    fn requires_capability(&self, bc: &str, projection_name: &str) -> Option<Option<&'static str>> {
         self.default_state(bc, projection_name).map(|_| None)
     }
 }
@@ -173,6 +173,7 @@ async fn scenario(pool: &Pool, label: &str, projections: &[&str]) {
                 consumed_event_types: vec![et.clone()],
                 sync: false,
                 caught_up_to: None,
+                requires_capability: None,
             },
         )
         .await

@@ -194,6 +194,8 @@ async fn seed_active_role_access_mapping(
         level,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,
@@ -1136,6 +1138,195 @@ fn round_trips_an_active_role_access_mapping() {
 }
 
 #[test]
+fn a_projections_required_capability_round_trips_and_can_be_set_alone() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let mut projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: "{}".to_string(),
+            schema_version: 1,
+            consumed_event_types: vec![et],
+            sync: false,
+            caught_up_to: None,
+            requires_capability: Some("staff".to_string()),
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+        let read = db::get_projection(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.requires_capability.as_deref(), Some("staff"));
+        let listed = db::list_projections_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(listed[0].requires_capability.as_deref(), Some("staff"));
+
+        // Set on its own, as a re-registration that stages a rebuild does.
+        db::set_projection_requires_capability(&pool, &bc.name, &projection.name, Some("audit"))
+            .await
+            .unwrap();
+        let read = db::get_projection(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.requires_capability.as_deref(), Some("audit"));
+        assert_eq!(read.schema_version, 1);
+
+        projection.requires_capability = None;
+        db::upsert_projection(&pool, &projection).await.unwrap();
+        let read = db::get_projection(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.requires_capability, None);
+    });
+}
+
+#[test]
+fn capabilities_and_delegable_round_trip_and_default_to_empty() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let role = seed_role(&pool, false).await;
+        let plain = seed_active_role_access_mapping(&pool, &role, &bc, AccessLevel::Admin).await;
+        let read = db::get_active_role_access_mapping(&pool, &role.id, &bc.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(read.capabilities.is_empty() && read.delegable.is_empty());
+        assert_eq!(read, plain);
+
+        let role2 = seed_role(&pool, false).await;
+        let mut with = plain.clone();
+        with.role = role2.clone();
+        with.capabilities = ["staff".to_string(), "audit".to_string()].into();
+        with.delegable = ["staff".to_string()].into();
+        db::insert_role_access_mapping(&pool, &with).await.unwrap();
+        let read = db::get_active_role_access_mapping(&pool, &role2.id, &bc.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.capabilities, with.capabilities);
+        assert_eq!(read.delegable, with.delegable);
+    });
+}
+
+#[test]
+fn adding_and_removing_a_capability_is_atomic_and_bounded() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let role = seed_role(&pool, false).await;
+        seed_active_role_access_mapping(&pool, &role, &bc, AccessLevel::Write).await;
+        let held = |pool: Pool, role_id: String, bc_name: String| async move {
+            db::get_active_role_access_mapping(&pool, &role_id, &bc_name)
+                .await
+                .unwrap()
+                .unwrap()
+                .capabilities
+        };
+
+        assert!(
+            db::add_mapping_capability(&pool, &role.id, &bc.name, "staff")
+                .await
+                .unwrap()
+        );
+        // Already held: nothing changes.
+        assert!(
+            !db::add_mapping_capability(&pool, &role.id, &bc.name, "staff")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            held(pool.clone(), role.id.clone(), bc.name.clone()).await,
+            ["staff".to_string()].into()
+        );
+
+        // Concurrent adds of the same name: exactly one wins.
+        let results = futures_util::future::join_all((0..8).map(|_| {
+            let pool = pool.clone();
+            let (r, b) = (role.id.clone(), bc.name.clone());
+            async move {
+                db::add_mapping_capability(&pool, &r, &b, "audit")
+                    .await
+                    .unwrap()
+            }
+        }))
+        .await;
+        assert_eq!(results.iter().filter(|won| **won).count(), 1);
+
+        // The limit holds under concurrency too: 2 held, 14 more fit.
+        let results = futures_util::future::join_all((0..30).map(|i| {
+            let pool = pool.clone();
+            let (r, b) = (role.id.clone(), bc.name.clone());
+            async move {
+                db::add_mapping_capability(&pool, &r, &b, &format!("c{i}"))
+                    .await
+                    .unwrap()
+            }
+        }))
+        .await;
+        assert_eq!(results.iter().filter(|won| **won).count(), 14);
+        assert_eq!(
+            held(pool.clone(), role.id.clone(), bc.name.clone())
+                .await
+                .len(),
+            db::MAX_CAPABILITIES_PER_MAPPING
+        );
+
+        assert!(
+            db::remove_mapping_capability(&pool, &role.id, &bc.name, "staff")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db::remove_mapping_capability(&pool, &role.id, &bc.name, "staff")
+                .await
+                .unwrap()
+        );
+    });
+}
+
+#[test]
+fn capability_changes_and_delegable_touch_only_an_active_mapping() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let role = seed_role(&pool, false).await;
+        seed_active_role_access_mapping(&pool, &role, &bc, AccessLevel::Admin).await;
+        let names: std::collections::BTreeSet<String> = ["staff".to_string()].into();
+        assert!(db::set_mapping_delegable(&pool, &role.id, &bc.name, &names)
+            .await
+            .unwrap());
+
+        db::revoke_active_role_access_mapping(&pool, &role.id, &bc.name, Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            !db::add_mapping_capability(&pool, &role.id, &bc.name, "staff")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db::set_mapping_delegable(&pool, &role.id, &bc.name, &names)
+                .await
+                .unwrap()
+        );
+    });
+}
+
+#[test]
 fn get_active_role_access_mapping_is_none_when_no_mapping_exists() {
     runtime().block_on(async {
         let Some(pool) = test_pool().await else {
@@ -1313,6 +1504,7 @@ fn round_trips_a_projection_with_no_consumed_event_types() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
 
@@ -1340,6 +1532,7 @@ fn round_trips_a_projection_with_consumed_event_types() {
             consumed_event_types: vec![et_a.clone(), et_b.clone()],
             sync: true,
             caught_up_to: Some(41),
+            requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
 
@@ -1375,6 +1568,7 @@ fn upsert_projection_replaces_consumed_event_types() {
             consumed_event_types: vec![et_a.clone()],
             sync: false,
             caught_up_to: None,
+            requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
 
@@ -1422,6 +1616,7 @@ fn round_trips_a_projection_rebuild() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: Some(10),
+            requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
 
@@ -1465,6 +1660,7 @@ fn get_projection_rebuild_is_none_when_none_staged() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
 
@@ -1495,6 +1691,7 @@ fn upsert_projection_rebuild_restages_in_place_when_status_is_unchanged() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
         let first = ProjectionRebuild {
@@ -1546,6 +1743,7 @@ fn a_pending_and_a_building_rebuild_coexist_for_the_same_projection() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
 
@@ -1652,6 +1850,7 @@ fn transition_projection_rebuild_to_building_replaces_the_pending_row() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
         let pending = ProjectionRebuild {
@@ -1718,6 +1917,7 @@ fn delete_projection_rebuild_removes_it() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
         let rebuild = ProjectionRebuild {

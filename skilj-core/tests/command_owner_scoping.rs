@@ -121,6 +121,8 @@ fn access_mapping(scope: Option<&str>) -> RoleAccessMapping {
         level: AccessLevel::Admin,
         can_read_sensitive: false,
         scope: scope.map(str::to_string),
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: timestamp(0),
         revoked_at: None,

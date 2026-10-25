@@ -261,7 +261,7 @@ impl skilj_core::plugin::ProjectionDispatcher for NoProjections {
     fn owner_tag_key(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
         None
     }
-    fn team_only(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+    fn requires_capability(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
         None
     }
 }

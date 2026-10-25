@@ -623,37 +623,33 @@ pub trait Projection {
     /// `owner_scope_satisfied`.
     const OWNER_TAG_KEY: Option<&'static str> = None;
 
-    /// The `Role.name` required to query this projection at all, if any -
-    /// `None` (the default, and every projection that predates this) for
-    /// one with no such notion. Deliberately Rust-only, no spec entity
-    /// field and no registration/admin-visible surface, the identical
-    /// treatment `OWNER_TAG_KEY` just above gets and for the same reason.
+    /// The capability a grant must hold to query this projection at all
+    /// (`RoleAccessMapping::capabilities`), if any - `None` (the default,
+    /// and every projection that predates this) for one anybody with read
+    /// access may query. A superadmin grants or revokes it, or an admin
+    /// allowed to delegate it (`RoleAccessMapping::delegable`); see
+    /// `access_control::grant_capability`. A name is lowercase letters,
+    /// digits, `_` and `-`, up to 64 characters
+    /// (`access_control::valid_capability_name`).
     ///
     /// Unlike `OWNER_TAG_KEY`, which is derived per-instance from folded
     /// event tags, this is a fixed, whole-projection gate: it names no
-    /// dimension to look up per instance, just one required team, so
-    /// either every instance of this projection is reachable by a
-    /// matching Role or none are - never a per-instance answer.
-    /// Composes with `OWNER_TAG_KEY` rather than replacing it: a
-    /// projection may declare both (staff-only *and* company-scoped),
-    /// and `query_projection` checks both independently. See that
-    /// function's own doc comment and specs/skilj.allium's
-    /// `team_only_satisfied`.
+    /// dimension to look up per instance, just one required capability, so
+    /// either every instance of this projection is reachable by a holder
+    /// or none are - never a per-instance answer. Composes with
+    /// `OWNER_TAG_KEY` rather than replacing it: a projection may declare
+    /// both (staff-only *and* company-scoped), and `query_projection`
+    /// checks both independently. Nothing implies a capability: not an
+    /// admin level, not a superadmin Role, not a Role that happens to be
+    /// named like it. To a grant without it the projection answers as if
+    /// it did not exist. See that function's own doc comment and
+    /// specs/skilj.allium's `CapabilityGatedWhenDeclared`.
     ///
-    /// Genuinely different in kind from `private_fields`' own `Team`
-    /// kind, even though the membership test is identical
-    /// (`Role.name` equality) - `private_fields` redacts one field of
-    /// one raw event/command, for one reader, traced back to who created
-    /// that specific record; a projection's stored state is one shared
-    /// value folded from possibly many events by `project()`, with no
-    /// single record each field individually traces back to, so nothing
-    /// short of a whole-instance gate generalizes to it (issue
-    /// #17's own finding, closing the gap left by `private_fields`
-    /// itself: it protects `queryEvents`/`fetchCommands`, surfaces no
-    /// `Write`-level Role can reach anyway, while `ProjectionQuery` - the
-    /// one surface a `Write`-level Role *can* reach - stayed exactly as
-    /// open as before).
-    const TEAM_ONLY: Option<&'static str> = None;
+    /// Replaces `TEAM_ONLY`, which matched `Role.name` exactly and so
+    /// needed every member of a team to share one Role name (issue #17).
+    /// The requirement is read from the compiled projection; an
+    /// admin-readable copy registered alongside it is a follow-up.
+    const REQUIRES_CAPABILITY: Option<&'static str> = None;
 
     /// How many partitions this projection's own `keys()` values hash
     /// into for async catch-up (issue #25,
@@ -668,14 +664,14 @@ pub trait Projection {
     /// `catch_up_partitioned_projection`'s own doc comment for the
     /// mechanism. Deliberately Rust-only, no spec entity field and no
     /// registration/admin-visible surface, the identical treatment
-    /// `OWNER_TAG_KEY`/`TEAM_ONLY` above already get: it's a pure
+    /// `OWNER_TAG_KEY`/`REQUIRES_CAPABILITY` above already get: it's a pure
     /// work-distribution detail, invisible to what `project()` actually
     /// folds, so changing it between deploys needs no rebuild (unlike
     /// `schema`/`consumed_event_types`/`sync`, which change what gets
     /// folded - see `register_projection`'s own rebuild-trigger logic).
     /// Meaningful only for `sync() == false`; inert (never validated
     /// against, never rejected) for a sync one, the same stance
-    /// `OWNER_TAG_KEY`/`TEAM_ONLY` already take toward combinations that
+    /// `OWNER_TAG_KEY`/`REQUIRES_CAPABILITY` already take toward combinations that
     /// don't make sense rather than erroring on them.
     const PARTITION_COUNT: u32 = 1;
 
@@ -1263,7 +1259,7 @@ pub trait ProjectionDispatcher: Send + Sync {
         projection_name: &str,
     ) -> Option<Option<&'static str>>;
 
-    /// The registered projection's own `Projection::TEAM_ONLY` - the
+    /// The registered projection's own `Projection::REQUIRES_CAPABILITY` - the
     /// identical `Option<Option<_>>` shape `owner_tag_key` just above
     /// already has, for the same reason. Defaulted to `None` (unlike
     /// `owner_tag_key`, which has no default) - every call site here
@@ -1271,7 +1267,7 @@ pub trait ProjectionDispatcher: Send + Sync {
     /// isn't registered" `None` and the inner "registered, no team
     /// declared" `Some(None)` already read identically, so a dispatcher
     /// with nothing team-gated needs no explicit override at all.
-    fn team_only(
+    fn requires_capability(
         &self,
         _bounded_context: &str,
         _projection_name: &str,
@@ -1285,7 +1281,7 @@ pub trait ProjectionDispatcher: Send + Sync {
     /// already has, treated by every real caller (`db::
     /// catch_up_bounded_context`) identically to `Some(1)`: unpartitioned.
     /// Defaulted (unlike `owner_tag_key`, which has no default) for the
-    /// same reason `team_only` is - a dispatcher with nothing partitioned
+    /// same reason `requires_capability` is - a dispatcher with nothing partitioned
     /// needs no explicit override at all.
     fn partition_count(&self, _bounded_context: &str, _projection_name: &str) -> Option<u32> {
         None

@@ -4,7 +4,7 @@
 //! named by the payload) and the owner-tag `scope` cross-tenant series
 //! ([§23](../../docs/architecture.md#cross-tenant-projection-read-fix-owner-tag)-30). Unlike both of those, this is a plain read-time redaction
 //! rule with no encryption anywhere behind it: a private field is always
-//! stored in plaintext, and `own`/`team`/`addressed` each name a
+//! stored in plaintext, and `own`/`capability`/`addressed` each name a
 //! different default reader for it (see `value PrivateField` in the
 //! spec).
 //!
@@ -66,6 +66,8 @@ fn access_mapping(role: Role, level: AccessLevel) -> RoleAccessMapping {
         level,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status: RoleStatus::Active,
         created_at: timestamp(0),
         revoked_at: None,
@@ -76,16 +78,16 @@ fn own_field() -> PrivateField {
     PrivateField {
         field: "note".into(),
         kind: PrivateFieldKind::Own,
-        team: None,
+        capability: None,
         addressee_field: None,
     }
 }
 
-fn team_field(team: &str) -> PrivateField {
+fn capability_field(capability: &str) -> PrivateField {
     PrivateField {
         field: "note".into(),
-        kind: PrivateFieldKind::Team,
-        team: Some(team.into()),
+        kind: PrivateFieldKind::Capability,
+        capability: Some(capability.into()),
         addressee_field: None,
     }
 }
@@ -94,7 +96,7 @@ fn addressed_field() -> PrivateField {
     PrivateField {
         field: "note".into(),
         kind: PrivateFieldKind::Addressed,
-        team: None,
+        capability: None,
         addressee_field: Some("addressee_id".into()),
     }
 }
@@ -209,10 +211,10 @@ fn valid_private_fields_accepts_a_real_own_field() {
 }
 
 #[test]
-fn valid_private_fields_accepts_a_real_team_field() {
+fn valid_private_fields_accepts_a_real_capability_field() {
     assert!(event_store::valid_private_fields(
         &schema(),
-        &[team_field("staff")]
+        &[capability_field("staff")]
     ));
 }
 
@@ -232,16 +234,16 @@ fn valid_private_fields_rejects_a_field_the_schema_does_not_declare() {
 }
 
 #[test]
-fn valid_private_fields_rejects_a_team_field_missing_its_team() {
-    let mut f = team_field("staff");
-    f.team = None;
+fn valid_private_fields_rejects_a_capability_field_missing_its_capability() {
+    let mut f = capability_field("staff");
+    f.capability = None;
     assert!(!event_store::valid_private_fields(&schema(), &[f]));
 }
 
 #[test]
-fn valid_private_fields_rejects_an_own_field_carrying_a_team() {
+fn valid_private_fields_rejects_an_own_field_carrying_a_capability() {
     let mut f = own_field();
-    f.team = Some("staff".into());
+    f.capability = Some("staff".into());
     assert!(!event_store::valid_private_fields(&schema(), &[f]));
 }
 
@@ -434,12 +436,12 @@ fn is_default_private_reader_fails_closed_when_the_addressee_field_is_absent() {
 }
 
 #[test]
-fn is_default_private_reader_fails_for_a_type_declaring_only_team_kind_fields() {
-    let et = event_type(vec![team_field("staff")]);
+fn is_default_private_reader_fails_for_a_type_declaring_only_capability_kind_fields() {
+    let et = event_type(vec![capability_field("staff")]);
     let e = event(&et, 0, "role-1", r#"{"note":"internal"}"#);
     let creator = role("role-1", "Agent", "agent@x");
 
-    // Even the creator is not the "default reader" of a team-kind field -
+    // Even the creator is not the "default reader" of a capability-kind field -
     // there is no default reader to be, see enum PrivateFieldKind.
     assert!(!event_store::is_default_private_reader(&e, &creator));
 }
@@ -481,11 +483,21 @@ fn render_event_redacts_an_own_field_from_a_non_creator_to_null() {
     assert_eq!(rendered, r#"{"note":null}"#);
 }
 
+fn staff_mapping(role: Role, level: AccessLevel, capabilities: &[&str]) -> RoleAccessMapping {
+    let mut mapping = access_mapping(role, level);
+    mapping.capabilities = capabilities.iter().map(|c| c.to_string()).collect();
+    mapping
+}
+
 #[test]
-fn render_event_leaves_a_team_field_visible_to_a_matching_role_name() {
-    let et = event_type(vec![team_field("staff")]);
+fn render_event_leaves_a_capability_field_visible_to_a_grant_holding_it() {
+    let et = event_type(vec![capability_field("staff")]);
     let e = event(&et, 0, "someone", r#"{"note":"internal"}"#);
-    let mapping = access_mapping(role("role-9", "staff", "staff@x"), AccessLevel::Admin);
+    let mapping = staff_mapping(
+        role("role-9", "anything", "a@x"),
+        AccessLevel::Read,
+        &["staff"],
+    );
 
     let rendered = event_store::render_event(&e, &mapping, &no_key, &[]);
 
@@ -493,10 +505,30 @@ fn render_event_leaves_a_team_field_visible_to_a_matching_role_name() {
 }
 
 #[test]
-fn render_event_redacts_a_team_field_from_a_non_matching_role_name() {
-    let et = event_type(vec![team_field("staff")]);
+fn render_event_redacts_a_capability_field_from_a_grant_without_it() {
+    let et = event_type(vec![capability_field("staff")]);
     let e = event(&et, 0, "someone", r#"{"note":"internal"}"#);
-    let mapping = access_mapping(role("role-9", "customer", "cust@x"), AccessLevel::Admin);
+    let mapping = staff_mapping(
+        role("role-9", "customer", "cust@x"),
+        AccessLevel::Admin,
+        &["other"],
+    );
+
+    let rendered = event_store::render_event(&e, &mapping, &no_key, &[]);
+
+    assert_eq!(rendered, r#"{"note":null}"#);
+}
+
+/// The regression this whole change exists for: a Role merely *named*
+/// `staff`, at admin level, and even a superadmin, opens nothing - only
+/// the capability does.
+#[test]
+fn render_event_ignores_role_name_level_and_superadmin() {
+    let et = event_type(vec![capability_field("staff")]);
+    let e = event(&et, 0, "someone", r#"{"note":"internal"}"#);
+    let mut named = role("role-9", "staff", "staff@x");
+    named.superadmin = true;
+    let mapping = staff_mapping(named, AccessLevel::Admin, &[]);
 
     let rendered = event_store::render_event(&e, &mapping, &no_key, &[]);
 
@@ -676,8 +708,8 @@ fn redact_private_fields_nulls_an_own_field_unconditionally() {
 }
 
 #[test]
-fn redact_private_fields_nulls_a_team_field_unconditionally() {
-    let et = event_type(vec![team_field("staff")]);
+fn redact_private_fields_nulls_a_capability_field_unconditionally() {
+    let et = event_type(vec![capability_field("staff")]);
     let e = event(&et, 0, "role-1", r#"{"note":"internal"}"#);
 
     let redacted = event_store::redact_private_fields(&e);

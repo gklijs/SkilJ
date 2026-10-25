@@ -503,8 +503,9 @@ value PrivateField {
                                   -- shape note above entity CommandType)
     kind: PrivateFieldKind       -- which of the three visibility rules this field
                                   -- follows - see the enum for what each means
-    team: String?                -- the Role.name this field is visible to, and set
-                                  -- exactly when kind = team; null for the other two
+    capability: String?          -- the capability a grant must hold to see this field,
+                                  -- and set exactly when kind = capability; null for the
+                                  -- other two
                                   -- kinds. Checked at every registration by
                                   -- valid_private_fields (see rule RegisterEventType)
     addressee_field: String?     -- name of the payload field this type reads the
@@ -552,11 +553,15 @@ enum EventReadStartPosition { beginning | latest | at_sequence | at_time }
 --     creator alone: it may grant another Role read access to one
 --     specific record or to every record of its own it has made or will
 --     make, and revoke that again later.
---   - team. Visible to any Role whose own name equals the fixed string
---     the field declares in PrivateField.team. Nothing is granted and
---     nothing needs to be: membership is the grant, instantly and
---     automatically, and it stops the moment the Role is no longer named
---     that. A "staff-only" field is one instance of this rather than a
+--   - capability. Visible to any grant in the field's bounded context
+--     that holds the capability the field declares in
+--     PrivateField.capability (RoleAccessMapping.capabilities). Nothing
+--     is shared by the record's creator: an admin or superadmin grants
+--     the capability to the grant (GrantCapabilityAsAdmin and
+--     GrantCapabilityAsSuperadmin), and it stops the moment the
+--     capability is revoked. This replaces the earlier team kind, which
+--     matched Role.name and so needed every member's Role to share one
+--     name. A "staff-only" field is one instance of this rather than a
 --     mechanism of its own.
 --   - addressed. Visible by default to the one other party the payload
 --     itself names, read from the second payload field
@@ -583,7 +588,7 @@ enum EventReadStartPosition { beginning | latest | at_sequence | at_time }
 -- projection it depends on is lagging, and it is left whole for a later
 -- pass rather than built halfway here. Nothing in this file is shaped
 -- around it and nothing in this file forecloses it.
-enum PrivateFieldKind { own | team | addressed }
+enum PrivateFieldKind { own | capability | addressed }
 
 -- What a scheduled EventType owes for an occurrence of its own schedule
 -- that passed while nothing was watching for it. Named rather than inline
@@ -1358,6 +1363,39 @@ entity RoleAccessMapping {
                                              -- CommandDecision.rejection_kind gets (see rule
                                              -- QueryProjection's guidance on
                                              -- owner_scope_satisfied for the full contract).
+    capabilities: Set<String>               -- named privileges this grant holds within its
+                                             -- bounded context, each a well-formed name
+                                             -- (valid_capability_name). Empty - which is
+                                             -- what every grant holds unless a capability
+                                             -- is granted afterwards - means none. Orthogonal
+                                             -- to level, to can_read_sensitive and to scope:
+                                             -- where those say how much, this says which
+                                             -- named gates the grant opens. A projection
+                                             -- (Projection.requires_capability) or a
+                                             -- capability-kind private field names the one
+                                             -- capability it needs, and a grant opens it
+                                             -- only by holding that exact name. No level
+                                             -- implies one: an admin grant holds exactly
+                                             -- the capabilities it was given, and a
+                                             -- superadmin Role gets none from
+                                             -- superadmin = true either. Changed in place by
+                                             -- GrantCapability and RevokeCapability, the one
+                                             -- thing about a mapping that is, because a
+                                             -- member joining or leaving a team is an
+                                             -- everyday operation that must not interrupt
+                                             -- the rest of the grant (see
+                                             -- UniqueActiveAccessPerRoleAndContext)
+    delegable: Set<String>                  -- the capabilities this grant may hand out to
+                                             -- other grants in its own bounded context,
+                                             -- meaningful only when level = admin and empty
+                                             -- otherwise. Set by a superadmin alone
+                                             -- (SetDelegableCapabilities), never by the
+                                             -- admin it belongs to, so delegation cannot
+                                             -- pass itself along. Separate from
+                                             -- capabilities on purpose: an admin may manage
+                                             -- who belongs to a team without being a member
+                                             -- of it, and so without being able to read
+                                             -- what the team alone may read
     status: active | revoked
     created_at: Timestamp
     revoked_at: Timestamp? when status = revoked
@@ -1610,6 +1648,18 @@ entity Projection {
     -- being created inline find exactly the sync projections it must
     -- update, without a runtime discovery step.
     consumed_event_types: Set<EventType>
+
+    -- The capability a grant must hold to query this projection at all, or
+    -- null for one anybody with read access may query. Declared by the
+    -- Rust projection definition and reconciled here by RegisterProjection
+    -- like schema, so an admin can read it back (CapabilityOverview) -
+    -- unlike the compiled-only team requirement it replaces. Covers the
+    -- projection whole rather than one instance of it, and composes with
+    -- the owner dimension: a projection may require both, and a query
+    -- must satisfy both. A change takes effect on the next query; it
+    -- neither rebuilds the projection nor bumps schema_version, since it
+    -- changes who may read, not what is folded.
+    requires_capability: String?
 
     -- Opt-in, and deliberate friction: use with care. A sync projection
     -- is updated inline, in the same transaction as the event that feeds
@@ -3085,8 +3135,8 @@ rule FetchEvents {
         -- structurally rather than by omission, which is why nothing needs
         -- to be decided per call. An EventReadToken is scoped to an
         -- EventType and tied to no Role: it is nobody's metadata.client_id,
-        -- so no own-kind field can match; it carries no Role.name, so no
-        -- team-kind field can match; and it carries no external_subject, so
+        -- so no own-kind field can match; it holds no capabilities, so no
+        -- capability-kind field can match; and it carries no external_subject, so
         -- no addressed-kind field can match. No PrivateFieldGrant can reach
         -- it either, since a grant names a Role as its grantee and there is
         -- no Role here to be named. So evaluating the three tests per field
@@ -3439,14 +3489,16 @@ rule QueryProjection {
     -- declares no owner dimension.
     requires: owner_scope_satisfied(projection, instance_key, access_mapping)
 
-    -- The membership check, decided against the querying grant's own Role
-    -- name and covering the projection whole rather than any one instance
-    -- of it - see the team_only_satisfied paragraphs in the guidance
-    -- below. Independent of the ownership check above and failing
+    -- The capability check, decided against the querying grant's own
+    -- capabilities and covering the projection whole rather than any one
+    -- instance of it - see the capability paragraph in the
+    -- guidance below. Independent of the ownership check above and failing
     -- separately from it: a projection may declare both, and a query must
-    -- satisfy both. Vacuously true for any projection that declares no
-    -- required team, which is every projection unless one names one.
-    requires: team_only_satisfied(projection, access_mapping)
+    -- satisfy both. Vacuously true for any projection that requires no
+    -- capability, which is every projection unless one names one.
+    requires:
+        projection.requires_capability = null
+        or projection.requires_capability in access_mapping.capabilities
 
     -- wait_for_sequence names a position the caller already knows, which
     -- means one already committed: the triggered events of a command it
@@ -3557,35 +3609,30 @@ rule QueryProjection {
         -- already get - invisible, not merely unreadable - see
         -- GrantScopedToOwnerWhenDeclared on surface ProjectionQuery.
         --
-        -- team_only_satisfied(projection, access_mapping) is a black box
-        -- in that same register, and gates the projection whole rather
+        -- the capability check above gates the projection whole rather
         -- than one instance of it. A projection may optionally declare
-        -- which Role name is required to query it at all - "support", say,
-        -- or "operations". That declaration gets identical treatment to
-        -- the owner tag key described just above: deliberately not a field
-        -- on entity Projection, with no registration and no admin-visible
-        -- surface anywhere, compiled and deployed configuration only. It
-        -- reuses a team-kind private field's own semantics exactly (see
-        -- enum PrivateFieldKind) - membership is the grant, decided by
-        -- Role.name equality, with nothing to share, nothing to revoke,
-        -- and entitlement ending the moment the Role is no longer named
-        -- that. What differs is only what it covers: one projection
-        -- entire, rather than one field of one record.
+        -- the one capability a grant must hold to query it at all -
+        -- "staff", say, or "operations" (Projection.requires_capability).
+        -- Unlike the owner tag key just above, the requirement is
+        -- registered and admin-readable, because who may hold it is admin
+        -- data (RoleAccessMapping.capabilities) and an admin needs to see
+        -- what a name gates. It replaces the earlier compiled-only team
+        -- requirement, which matched Role.name exactly and so needed every
+        -- member's Role to carry one shared name.
         --
         -- The predicate holds, and the query proceeds, when either of two
-        -- things is true: the projection declares no required team at all,
-        -- so there is no membership to hold and it reads exactly as every
-        -- projection read before this existed; or it does declare one and
-        -- access_mapping.role.name equals it exactly. It does not hold,
-        -- and the query is rejected, when the projection declares a
-        -- required team and the querying grant's own Role carries a
-        -- different name. This is a separate test from the ownership one
-        -- above rather than a refinement of it - a projection declaring
-        -- both is answered only when both hold - and what a rejected query
-        -- leaves the caller with is the same framing the owner mismatch
-        -- gets: invisible, not merely unreadable - see
-        -- TeamGatedWhenDeclared on surface ProjectionQuery, which states
-        -- it in the same terms GrantScopedToOwnerWhenDeclared does.
+        -- things is true: the projection requires no capability, so it
+        -- reads exactly as every projection read before this existed; or
+        -- it does and access_mapping.capabilities contains it. It does not
+        -- hold, and the query is rejected, when the projection requires a
+        -- capability the grant does not hold - whatever its level, and
+        -- whether or not its Role is a superadmin. This is a separate test
+        -- from the ownership one above rather than a refinement of it - a
+        -- projection declaring both is answered only when both hold - and
+        -- what a rejected query leaves the caller with is the same framing
+        -- the owner mismatch gets: invisible, not merely unreadable, and
+        -- answered exactly as a projection that does not exist is - see
+        -- CapabilityGatedWhenDeclared on surface ProjectionQuery.
 }
 
 -- CreateAllEventsSubscription and CreateEventTypeSubscription register a
@@ -3726,10 +3773,10 @@ rule CreateEventTypeSubscription {
 --     was made. That is what keeps a blanket grant a convenience instead
 --     of a wider trust boundary: it can never let a grantee see something
 --     its grantor could not have handed over one record at a time.
--- For a team-kind field, the caller is entitled when
--- access_mapping.role.name equals that field's own declared team, and
--- there is no grant to look for - membership is the grant (see enum
--- PrivateFieldKind).
+-- For a capability-kind field, the caller is entitled when
+-- access_mapping.capabilities contains that field's own declared
+-- capability, and there is no PrivateFieldGrant to look for - holding
+-- the capability is the grant (see enum PrivateFieldKind).
 --
 -- A caller with none of those gets the record, with that one JSON leaf
 -- set to null. Not the enclosing object, not the whole record withheld,
@@ -3751,7 +3798,7 @@ rule CreateEventTypeSubscription {
 -- That is not a stricter policy bolted onto that track but the same three
 -- tests reaching their only possible answer there. Each is stated in
 -- terms of a Role, and an EventReadToken is tied to none: it is nobody's
--- client_id, carries no Role.name and carries no external_subject, and no
+-- client_id, holds no capabilities and carries no external_subject, and no
 -- PrivateFieldGrant can name it as a grantee. So all three fail closed
 -- structurally, and the black box states that outcome directly rather
 -- than computing a foregone conclusion per field. Declaring
@@ -5247,6 +5294,8 @@ rule CreateBoundedContextFromTemplate {
             level: level,
             can_read_sensitive: can_read_sensitive,
             scope: scope,
+            capabilities: {},
+            delegable: {},
             status: active,
             created_at: now
         )
@@ -5665,12 +5714,13 @@ rule ApplyTemplateRegistrations {
 -- subject_field do - and it asks one further question they have no
 -- counterpart for, because PrivateField is the first of these value types
 -- whose own fields are conditional on a kind. That further question needs
--- no schema knowledge at all, only the declaration's own shape: team is
--- set and addressee_field is null exactly when kind = team,
--- addressee_field is set and team is null exactly when kind = addressed,
--- and both are null when kind = own. Anything else is rejected outright,
+-- no schema knowledge at all, only the declaration's own shape:
+-- capability is set (and a valid_capability_name) and addressee_field is
+-- null exactly when kind = capability, addressee_field is set and
+-- capability is null exactly when kind = addressed, and both are null
+-- when kind = own. Anything else is rejected outright,
 -- the same as an invalid tag mapping is, rather than registered as a rule
--- no reader could evaluate - a team field naming no team, or an addressed
+-- no reader could evaluate - a capability field naming no capability, or an addressed
 -- field naming no addressee field, is one nobody could ever be entitled
 -- to, so it would silently redact itself from everybody forever.
 --
@@ -6080,12 +6130,13 @@ rule RegisterCommandType {
 
 rule RegisterProjection {
     when: RegisterProjection(access_mapping, bounded_context, name, schema,
-        consumed_event_types, sync)
+        consumed_event_types, sync, requires_capability?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
     requires: valid_schema(schema)
+    requires: requires_capability = null or valid_capability_name(requires_capability)
 
     -- Every EventType a projection consumes must belong to the same
     -- bounded context: a projection is built from its own context's
@@ -6172,6 +6223,7 @@ rule RegisterProjection {
                 schema_version: 1,
                 consumed_event_types: consumed_event_types,
                 sync: sync,
+                requires_capability: requires_capability,
                 -- The bounded context's latest committed sequence, not
                 -- merely the latest one of a consumed type: the history is
                 -- folded through the same black-box project() an async
@@ -6192,6 +6244,10 @@ rule RegisterProjection {
                     else: null
             )
         else if rebuild_needed:
+            -- Who may read is not part of what a rebuild replays, so the
+            -- live definition takes the new requirement at once rather
+            -- than waiting for the staged one to be promoted.
+            existing.requires_capability = requires_capability
             if exists staged:
                 staged.schema = schema
                 staged.schema_version =
@@ -6217,6 +6273,7 @@ rule RegisterProjection {
             -- registration non-trivial.
             existing.consumed_event_types = consumed_event_types
             existing.sync = sync
+            existing.requires_capability = requires_capability
 }
 
 -- The admin action the staging above waits for, and the only thing in this
@@ -6700,9 +6757,94 @@ rule GrantRoleAccessMapping {
             level: level,
             can_read_sensitive: can_read_sensitive,
             scope: scope,
+            capabilities: {},
+            delegable: {},
             status: active,
             created_at: now
         )
+}
+
+-- Capabilities (docs/architecture.md, the section replacing §32's
+-- Role.name team gate). A capability is a named privilege a grant holds
+-- within one bounded context; a projection or a private field requires
+-- exactly one, and a grant opens it only by holding that name. These
+-- rules are the only way a grant's capabilities change after creation.
+--
+-- valid_capability_name(name) is a black box in the register of
+-- valid_schema: lowercase letters, digits, underscore and hyphen, one to
+-- sixty-four characters. A malformed name is refused outright. A
+-- well-formed name that no registered type requires is accepted - types
+-- may register after grants are made (a bounded context is bootstrapped
+-- with its reconciliation grant before any type exists) - and surfaces
+-- instead in surface CapabilityOverview, so a typo fails closed and is
+-- visible rather than rejected on an ordering it cannot control.
+--
+-- Two actors may change a grant's capabilities. A superadmin may change
+-- any grant's, including its own. A context admin may change only those
+-- of other grants in its own bounded context, only for names in its own
+-- delegable set, and never its own: handing out access is separated from
+-- holding it, so an admin cannot grant itself a delegable capability and
+-- thereby read what the capability gates (SelfGrantRefused).
+
+rule GrantCapabilityAsSuperadmin {
+    when: GrantCapabilityAsSuperadmin(caller, target, capability)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: target.status = active
+    requires: valid_capability_name(capability)
+    requires: capability not in target.capabilities
+    requires: target.capabilities.count < 16
+    ensures: target.capabilities = target.capabilities + {capability}
+}
+
+rule RevokeCapabilityAsSuperadmin {
+    when: RevokeCapabilityAsSuperadmin(caller, target, capability)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: target.status = active
+    requires: capability in target.capabilities
+    ensures: target.capabilities = target.capabilities - {capability}
+}
+
+rule GrantCapabilityAsAdmin {
+    when: GrantCapabilityAsAdmin(access_mapping, target, capability)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: target.status = active
+    requires: target.bounded_context = access_mapping.bounded_context
+    requires: target.role != access_mapping.role
+    requires: capability in access_mapping.delegable
+    requires: capability not in target.capabilities
+    requires: target.capabilities.count < 16
+    ensures: target.capabilities = target.capabilities + {capability}
+}
+
+rule RevokeCapabilityAsAdmin {
+    when: RevokeCapabilityAsAdmin(access_mapping, target, capability)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: target.status = active
+    requires: target.bounded_context = access_mapping.bounded_context
+    requires: target.role != access_mapping.role
+    requires: capability in access_mapping.delegable
+    requires: capability in target.capabilities
+    ensures: target.capabilities = target.capabilities - {capability}
+}
+
+-- Only a superadmin decides what an admin may hand out. Lowering the set
+-- does not reach back: capabilities the admin already granted stay where
+-- they are, since delegation governs who may change things from now on,
+-- not whose access is quietly removed because someone else's was. A
+-- superadmin revokes individual grants with RevokeCapabilityAsSuperadmin.
+rule SetDelegableCapabilities {
+    when: SetDelegableCapabilities(caller, target, delegable)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: target.status = active
+    requires: target.level = admin
+    requires: delegable.all(c => valid_capability_name(c))
+    requires: delegable.count <= 16
+    ensures: target.delegable = delegable
 }
 
 rule RevokeRoleAccessMapping {
@@ -6840,7 +6982,7 @@ rule GrantPrivateFieldAccessForEvent {
         --     payload field rather than an EncryptionKey's subject_value.
         --
         -- It does not hold otherwise, and in particular does not hold at
-        -- all for a record whose type declares only team-kind private
+        -- all for a record whose type declares only capability-kind private
         -- fields, or none: there is no default reader to be, so there is
         -- nothing to share and the grant is refused rather than made
         -- empty. Nor does it hold for a caller presenting no Role - a REST
@@ -6928,8 +7070,8 @@ rule RevokePrivateFieldAccess {
 -- trigger with overlapping preconditions is an ambiguity, not a
 -- clarification: the admin case genuinely includes the self case.
 --
--- Nothing is ever listed for a team-kind private field, and nothing is
--- missing when nothing is: team membership is the grant, so there is no
+-- Nothing is ever listed for a capability-kind private field, and nothing is
+-- missing when nothing is: holding the capability is the grant, so there is no
 -- row for it to have made and none for this to find (see enum
 -- PrivateFieldKind).
 
@@ -7289,6 +7431,18 @@ invariant UniqueActiveAccessPerRoleAndContext {
         for b in RoleAccessMappings:
             a != b and a.role = b.role and a.bounded_context = b.bounded_context
                 implies not (a.status = active and b.status = active)
+}
+
+invariant CapabilitiesAreWellFormed {
+    -- Every capability name a grant holds or may delegate is well formed
+    -- (valid_capability_name), and a grant holds and delegates at most
+    -- sixteen of each, so what a grant can do stays small enough to read
+    -- off in one place.
+    for m in RoleAccessMappings:
+        m.capabilities.all(c => valid_capability_name(c))
+        and m.delegable.all(c => valid_capability_name(c))
+        and m.capabilities.count <= 16
+        and m.delegable.count <= 16
 }
 
 invariant UniqueActiveExternalSubject {
@@ -7660,8 +7814,8 @@ surface EventFetch {
         -- field are stated in terms of a Role, and this track has none, so
         -- each fails closed structurally rather than by omission. An
         -- EventReadToken is scoped to an EventType and tied to no Role: it
-        -- is nobody's client_id, so it is no record's creator; it carries
-        -- no Role.name, so it is in no team; and it carries no
+        -- is nobody's client_id, so it is no record's creator; it holds
+        -- no capabilities, so it opens no capability field; and it carries no
         -- external_subject, so it is nobody's addressee. A
         -- PrivateFieldGrant cannot reach it either, since a grant names a
         -- Role as its grantee and there is no Role here to name - so no
@@ -7796,27 +7950,30 @@ surface ProjectionQuery {
         -- instance may show (see rule QueryProjection's guidance on
         -- owner_scope_satisfied).
 
-    @guarantee TeamGatedWhenDeclared
-        -- Within its own bounded context, a projection may declare which
-        -- Role name is required to query it at all - in deployed
-        -- configuration only, with no registration surface and nothing an
-        -- admin can read it back from, exactly as the owner tag key above
-        -- - and one that declares a required team only answers queries
-        -- from a grant whose own Role.name equals it exactly. Membership
-        -- is the grant: there is nothing to share and nothing to revoke,
-        -- and entitlement ends the moment the Role is no longer named
-        -- that, which is the same semantics a team-kind private field
-        -- already carries, applied to the whole projection rather than to
-        -- one field of one record. To a Role named anything else the
-        -- projection is not merely unreadable but invisible, exactly as a
-        -- projection in another bounded context is above. A projection
-        -- that declares no required team is unrestricted by this
+    @guarantee CapabilityGatedWhenDeclared
+        -- Within its own bounded context, a projection may declare the one
+        -- capability a grant must hold to query it at all
+        -- (Projection.requires_capability, registered and readable by an
+        -- admin in CapabilityOverview), and one that does only answers
+        -- queries from a grant whose RoleAccessMapping.capabilities
+        -- contains it. No access level implies a capability and a
+        -- superadmin Role holds none by being one: an admin must be given
+        -- the capability like anyone else, and an admin allowed to hand it
+        -- out (RoleAccessMapping.delegable) still cannot grant it to
+        -- itself. To a grant without it the projection is not merely
+        -- unreadable but invisible, answered exactly as a projection that
+        -- does not exist is - in the GraphQL schema that caller is served
+        -- as well as in the resolver - exactly as a projection in another
+        -- bounded context is above. A superadmin is the one exception to
+        -- invisibility, and only for the type: it is served the schema so it
+        -- can administer it, but reads the data only by holding the
+        -- capability. A projection that requires none is unrestricted by this
         -- guarantee, which is every projection today. This is independent
         -- of GrantScopedToOwnerWhenDeclared above rather than a refinement
         -- of it: a projection may declare both an owner dimension and a
-        -- required team, and a query must satisfy both - neither
+        -- required capability, and a query must satisfy both - neither
         -- substitutes for the other, and failing either rejects (see rule
-        -- QueryProjection's guidance on team_only_satisfied).
+        -- QueryProjection's guidance on the capability check).
 
     @guarantee SensitiveFieldsStayProtected
         -- A projection built from a field its source EventType marked
@@ -7848,10 +8005,10 @@ surface ProjectionQuery {
         -- fold. Whatever of it a projection keeps in its state, every
         -- caller this surface serves that projection to reads, whatever
         -- their own entitlement to the field: state has no per-record
-        -- creator, team or addressee to redact against. Keeping one is
+        -- creator, capability or addressee to redact against. Keeping one is
         -- the projection's choice, made where its state is defined - leave
         -- it out of the state, or gate the whole projection with
-        -- team_only (TeamGatedWhenDeclared). The library reports every
+        -- requires_capability (CapabilityGatedWhenDeclared). The library reports every
         -- projection consuming an event type with private fields when it
         -- starts, and refuses none of them, since a staff view may need
         -- exactly that.
@@ -9330,11 +9487,17 @@ surface AccessManagement {
         RevokeRole(caller, role)
         GrantRoleAccessMapping(caller, role, bounded_context, level, can_read_sensitive, scope?)
         RevokeRoleAccessMapping(caller, access_mapping)
+        GrantCapabilityAsSuperadmin(caller, target, capability)
+        RevokeCapabilityAsSuperadmin(caller, target, capability)
+        SetDelegableCapabilities(caller, target, delegable)
 
     @guarantee SuperadminOnly
         -- Only an active Role with superadmin = true may create or
         -- revoke Roles, or grant/revoke RoleAccessMappings on their behalf -
-        -- including its own. There is no self-service path.
+        -- including its own, and only one may decide what an admin may
+        -- delegate (SetDelegableCapabilities). There is no self-service
+        -- path; the one limited exception, an admin handing out capabilities
+        -- the superadmin allowed it to, is surface CapabilityDelegation.
 
     @guarantee ExternalIdentityRegisteredExplicitly
         -- A Role is bound to an external IdP identity only because a
@@ -9350,6 +9513,60 @@ surface AccessManagement {
         -- SuperadminBootstrap instead, claimed with a secret SkilJ prints
         -- to its own startup log rather than any caller-supplied value.
         -- See the note above rule CreateSuperadmin for the full mechanism.
+}
+
+-- The only act an admin performs on other grants' access, and bounded
+-- twice: to its own bounded context, and to the names a superadmin put in
+-- its delegable set.
+surface CapabilityDelegation {
+    facing access_mapping: AdminAccess
+
+    exposes:
+        access_mapping.delegable
+        for target in RoleAccessMappings where bounded_context = access_mapping.bounded_context
+                and status = active:
+            target.role.id
+            target.role.name
+            target.capabilities
+
+    provides:
+        GrantCapabilityAsAdmin(access_mapping, target, capability)
+        RevokeCapabilityAsAdmin(access_mapping, target, capability)
+
+    @guarantee DelegationIsBounded
+        -- An admin may only hand out, or take back, a capability in its
+        -- own delegable set, only for another grant in its own bounded
+        -- context. It cannot change delegable - that is a superadmin's
+        -- alone - so delegation cannot pass itself along. Lowering the
+        -- set does not undo what was already granted (see rule
+        -- SetDelegableCapabilities).
+
+    @guarantee SelfGrantRefused
+        -- An admin cannot grant or revoke a capability on its own grant,
+        -- even one it may delegate. Handing out access and holding it are
+        -- separate: an admin can manage who belongs to a team without
+        -- being able to read what the team alone may read, and a one-admin
+        -- bounded context needs a superadmin for that one step.
+}
+
+-- What a superadmin sees to find a capability that nothing requires or
+-- nothing holds: a typo on either side fails closed (nobody matches) and
+-- would otherwise be invisible. Read-only, and deliberately the only
+-- reporting there is.
+surface CapabilityOverview {
+    facing caller: Superadmin
+
+    exposes:
+        for bc in BoundedContexts where status = active:
+            bc.name
+            -- Required by a registered Projection or PrivateField...
+            required_capabilities(bc)
+            -- ...and held by an active grant.
+            held_capabilities(bc)
+            -- Required but held by no grant, and held but required by no
+            -- type: the two lists to read for a typo.
+            required_capabilities(bc) - held_capabilities(bc)
+            held_capabilities(bc) - required_capabilities(bc)
 }
 
 surface PrivateFieldGrantManagement {
@@ -9406,16 +9623,18 @@ surface PrivateFieldGrantManagement {
         -- declares private (see the render_event note above rule
         -- DeliverToSubscriptions).
 
-    @guarantee TeamFieldsNeedNoGrant
-        -- A team-kind private field is visible to any Role whose own name
-        -- is the one the field declares, immediately and automatically,
-        -- with nothing granted and nothing to grant. Membership is the
-        -- grant. So nothing here shares a team field, nothing here revokes
-        -- one, and ListPrivateFieldGrants never lists anything for one -
-        -- not because the listing is incomplete but because there is no
-        -- row and never was. Changing who sees a team field means changing
-        -- which Roles carry that name, which is surface AccessManagement's
-        -- business rather than this one's.
+    @guarantee CapabilityFieldsNeedNoGrant
+        -- A capability-kind private field is visible to any grant that
+        -- holds the capability the field declares, immediately and
+        -- automatically, with no PrivateFieldGrant made and none to make.
+        -- Holding the capability is the grant. So nothing here shares a
+        -- capability field, nothing here revokes one, and
+        -- ListPrivateFieldGrants never lists anything for one - not
+        -- because the listing is incomplete but because there is no row
+        -- and never was. Changing who sees a capability field means
+        -- changing which grants hold the capability, which is surface
+        -- AccessManagement's and surface CapabilityDelegation's business
+        -- rather than this one's.
 
     @guarantee ListingScopedToGrantorUnlessAdmin
         -- Any active grant may list its own outgoing grants, at any level:
@@ -9532,7 +9751,7 @@ surface FederatedSubgraph {
         -- rather than standing in for it, and every guarantee of the
         -- surface the request lands on holds unchanged -
         -- GrantScopedToBoundedContext, GrantScopedToOwnerWhenDeclared,
-        -- TeamGatedWhenDeclared, SensitiveFieldsStayProtected. A bounded
+        -- CapabilityGatedWhenDeclared, SensitiveFieldsStayProtected. A bounded
         -- context the caller has no grant on answers exactly as one that
         -- does not exist, whether or not the description names it. A
         -- projection instance looked up by its key on a router's behalf is

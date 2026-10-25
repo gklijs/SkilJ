@@ -1427,10 +1427,15 @@ pub fn valid_private_fields(schema: &str, private_fields: &[PrivateField]) -> bo
             return false;
         }
         match p.kind {
-            PrivateFieldKind::Own => p.team.is_none() && p.addressee_field.is_none(),
-            PrivateFieldKind::Team => p.team.is_some() && p.addressee_field.is_none(),
+            PrivateFieldKind::Own => p.capability.is_none() && p.addressee_field.is_none(),
+            PrivateFieldKind::Capability => {
+                p.capability
+                    .as_deref()
+                    .is_some_and(crate::access_control::valid_capability_name)
+                    && p.addressee_field.is_none()
+            }
             PrivateFieldKind::Addressed => {
-                p.team.is_none()
+                p.capability.is_none()
                     && p.addressee_field.as_deref().is_some_and(|af| {
                         resolve_field_kind(&properties, definitions.as_ref(), af).is_some()
                     })
@@ -2529,14 +2534,14 @@ pub fn is_default_private_reader<R: PrivateFieldRecord>(record: &R, role: &Role)
 fn entitled_to_read_private_field<R: PrivateFieldRecord>(
     record: &R,
     kind: PrivateFieldKind,
-    team: Option<&str>,
+    capability: Option<&str>,
     access_mapping: &RoleAccessMapping,
     grants: &[PrivateFieldGrant],
     matches_this_record: impl Fn(&PrivateFieldGrant) -> bool,
 ) -> bool {
     match kind {
-        PrivateFieldKind::Team => {
-            crate::access_control::role_matches_required_team(&access_mapping.role, team)
+        PrivateFieldKind::Capability => {
+            crate::access_control::mapping_holds_capability(access_mapping, capability)
         }
         PrivateFieldKind::Own | PrivateFieldKind::Addressed => {
             is_default_private_reader(record, &access_mapping.role)
@@ -2728,7 +2733,7 @@ fn redact_unentitled_private_fields<R: PrivateFieldRecord>(
         if entitled_to_read_private_field(
             record,
             p.kind,
-            p.team.as_deref(),
+            p.capability.as_deref(),
             access_mapping,
             grants,
             &matches_this_record,

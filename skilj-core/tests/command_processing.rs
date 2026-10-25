@@ -159,6 +159,8 @@ fn access_mapping(
         level,
         can_read_sensitive: false,
         scope: None,
+        capabilities: Default::default(),
+        delegable: Default::default(),
         status,
         created_at: timestamp(0),
         revoked_at: None,
@@ -534,6 +536,8 @@ fn authorise_command_submission_rejects_a_command_whose_owner_does_not_match_the
     };
     let mapping = RoleAccessMapping {
         scope: Some("acme".into()),
+        capabilities: Default::default(),
+        delegable: Default::default(),
         ..access_mapping(
             RoleStatus::Active,
             AccessLevel::Write,
@@ -569,6 +573,8 @@ fn authorise_command_submission_succeeds_when_the_owner_matches_the_grants_scope
     };
     let mapping = RoleAccessMapping {
         scope: Some("acme".into()),
+        capabilities: Default::default(),
+        delegable: Default::default(),
         ..access_mapping(
             RoleStatus::Active,
             AccessLevel::Write,

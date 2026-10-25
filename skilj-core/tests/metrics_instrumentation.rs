@@ -54,7 +54,7 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
         None
     }
 
-    // `team_only` intentionally not overridden - the trait's own default
+    // `requires_capability` intentionally not overridden - the trait's own default
     // (`None`) already reads identically to what a plain-`None` override
     // here would return.
 }

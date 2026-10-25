@@ -548,7 +548,7 @@ impl ProjectionDispatcherImpl {
     /// The one `effective_bounded_context` + registry lookup every
     /// accessor below needs, shared rather than repeated per accessor -
     /// each of `keys`/`project`/`default_state`/`owner_tag_key`/
-    /// `team_only` becomes a one-line wrapper around this plus whatever
+    /// `requires_capability` becomes a one-line wrapper around this plus whatever
     /// it does with the field it wants, so the next per-projection
     /// config knob added to `ProjectionDispatcher` costs one small
     /// method here, not another full copy of the lookup.
@@ -607,12 +607,15 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
         )
     }
 
-    fn team_only(
+    fn requires_capability(
         &self,
         bounded_context: &str,
         projection_name: &str,
     ) -> Option<Option<&'static str>> {
-        Some(self.registered(bounded_context, projection_name)?.team_only)
+        Some(
+            self.registered(bounded_context, projection_name)?
+                .requires_capability,
+        )
     }
 
     fn partition_count(&self, bounded_context: &str, projection_name: &str) -> Option<u32> {
@@ -1975,7 +1978,7 @@ struct RegisteredProjection {
     sync: bool,
     default_state_json: String,
     owner_tag_key: Option<&'static str>,
-    team_only: Option<&'static str>,
+    requires_capability: Option<&'static str>,
     partition_count: u32,
     keys: KeysFn,
     project: ProjectFn,
@@ -1994,7 +1997,7 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
         sync: T::sync(),
         default_state_json,
         owner_tag_key: T::OWNER_TAG_KEY,
-        team_only: T::TEAM_ONLY,
+        requires_capability: T::REQUIRES_CAPABILITY,
         partition_count: T::PARTITION_COUNT,
         keys: Box::new(move |event| {
             if !consumed_for_keys
@@ -3165,6 +3168,10 @@ impl SkiljBuilder {
                         // `ensure_private_field_grants_table`'s own doc
                         // comments.
                         skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
+                        skilj_core::db::ensure_projection_requires_capability_column(
+                            pool, &bc.name,
+                        )
+                        .await?;
                         skilj_core::db::ensure_private_field_grants_table(pool, &bc.name).await?;
                         // issue #98: the approval policy and
                         // proposal tables, same "patched into every bounded
@@ -5095,11 +5102,11 @@ async fn reconcile_projections(
             tracing::warn!(
                 projection = %key,
                 private_fields = ?fields,
-                team_only = ?registered.team_only,
+                requires_capability = ?registered.requires_capability,
                 "this Projection consumes event types with private fields - they reach \
                  project() unredacted, and anything of them it keeps in its state is visible \
                  to every reader of the projection, whatever their private-field grants. \
-                 Leave them out of the state, or gate the projection with team_only"
+                 Leave them out of the state, or gate the projection with requires_capability"
             );
         }
 
@@ -5146,6 +5153,7 @@ async fn reconcile_projections(
             registered.schema.clone(),
             consumed_event_types,
             registered.sync,
+            registered.requires_capability.map(str::to_owned),
             existing.as_ref(),
             staged.as_ref(),
             &bounded_context_events,
@@ -5199,6 +5207,13 @@ async fn reconcile_projections(
                 skilj_core::db::upsert_projection(pool, &projection).await?;
             }
             ProjectionRegistration::RebuildStaged(rebuild) => {
+                skilj_core::db::set_projection_requires_capability(
+                    pool,
+                    bounded_context_name,
+                    name,
+                    registered.requires_capability,
+                )
+                .await?;
                 skilj_core::db::upsert_projection_rebuild(pool, &rebuild).await?;
             }
             _ => {
