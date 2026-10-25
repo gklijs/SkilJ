@@ -1568,7 +1568,7 @@ entity Event {
                                             -- such an event holds those fields in plaintext,
                                             -- even if sensitive_fields later gains an entry
                                             -- for them (see EventType.sensitive_fields)
-    origin: CommandTriggered | ExternalTriggered | DirectlyCreated | SystemTriggered
+    origin: CommandTriggered | ExternalTriggered | DirectlyCreated | SystemTriggered | SkiljRecorded
 }
 
 variant CommandTriggered : Event {
@@ -1623,6 +1623,17 @@ variant SystemTriggered : Event {
     -- No variant-specific fields: the scheduler is the originator, so
     -- there is no external token or command to point back at. See
     -- SystemTriggeredClientIdIsSystem for the client_id constraint.
+}
+
+variant SkiljRecorded : Event {
+    -- A fact the library records about its own state, in the admin
+    -- context, as part of the change it describes (rule RecordAccessEvent).
+    -- No variant-specific fields. Not SystemTriggered, which is the
+    -- scheduler's and whose type must be scheduled (invariant
+    -- ScheduledTypeIsFullyConfigured), and not a command's: nothing was
+    -- decided, a rule was applied. Who applied it is in the payload, as
+    -- actor_role_id, because client_id has nobody to name here either -
+    -- see SystemTriggeredClientIdIsSystem, which covers this origin too.
 }
 
 entity Projection {
@@ -5301,6 +5312,17 @@ rule CreateBoundedContextFromTemplate {
             status: active,
             created_at: now
         )
+        AccessChanged(
+            event_type_name: "AccessGranted",
+            role: role,
+            bounded_context: tenant,
+            payload: {
+                actor_role_id: caller.id,
+                level: level,
+                can_read_sensitive: can_read_sensitive,
+                scope: scope
+            }
+        )
         TemplateApplicationDue(bounded_context: tenant, template: template)
 }
 
@@ -6735,6 +6757,12 @@ rule RevokeRole {
         for mapping in role.access_mappings where status = active:
             mapping.status = revoked
             mapping.revoked_at = now
+            AccessChanged(
+                event_type_name: "AccessRevoked",
+                role: role,
+                bounded_context: mapping.bounded_context,
+                payload: { actor_role_id: caller.id, reason: "role_revoked" }
+            )
 }
 
 rule GrantRoleAccessMapping {
@@ -6763,6 +6791,17 @@ rule GrantRoleAccessMapping {
             delegable: {},
             status: active,
             created_at: now
+        )
+        AccessChanged(
+            event_type_name: "AccessGranted",
+            role: role,
+            bounded_context: bounded_context,
+            payload: {
+                actor_role_id: caller.id,
+                level: level,
+                can_read_sensitive: can_read_sensitive,
+                scope: scope
+            }
         )
 }
 
@@ -6796,7 +6835,14 @@ rule GrantCapabilityAsSuperadmin {
     requires: valid_capability_name(capability)
     requires: capability not in target.capabilities
     requires: target.capabilities.count < 16
-    ensures: target.capabilities = target.capabilities + {capability}
+    ensures:
+        target.capabilities = target.capabilities + {capability}
+        AccessChanged(
+            event_type_name: "CapabilityGranted",
+            role: target.role,
+            bounded_context: target.bounded_context,
+            payload: { actor_role_id: caller.id, capability: capability, via: "superadmin" }
+        )
 }
 
 rule RevokeCapabilityAsSuperadmin {
@@ -6805,7 +6851,14 @@ rule RevokeCapabilityAsSuperadmin {
     requires: caller.superadmin = true
     requires: target.status = active
     requires: capability in target.capabilities
-    ensures: target.capabilities = target.capabilities - {capability}
+    ensures:
+        target.capabilities = target.capabilities - {capability}
+        AccessChanged(
+            event_type_name: "CapabilityRevoked",
+            role: target.role,
+            bounded_context: target.bounded_context,
+            payload: { actor_role_id: caller.id, capability: capability, via: "superadmin" }
+        )
 }
 
 rule GrantCapabilityAsAdmin {
@@ -6818,7 +6871,14 @@ rule GrantCapabilityAsAdmin {
     requires: capability in access_mapping.delegable
     requires: capability not in target.capabilities
     requires: target.capabilities.count < 16
-    ensures: target.capabilities = target.capabilities + {capability}
+    ensures:
+        target.capabilities = target.capabilities + {capability}
+        AccessChanged(
+            event_type_name: "CapabilityGranted",
+            role: target.role,
+            bounded_context: target.bounded_context,
+            payload: { actor_role_id: access_mapping.role.id, capability: capability, via: "admin" }
+        )
 }
 
 rule RevokeCapabilityAsAdmin {
@@ -6830,7 +6890,14 @@ rule RevokeCapabilityAsAdmin {
     requires: target.role != access_mapping.role
     requires: capability in access_mapping.delegable
     requires: capability in target.capabilities
-    ensures: target.capabilities = target.capabilities - {capability}
+    ensures:
+        target.capabilities = target.capabilities - {capability}
+        AccessChanged(
+            event_type_name: "CapabilityRevoked",
+            role: target.role,
+            bounded_context: target.bounded_context,
+            payload: { actor_role_id: access_mapping.role.id, capability: capability, via: "admin" }
+        )
 }
 
 -- Only a superadmin decides what an admin may hand out. Lowering the set
@@ -6846,7 +6913,14 @@ rule SetDelegableCapabilities {
     requires: target.level = admin
     requires: delegable.all(c => valid_capability_name(c))
     requires: delegable.count <= 16
-    ensures: target.delegable = delegable
+    ensures:
+        target.delegable = delegable
+        AccessChanged(
+            event_type_name: "DelegableCapabilitiesSet",
+            role: target.role,
+            bounded_context: target.bounded_context,
+            payload: { actor_role_id: caller.id, delegable: delegable }
+        )
 }
 
 rule RevokeRoleAccessMapping {
@@ -6857,6 +6931,172 @@ rule RevokeRoleAccessMapping {
     ensures:
         access_mapping.status = revoked
         access_mapping.revoked_at = now
+        AccessChanged(
+            event_type_name: "AccessRevoked",
+            role: access_mapping.role,
+            bounded_context: access_mapping.bounded_context,
+            payload: { actor_role_id: caller.id, reason: "grant_revoked" }
+        )
+}
+
+-- The access trail (docs/architecture.md, the section after the
+-- capabilities one). Every change to who holds what is also an Event in
+-- the admin context, recorded by the same rule execution that makes the
+-- change: no change without a record and no record without a change.
+-- That is what makes "could this grant read X on that date" answerable
+-- later from stored facts, where the RoleAccessMapping rows only say what
+-- is true now (a revoked mapping keeps its revoked_at and nothing about
+-- what it held).
+--
+-- Six event types, all registered in the admin context by SkilJ itself,
+-- none registrable or creatable by anyone else:
+--   AccessGranted            a RoleAccessMapping was made: level,
+--                            can_read_sensitive, scope
+--   AccessRevoked            one ended, with reason grant_revoked (the
+--                            mapping alone) or role_revoked (its Role)
+--   CapabilityGranted        a capability was added, via superadmin or
+--   CapabilityRevoked        admin, removed likewise
+--   DelegableCapabilitiesSet the delegable set was replaced
+--   AccessBaselined          what an existing, active grant held when
+--                            this trail began (rule BaselineAccessEvents)
+-- Every payload names the Role and bounded context the change is about
+-- and the Role that made it (actor_role_id), by id: no name, no
+-- external_subject, nothing a person could ask to have forgotten. The
+-- events are tagged role and bounded_context, so one grant's history is
+-- one tagged read. The one free-form value is scope, an opaque string the
+-- operator already stores on the grant itself.
+--
+-- Not recorded: the failures. A refused attempt (SelfGrantRefused, a name
+-- outside delegable) changes nothing and so has nothing to be consistent
+-- with. A deleted bounded context takes its mappings with it
+-- (DeleteBoundedContext); its trail stays, and ends at the last event
+-- before deletion.
+
+-- A view of the admin context's access events, one per Event whose type
+-- is among access_event_type_names: the two tagged values lifted out of
+-- the payload so the rules and invariants below can ask about a grant
+-- without parsing one.
+entity AccessEvent {
+    event: Event
+    event_type_name: String
+    role_id: String
+    bounded_context: String        -- the name of the context the change concerns,
+                                   -- not the admin context the event lives in
+    created_at: Timestamp
+}
+
+rule RecordAccessEvent {
+    when: AccessChanged(event_type_name, role, bounded_context, payload)
+    let event_type = EventType{bounded_context: admin, name: event_type_name}
+    let full = payload + { role_id: role.id, bounded_context: bounded_context.name }
+
+    ensures:
+        SkiljRecorded.created(
+            bounded_context: admin,
+            event_type: event_type,
+            payload: full,
+            metadata: {
+                type: event_type.name,
+                version: event_type.schema_version,
+                client_id: "system",
+                created_at: now,
+                correlation_id: generate_id(),
+                causation_id: null
+            },
+            sequence: next_sequence(admin),
+            tags: derive_tags(event_type, full),
+            encryption_keys: {}
+        )
+}
+
+-- Registers the six types above in the admin context. Idempotent in the
+-- way stamp_admin_bounded_context is: it acts only for a type that is not
+-- registered yet, so a restart changes nothing. Not RegisterEventType: no
+-- grant is behind it, the types are part of the library, and they may be
+-- neither created, scheduled nor read through the token surfaces
+-- (external, direct and system creation all false).
+rule RegisterAccessEventTypes {
+    when: SkiljStarted()
+    ensures:
+        for name in access_event_type_names:
+            if not exists EventType{bounded_context: admin, name: name}:
+                EventType.created(
+                    bounded_context: admin,
+                    name: name,
+                    schema: access_event_schema(name),
+                    schema_version: 1,
+                    tag_mappings: {
+                        TagMapping{key: "role", field: "role_id"},
+                        TagMapping{key: "bounded_context", field: "bounded_context"}
+                    },
+                    owner_tag_key: null,
+                    sensitive_fields: {},
+                    private_fields: {},
+                    external_creation_allowed: false,
+                    direct_creation_allowed: false,
+                    system_triggered_allowed: false,
+                    system_triggered_schedule: null,
+                    missed_occurrence_policy: null,
+                    schedule_position: null,
+                    last_fired_at: null,
+                    event_read_allowed: false
+                )
+}
+
+-- Closes the gap for a database that already holds grants when this
+-- trail begins. A mapping is baselined when it is active and no access
+-- event names its Role and bounded context yet; the event records what it
+-- holds right then, and says in its name that it is a starting point
+-- rather than a change. History is complete from that moment on, and
+-- honest before it: nothing earlier is invented, and a mapping revoked
+-- before the upgrade has no events at all.
+--
+-- Safe to repeat. Once a mapping has any event the requires fails, so a
+-- restart baselines nothing it already covers.
+rule BaselineAccessEvents {
+    when: SkiljStarted()
+    ensures:
+        for mapping in RoleAccessMappings where status = active:
+            if not exists AccessEvent where role_id = mapping.role.id
+                    and bounded_context = mapping.bounded_context.name:
+                AccessChanged(
+                    event_type_name: "AccessBaselined",
+                    role: mapping.role,
+                    bounded_context: mapping.bounded_context,
+                    payload: {
+                        actor_role_id: null,
+                        level: mapping.level,
+                        can_read_sensitive: mapping.can_read_sensitive,
+                        scope: mapping.scope,
+                        capabilities: mapping.capabilities,
+                        delegable: mapping.delegable
+                    }
+                )
+}
+
+-- What one grant held at a past instant, folded from its events up to and
+-- including as_of. held is false before the first AccessGranted or
+-- AccessBaselined, and again after an AccessRevoked; capabilities and
+-- delegable are the sets the events leave. A superadmin only: it reads
+-- the admin context, which no other grant is given (see surface
+-- AccessHistory). For an as_of before the trail began for that mapping
+-- the answer is unknown, not "held nothing".
+rule CapabilityHistory {
+    when: CapabilityHistory(caller, role, bounded_context, as_of)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+
+    ensures:
+        CapabilityHistoryReturned(
+            caller: caller,
+            known: exists AccessEvent where role_id = role.id
+                and bounded_context = bounded_context.name
+                and created_at <= as_of,
+            held: fold_access_events(role, bounded_context, as_of).held,
+            level: fold_access_events(role, bounded_context, as_of).level,
+            capabilities: fold_access_events(role, bounded_context, as_of).capabilities,
+            delegable: fold_access_events(role, bounded_context, as_of).delegable
+        )
 }
 
 -- ForgetSubject is not part of the superadmin-only group above: it is a
@@ -7327,7 +7567,8 @@ invariant SystemTriggeredClientIdIsSystem {
     -- system-triggered event has none, so it records the literal
     -- "system" rather than borrowing an identity it doesn't have.
     for e in Events:
-        e.origin = SystemTriggered implies e.metadata.client_id = "system"
+        (e.origin = SystemTriggered or e.origin = SkiljRecorded)
+            implies e.metadata.client_id = "system"
 }
 
 invariant CorrelationIdIsAlwaysRecorded {
@@ -7445,6 +7686,24 @@ invariant CapabilitiesAreWellFormed {
         and m.delegable.all(c => valid_capability_name(c))
         and m.capabilities.count <= 16
         and m.delegable.count <= 16
+}
+
+invariant AccessTrailIsComplete {
+    -- Every active grant has a trail: an AccessGranted or AccessBaselined
+    -- event for its Role and bounded context, so CapabilityHistory never
+    -- starts from a grant it cannot account for. Holds once startup has
+    -- run (rule BaselineAccessEvents) and from then on because every rule
+    -- that creates or ends a mapping records it (rule RecordAccessEvent).
+    for m in RoleAccessMappings where status = active:
+        exists AccessEvent where role_id = m.role.id
+            and bounded_context = m.bounded_context.name
+            and event_type_name in {"AccessGranted", "AccessBaselined"}
+}
+
+invariant AccessEventsAreSkiljsAlone {
+    -- Only the library writes these, and only into the admin context.
+    for e in Events where e.event_type.name in access_event_type_names:
+        e.bounded_context = admin and e.origin = SkiljRecorded
 }
 
 invariant UniqueActiveExternalSubject {
@@ -9569,6 +9828,33 @@ surface CapabilityOverview {
             -- type: the two lists to read for a typo.
             required_capabilities(bc) - held_capabilities(bc)
             held_capabilities(bc) - required_capabilities(bc)
+}
+
+-- The history of who held what, for a superadmin. The events behind it
+-- are ordinary events of the admin context, readable through the usual
+-- event queries with an admin-context grant; this surface adds the fold
+-- so no client has to re-implement it.
+surface AccessHistory {
+    facing caller: Superadmin
+
+    provides:
+        CapabilityHistory(caller, role, bounded_context, as_of)
+
+    @guarantee SuperadminOnly
+        -- The trail names every grant in every bounded context, which is
+        -- more than any context admin sees (surface CapabilityDelegation
+        -- shows one context's grants and nothing of who changed them), so
+        -- it is a superadmin's alone.
+
+    @guarantee TrailIsWrittenWithTheChange
+        -- A change and its event are one write: if the event cannot be
+        -- recorded the change is not made, and if the change fails no
+        -- event is left behind. Nothing here is best-effort.
+
+    @guidance
+        -- The same answer is available without this query by reading the
+        -- events tagged with the Role and bounded context and folding them
+        -- in order; the query exists to keep one definition of "held".
 }
 
 surface PrivateFieldGrantManagement {

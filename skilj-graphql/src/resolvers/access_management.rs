@@ -93,6 +93,7 @@ pub fn revoke_role_field(n: &Naming) -> Field {
                     &state.pool,
                     &revoked_role,
                     &revoked_mappings,
+                    &caller.id,
                 )
                 .await
                 .map_err(to_graphql_error)?;
@@ -185,9 +186,13 @@ pub fn grant_role_access_mapping_field(n: &Naming) -> Field {
                     chrono::Utc::now(),
                 )
                 .map_err(to_graphql_error)?;
-                skilj_core::db::insert_role_access_mapping(&state.pool, &mapping)
-                    .await
-                    .map_err(to_graphql_error)?;
+                skilj_core::db::grant_role_access_mapping_with_trail(
+                    &state.pool,
+                    &mapping,
+                    Some(&caller.id),
+                )
+                .await
+                .map_err(to_graphql_error)?;
 
                 Ok(Some(FieldValue::owned_any(mapping)))
             })
@@ -246,13 +251,14 @@ pub fn revoke_role_access_mapping_field(n: &Naming) -> Field {
                     chrono::Utc::now(),
                 )
                 .map_err(to_graphql_error)?;
-                skilj_core::db::revoke_active_role_access_mapping(
+                skilj_core::db::revoke_role_access_mapping_with_trail(
                     &state.pool,
                     &role_id,
                     &bounded_context_name,
                     revoked
                         .revoked_at
                         .expect("revoke_role_access_mapping always stamps revoked_at"),
+                    &caller.id,
                 )
                 .await
                 .map_err(to_graphql_error)?;

@@ -125,3 +125,36 @@ a service, a customer-facing backend - gets its own access to a
 bounded context once it exists. `scope` (optional) restricts a grant
 to one tenant's own data, for a bounded context that declares an
 `owner_tag_key` - leave it `null` for an unscoped grant.
+
+## Granting capabilities
+
+A projection that declares `REQUIRES_CAPABILITY` (or a private field of
+kind `capability`) is readable only by a grant that *holds* that name;
+`level`, superadmin and the Role's name never imply it, so a freshly
+granted Role reads none of those until you add it:
+
+```graphql
+mutation {
+  grantCapability(roleId: "<Role id>", boundedContext: "helpdesk", capability: "staff") {
+    capabilities
+  }
+}
+```
+
+Names are not checked against what types declare - the reconciliation
+grant exists before any type registers - so run `capabilityOverview`
+after bootstrapping: a name in `requiredButNotHeld` is a gate nobody
+can pass yet, one in `heldButNotRequired` is usually a typo.
+`setDelegableCapabilities` (superadmin) lets a context admin hand out
+chosen names to other grants in its context, never to its own. Large
+teams are granted through these mutations, not through IdP claims.
+
+Every grant, revoke and capability change is also recorded as an event in
+the `admin` bounded context, in the same transaction. A superadmin asks
+what a grant held at a past time with
+`capabilityHistory(roleId: "<Role id>", boundedContext: "helpdesk", asOf: "2026-10-01T00:00:00Z") { known held capabilities }`;
+`known: false` means the trail had not begun for that grant by then
+(grants from before the trail are baselined at the first start of a
+version that has it). Writing `role_access_mappings` directly, as the
+local-dev shortcut does, records nothing until that baseline runs.
+

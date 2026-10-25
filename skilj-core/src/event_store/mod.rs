@@ -422,6 +422,12 @@ pub enum EventOrigin {
     DirectlyCreated,
     /// Fired by the scheduler for a scheduled event type.
     SystemTriggered,
+    /// A fact the library records about its own state, in the same write
+    /// as the change it describes (`variant SkiljRecorded`,
+    /// [`crate::access_trail`]). Like `SystemTriggered` it has no
+    /// originator to name: `metadata.client_id` is the literal `"system"`
+    /// and the acting Role is in the payload.
+    SkiljRecorded,
 }
 
 /// See `entity Event`.

@@ -295,7 +295,7 @@ async fn finish_creating_tenant(
         now,
     )
     .map_err(to_graphql_error)?;
-    skilj_core::db::insert_role_access_mapping(&state.pool, &mapping)
+    skilj_core::db::grant_role_access_mapping_with_trail(&state.pool, &mapping, Some(&caller.id))
         .await
         .map_err(to_graphql_error)?;
 

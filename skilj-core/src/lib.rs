@@ -21,6 +21,8 @@
 #![warn(missing_docs)]
 
 pub mod access_control;
+#[doc(hidden)]
+pub mod access_trail;
 pub mod approvals;
 mod base64;
 pub mod blind;

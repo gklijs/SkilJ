@@ -14,7 +14,7 @@
 //! make every decision; `db::add_mapping_capability`/
 //! `remove_mapping_capability` apply it atomically.
 
-use super::{not_found, require_admin_mapping, require_caller, require_superadmin};
+use super::{not_found, parse_rfc3339, require_admin_mapping, require_caller, require_superadmin};
 use crate::error::to_graphql_error;
 use crate::naming::Naming;
 use crate::GraphqlState;
@@ -83,23 +83,16 @@ fn change_field(n: &Naming, name: &'static str, grant: bool) -> Field {
                 }
                 .map_err(to_graphql_error)?;
 
-                let applied = if grant {
-                    skilj_core::db::add_mapping_capability(
-                        &state.pool,
-                        &role_id,
-                        &bounded_context_name,
-                        &capability,
-                    )
-                    .await
-                } else {
-                    skilj_core::db::remove_mapping_capability(
-                        &state.pool,
-                        &role_id,
-                        &bounded_context_name,
-                        &capability,
-                    )
-                    .await
-                }
+                let applied = skilj_core::db::change_mapping_capability_with_trail(
+                    &state.pool,
+                    &role_id,
+                    &bounded_context_name,
+                    &capability,
+                    grant,
+                    &caller.id,
+                    admin_mapping.is_some(),
+                )
+                .await
                 .map_err(to_graphql_error)?;
                 if !applied {
                     // A concurrent change got there first: the decision
@@ -174,11 +167,12 @@ pub fn set_delegable_capabilities_field(n: &Naming) -> Field {
                 // `false` is a grant gone or revoked, or (only in a race with
                 // the pure size check above) an oversized set; both read as
                 // not active.
-                if !skilj_core::db::set_mapping_delegable(
+                if !skilj_core::db::set_mapping_delegable_with_trail(
                     &state.pool,
                     &role_id,
                     &bounded_context_name,
                     &updated.delegable,
+                    &caller.id,
                 )
                 .await
                 .map_err(to_graphql_error)?
@@ -338,4 +332,45 @@ pub fn capability_overview_field(n: &Naming) -> Field {
             })
         },
     )
+}
+
+/// `capabilityHistory(roleId: ID!, boundedContext: String!, asOf: String): CapabilityHistory!` -
+/// `rule CapabilityHistory`, superadmin only: what the grant held at
+/// `asOf` (RFC 3339, default now), folded from the access trail
+/// (docs/architecture.md §229). `known: false` when the trail had not
+/// begun for that grant by then.
+pub fn capability_history_field(n: &Naming) -> Field {
+    Field::new(
+        n.root("capabilityHistory"),
+        TypeRef::named_nn(n.ty("CapabilityHistory")),
+        |ctx| {
+            FieldFuture::new(async move {
+                require_superadmin(&ctx)?;
+                let state = ctx.data::<GraphqlState>()?;
+                let role_id = ctx.args.try_get("roleId")?.string()?.to_string();
+                let bounded_context_name =
+                    ctx.args.try_get("boundedContext")?.string()?.to_string();
+                let as_of = match ctx.args.get("asOf").filter(|value| !value.is_null()) {
+                    Some(value) => parse_rfc3339(value.string()?)?,
+                    None => chrono::Utc::now(),
+                };
+                let records = skilj_core::db::list_access_event_records(
+                    &state.pool,
+                    &role_id,
+                    &bounded_context_name,
+                )
+                .await
+                .map_err(to_graphql_error)?;
+                Ok(Some(FieldValue::owned_any(
+                    skilj_core::access_trail::fold_access_events(&records, as_of),
+                )))
+            })
+        },
+    )
+    .argument(InputValue::new("roleId", TypeRef::named_nn(TypeRef::ID)))
+    .argument(InputValue::new(
+        "boundedContext",
+        TypeRef::named_nn(TypeRef::STRING),
+    ))
+    .argument(InputValue::new("asOf", TypeRef::named(TypeRef::STRING)))
 }

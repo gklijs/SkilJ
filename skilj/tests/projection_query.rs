@@ -2280,5 +2280,56 @@ fn capability_mutations_and_reads_end_to_end() {
             entry_for_bc(&response)["heldButNotRequired"],
             json!(["never-required"])
         );
+
+        // The access trail (docs/architecture.md §229): the agent's grant
+        // was made before the process started, so its history begins with
+        // a baseline, then the admin's grant and revoke of "support" and
+        // the superadmin's of "never-required" - and a time before any of
+        // it is unknown rather than empty.
+        const HISTORY: &str = "query($r: ID!, $bc: String!, $at: String) { \
+            capabilityHistory(roleId: $r, boundedContext: $bc, asOf: $at) \
+            { known held level capabilities delegable } }";
+        let history_vars =
+            |role: &Role, at: Option<&str>| json!({ "r": role.id, "bc": bc_name, "at": at });
+        let response = graphql_request(
+            &router,
+            Some(&root_jwt),
+            HISTORY,
+            history_vars(&agent_role, None),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        let now = &response["data"]["capabilityHistory"];
+        assert_eq!(now["known"], json!(true));
+        assert_eq!(now["held"], json!(true));
+        assert_eq!(now["level"], json!("read"));
+        assert_eq!(now["capabilities"], json!(["never-required"]));
+        let response = graphql_request(
+            &router,
+            Some(&root_jwt),
+            HISTORY,
+            history_vars(&agent_role, Some("2000-01-01T00:00:00Z")),
+        )
+        .await;
+        assert_eq!(response["data"]["capabilityHistory"]["known"], json!(false));
+        let response = graphql_request(
+            &router,
+            Some(&root_jwt),
+            HISTORY,
+            history_vars(&admin_role, None),
+        )
+        .await;
+        assert_eq!(
+            response["data"]["capabilityHistory"]["delegable"],
+            json!(["support"])
+        );
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            HISTORY,
+            history_vars(&agent_role, None),
+        )
+        .await;
+        assert_eq!(code(&response).as_deref(), Some("not_superadmin"));
     });
 }
