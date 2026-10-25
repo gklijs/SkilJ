@@ -363,7 +363,7 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
         let state = ctx.data::<GraphqlState>()?;
         let representations = ctx.args.try_get("representations")?.list()?;
         // A router sends a page of instances at once, mostly of one type:
-        // each projection's grant, registration and team check are read
+        // each projection's grant, registration and capability check are read
         // once, and its instances' rows in one statement
         // (docs/architecture.md §199), not each per instance.
         let mut wanted: Vec<(String, String, String)> = Vec::with_capacity(representations.len());
@@ -487,10 +487,10 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
 ///
 /// `REQUIRES_CAPABILITY`-gated exactly like the `projection` field above (
 /// issue #17): a projection's own declared schema is whole-projection
-/// data, the same thing the gate protects there, so a Role not on the
-/// required team gets the identical rejection here rather than being
+/// data, the same thing the gate protects there, so a grant not
+/// holding the required capability gets the identical rejection here rather than being
 /// able to learn the projection's name/schema/version through this
-/// field while `projection` itself refuses it - `TeamGatedWhenDeclared`'s
+/// field while `projection` itself refuses it - `CapabilityGatedWhenDeclared`'s
 /// own "invisible, not merely unreadable" promise would otherwise hold
 /// for one field and not the other on the same surface.
 pub fn schema_field(n: &Naming) -> Field {

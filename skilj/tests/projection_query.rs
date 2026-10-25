@@ -963,7 +963,7 @@ fn projection_schema_end_to_end() {
 /// `projection` enforced it - a wrong-team caller could still learn the
 /// projection's declared shape (name/schema/schemaVersion) even though
 /// its actual data was correctly refused, contradicting
-/// `TeamGatedWhenDeclared`'s "invisible, not merely unreadable" promise
+/// `CapabilityGatedWhenDeclared`'s "invisible, not merely unreadable" promise
 /// for one field on the same surface.
 #[test]
 fn capability_gated_projection_gates_both_projection_and_projection_schema_end_to_end() {
