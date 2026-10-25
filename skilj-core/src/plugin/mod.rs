@@ -1264,9 +1264,9 @@ pub trait ProjectionDispatcher: Send + Sync {
     /// already has, for the same reason. Defaulted to `None` (unlike
     /// `owner_tag_key`, which has no default) - every call site here
     /// only ever `.flatten()`s the result, for which the outer "pair
-    /// isn't registered" `None` and the inner "registered, no team
-    /// declared" `Some(None)` already read identically, so a dispatcher
-    /// with nothing team-gated needs no explicit override at all.
+    /// isn't registered" `None` and the inner "registered, no capability
+    /// required" `Some(None)` already read identically, so a dispatcher
+    /// with nothing capability-gated needs no explicit override at all.
     fn requires_capability(
         &self,
         _bounded_context: &str,

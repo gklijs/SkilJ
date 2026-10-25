@@ -653,10 +653,10 @@ pub enum Error {
 
     /// `valid_private_fields`'s own rejection - either `field`/
     /// `addressee_field` names something the schema doesn't declare, or
-    /// the `team`/`addressee_field` presence doesn't match `kind` (see
+    /// the `capability`/`addressee_field` presence doesn't match `kind` (see
     /// that function's own doc comment for the full contract).
     #[error(
-        "this private field names a field the schema doesn't declare, or its team/addressee_field \
+        "this private field names a field the schema doesn't declare, or its capability/addressee_field \
          presence doesn't match its kind"
     )]
     InvalidPrivateField,

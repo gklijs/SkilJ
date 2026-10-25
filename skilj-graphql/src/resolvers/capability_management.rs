@@ -171,6 +171,9 @@ pub fn set_delegable_capabilities_field(n: &Naming) -> Field {
                     &caller, &target, delegable,
                 )
                 .map_err(to_graphql_error)?;
+                // `false` is a grant gone or revoked, or (only in a race with
+                // the pure size check above) an oversized set; both read as
+                // not active.
                 if !skilj_core::db::set_mapping_delegable(
                     &state.pool,
                     &role_id,
