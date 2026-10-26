@@ -1,4 +1,5 @@
-//! A small, dependency-free backoff/attempt-cap policy - see
+//! A small backoff/attempt-cap policy (its one dependency is `chrono`, for
+//! [`RetryPolicy::next_attempt_at`]) - see
 //! docs/architecture.md's parked-deliveries section. Pure data and pure
 //! functions only, deliberately: no `tokio::time::sleep`, no clock read,
 //! no I/O. Every caller (`skilj-core`'s `CrossContextRoute` catch-up

@@ -26,7 +26,7 @@
 --   right-to-be-forgotten via ForgetSubject) - per-field private marking
 --   on events and commands alike, the plain read-time redaction rule
 --   standing beside that cryptographic one for a field that should be
---   visible only to whoever created the record, only to a named team, or
+--   visible only to whoever created the record, only to holders of a named capability, or
 --   only to the one other party the record itself names, with sharing and
 --   revocation the creator drives itself and no encryption or erasure
 --   involved anywhere (PrivateField, PrivateFieldGrant) - admin-facing retrieval of

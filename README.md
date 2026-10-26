@@ -47,7 +47,7 @@ write path.
 
 What you get in one library on one Postgres database, without running a separate event store:
 
-- **Consistency per command, not per aggregate** (see below), with gapless sequence numbers
+- **Consistency per command, not per aggregate** (see above), with gapless sequence numbers
   per bounded context.
 - **GraphQL and REST APIs, generated from your registered types.** The GraphQL schema is
   tailored to each caller's grants, can serve as an Apollo Federation subgraph, and has live
@@ -141,7 +141,7 @@ To add `skilj` to an existing project instead:
 
 ```toml
 [dependencies]
-skilj = "0.1"
+skilj = "0.2"
 ```
 
 [`skilj-demo`](skilj-demo) in this repository is a larger worked example (two bounded contexts:
@@ -196,6 +196,7 @@ Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/arc
 | [`skilj-amqp`](skilj-amqp) | Optional: `skilj-kafka`'s own sibling for any AMQP 1.0 broker - Solace PubSub+, Azure Service Bus, ActiveMQ Artemis. See [`docs/architecture.md` §41](docs/architecture.md#skilj-amqp-bridge). |
 | [`skilj-nats`](skilj-nats) | Optional: a third bridge sibling, for NATS JetStream. See [`docs/architecture.md` §42](docs/architecture.md#skilj-nats-bridge). |
 | [`skilj-test-fixture`](skilj-test-fixture) | Optional dev-dependency: a given/when/then test harness for your own `CommandType::decide()`/`Projection::project()` - no database, no HTTP. See [`docs/architecture.md` §45](docs/architecture.md#given-when-then-test-fixture). |
+| [`skilj-retry`](skilj-retry) | Internal: the backoff/attempt-cap policy `skilj-core`'s routes and the broker bridges share. A dependency, not used directly. |
 | [`skilj-macros`](skilj-macros) | Internal proc-macros, re-exported through `skilj-core`/`skilj` (not uniformly - each macro picks whichever crate it applies to) - you won't normally add this directly. |
 
 ## Documentation

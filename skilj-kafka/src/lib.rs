@@ -162,6 +162,11 @@
 //!   "libzstd not available at build time". Add
 //!   `rdkafka = { version = "0.39", features = ["zstd"] }` to your own
 //!   dependencies to get it.
+//! - `security.protocol`: this crate's build of librdkafka has no
+//!   OpenSSL, so `SSL` and `SASL_SSL` (most managed Kafka services) fail
+//!   when the client is created. Add rdkafka's `ssl` feature (or
+//!   `ssl-vendored` to build OpenSSL from source) the same way;
+//!   `SCRAM-SHA-*` needs it too, and Kerberos (`GSSAPI`) needs `gssapi`.
 //!
 //! ```rust,no_run
 //! use rdkafka::producer::FutureProducer;

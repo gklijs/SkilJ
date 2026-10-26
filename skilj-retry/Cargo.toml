@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "A small, dependency-free backoff and attempt-cap policy, shared by skilj's routes and message-broker bridges."
+description = "A small backoff and attempt-cap policy, shared by skilj's routes and message-broker bridges."
 keywords = ["retry", "backoff", "skilj"]
 categories = ["algorithms"]
 
