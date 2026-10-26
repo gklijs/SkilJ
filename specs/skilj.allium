@@ -5156,6 +5156,31 @@ rule DeleteBoundedContext {
         -- a decision of its own. See the note above.
         for bc in BoundedContexts where template = bounded_context:
             bc.template = null
+        -- Its grants end with it, and the access trail says so: an
+        -- AccessRevoked (reason bounded_context_deleted) for every active
+        -- mapping and a PrivateFieldAccessRevoked for every active
+        -- PrivateFieldGrant, recorded in the same step. Otherwise
+        -- CapabilityHistory would go on answering held for a context that
+        -- no longer exists. Archiving ends nothing, so records nothing.
+        for mapping in bounded_context.access_mappings where status = active:
+            AccessChanged(
+                event_type_name: "AccessRevoked",
+                role: mapping.role,
+                bounded_context: bounded_context,
+                payload: { actor_role_id: caller.id, reason: "bounded_context_deleted" }
+            )
+        for grant in PrivateFieldGrants where bounded_context = bounded_context
+                and status = active:
+            AccessChanged(
+                event_type_name: "PrivateFieldAccessRevoked",
+                role: grant.grantee,
+                bounded_context: bounded_context,
+                payload: {
+                    actor_role_id: caller.id,
+                    grant_id: grant.id,
+                    reason: "bounded_context_deleted"
+                }
+            )
         not exists bounded_context
 }
 
@@ -6948,17 +6973,27 @@ rule RevokeRoleAccessMapping {
 -- is true now (a revoked mapping keeps its revoked_at and nothing about
 -- what it held).
 --
--- Six event types, all registered in the admin context by SkilJ itself,
+-- Eight event types, all registered in the admin context by SkilJ itself,
 -- none registrable or creatable by anyone else:
 --   AccessGranted            a RoleAccessMapping was made: level,
 --                            can_read_sensitive, scope
 --   AccessRevoked            one ended, with reason grant_revoked (the
---                            mapping alone) or role_revoked (its Role)
+--                            mapping alone), role_revoked (its Role) or
+--                            bounded_context_deleted
 --   CapabilityGranted        a capability was added, via superadmin or
 --   CapabilityRevoked        admin, removed likewise
 --   DelegableCapabilitiesSet the delegable set was replaced
 --   AccessBaselined          what an existing, active grant held when
 --                            this trail began (rule BaselineAccessEvents)
+--   PrivateFieldAccessGranted a Role let another read the private fields of
+--   PrivateFieldAccessRevoked one record or of all its records, and ended
+--                            that (rules GrantPrivateFieldAccessForEvent,
+--                            GrantPrivateFieldAccessForCommand and
+--                            RevokePrivateFieldAccess)
+-- The first six are the history of a RoleAccessMapping, the one
+-- CapabilityHistory folds. The last two are about a PrivateFieldGrant:
+-- role_id is the grantee, whose access it is, actor_role_id the grantor,
+-- and they name no mapping, so they never make a mapping known or held.
 -- Every payload names the Role and bounded context the change is about
 -- and the Role that made it (actor_role_id), by id: no name, no
 -- external_subject, nothing a person could ask to have forgotten. The
@@ -6968,9 +7003,12 @@ rule RevokeRoleAccessMapping {
 --
 -- Not recorded: the failures. A refused attempt (SelfGrantRefused, a name
 -- outside delegable) changes nothing and so has nothing to be consistent
--- with. A deleted bounded context takes its mappings with it
--- (DeleteBoundedContext); its trail stays, and ends at the last event
--- before deletion.
+-- with. A deleted bounded context takes its mappings with it, and
+-- DeleteBoundedContext records the end of each active one (reason
+-- bounded_context_deleted) as it goes; the trail stays. Archiving ends
+-- nothing and records nothing.
+-- A PrivateFieldGrant made before the trail began has no event; its
+-- revocation is still recorded, as a revoke with no grant before it.
 
 -- A view of the admin context's access events, one per Event whose type
 -- is among access_event_type_names: the two tagged values lifted out of
@@ -7044,21 +7082,23 @@ rule RegisterAccessEventTypes {
 }
 
 -- Closes the gap for a database that already holds grants when this
--- trail begins. A mapping is baselined when it is active and no access
--- event names its Role and bounded context yet; the event records what it
--- holds right then, and says in its name that it is a starting point
--- rather than a change. History is complete from that moment on, and
--- honest before it: nothing earlier is invented, and a mapping revoked
--- before the upgrade has no events at all.
+-- trail begins. A mapping is baselined when it is active and its events
+-- do not fold to held; the event records what it holds right then, and
+-- says in its name that it is a starting point rather than a change.
+-- "Some event names it" is not enough: a mapping made by a writer that
+-- records nothing, and then given a capability, has a CapabilityGranted
+-- and no start, and one made again after an AccessRevoked folds to not
+-- held. History is complete from that moment on, and honest before it:
+-- nothing earlier is invented, and a mapping revoked before the upgrade
+-- has no events at all.
 --
--- Safe to repeat. Once a mapping has any event the requires fails, so a
+-- Safe to repeat. Once a mapping folds to held the condition fails, so a
 -- restart baselines nothing it already covers.
 rule BaselineAccessEvents {
     when: SkiljStarted()
     ensures:
         for mapping in RoleAccessMappings where status = active:
-            if not exists AccessEvent where role_id = mapping.role.id
-                    and bounded_context = mapping.bounded_context.name:
+            if not fold_access_events(mapping.role, mapping.bounded_context, now).held:
                 AccessChanged(
                     event_type_name: "AccessBaselined",
                     role: mapping.role,
@@ -7091,6 +7131,8 @@ rule CapabilityHistory {
             caller: caller,
             known: exists AccessEvent where role_id = role.id
                 and bounded_context = bounded_context.name
+                and event_type_name not in {"PrivateFieldAccessGranted",
+                                            "PrivateFieldAccessRevoked"}
                 and created_at <= as_of,
             held: fold_access_events(role, bounded_context, as_of).held,
             level: fold_access_events(role, bounded_context, as_of).level,
@@ -7181,7 +7223,7 @@ rule GrantPrivateFieldAccessForEvent {
         or is_default_private_reader(event, access_mapping)
 
     ensures:
-        PrivateFieldGrant.created(
+        let grant = PrivateFieldGrant.created(
             bounded_context: access_mapping.bounded_context,
             grantor: access_mapping.role,
             grantee: grantee,
@@ -7189,6 +7231,17 @@ rule GrantPrivateFieldAccessForEvent {
             command: null,
             status: active,
             created_at: now
+        )
+        AccessChanged(
+            event_type_name: "PrivateFieldAccessGranted",
+            role: grantee,
+            bounded_context: access_mapping.bounded_context,
+            payload: {
+                actor_role_id: access_mapping.role.id,
+                grant_id: grant.id,
+                event_sequence: event?.sequence,
+                command_id: null
+            }
         )
 
     @guidance
@@ -7270,7 +7323,7 @@ rule GrantPrivateFieldAccessForCommand {
         or is_default_private_reader(command, access_mapping)
 
     ensures:
-        PrivateFieldGrant.created(
+        let grant = PrivateFieldGrant.created(
             bounded_context: access_mapping.bounded_context,
             grantor: access_mapping.role,
             grantee: grantee,
@@ -7278,6 +7331,17 @@ rule GrantPrivateFieldAccessForCommand {
             command: command,
             status: active,
             created_at: now
+        )
+        AccessChanged(
+            event_type_name: "PrivateFieldAccessGranted",
+            role: grantee,
+            bounded_context: access_mapping.bounded_context,
+            payload: {
+                actor_role_id: access_mapping.role.id,
+                grant_id: grant.id,
+                event_sequence: null,
+                command_id: command?.id
+            }
         )
 }
 
@@ -7295,6 +7359,12 @@ rule RevokePrivateFieldAccess {
     ensures:
         grant.status = revoked
         grant.revoked_at = now
+        AccessChanged(
+            event_type_name: "PrivateFieldAccessRevoked",
+            role: grant.grantee,
+            bounded_context: access_mapping.bounded_context,
+            payload: { actor_role_id: access_mapping.role.id, grant_id: grant.id }
+        )
 }
 
 -- Reading back what has been shared, and the one rule here that writes
@@ -7689,21 +7759,22 @@ invariant CapabilitiesAreWellFormed {
 }
 
 invariant AccessTrailIsComplete {
-    -- Every active grant has a trail: an AccessGranted or AccessBaselined
-    -- event for its Role and bounded context, so CapabilityHistory never
-    -- starts from a grant it cannot account for. Holds once startup has
-    -- run (rule BaselineAccessEvents) and from then on because every rule
-    -- that creates or ends a mapping records it (rule RecordAccessEvent).
+    -- Every active grant has a trail that accounts for it: its events
+    -- fold to held, so CapabilityHistory never calls an active grant not
+    -- held. Holds once startup has run (rule BaselineAccessEvents) and from
+    -- then on because every rule that creates or ends a mapping records it
+    -- (rule RecordAccessEvent).
     for m in RoleAccessMappings where status = active:
-        exists AccessEvent where role_id = m.role.id
-            and bounded_context = m.bounded_context.name
-            and event_type_name in {"AccessGranted", "AccessBaselined"}
+        fold_access_events(m.role, m.bounded_context, now).held
 }
 
 invariant AccessEventsAreSkiljsAlone {
-    -- Only the library writes these, and only into the admin context.
-    for e in Events where e.event_type.name in access_event_type_names:
-        e.bounded_context = admin and e.origin = SkiljRecorded
+    -- Only the library writes the admin context's access event types.
+    -- Another bounded context may register a type of the same name; that
+    -- is its own type and none of this concerns it.
+    for e in Events where e.bounded_context = admin
+            and e.event_type.name in access_event_type_names:
+        e.origin = SkiljRecorded
 }
 
 invariant UniqueActiveExternalSubject {

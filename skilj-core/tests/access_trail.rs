@@ -6,7 +6,9 @@
 //! the database is found).
 
 use chrono::{Duration, SubsecRound, TimeZone, Utc};
-use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
+use skilj_core::access_control::{
+    AccessLevel, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
+};
 use skilj_core::access_trail::{fold_access_events, AccessEventKind, AccessEventRecord};
 use skilj_core::bootstrap::{ContextCreator, ADMIN_BOUNDED_CONTEXT_NAME};
 use skilj_core::db::{self, Pool};
@@ -21,23 +23,43 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 static TEST_DB: tokio::sync::OnceCell<Option<Pool>> = tokio::sync::OnceCell::const_new();
 
+/// `baseline_access_events` covers every raw grant in the database, so a
+/// test that makes one and then looks at its trail cannot share the
+/// database with another test's baseline. Those tests take this first.
+static BASELINES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn test_pool() -> Option<Pool> {
     TEST_DB.get_or_init(provision).await.clone()
 }
 
 async fn provision() -> Option<Pool> {
     let url = skilj_test_support::database_url("skilj_access_trail").await?;
-    let pool = db::connect(&url).await.ok()?;
-    db::migrate(&pool).await.ok()?;
+    let pool = match db::connect(&url).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("skipping: connecting to the test database failed: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = db::migrate(&pool).await {
+        eprintln!("skipping: migrating the test database failed: {e}");
+        return None;
+    }
+    // From here a failure is the code under test failing, not a missing
+    // service, so it fails the run instead of skipping it.
     let existing = db::get_bounded_context(&pool, ADMIN_BOUNDED_CONTEXT_NAME)
         .await
-        .ok()?;
+        .expect("reading the admin bounded context");
     if let Some(admin) =
         skilj_core::bootstrap::stamp_admin_bounded_context(existing.as_ref(), Utc::now())
     {
-        db::insert_bounded_context(&pool, &admin).await.ok()?;
+        db::insert_bounded_context(&pool, &admin)
+            .await
+            .expect("creating the admin bounded context");
     }
-    db::ensure_access_trail(&pool).await.ok()?;
+    db::ensure_access_trail(&pool)
+        .await
+        .expect("ensuring the access trail");
     Some(pool)
 }
 
@@ -465,6 +487,264 @@ fn the_admin_log_stays_gapless_across_many_writers() {
     });
 }
 
+// --- private-field grants ---
+
+fn blanket_grant(grantor: &Role, grantee: &Role, bc: &BoundedContext) -> PrivateFieldGrant {
+    PrivateFieldGrant {
+        id: generate_token_id(),
+        bounded_context: bc.clone(),
+        grantor: grantor.clone(),
+        grantee: grantee.clone(),
+        event_sequence: None,
+        command_id: None,
+        status: TokenStatus::Active,
+        created_at: now(),
+        revoked_at: None,
+    }
+}
+
+/// The admin context's events that mention `grant_id`, oldest first, as
+/// `(event type name, payload)`.
+async fn private_field_events(pool: &Pool, grant_id: &str) -> Vec<(String, serde_json::Value)> {
+    db::list_events_for_bounded_context(pool, ADMIN_BOUNDED_CONTEXT_NAME)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.payload.contains(grant_id))
+        .map(|event| {
+            (
+                event.event_type.name.clone(),
+                serde_json::from_str(&event.payload).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_private_field_grant_and_its_revoke_are_recorded_by_the_grantee() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let grantor = seed_role(&pool).await;
+        let grantee = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        let grant = blanket_grant(&grantor, &grantee, &bc);
+
+        db::grant_private_field_access_with_trail(&pool, &grant)
+            .await
+            .unwrap();
+        let revoked = PrivateFieldGrant {
+            status: TokenStatus::Revoked,
+            revoked_at: Some(now()),
+            ..grant.clone()
+        };
+        let first = db::revoke_private_field_access_with_trail(&pool, &revoked)
+            .await
+            .unwrap();
+        let second = db::revoke_private_field_access_with_trail(&pool, &revoked)
+            .await
+            .unwrap();
+
+        assert!(first);
+        assert!(!second, "an already revoked grant records nothing");
+        let events = private_field_events(&pool, &grant.id).await;
+        assert_eq!(
+            events
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PrivateFieldAccessGranted", "PrivateFieldAccessRevoked"]
+        );
+        for (_, payload) in &events {
+            assert_eq!(payload["role_id"], grantee.id.as_str());
+            assert_eq!(payload["actor_role_id"], grantor.id.as_str());
+            assert_eq!(payload["bounded_context"], bc.name.as_str());
+            assert_eq!(payload["grant_id"], grant.id.as_str());
+        }
+        assert!(events[0].1["event_sequence"].is_null() && events[0].1["command_id"].is_null());
+
+        // The grantee's mapping history is not touched by it.
+        assert!(trail(&pool, &grantee, &bc).await.is_empty());
+        assert!(!fold_access_events(&[], now()).known);
+    });
+}
+
+#[test]
+fn a_private_field_grant_that_cannot_be_recorded_is_not_made() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let grantor = seed_role(&pool).await;
+        let grantee = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        let grant = blanket_grant(&grantor, &grantee, &bc);
+        // The grant row and its event commit together: a second insert of
+        // the same id fails on the primary key and leaves one event.
+        db::grant_private_field_access_with_trail(&pool, &grant)
+            .await
+            .unwrap();
+        assert!(db::grant_private_field_access_with_trail(&pool, &grant)
+            .await
+            .is_err());
+        assert_eq!(private_field_events(&pool, &grant.id).await.len(), 1);
+    });
+}
+
+#[test]
+fn private_field_events_carry_the_record_they_name_and_nothing_personal() {
+    let grantor = Role {
+        id: "grantor".into(),
+        external_subject: "someone@example.com".into(),
+        name: "Some Person".into(),
+        superadmin: false,
+        status: RoleStatus::Active,
+        created_at: now(),
+        revoked_at: None,
+    };
+    let grantee = Role {
+        id: "grantee".into(),
+        ..grantor.clone()
+    };
+    let bc = BoundedContext {
+        name: "helpdesk".into(),
+        status: BoundedContextStatus::Active,
+        created_at: now(),
+        created_by: ContextCreator::SystemCreator,
+        template: None,
+    };
+    let grant = PrivateFieldGrant {
+        event_sequence: Some(42),
+        ..blanket_grant(&grantor, &grantee, &bc)
+    };
+    let payload = skilj_core::access_trail::AccessChange::private_field_granted(&grant).payload();
+    assert!(!payload.contains("someone@example.com") && !payload.contains("Some Person"));
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["event_sequence"], 42);
+    assert_eq!(payload["role_id"], "grantee");
+    assert_eq!(payload["actor_role_id"], "grantor");
+}
+
+#[test]
+fn deleting_a_bounded_context_ends_its_active_grants_in_the_trail() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let deleter = seed_role(&pool).await;
+        let held = seed_role(&pool).await;
+        let already_revoked = seed_role(&pool).await;
+        let sharer = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        let mut with_capability = mapping(&held, &bc, AccessLevel::Write);
+        with_capability.capabilities = ["support".to_string()].into();
+        db::grant_role_access_mapping_with_trail(&pool, &with_capability, None)
+            .await
+            .unwrap();
+        db::grant_role_access_mapping_with_trail(
+            &pool,
+            &mapping(&already_revoked, &bc, AccessLevel::Read),
+            None,
+        )
+        .await
+        .unwrap();
+        db::revoke_role_access_mapping_with_trail(
+            &pool,
+            &already_revoked.id,
+            &bc.name,
+            now(),
+            &deleter.id,
+        )
+        .await
+        .unwrap();
+        let open_share = blanket_grant(&sharer, &held, &bc);
+        db::grant_private_field_access_with_trail(&pool, &open_share)
+            .await
+            .unwrap();
+        let closed_share = blanket_grant(&sharer, &already_revoked, &bc);
+        db::grant_private_field_access_with_trail(&pool, &closed_share)
+            .await
+            .unwrap();
+        db::revoke_private_field_access_with_trail(
+            &pool,
+            &PrivateFieldGrant {
+                status: TokenStatus::Revoked,
+                revoked_at: Some(now()),
+                ..closed_share.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+        db::hard_delete_bounded_context_with_trail(&pool, &bc.name, &deleter.id)
+            .await
+            .unwrap();
+
+        let held_trail = trail(&pool, &held, &bc).await;
+        assert_eq!(
+            kinds(&held_trail),
+            vec![
+                AccessEventKind::AccessGranted,
+                AccessEventKind::AccessRevoked
+            ]
+        );
+        let ended = &held_trail[1].payload;
+        assert_eq!(ended["reason"], "bounded_context_deleted");
+        assert_eq!(ended["actor_role_id"], deleter.id.as_str());
+        assert!(
+            !fold_access_events(&held_trail, now()).held,
+            "a deleted context's grants are no longer held"
+        );
+        assert_eq!(
+            kinds(&trail(&pool, &already_revoked, &bc).await),
+            vec![
+                AccessEventKind::AccessGranted,
+                AccessEventKind::AccessRevoked
+            ],
+            "a grant that was already revoked is not revoked twice"
+        );
+
+        let open = private_field_events(&pool, &open_share.id).await;
+        assert_eq!(
+            open.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["PrivateFieldAccessGranted", "PrivateFieldAccessRevoked"]
+        );
+        assert_eq!(open[1].1["reason"], "bounded_context_deleted");
+        assert_eq!(open[1].1["actor_role_id"], deleter.id.as_str());
+        assert_eq!(private_field_events(&pool, &closed_share.id).await.len(), 2);
+    });
+}
+
+#[test]
+fn deleting_a_bounded_context_nobody_was_granted_in_records_nothing() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let deleter = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        db::hard_delete_bounded_context_with_trail(&pool, &bc.name, &deleter.id)
+            .await
+            .unwrap();
+        assert!(db::get_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap()
+            .is_none());
+    });
+}
+
+#[test]
+fn the_fold_ignores_private_field_events() {
+    use serde_json::json;
+    let events = vec![record(
+        AccessEventKind::PrivateFieldAccessGranted,
+        10,
+        json!({"grant_id": "g"}),
+    )];
+    assert_eq!(fold_access_events(&events, at(100)), Default::default());
+}
+
 // --- the baseline ---
 
 #[test]
@@ -473,6 +753,7 @@ fn a_grant_with_no_history_is_baselined_once() {
         let Some(pool) = test_pool().await else {
             return;
         };
+        let _serial = BASELINES.lock().await;
         let role = seed_role(&pool).await;
         let bc = seed_bounded_context(&pool).await;
         let mut raw = mapping(&role, &bc, AccessLevel::Admin);
@@ -483,11 +764,17 @@ fn a_grant_with_no_history_is_baselined_once() {
         assert!(trail(&pool, &role, &bc).await.is_empty());
 
         db::baseline_access_events(&pool).await.unwrap();
-        let second = db::baseline_access_events(&pool).await.unwrap();
+        // Not asserted on the returned count: the tests of this binary share
+        // one database, and another test's raw grant may be baselined by
+        // either call. This grant's own trail is what must not grow.
+        db::baseline_access_events(&pool).await.unwrap();
 
         let records = trail(&pool, &role, &bc).await;
-        assert_eq!(kinds(&records), vec![AccessEventKind::AccessBaselined]);
-        assert_eq!(second, 0, "a covered grant is not baselined again");
+        assert_eq!(
+            kinds(&records),
+            vec![AccessEventKind::AccessBaselined],
+            "a covered grant is not baselined again"
+        );
         let answer = fold_access_events(&records, now() + Duration::seconds(1));
         assert!(answer.held);
         assert_eq!(answer.level.as_deref(), Some("admin"));
@@ -502,6 +789,7 @@ fn instances_baselining_together_write_one_event_per_grant() {
         let Some(pool) = test_pool().await else {
             return;
         };
+        let _serial = BASELINES.lock().await;
         let role = seed_role(&pool).await;
         let bc = seed_bounded_context(&pool).await;
         db::insert_role_access_mapping(&pool, &mapping(&role, &bc, AccessLevel::Read))
@@ -522,11 +810,205 @@ fn instances_baselining_together_write_one_event_per_grant() {
 }
 
 #[test]
+fn a_raw_grant_with_a_capability_event_is_still_baselined() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let _serial = BASELINES.lock().await;
+        let role = seed_role(&pool).await;
+        let actor = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        db::insert_role_access_mapping(&pool, &mapping(&role, &bc, AccessLevel::Write))
+            .await
+            .unwrap();
+        // A change after a raw write records `CapabilityGranted` and no start.
+        assert!(db::change_mapping_capability_with_trail(
+            &pool, &role.id, &bc.name, "staff", true, &actor.id, false,
+        )
+        .await
+        .unwrap());
+        assert_eq!(kinds(&trail(&pool, &role, &bc).await).len(), 1);
+
+        db::baseline_access_events(&pool).await.unwrap();
+
+        let records = trail(&pool, &role, &bc).await;
+        assert_eq!(
+            kinds(&records),
+            vec![
+                AccessEventKind::CapabilityGranted,
+                AccessEventKind::AccessBaselined
+            ]
+        );
+        let answer = fold_access_events(&records, now() + Duration::seconds(1));
+        assert!(answer.held, "an active grant is held");
+        assert_eq!(answer.capabilities, BTreeSet::from(["staff".to_string()]));
+    });
+}
+
+#[test]
+fn a_raw_regrant_after_a_revoke_is_baselined() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let _serial = BASELINES.lock().await;
+        let role = seed_role(&pool).await;
+        let actor = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        db::grant_role_access_mapping_with_trail(
+            &pool,
+            &mapping(&role, &bc, AccessLevel::Read),
+            Some(&actor.id),
+        )
+        .await
+        .unwrap();
+        db::revoke_role_access_mapping_with_trail(&pool, &role.id, &bc.name, now(), &actor.id)
+            .await
+            .unwrap();
+        db::insert_role_access_mapping(&pool, &mapping(&role, &bc, AccessLevel::Admin))
+            .await
+            .unwrap();
+
+        db::baseline_access_events(&pool).await.unwrap();
+
+        let records = trail(&pool, &role, &bc).await;
+        assert_eq!(
+            records.last().unwrap().kind,
+            AccessEventKind::AccessBaselined
+        );
+        let answer = fold_access_events(&records, now() + Duration::seconds(1));
+        assert!(answer.held);
+        assert_eq!(answer.level.as_deref(), Some("admin"));
+    });
+}
+
+#[test]
+fn a_revoke_of_a_grant_that_is_already_revoked_records_nothing() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool).await;
+        let actor = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        db::grant_role_access_mapping_with_trail(
+            &pool,
+            &mapping(&role, &bc, AccessLevel::Read),
+            Some(&actor.id),
+        )
+        .await
+        .unwrap();
+
+        let first =
+            db::revoke_role_access_mapping_with_trail(&pool, &role.id, &bc.name, now(), &actor.id)
+                .await
+                .unwrap();
+        let second =
+            db::revoke_role_access_mapping_with_trail(&pool, &role.id, &bc.name, now(), &actor.id)
+                .await
+                .unwrap();
+
+        assert!(first);
+        assert!(!second, "nothing was left to revoke");
+        assert_eq!(
+            kinds(&trail(&pool, &role, &bc).await),
+            vec![
+                AccessEventKind::AccessGranted,
+                AccessEventKind::AccessRevoked
+            ]
+        );
+    });
+}
+
+#[test]
+fn a_grant_made_with_capabilities_records_them() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool).await;
+        let actor = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        let mut granted = mapping(&role, &bc, AccessLevel::Admin);
+        granted.capabilities = BTreeSet::from(["staff".to_string()]);
+        granted.delegable = BTreeSet::from(["audit".to_string()]);
+        db::grant_role_access_mapping_with_trail(&pool, &granted, Some(&actor.id))
+            .await
+            .unwrap();
+
+        let answer = fold_access_events(
+            &trail(&pool, &role, &bc).await,
+            now() + Duration::seconds(1),
+        );
+        assert_eq!(answer.capabilities, granted.capabilities);
+        assert_eq!(answer.delegable, granted.delegable);
+    });
+}
+
+#[test]
+fn a_stored_event_that_does_not_parse_is_an_error_not_a_gap() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool).await;
+        let actor = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        db::grant_role_access_mapping_with_trail(
+            &pool,
+            &mapping(&role, &bc, AccessLevel::Read),
+            Some(&actor.id),
+        )
+        .await
+        .unwrap();
+        // Revoked, so no other test's baseline reads the row broken below.
+        db::revoke_role_access_mapping_with_trail(&pool, &role.id, &bc.name, now(), &actor.id)
+            .await
+            .unwrap();
+        let schema = format!("\"bc_{ADMIN_BOUNDED_CONTEXT_NAME}\"");
+        let like = format!("%{}%", role.id);
+        let originals: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT sequence, payload FROM {schema}.events WHERE payload LIKE $1"
+        )))
+        .bind(&like)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.events SET payload = 'not json' WHERE payload LIKE $1"
+        )))
+        .bind(&like)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let read = db::list_access_event_records(&pool, &role.id, &bc.name).await;
+
+        for (sequence, payload) in originals {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {schema}.events SET payload = $1 WHERE sequence = $2"
+            )))
+            .bind(payload)
+            .bind(sequence)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert!(
+            read.is_err(),
+            "a trail that cannot be read in full is not answered from part of it"
+        );
+    });
+}
+
+#[test]
 fn a_revoked_grant_with_no_history_is_not_invented() {
     runtime().block_on(async {
         let Some(pool) = test_pool().await else {
             return;
         };
+        let _serial = BASELINES.lock().await;
         let role = seed_role(&pool).await;
         let bc = seed_bounded_context(&pool).await;
         let revoked = RoleAccessMapping {
@@ -543,7 +1025,7 @@ fn a_revoked_grant_with_no_history_is_not_invented() {
 }
 
 #[test]
-fn the_registered_types_are_the_six_and_registering_again_changes_nothing() {
+fn the_registered_types_are_the_eight_and_registering_again_changes_nothing() {
     runtime().block_on(async {
         let Some(pool) = test_pool().await else {
             return;

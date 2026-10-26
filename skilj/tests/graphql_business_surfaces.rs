@@ -2292,6 +2292,28 @@ fn private_field_grant_lifecycle_end_to_end() {
             "REVOKED"
         );
 
+        // Both changes are in the access trail, naming the grantee and
+        // acting as the grantor (docs/architecture.md §229).
+        let recorded: Vec<String> = skilj_core::db::list_events_for_bounded_context(
+            &pool,
+            skilj_core::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.payload.contains(&grant_id))
+        .map(|event| {
+            let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+            assert_eq!(payload["role_id"], colleague_role.id.as_str());
+            assert_eq!(payload["actor_role_id"], creator_role.id.as_str());
+            event.event_type.name.clone()
+        })
+        .collect();
+        assert_eq!(
+            recorded,
+            vec!["PrivateFieldAccessGranted", "PrivateFieldAccessRevoked"]
+        );
+
         // The colleague is redacted again - the same fail-closed answer
         // as before any grant ever existed.
         let response = graphql_request(
