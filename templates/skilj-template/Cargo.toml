@@ -20,6 +20,10 @@ serde_json = "1"
 schemars = { version = "1", features = ["chrono04"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+[package.metadata.cargo-machete]
+# schemars's `chrono04` feature above is for the date fields a project adds.
+ignored = ["chrono"]
+
 [[bin]]
 name = "server"
 path = "src/bin/server.rs"

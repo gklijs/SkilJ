@@ -57,7 +57,7 @@ Every public enum of the library crates is `#[non_exhaustive]` (docs/architectur
 
 ## CI checks
 
-The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each:
+The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each (12-15 are their own jobs; 16 is a weekly workflow):
 1. actionlint — checks the workflow file itself, including shellcheck on its `run:` blocks
 2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`
 3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace, then runs its quickstart (embedded Postgres, a deposit accepted, an overdraft rejected); `--no-run` skips the run
@@ -69,3 +69,8 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 9. `cargo test --workspace --no-run`, then `scripts/ci-test.sh` — `cargo test --workspace -- --nocapture` against that database, plus the guard that fails the build if any test skipped (Postgres, brokers or Temporal)
 10. `cargo clippy --workspace --all-targets -- -D warnings`
 11. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
+12. `scripts/check-spec.sh` — `allium check` on `specs/skilj.allium`: fails on an error, or on more warnings than the script's `MAX_WARNINGS` (a ratchet; lower it when a warning is fixed)
+13. `cargo machete` — no unused dependency; one kept on purpose goes in the crate's `[package.metadata.cargo-machete] ignored` with its reason
+14. `cargo semver-checks` on the library crates against their latest release, pull requests only. Reports without blocking until the 0.2.0 bump (`continue-on-error` in the workflow)
+15. `cargo llvm-cov` — line coverage of the full test run, in the job summary and as an lcov artifact. Informational (`continue-on-error`), no threshold
+16. `cargo mutants` — weekly (`.github/workflows/mutants.yml`), on the access trail and the `*_with_trail` writers against the `access_trail` tests. Surviving mutants are listed in the job summary. Informational

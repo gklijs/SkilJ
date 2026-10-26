@@ -12,7 +12,6 @@ categories = ["network-programming"]
 
 [dependencies]
 tokio.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 tracing.workspace = true
@@ -37,6 +36,10 @@ fe2o3-amqp-types = "0.18"
 # compiling. Cargo.lock isn't committed, so CI resolves the newest
 # tokio-util on every run. Lift the cap once fe2o3-amqp builds against it.
 tokio-util = ">=0.7, <0.7.20"
+
+[package.metadata.cargo-machete]
+# The tokio-util cap above is the point of that line.
+ignored = ["tokio-util"]
 
 [lib]
 name = "skilj_amqp"
