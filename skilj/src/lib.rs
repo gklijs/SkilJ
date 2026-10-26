@@ -1,16 +1,138 @@
 //! SkilJ: a Rust library for building event-sourced, DDD-style
 //! applications backed by a single-instance Postgres database, exposing a
-//! GraphQL surface and a REST surface. See `specs/skilj.allium` for the
-//! full behavioural specification and `docs/architecture.md` for how
-//! it's built.
+//! GraphQL surface and a REST surface. Consistency comes from the Dynamic
+//! Consistency Boundary: a command is decided against exactly the events
+//! sharing its tags, and accepted only if none of them changed meanwhile.
 //!
 //! This crate is a thin facade over `skilj-core` + `skilj-graphql` +
 //! `skilj-rest`, for the common case of wanting all three. A consumer
 //! wanting only one surface can depend on `skilj-core` plus the relevant
-//! surface crate directly instead - see docs/architecture.md §3.1.
+//! surface crate directly instead - see
+//! [docs/architecture.md §3.1](https://github.com/gklijs/SkilJ/blob/main/docs/architecture.md).
 //!
-//! This is also where the type-erasure boundary docs/architecture.md
-//! §1.7 describes actually lives: `SkiljBuilder::event_type::<T>()`/
+//! # Quickstart
+//!
+//! The fastest start is a generated project, which has a running wallet
+//! example with an embedded Postgres:
+//!
+//! ```sh
+//! cargo generate --git https://github.com/gklijs/SkilJ.git templates/skilj-template
+//! ```
+//!
+//! # An event and a command
+//!
+//! An event says what happened and which tags it carries; a command is
+//! decided against the events sharing its tags - here, the deposits for
+//! one wallet and nothing else.
+//!
+//! ```no_run
+//! use schemars::JsonSchema;
+//! use serde::{Deserialize, Serialize};
+//! use skilj::{auto_register, CommandType, EventType};
+//! use skilj_core::event_store::Event;
+//! use skilj_core::plugin::BoundedContextEvent;
+//! use skilj_core::shared::{CommandDecision, EventSpec, TagMapping};
+//!
+//! const BOUNDED_CONTEXT: &str = "wallet";
+//!
+//! #[derive(Serialize, Deserialize, JsonSchema)]
+//! struct DepositedPayload { wallet_id: String, amount: i64 }
+//!
+//! struct Deposited;
+//!
+//! #[auto_register(BOUNDED_CONTEXT)]
+//! impl EventType for Deposited {
+//!     type Payload = DepositedPayload;
+//!     const NAME: &'static str = "Deposited";
+//!     fn tag_mappings() -> Vec<TagMapping> {
+//!         vec![TagMapping::new("wallet", "wallet_id")]
+//!     }
+//! }
+//!
+//! // The events a command is decided against, one variant per event type
+//! // of the bounded context; a missed variant is a compile error.
+//! enum WalletEvent {
+//!     Deposited(DepositedPayload),
+//! }
+//!
+//! impl BoundedContextEvent for WalletEvent {
+//!     fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+//!         match event.event_type.name.as_str() {
+//!             "Deposited" => Some(serde_json::from_str(&event.payload).map(WalletEvent::Deposited)),
+//!             _ => None,
+//!         }
+//!     }
+//! }
+//!
+//! #[derive(Serialize, Deserialize, JsonSchema)]
+//! struct DepositPayload { wallet_id: String, amount: i64 }
+//!
+//! struct Deposit;
+//!
+//! #[auto_register(BOUNDED_CONTEXT)]
+//! impl CommandType for Deposit {
+//!     type Payload = DepositPayload;
+//!     type Event = WalletEvent;
+//!     const NAME: &'static str = "Deposit";
+//!     fn tag_mappings() -> Vec<TagMapping> {
+//!         vec![TagMapping::new("wallet", "wallet_id")]
+//!     }
+//!
+//!     fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+//!         if payload.amount <= 0 {
+//!             return CommandDecision::Rejected {
+//!                 reason: "a deposit must be positive".into(),
+//!                 kind: "invalid_amount".into(),
+//!             };
+//!         }
+//!         CommandDecision::Accepted {
+//!             events: vec![EventSpec {
+//!                 event_type: "Deposited".into(),
+//!                 payload: serde_json::json!({
+//!                     "wallet_id": payload.wallet_id,
+//!                     "amount": payload.amount,
+//!                 }),
+//!             }],
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! The generated project's `wallet.rs` has the complete version, with a
+//! `Withdraw` that rejects an overdraft against the balance folded from the
+//! matching events, and a `Projection`.
+//!
+//! # A server
+//!
+//! ```no_run
+//! use skilj::Skilj;
+//!
+//! # async fn run(database_url: String) -> Result<(), Box<dyn std::error::Error>> {
+//! let (skilj, report) = Skilj::builder(database_url).build().await?;
+//! println!("registered: {:?}", report.registered);
+//!
+//! let app = skilj.rest_router().merge(skilj.graphql_router().await?);
+//! let listener = tokio::net::TcpListener::bind(("0.0.0.0", 8080)).await?;
+//! axum::serve(listener, app).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! `build()` prints a once-only bootstrap secret for creating the first
+//! superadmin; see the README's "Getting started" and
+//! [docs/architecture.md §6](https://github.com/gklijs/SkilJ/blob/main/docs/architecture.md)
+//! for identity providers and access control.
+//!
+//! # Where the details are
+//!
+//! The behavioural specification is
+//! [`specs/skilj.allium`](https://github.com/gklijs/SkilJ/blob/main/specs/skilj.allium),
+//! and
+//! [docs/architecture.md](https://github.com/gklijs/SkilJ/blob/main/docs/architecture.md)
+//! says how it is built.
+//!
+//! This crate is also where the type-erasure boundary of
+//! docs/architecture.md §1.7 lives: `SkiljBuilder::event_type::<T>()`/
 //! `command_type::<T>()`/`projection::<T>()` each capture a plain data
 //! record (name, `schemars`-derived JSON Schema, etc.) plus - for command
 //! types - one boxed decider closure that bridges a raw stored payload

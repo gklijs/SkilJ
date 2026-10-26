@@ -18,8 +18,19 @@ README.md, "Status and stability").
   the reader. GraphQL's `EventOrigin.kind` answers the kind as that
   version would. Writing an event with an `Unknown` origin is refused with
   `Unsupported` (issue #121).
+- `skilj-kafka` features `ssl`, `ssl-vendored`, `gssapi` and `zstd`,
+  passing through to rdkafka's, so `security.protocol=SSL`/`SASL_SSL`,
+  `SCRAM-SHA-*`, Kerberos and `compression.type=zstd` no longer need a
+  matching `rdkafka` line in your own manifest. TLS is on by default
+  (`ssl-vendored`: OpenSSL built from source and linked statically, so
+  the binary still runs in a `FROM scratch` image); it needs perl and make
+  at build time, and `default-features = false` drops it (issue #124).
 
 ### Fixed
+
+- The template's Dockerfile builds on arm64 as well as amd64: it no
+  longer names `x86_64-unknown-linux-musl`, which Alpine's arm64 Rust
+  image lacks. CI now builds the image (issue #123).
 
 - `skilj-tui`'s live views work against an `https://` endpoint: its
   websocket client is now built with TLS, so subscriptions over `wss://`

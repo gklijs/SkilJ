@@ -71,6 +71,15 @@ jobs:
       # and runs the quickstart: deposit accepted, overdraft rejected.
       - run: scripts/check-template.sh
 
+  check-template-docker:
+    # The template's Dockerfile, built the way a user builds it (amd64;
+    # the file names no architecture, so arm64 differs only in the base
+    # image's platform). The runner's own Docker daemon, hence no container.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/check-template-docker.sh
+
   check-federation-composition:
     runs-on: ubuntu-24.04
     steps:
@@ -122,8 +131,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The library crates, compared with their latest release on crates.io.
-      - run: cargo semver-checks --package skilj --package skilj-core --package skilj-graphql --package skilj-rest --package skilj-retry --package skilj-macros
+      # Every published crate with a library target, compared with its
+      # latest release on crates.io: the ones the README's stability
+      # promise names, and the internal ones a patch release must not
+      # break either. `--workspace` skips `publish = false` crates
+      # (skilj-demo, skilj-test-support) and binary-only ones (skilj-tui,
+      # skilj-inspector), and a new crate is skipped until it has a
+      # release to compare with. skilj-kafka is why this job installs
+      # cmake and libcurl: building its baseline compiles librdkafka.
+      - run: cargo semver-checks --workspace
 
   machete:
     runs-on: ubuntu-24.04
@@ -170,6 +186,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # skilj-kafka's TLS (on by default, issue #124) and zstd build: the bundled
+      # OpenSSL and libzstd are the ones with build requirements of their own.
+      - run: cargo check -p skilj-kafka --features zstd
       # Broken intra-doc links and public docs linking to private items
       # don't fail a build, and docs.rs renders them as dead text.
       - run: cargo doc --workspace --no-deps

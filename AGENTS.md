@@ -57,7 +57,7 @@ Every public enum of the library crates is `#[non_exhaustive]` (docs/architectur
 
 ## CI checks
 
-The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each (12-15 are their own jobs; 16 is a weekly workflow):
+The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each (12-15 and 17 are their own jobs; 16 is a weekly workflow):
 1. actionlint — checks the workflow file itself, including shellcheck on its `run:` blocks
 2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`
 3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace, then runs its quickstart (embedded Postgres, a deposit accepted, an overdraft rejected); `--no-run` skips the run
@@ -74,3 +74,4 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 14. `cargo semver-checks` on the library crates against their latest release, pull requests only. Blocking: a breaking change fails it until the minor version is bumped in the same diff
 15. `cargo llvm-cov` — line coverage of the full test run, in the job summary and as an lcov artifact. Informational (`continue-on-error`), no threshold
 16. `cargo mutants` — weekly (`.github/workflows/mutants.yml`), on the access trail and the `*_with_trail` writers against the `access_trail` tests. Surviving mutants are listed in the job summary. Informational
+17. `scripts/check-template-docker.sh` — builds `templates/skilj-template`'s Dockerfile against this workspace and starts the image (its own job, needs Docker)

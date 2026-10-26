@@ -32,6 +32,26 @@ skilj-bridge.workspace = true
 # regardless of WITH_CURL).
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
 
+# Pass-throughs to rdkafka's own features (GitHub issue #124). TLS is on
+# by default because most managed Kafka requires it, and it is the
+# vendored OpenSSL, linked statically, so the binary still runs in a
+# `FROM scratch` image. Build with `default-features = false` to drop it
+# (no OpenSSL, perl or make needed; `SSL`/`SASL_SSL` then fail at client
+# creation), or `default-features = false, features = ["ssl"]` to link
+# the system OpenSSL instead.
+[features]
+default = ["ssl-vendored"]
+# `security.protocol=SSL` / `SASL_SSL` and `SCRAM-SHA-*`, linking the
+# system OpenSSL dynamically.
+ssl = ["rdkafka/ssl"]
+# The same, building OpenSSL from source and linking it statically (needs
+# a C compiler, perl and make).
+ssl-vendored = ["rdkafka/ssl-vendored"]
+# Kerberos (`sasl.mechanism=GSSAPI`).
+gssapi = ["rdkafka/gssapi"]
+# `compression.type=zstd`.
+zstd = ["rdkafka/zstd"]
+
 [lib]
 name = "skilj_kafka"
 path = "src/lib.rs"

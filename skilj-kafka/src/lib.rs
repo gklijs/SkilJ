@@ -157,16 +157,16 @@
 //! - `compression.type`: every batch holds one record, so each payload is
 //!   compressed on its own; whether that pays depends on the payload
 //!   size. `lz4`, `snappy` and `gzip` work with this crate's build of
-//!   librdkafka. `zstd` needs rdkafka's `zstd` feature, which this crate
-//!   doesn't enable: without it, creating the producer fails with
-//!   "libzstd not available at build time". Add
-//!   `rdkafka = { version = "0.39", features = ["zstd"] }` to your own
-//!   dependencies to get it.
-//! - `security.protocol`: this crate's build of librdkafka has no
-//!   OpenSSL, so `SSL` and `SASL_SSL` (most managed Kafka services) fail
-//!   when the client is created. Add rdkafka's `ssl` feature (or
-//!   `ssl-vendored` to build OpenSSL from source) the same way;
-//!   `SCRAM-SHA-*` needs it too, and Kerberos (`GSSAPI`) needs `gssapi`.
+//!   librdkafka. `zstd` needs this crate's `zstd` feature, which is off
+//!   by default: without it, creating the producer fails with
+//!   "libzstd not available at build time".
+//! - `security.protocol`: `SSL`, `SASL_SSL` (most managed Kafka services)
+//!   and `SCRAM-SHA-*` work with the default `ssl-vendored` feature, which
+//!   builds OpenSSL from source (a C compiler, perl and make) and links it
+//!   statically, so a `FROM scratch` image still works. With
+//!   `default-features = false` they fail when the client is created;
+//!   add `ssl` to link the system OpenSSL instead. Kerberos (`GSSAPI`)
+//!   needs `gssapi`.
 //!
 //! ```rust,no_run
 //! use rdkafka::producer::FutureProducer;
