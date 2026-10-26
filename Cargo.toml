@@ -77,7 +77,7 @@ members = [
 #                 partitions; broker-assigned (stream, stream-sequence)
 #                 on every message, unlike AMQP's sender-optional
 #                 group-id/group-sequence).
-# skilj-retry   - a small, dependency-free backoff/attempt-cap policy
+# skilj-retry   - a small backoff/attempt-cap policy (chrono only)
 #                 (issue #21) shared by `CrossContextRoute`'s own
 #                 catch-up loop and the three bridge crates' inbound and
 #                 outbound loops - the one piece of real code-sharing the
