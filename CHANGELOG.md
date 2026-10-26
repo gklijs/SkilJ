@@ -10,6 +10,15 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Added
+
+- `EventOrigin::Unknown { kind }`: an event whose origin was written by a
+  newer skilj version sharing the database - mid rolling deploy, or after
+  a rollback - reads back with that origin's kind instead of panicking
+  the reader. GraphQL's `EventOrigin.kind` answers the kind as that
+  version would. Writing an event with an `Unknown` origin is refused with
+  `Unsupported` (issue #121).
+
 ## [0.2.0] - 2026-10-26
 
 ### Changed (breaking)

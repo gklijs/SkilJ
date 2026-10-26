@@ -3185,3 +3185,74 @@ fn list_active_data_keys_for_subject_value_excludes_the_secrets_namespace() {
         );
     });
 }
+
+/// An events row whose `origin_kind` this build doesn't know - as a
+/// newer skilj version sharing the database writes - reads back as
+/// `EventOrigin::Unknown` through both row decoders (the single-row one
+/// and the batched one), instead of panicking the reader (issue #121).
+/// Writing such an origin back is refused, not guessed at.
+#[test]
+fn an_origin_kind_from_a_newer_version_reads_back_as_unknown() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let schema = format!("\"bc_{}\"", bc.name);
+
+        // A newer version widens the check before it writes a new kind.
+        let constraint: (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT conname::text FROM pg_constraint \
+             WHERE conrelid = '{schema}.events'::regclass AND contype = 'c' \
+             AND pg_get_constraintdef(oid) LIKE '%origin_kind%'"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {schema}.events DROP CONSTRAINT \"{}\"",
+            constraint.0
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.events (sequence, event_type_name, payload, metadata_type, \
+             metadata_version, metadata_client_id, metadata_created_at, tags, origin_kind) \
+             VALUES (1, $1, '{{\"amount\":1}}', 'test', 1, 'system', now(), '[]', \
+             'from_a_newer_version')"
+        )))
+        .bind(&et.name)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let unknown = EventOrigin::Unknown {
+            kind: "from_a_newer_version".to_string(),
+        };
+        let single = db::get_event_by_sequence(&pool, &bc.name, 1)
+            .await
+            .unwrap()
+            .expect("the row is there");
+        assert_eq!(single.origin, unknown);
+        let listed = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].origin, unknown);
+
+        let mut copy = single.clone();
+        copy.sequence = 2;
+        let refused = db::insert_event(&pool, &copy, None).await.unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                skilj_core::error::Error::Unsupported {
+                    what: "EventOrigin"
+                }
+            ),
+            "{refused:?}"
+        );
+    });
+}

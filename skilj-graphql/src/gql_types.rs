@@ -999,12 +999,15 @@ pub fn event_origin_object(n: &Naming) -> Object {
     gql_object!(EventOrigin => n.ty("EventOrigin") {
         scalar "kind": TypeRef::named_nn(TypeRef::STRING) => |o| {
             Value::from(match o {
-                EventOrigin::ExternalTriggered { .. } => "EXTERNAL_TRIGGERED",
-                EventOrigin::DirectlyCreated => "DIRECTLY_CREATED",
-                EventOrigin::SystemTriggered => "SYSTEM_TRIGGERED",
-                EventOrigin::SkiljRecorded => "SKILJ_RECORDED",
-                EventOrigin::CommandTriggered { .. } => "COMMAND_TRIGGERED",
-                _ => UNSUPPORTED_VALUE,
+                EventOrigin::ExternalTriggered { .. } => "EXTERNAL_TRIGGERED".to_string(),
+                EventOrigin::DirectlyCreated => "DIRECTLY_CREATED".to_string(),
+                EventOrigin::SystemTriggered => "SYSTEM_TRIGGERED".to_string(),
+                EventOrigin::SkiljRecorded => "SKILJ_RECORDED".to_string(),
+                EventOrigin::CommandTriggered { .. } => "COMMAND_TRIGGERED".to_string(),
+                // Written by a newer version: its kind, in the casing that
+                // version answers with.
+                EventOrigin::Unknown { kind } => kind.to_uppercase(),
+                _ => UNSUPPORTED_VALUE.to_string(),
             })
         },
         scalar "sourceContent": TypeRef::named(TypeRef::STRING) => |o| match o {
