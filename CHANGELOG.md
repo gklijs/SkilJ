@@ -19,6 +19,12 @@ README.md, "Status and stability").
   version would. Writing an event with an `Unknown` origin is refused with
   `Unsupported` (issue #121).
 
+### Fixed
+
+- `skilj-tui`'s live views work against an `https://` endpoint: its
+  websocket client is now built with TLS, so subscriptions over `wss://`
+  no longer fail with "TLS support not compiled in".
+
 ## [0.2.0] - 2026-10-26
 
 ### Changed (breaking)

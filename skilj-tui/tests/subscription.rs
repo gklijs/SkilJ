@@ -103,3 +103,42 @@ async fn drives_the_handshake_and_delivers_one_next_payload() {
         "expected the channel to close after \"complete\", got {after:?}"
     );
 }
+
+/// A `--url https://...` endpoint subscribes over `wss://`, so the
+/// websocket client must be built with TLS: without it, tungstenite
+/// refuses the URL before connecting (`TlsFeatureNotEnabled`) and the
+/// live view never works against a TLS deployment. A plain TCP listener
+/// that hangs up makes the TLS handshake itself fail instead, which is
+/// only reachable when TLS support is compiled in.
+#[tokio::test]
+async fn wss_endpoints_get_a_tls_handshake() {
+    use tokio_tungstenite::tungstenite::error::{Error, UrlError};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            drop(socket);
+        }
+    });
+
+    let mut rx = spawn_subscription(
+        format!("wss://{addr}/graphql").parse().unwrap(),
+        "test-jwt".to_string(),
+        "subscription { ping }".to_string(),
+        json!({}),
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the subscription task reports within 5s")
+        .expect("the subscription task reports an error rather than panicking");
+    match result {
+        Err(skilj_tui::graphql::ClientError::WebSocket(Error::Url(
+            UrlError::TlsFeatureNotEnabled,
+        ))) => {
+            panic!("skilj-tui was built without websocket TLS support")
+        }
+        Err(_) => {}
+        Ok(value) => panic!("a hung-up connection delivered {value}"),
+    }
+}
