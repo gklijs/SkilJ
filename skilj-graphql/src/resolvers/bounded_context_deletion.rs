@@ -10,7 +10,7 @@ use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
 /// `deleteBoundedContext(name: String!): BoundedContext!` - returns the
-/// pre-deletion snapshot, loaded before `hard_delete_bounded_context`
+/// pre-deletion snapshot, loaded before `hard_delete_bounded_context_with_trail`
 /// runs: there is nothing left to query afterward (`DROP SCHEMA ...
 /// CASCADE` removes the schema, and the registry row itself is gone
 /// too), so the response is built from what was there right before the
@@ -31,7 +31,7 @@ pub fn field(n: &Naming) -> Field {
                     .ok_or_else(|| super::not_found("BoundedContext", &name))?;
                 // Two concurrent `deleteBoundedContext` calls for the same
                 // name (a caller's own timed-out retry, say) could have the
-                // first one's `hard_delete_bounded_context` land between
+                // first one's `hard_delete_bounded_context_with_trail` land between
                 // this request's own `get_bounded_context` above and this
                 // reload - an ordinary error, not a panic, same as every
                 // other version of this race.

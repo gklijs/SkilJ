@@ -253,7 +253,7 @@ async fn apply_template_registrations(
 /// than reusing `BoundedContext.template`), grant the given role access,
 /// apply the template's current registrations, and load the result back.
 /// Factored out so the caller can wrap it: any `Err` here means a
-/// compensating `hard_delete_bounded_context` runs before the error is
+/// compensating `hard_delete_bounded_context_with_trail` runs before the error is
 /// propagated (ultra-review bug_002).
 #[allow(clippy::too_many_arguments)]
 async fn finish_creating_tenant(

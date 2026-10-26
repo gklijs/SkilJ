@@ -1333,9 +1333,11 @@ impl PrivateFieldGrantRow {
 const PRIVATE_FIELD_GRANT_COLUMNS: &str =
     "id, grantor_role_id, grantee_role_id, event_sequence, command_id, status, created_at, revoked_at";
 
-/// Inserts the grant and records nothing: how tests seed one.
-/// [`grant_private_field_access_with_trail`] is the write that also
-/// records `PrivateFieldAccessGranted`.
+/// Inserts the grant and records nothing: how tests seed one, and a
+/// bypass of the access trail (docs/architecture.md §229) for anyone else.
+/// Unlike a role mapping, a private-field grant made this way is never
+/// baselined, so it has no `PrivateFieldAccessGranted` at all.
+/// [`grant_private_field_access_with_trail`] is the write that records it.
 #[tracing::instrument(skip_all)]
 pub async fn insert_private_field_grant(
     pool: &Pool,
@@ -1538,6 +1540,9 @@ pub async fn get_private_field_grant(
 /// `true` when an active grant was updated, `false` when there was none
 /// (already revoked by a concurrent request): the trail records a
 /// revocation only on `true`.
+/// Records nothing itself, so a bypass of the access trail like
+/// [`insert_private_field_grant`]: [`revoke_private_field_access_with_trail`]
+/// is the write that records `PrivateFieldAccessRevoked`.
 #[tracing::instrument(skip_all)]
 pub async fn update_private_field_grant<'e>(
     executor: impl sqlx::PgExecutor<'e>,
@@ -3499,7 +3504,11 @@ pub async fn ensure_event_read_token_start_from_column(
 }
 
 /// Physically, permanently removes a bounded context and everything
-/// scoped to it - `DeleteBoundedContext` in specs/skilj.allium. One
+/// scoped to it - `DeleteBoundedContext` in specs/skilj.allium. Writes
+/// nothing to the access trail, so its grants stay `held` in
+/// `capabilityHistory`: production code calls
+/// [`hard_delete_bounded_context_with_trail`], and this is for tests and
+/// for a caller that records the end itself. One
 /// transaction: `DROP SCHEMA ... CASCADE` (every per-context table this
 /// module owns, gone in a single statement), then the `bounded_contexts`
 /// registry row itself, whose own `ON DELETE CASCADE` cleans up
@@ -3524,12 +3533,20 @@ pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::erro
 }
 
 /// [`hard_delete_bounded_context`] that also ends the context's grants in
-/// the access trail (docs/architecture.md §229): in the deleting
-/// transaction, an `AccessRevoked` (reason `bounded_context_deleted`) for
-/// every active mapping and a `PrivateFieldAccessRevoked` for every active
-/// private-field grant, with `actor_role_id` as the actor. Without them
+/// the access trail (docs/architecture.md §229): an `AccessRevoked`
+/// (reason `bounded_context_deleted`) for every active mapping and a
+/// `PrivateFieldAccessRevoked` for every active private-field grant, with
+/// `actor_role_id` as the actor, committed with the deletion. Without them
 /// `capabilityHistory` would keep saying a deleted context's grants are
 /// held. A context nobody was granted anything in records nothing.
+///
+/// Locks, in the writers' order (a mapping row, then the admin sequence):
+/// the `bounded_contexts` row first, which also holds off a new mapping
+/// (its foreign key needs that row), then the active mapping rows, then
+/// the private-field grants table, so what is read here is everything
+/// there is and nothing can be added before the drop. The schema is
+/// dropped before the events are recorded, so the admin sequence lock is
+/// held only for those inserts and the commit, not across a large drop.
 #[tracing::instrument(skip_all, fields(name = %name))]
 pub async fn hard_delete_bounded_context_with_trail(
     pool: &Pool,
@@ -3539,12 +3556,21 @@ pub async fn hard_delete_bounded_context_with_trail(
     let admin = require_admin_bounded_context(pool).await?;
     let schema = schema_ident(name);
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT name FROM bounded_contexts WHERE name = $1 FOR UPDATE")
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
     let mapped: Vec<(String,)> = sqlx::query_as(
         "SELECT role_id FROM role_access_mappings \
-         WHERE bounded_context = $1 AND status = 'active' ORDER BY role_id",
+         WHERE bounded_context = $1 AND status = 'active' ORDER BY role_id FOR UPDATE",
     )
     .bind(name)
     .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {schema}.private_field_grants IN SHARE ROW EXCLUSIVE MODE"
+    )))
+    .execute(&mut *tx)
     .await?;
     let private: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, grantee_role_id FROM {schema}.private_field_grants \
@@ -3552,6 +3578,13 @@ pub async fn hard_delete_bounded_context_with_trail(
     )))
     .fetch_all(&mut *tx)
     .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM bounded_contexts WHERE name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
     for (role_id,) in &mapped {
         record_access_event(
             &mut tx,
@@ -3568,13 +3601,6 @@ pub async fn hard_delete_bounded_context_with_trail(
         )
         .await?;
     }
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM bounded_contexts WHERE name = $1")
-        .bind(name)
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
     notify_registration_changed(pool).await;
     Ok(())
@@ -8780,19 +8806,26 @@ pub async fn set_mapping_delegable_with_trail(
     Ok(true)
 }
 
-/// Registers the six access event types in the admin bounded context
-/// (`rule RegisterAccessEventTypes`), each only if it is not registered
-/// yet: a restart changes nothing. Must run after the per-context startup
-/// patches, since the rows carry columns they add.
+/// Registers the access event types in the admin bounded context
+/// (`rule RegisterAccessEventTypes`): each missing one is added, and one
+/// already registered gets its schema brought up to date when the library
+/// describes it differently now (a release that adds an optional payload
+/// field, say), so the stored schema never lags what is written. Nothing
+/// else about a registered type is touched, and a restart with nothing new
+/// changes nothing. Must run after the per-context startup patches, since
+/// the rows carry columns they add.
 #[tracing::instrument(skip_all)]
 pub async fn register_access_event_types(pool: &Pool) -> crate::error::Result<()> {
     let admin = require_admin_bounded_context(pool).await?;
     for kind in AccessEventKind::ALL {
-        if get_event_type(pool, &admin.name, kind.name())
-            .await?
-            .is_none()
-        {
-            upsert_event_type(pool, &crate::access_trail::access_event_type(&admin, kind)).await?;
+        let wanted = crate::access_trail::access_event_type(&admin, kind);
+        let current = get_event_type(pool, &admin.name, kind.name()).await?;
+        let up_to_date = current.as_ref().is_some_and(|current| {
+            let parse = |schema: &str| serde_json::from_str::<serde_json::Value>(schema).ok();
+            parse(&current.schema).is_some() && parse(&current.schema) == parse(&wanted.schema)
+        });
+        if !up_to_date {
+            upsert_event_type(pool, &wanted).await?;
         }
     }
     Ok(())
@@ -8866,12 +8899,37 @@ pub async fn baseline_access_events(pool: &Pool) -> crate::error::Result<usize> 
     let admin = require_admin_bounded_context(pool).await?;
     let schema = schema_ident(&admin.name);
     let mut written = 0;
-    for mapping in list_role_access_mappings(pool).await? {
-        if mapping.status != RoleStatus::Active {
+    for listed in list_role_access_mappings(pool).await? {
+        if listed.status != RoleStatus::Active {
             continue;
         }
         let mut tx = pool.begin().await?;
-        // The lock `next_sequence` takes, taken first: the existence check
+        // The mapping row first, as every writer does (a revoke or a
+        // capability change locks the row, then takes the sequence lock):
+        // the other order deadlocks. Re-read under that lock, because the
+        // listing above is stale by now: a grant revoked or deleted since
+        // is not ours to baseline, and one whose capabilities changed
+        // must be baselined with what it holds now.
+        let row: Option<RoleAccessMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {ROLE_ACCESS_MAPPING_COLUMNS} FROM role_access_mappings \
+             WHERE role_id = $1 AND bounded_context = $2 AND status = 'active' FOR UPDATE"
+        )))
+        .bind(&listed.role.id)
+        .bind(&listed.bounded_context.name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            continue;
+        };
+        let mapping = RoleAccessMapping {
+            level: access_level_from_str(&row.level),
+            can_read_sensitive: row.can_read_sensitive,
+            scope: row.scope,
+            capabilities: row.capabilities.into_iter().collect(),
+            delegable: row.delegable.into_iter().collect(),
+            ..listed
+        };
+        // The lock `next_sequence` takes, taken next: the existence check
         // below then cannot race another instance's baseline.
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT next_value FROM {schema}.sequence FOR UPDATE"

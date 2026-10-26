@@ -223,6 +223,19 @@ listed separately here; see that section itself for its own structure.
 - [168. Which of two colliding projections is served was a coin flip](#projection-type-name-collision-order)
 - [212. Per-entity recurrence for deadlines, with a missed-run policy](#deadline-recurrence)
 - [213. The firing time, and a deadline's expiry, handed to `decide()`](#deadline-firing-time-and-expiry)
+- [214. Generic command approval (issue #98)](#command-approval)
+- [215. External workers and private fields (issue #99)](#external-workers-private-fields)
+- [216. Local mode: a supported embedded Postgres (issue #100)](#local-mode)
+- [217. Preparing the 0.1 compatibility promise](#compat-promise)
+- [218. Bounded pages for `commandProposals`](#proposals-paging)
+- [219. Every public enum of the library crates is `#[non_exhaustive]`](#non-exhaustive-enums)
+- [220. `skilj-core`'s internal modules are `#[doc(hidden)]`](#hidden-internals)
+- [221. `forgetSubject` forgets pending command proposals too](#forgotten-proposals)
+- [222. CI moves from Woodpecker on Codeberg to GitHub Actions](#github-actions)
+- [223. CI runs the broker suites, and splits clippy from the tests](#ci-broker-suites-and-job-split)
+- [224. Local mode pins Postgres 18.6.0](#local-mode-postgres-pin)
+- [225. Local mode says why it can't start](#local-mode-cant-start)
+- [226. Local mode runs with fsync on](#local-mode-fsync)
 - [227. Ordered batch submission for commands and external events](#batch-submission)
 - [228. Capabilities replace the `Role.name` team gate (issue #17)](#capabilities)
 - [229. The access trail: who held what, as events in the admin context](#access-trail)
@@ -12306,6 +12319,7 @@ deadline. `skilj-test-fixture/tests/fixture.rs` pins the pure
 `Decision::now`/`Decision::deadline` plumbing.
 
 
+<a id="command-approval"></a>
 ## 214. Generic command approval (issue #98)
 
 Some commands are too consequential for the credential that can submit
@@ -12463,6 +12477,7 @@ deadline at an approval-required type, finds a proposal and no event,
 and re-fires it to check no second proposal appears. The cross-context
 route uses the same helper; it has no test of its own.
 
+<a id="external-workers-private-fields"></a>
 ## 215. External workers and private fields (issue #99)
 
 The question this section answers: what can be promised to a service
@@ -12528,6 +12543,7 @@ field appear. The fail-closed redaction is the guarantee worth keeping.
 route with an `EventReadToken`, and asserts both that the field is `null`
 and that the plaintext appears nowhere in the response.
 
+<a id="local-mode"></a>
 ## 216. Local mode: a supported embedded Postgres (issue #100)
 
 The embedded Postgres already used by the test harness is now a supported
@@ -12629,6 +12645,7 @@ login is enforced - the URL's password connects, a wrong one and none do
 not - against whichever backend the process gets; as root it exercises
 the system path, and it fails if `initdb` is switched back to `trust`.
 
+<a id="compat-promise"></a>
 ## 217. Preparing the 0.1 compatibility promise
 
 From 0.1.0 Cargo treats `0.1.x` releases as compatible, so a patch release
@@ -12703,6 +12720,7 @@ yet: `skilj-core` (572, mostly `db`, `event_store` and `access_control`,
 `skilj-tui` (92) and the bridges and tools (12-26 each). The plugin module
 and `skilj-graphql` are the next ones worth closing.
 
+<a id="proposals-paging"></a>
 ## 218. Bounded pages for `commandProposals`
 
 `commandProposals` (§214) loaded every proposal in the bounded context -
@@ -12741,6 +12759,7 @@ rejecting the last proposal of the first page leaves the next pages intact,
 then an empty one. An admin scoped to one owner gets full pages past the
 other owner's proposals. A bad cursor is refused.
 
+<a id="non-exhaustive-enums"></a>
 ## 219. Every public enum of the library crates is `#[non_exhaustive]`
 
 §217 marked the error enums and left the rest exhaustive - the status and
@@ -12829,6 +12848,7 @@ rather than fail.
 The bridge and GraphQL fallbacks have no test: an unknown variant of an
 enum cannot be built to drive them.
 
+<a id="hidden-internals"></a>
 ## 220. `skilj-core`'s internal modules are `#[doc(hidden)]`
 
 §217 left all of `skilj-core` covered by the patch-release promise, which
@@ -12918,6 +12938,7 @@ Test: `forgetting_a_subject_forgets_its_pending_proposals` (`skilj/tests/subject
 
 Without the `forgetSubject` step, 42's proposal stayed `pending`.
 
+<a id="github-actions"></a>
 ## 222. CI moves from Woodpecker on Codeberg to GitHub Actions
 
 skilj moved its primary repository from Codeberg to GitHub. Codeberg's terms of use, amended in July 2026, no longer allow projects that mostly consist of code written by generative AI tools, and skilj is built with Claude. The issues and pull requests moved with their numbers kept: every Codeberg PR became a closed GitHub issue labelled `pr (codeberg)` naming its merge commit, and the numbers Codeberg no longer had (#25, #32) are closed placeholders. So "issue #N" anywhere in the code and docs means GitHub's #N.
@@ -12953,6 +12974,7 @@ The first GitHub Actions run (§222) took 18 minutes and failed. Both have one f
 
 Not done: `cargo-nextest`, which runs each test in its own process. Every test binary drops and recreates its own database on first use (§167), so processes of one binary would drop it from under each other. After these changes the test run itself is about 6.5 minutes, 157s of it `skilj/tests/graphql_business_surfaces.rs`.
 
+<a id="local-mode-postgres-pin"></a>
 ## 224. Local mode pins Postgres 18.6.0
 
 `check-template.sh` runs the README's quickstart on a fresh CI runner (§105), and the first run failed: the embedded Postgres started, but `postgresql_embedded`'s own connection was refused with `FATAL: invalid value for parameter "TimeZone": "UTC"`. Reproduced as a non-root user in an Ubuntu 24.04 container, with and without the host's `tzdata`.
@@ -12961,6 +12983,7 @@ The cause is upstream, from the day of that run (theseus-rs/postgresql-embedded#
 
 `local::postgres_version` is now `=18.6.0`, which reads the system's timezone data. Its cost is the one #21 was about: a system without `/usr/share/zoneinfo` (NixOS without it, a minimal container) can't use it - as before 18.6.1. A data directory created by 18.6.1 can't have been used, since that version never got past the first connection. Relax the requirement back to `V18` once a release with hardlink extraction is out; `the_version_is_pinned` asserts 18.6.1 is excluded, so that change is a deliberate one.
 
+<a id="local-mode-cant-start"></a>
 ## 225. Local mode says why it can't start
 
 Two of local mode's start failures named the wrong thing.
@@ -13059,13 +13082,13 @@ Tests: `skilj/tests/projection_query.rs` (`capability_mutations_and_reads_end_to
 
 §228 put capabilities on the grant, and a grant is a mutable row: a revoked mapping keeps `revoked_at` and nothing about what it held, and a capability taken away leaves no mark. "Could this grant read the staff projection on that date" had no answer, and the only record of a change was an `info` log line. The user chose events in the store over a table or a log, and wanted the point-in-time question answered, not just who changed what. The spec's own note on the admin context's operations ("in principle each should itself be a Command producing a CommandTriggered Event") had never been built; this is the first thing written into `admin`.
 
-**What is recorded.** Eight event types, registered in the admin bounded context by skilj at startup (`db::register_access_event_types`, each only if missing, so an existing deployment gets the later ones on its next start): `AccessGranted`, `AccessRevoked` (reason `grant_revoked` or `role_revoked`), `CapabilityGranted`, `CapabilityRevoked` (via `superadmin` or `admin`), `DelegableCapabilitiesSet`, and `AccessBaselined`, which are the history of a `RoleAccessMapping`; and `PrivateFieldAccessGranted` and `PrivateFieldAccessRevoked`, described below. Payloads carry ids only: the Role, the bounded context, and `actor_role_id`. No name, no `external_subject`, so there is nothing a person could ask to have forgotten; `scope` is the one free-form value and the grant already stores it. Tags are `role` and `bounded_context`. None of the types can be created externally, directly or by schedule, and none has event read tokens. Refused attempts are not recorded: they change nothing, so there is nothing to be consistent with.
+**What is recorded.** Eight event types, registered in the admin bounded context by skilj at startup (`db::register_access_event_types`: a missing one is added, and one already registered gets its schema refreshed when the library now describes it differently, so an existing deployment gets the later types and fields on its next start): `AccessGranted`, `AccessRevoked` (reason `grant_revoked`, `role_revoked` or `bounded_context_deleted`), `CapabilityGranted`, `CapabilityRevoked` (via `superadmin` or `admin`), `DelegableCapabilitiesSet`, and `AccessBaselined`, which are the history of a `RoleAccessMapping`; and `PrivateFieldAccessGranted` and `PrivateFieldAccessRevoked`, described below. Payloads carry ids only: the Role, the bounded context, and `actor_role_id`. No name, no `external_subject`, so there is nothing a person could ask to have forgotten; `scope` is the one free-form value and the grant already stores it. Tags are `role` and `bounded_context`. None of the types can be created externally, directly or by schedule, and none has event read tokens. Refused attempts are not recorded: they change nothing, so there is nothing to be consistent with.
 
 **A fifth origin.** `EventOrigin::SkiljRecorded` (`variant SkiljRecorded`). `SystemTriggered` was the obvious fit and was rejected: it is the scheduler's, and `ScheduledTypeIsFullyConfigured` requires every type allowing it to carry a schedule. `client_id` is the literal `"system"` (`SystemTriggeredClientIdIsSystem` covers both origins) and the actor is in the payload. `events.origin_kind` has a CHECK, and widening it on every bounded context would rescan every events table, so only the admin context's is widened (`db::ensure_admin_events_origin_kind`, run once, tolerant of two instances starting together). Other contexts keep the old check, and a bounded context upgraded from 0.0.1 still matches a fresh one except in `admin`, where both get the same patch.
 
 **Written with the change.** Each mutation is one transaction: the change, then `db::record_access_event` (the admin context's `next_sequence` and `insert_event` on the same `tx`). `grant_role_access_mapping_with_trail` (grant, and a templated tenant's first grant), `revoke_role_access_mapping_with_trail`, `revoke_role_and_mappings` (one `AccessRevoked` per ended grant; it takes the acting Role), `change_mapping_capability_with_trail` (nothing is recorded when the atomic statement applied nothing) and `set_mapping_delegable_with_trail`. If the admin context is missing the change fails; if the event cannot be written the change is not made. The admin context's sequence row lock now serialises access changes. They are rare and the lock is held for two statements. A revoke that finds no active mapping (two requests racing, a stale list) changes nothing and records nothing, like a capability change that applied nothing. The events are not broadcast and not appended to the event cache: nothing subscribes to them, and a cache read compares against `latest_sequence` anyway (§89).
 
-**Raw writers stay.** `insert_role_access_mapping` and the other plain functions are still public, and still how tests seed a grant and how local mode (`skilj::dev`) seeds its admin grant. They write no trail, which is what the baseline is for.
+**Raw writers stay.** `insert_role_access_mapping` and the other plain functions are still public, and still how tests seed a grant and how local mode (`skilj::dev`) seeds its admin grant. They write no trail, which is what the baseline is for. The private-field writers (`insert_private_field_grant`, `update_private_field_grant`) and `hard_delete_bounded_context` are public too and also bypass the trail, but nothing baselines them: a private-field grant made that way has no event, and a context deleted that way leaves its grants `held`. Production code uses the `_with_trail` variants; the plain ones are for tests and say so in their docs.
 
 **The baseline.** At startup, after the per-context patches (the event types need their columns), `db::ensure_access_trail` widens the check, registers the types and runs `baseline_access_events`: for each active mapping whose trail does not fold to held, one `AccessBaselined` carrying what it holds now (level, `can_read_sensitive`, `scope`, `capabilities`, `delegable`, no actor). "Covered" is the fold's answer, not the existence of an event: a grant a raw writer made and a capability change then touched has a `CapabilityGranted` and no start, and one raw-re-granted after an `AccessRevoked` folds to not held, and both are baselined. It takes the admin sequence row lock before checking, so several instances starting together write one event per grant. A mapping revoked before the upgrade gets nothing: its history is not invented, and `capabilityHistory` answers `known: false` for a time the trail had not begun.
 
@@ -13073,11 +13096,15 @@ Tests: `skilj/tests/projection_query.rs` (`capability_mutations_and_reads_end_to
 
 **Decisions** (the user's): events in the store rather than a table or a log line; the grant lifecycle recorded with the capabilities, so "held" can be answered; the same transaction, not afterwards; a baseline for existing grants; and the trail blocks 0.2.0. My calls: the new origin over reusing `SystemTriggered`, ids and not names in payloads, and the admin-only check.
 
-**Private-field grants.** `grantPrivateFieldAccessForEvent`, `grantPrivateFieldAccessForCommand` and `revokePrivateFieldAccess` change who can read a record's private fields, so they are recorded too, by the user's choice: `PrivateFieldAccessGranted` and `PrivateFieldAccessRevoked`, written in the same transaction as the grant row (`db::grant_private_field_access_with_trail`, `db::revoke_private_field_access_with_trail`). `role_id` is the grantee, whose access it is, and `actor_role_id` the grantor, the only Role that can make or end one; the payload adds the `grant_id` and, for a per-record grant, the `event_sequence` or `command_id` (both null for a blanket grant). Ids only, as above. They share the `role` and `bounded_context` tags, so "who could read what Role X shared" is the same kind of tagged read, but they name no mapping: `AccessEventKind::is_mapping_event` is false for them, and neither `fold_access_events` nor the baseline's read sees them, so a private-field grant never makes a mapping `known` or `held`. A revoke of a grant that is no longer active records nothing (`update_private_field_grant` only touches an active row and says whether it did; the resolver answers `private_field_grant_not_active`). There is no baseline and no `capabilityHistory` equivalent: a grant made before the trail has no event, and its later revoke is recorded as a revoke with no grant before it. The events are readable through the usual event queries with an admin-context grant.
+**Private-field grants.** `grantPrivateFieldAccessForEvent`, `grantPrivateFieldAccessForCommand` and `revokePrivateFieldAccess` change who can read a record's private fields, so they are recorded too, by the user's choice: `PrivateFieldAccessGranted` and `PrivateFieldAccessRevoked`, written in the same transaction as the grant row (`db::grant_private_field_access_with_trail`, `db::revoke_private_field_access_with_trail`). `role_id` is the grantee, whose access it is, and `actor_role_id` the grantor, the only Role that can make or end one; the payload adds the `grant_id` and, for a per-record grant, the `event_sequence` or `command_id` (both null for a blanket grant). Ids only, as above. They share the `role` and `bounded_context` tags, where `role` is the grantee: "what was shared with Role X" is a tagged read, but "what did Role X share" is not, since the grantor is only the payload's `actor_role_id` (no tag), so that needs a scan of these two types. They name no mapping: `AccessEventKind::is_mapping_event` is false for them, and neither `fold_access_events` nor the baseline's read sees them, so a private-field grant never makes a mapping `known` or `held`. A revoke of a grant that is no longer active records nothing (`update_private_field_grant` only touches an active row and says whether it did; the resolver answers `private_field_grant_not_active`). There is no baseline and no `capabilityHistory` equivalent: a grant made before the trail has no event, and its later revoke is recorded as a revoke with no grant before it. The events are readable through the usual event queries with an admin-context grant.
 
 **Deleting a bounded context.** `deleteBoundedContext` runs `db::hard_delete_bounded_context_with_trail`: in the transaction that drops the schema it records an `AccessRevoked` (reason `bounded_context_deleted`) for every active mapping and a `PrivateFieldAccessRevoked` (same reason) for every active private-field grant, the deleting superadmin as actor. Without them `capabilityHistory` would say `held: true` for a context that no longer exists. Grants already revoked get nothing a second time. The tenant rollback in `createBoundedContextFromTemplate` uses the same function. Archiving ends no grant, so records nothing. Test: `deleting_a_bounded_context_ends_its_active_grants_in_the_trail`.
 
-**Not done:** denied attempts, reads of gated projections, and the other admin operations (bounded contexts, tokens, type registration), which the spec still lists as direct effects.
+**Concurrency.** Every writer takes the mapping row first and the admin context's `sequence` row second, and everything that locks both follows that order. The baseline re-reads the mapping `FOR UPDATE` inside its transaction before taking the sequence lock, and baselines from that fresh row, so a grant revoked, deleted or changed since the list was read is skipped or recorded as it is now, never resurrected after its `AccessRevoked`. The deletion locks the `bounded_contexts` row (which holds off a new mapping through its foreign key), then the active mapping rows, then the private-field grants table (`SHARE ROW EXCLUSIVE`), reads what is active, drops the schema, and only then records the revokes, so the sequence lock is held for the inserts and the commit, not across the drop, and a grant committed after the read cannot exist. Tests: `a_baseline_does_not_resurrect_a_grant_revoked_after_it_listed`, `a_deletion_waits_for_a_private_field_grant_in_flight_and_records_it`, `a_stale_registered_schema_is_refreshed_at_startup`.
+
+**Role revocation and private-field grants.** `revokeRole` ends the Role's mappings and records each (`role_revoked`). It does not end the private-field grants the Role made or holds, and records nothing for them: a revoked Role cannot authenticate, so a share to it reads nothing and a share by it is a decision about records the grantor can no longer reach, and a Role is never reactivated. The grants remain `active` rows with no revoke event. Ending them with the Role would be a separate change.
+
+**Not done:** denied attempts, reads of gated projections, and the other admin operations (tokens, type registration, and the adding and archiving of bounded contexts), which the spec still lists as direct effects.
 
 Tests: `skilj-core/tests/access_trail.rs` (private-field grants: a grant and a repeated revoke recorded by the grantee with the grantor as actor, a failed insert leaves one event, the payload names the record and nothing personal, the fold ignores them; the fold: unknown before the trail, a capability held between its grant and revoke, level, scope and delegable as of an instant, a revoked grant holding nothing, a baseline as the starting point; the writers: grant and revoke leave events with the system origin and both tags, capability changes record only when they apply, a revoked grant records nothing, a role revoked ends each grant with its own event, the admin log stays gapless across eight writers; the baseline: once, once under four concurrent instances, not for a revoked grant; the eight types registered with creation closed), and `skilj/tests/graphql_business_surfaces.rs` (the private-field mutations leave both events).
 

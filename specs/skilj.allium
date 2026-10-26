@@ -5345,7 +5345,9 @@ rule CreateBoundedContextFromTemplate {
                 actor_role_id: caller.id,
                 level: level,
                 can_read_sensitive: can_read_sensitive,
-                scope: scope
+                scope: scope,
+                capabilities: {},
+                delegable: {}
             }
         )
         TemplateApplicationDue(bounded_context: tenant, template: template)
@@ -6825,7 +6827,9 @@ rule GrantRoleAccessMapping {
                 actor_role_id: caller.id,
                 level: level,
                 can_read_sensitive: can_read_sensitive,
-                scope: scope
+                scope: scope,
+                capabilities: {},
+                delegable: {}
             }
         )
 }
@@ -6976,7 +6980,8 @@ rule RevokeRoleAccessMapping {
 -- Eight event types, all registered in the admin context by SkilJ itself,
 -- none registrable or creatable by anyone else:
 --   AccessGranted            a RoleAccessMapping was made: level,
---                            can_read_sensitive, scope
+--                            can_read_sensitive, scope, and the
+--                            capabilities and delegable set it starts with
 --   AccessRevoked            one ended, with reason grant_revoked (the
 --                            mapping alone), role_revoked (its Role) or
 --                            bounded_context_deleted
@@ -7223,7 +7228,7 @@ rule GrantPrivateFieldAccessForEvent {
         or is_default_private_reader(event, access_mapping)
 
     ensures:
-        let grant = PrivateFieldGrant.created(
+        PrivateFieldGrant.created(
             bounded_context: access_mapping.bounded_context,
             grantor: access_mapping.role,
             grantee: grantee,
@@ -7238,7 +7243,7 @@ rule GrantPrivateFieldAccessForEvent {
             bounded_context: access_mapping.bounded_context,
             payload: {
                 actor_role_id: access_mapping.role.id,
-                grant_id: grant.id,
+                -- grant_id names the grant created just above
                 event_sequence: event?.sequence,
                 command_id: null
             }
@@ -7323,7 +7328,7 @@ rule GrantPrivateFieldAccessForCommand {
         or is_default_private_reader(command, access_mapping)
 
     ensures:
-        let grant = PrivateFieldGrant.created(
+        PrivateFieldGrant.created(
             bounded_context: access_mapping.bounded_context,
             grantor: access_mapping.role,
             grantee: grantee,
@@ -7338,7 +7343,7 @@ rule GrantPrivateFieldAccessForCommand {
             bounded_context: access_mapping.bounded_context,
             payload: {
                 actor_role_id: access_mapping.role.id,
-                grant_id: grant.id,
+                -- grant_id names the grant created just above
                 event_sequence: null,
                 command_id: command?.id
             }
