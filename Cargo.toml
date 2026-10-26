@@ -101,7 +101,7 @@ members = [
 #                 skilj-core directly, same posture as skilj-inspector.
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 # The oldest Rust the workspace builds on: sqlx 0.9 and postgresql_embedded
 # need 1.94, and `AtomicUsize::try_update` (skilj-graphql) 1.95. CI checks it.
@@ -189,12 +189,12 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 opentelemetry-appender-tracing = "0.33"
 
 # Path dependencies between skilj's own crates
-skilj-core = { path = "skilj-core", version = "0.1.1" }
-skilj-graphql = { path = "skilj-graphql", version = "0.1.1" }
-skilj-macros = { path = "skilj-macros", version = "0.1.1" }
-skilj-rest = { path = "skilj-rest", version = "0.1.1" }
-skilj = { path = "skilj", version = "0.1.1" }
-skilj-codegen = { path = "skilj-codegen", version = "0.1.1" }
-skilj-test-fixture = { path = "skilj-test-fixture", version = "0.1.1" }
-skilj-retry = { path = "skilj-retry", version = "0.1.1" }
-skilj-bridge = { path = "skilj-bridge", version = "0.1.1" }
+skilj-core = { path = "skilj-core", version = "0.2.0" }
+skilj-graphql = { path = "skilj-graphql", version = "0.2.0" }
+skilj-macros = { path = "skilj-macros", version = "0.2.0" }
+skilj-rest = { path = "skilj-rest", version = "0.2.0" }
+skilj = { path = "skilj", version = "0.2.0" }
+skilj-codegen = { path = "skilj-codegen", version = "0.2.0" }
+skilj-test-fixture = { path = "skilj-test-fixture", version = "0.2.0" }
+skilj-retry = { path = "skilj-retry", version = "0.2.0" }
+skilj-bridge = { path = "skilj-bridge", version = "0.2.0" }

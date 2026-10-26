@@ -109,10 +109,6 @@ jobs:
     # (the crates are 0.x) shows up as a failure that asks for the minor
     # bump in the same diff.
     if: github.event_name == 'pull_request'
-    # Reports without blocking for now: the capabilities change (issue #17)
-    # removed `Projection::TEAM_ONLY` and more since 0.1.1, so this fails
-    # until the next release bumps to 0.2.0. Drop this line then.
-    continue-on-error: true
     runs-on: ubuntu-24.04
     container: rust:1-bookworm
     env:
