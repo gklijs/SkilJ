@@ -9560,7 +9560,9 @@ async fn event_origin_from_row(
                 command: Box::new(command),
             }
         }
-        other => panic!("events row has unknown origin_kind {other:?}"),
+        other => EventOrigin::Unknown {
+            kind: other.to_string(),
+        },
     })
 }
 
@@ -10386,7 +10388,9 @@ async fn events_from_rows(
                     command: Box::new(command.clone()),
                 }
             }
-            other => panic!("events row has unknown origin_kind {other:?}"),
+            other => EventOrigin::Unknown {
+                kind: other.to_string(),
+            },
         });
     }
     let origin_lookup_elapsed = origin_lookup_started.elapsed();
@@ -11027,6 +11031,13 @@ pub async fn insert_event<'e>(
                  insert_command(pool, &result.command) first and pass its returned id"
             );
             ("command_triggered", None, None)
+        }
+        // Only ever read back from a newer version's row; this build has
+        // no way to write the per-kind columns it would need.
+        EventOrigin::Unknown { .. } => {
+            return Err(crate::error::Error::Unsupported {
+                what: "EventOrigin",
+            })
         }
     };
 

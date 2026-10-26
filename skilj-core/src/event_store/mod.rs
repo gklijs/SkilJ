@@ -428,6 +428,15 @@ pub enum EventOrigin {
     /// originator to name: `metadata.client_id` is the literal `"system"`
     /// and the acting Role is in the payload.
     SkiljRecorded,
+    /// An origin this build doesn't know, read from a row a newer skilj
+    /// version wrote to the same database - mid rolling deploy, or after a
+    /// rollback. Read-only: the event is served with its origin's kind and
+    /// nothing else, rather than failing the whole read, and
+    /// [`crate::db::insert_event`] refuses to write one.
+    Unknown {
+        /// The stored `origin_kind`, as the newer version wrote it.
+        kind: String,
+    },
 }
 
 /// See `entity Event`.
