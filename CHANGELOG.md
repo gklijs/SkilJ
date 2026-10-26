@@ -46,6 +46,11 @@ README.md, "Status and stability").
 
 ### Upgrading from 0.1
 
+- **Not a rolling upgrade.** Stop every 0.1.x instance before the first
+  0.2.0 instance starts, and don't roll back to 0.1.x once one has. 0.2.0
+  writes `admin` events with the new `SKILJ_RECORDED` origin as soon as it
+  starts, and 0.1.x panics when it reads an event origin it doesn't know
+  (issue #121).
 - Startup widens the `admin` bounded context's `events.origin_kind` check,
   registers eight access event types there (and brings the schema of one already registered up to date) and baselines existing grants. A
   grant made by writing `role_access_mappings` directly (as local mode's
