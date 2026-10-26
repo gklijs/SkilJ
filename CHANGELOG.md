@@ -10,6 +10,8 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-26
+
 ### Changed (breaking)
 
 - Capabilities replace the `Role.name` team gate (issue #17,
@@ -2159,7 +2161,8 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://github.com/gklijs/SkilJ/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/gklijs/SkilJ/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/gklijs/SkilJ/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/gklijs/SkilJ/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/gklijs/SkilJ/compare/v0.0.10...v0.1.0
 [0.0.10]: https://github.com/gklijs/SkilJ/compare/v0.0.9...v0.0.10
