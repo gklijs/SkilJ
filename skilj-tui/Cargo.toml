@@ -20,6 +20,8 @@ serde_json.workspace = true
 # TLS for `wss://`: an `https://` endpoint's subscriptions go over it
 # (`graphql::to_websocket_url`). Native roots, like reqwest's own verifier.
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
+# Only to choose the crypto provider explicitly (`graphql::ensure_crypto_provider`).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 futures-util.workspace = true
 
 [dev-dependencies]
