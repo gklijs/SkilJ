@@ -5,7 +5,7 @@
 //! date" is answered from stored facts instead of from rows that only say
 //! what is true now.
 //!
-//! This module is the pure half: the six event types, how an event is
+//! This module is the pure half: the eight event types, how an event is
 //! built from a change, and the fold behind `capabilityHistory`. The
 //! transaction that writes them is `db::record_access_event` and the
 //! `*_with_trail` functions around it.
@@ -23,8 +23,11 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
-/// `access_event_type_names` in the spec: the six event types SkilJ
-/// registers in the admin bounded context itself.
+/// `access_event_type_names` in the spec: the eight event types SkilJ
+/// registers in the admin bounded context itself. The first six are the
+/// history of a `RoleAccessMapping` ([`AccessEventKind::is_mapping_event`]);
+/// the last two record a Role sharing the private fields of its records
+/// with another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AccessEventKind {
@@ -40,18 +43,36 @@ pub enum AccessEventKind {
     DelegableCapabilitiesSet,
     /// What an existing, active grant held when the trail began.
     AccessBaselined,
+    /// A Role let another read the private fields of one record, or of all
+    /// its records (`PrivateFieldGrant`). `role_id` is the grantee and
+    /// `actor_role_id` the grantor.
+    PrivateFieldAccessGranted,
+    /// The grantor ended such a grant.
+    PrivateFieldAccessRevoked,
 }
 
 impl AccessEventKind {
     /// Every kind, in the order they are registered.
-    pub const ALL: [AccessEventKind; 6] = [
+    pub const ALL: [AccessEventKind; 8] = [
         AccessEventKind::AccessGranted,
         AccessEventKind::AccessRevoked,
         AccessEventKind::CapabilityGranted,
         AccessEventKind::CapabilityRevoked,
         AccessEventKind::DelegableCapabilitiesSet,
         AccessEventKind::AccessBaselined,
+        AccessEventKind::PrivateFieldAccessGranted,
+        AccessEventKind::PrivateFieldAccessRevoked,
     ];
+
+    /// Whether the kind belongs to a `RoleAccessMapping`'s history, which
+    /// [`fold_access_events`] folds. A private-field grant is not part of
+    /// it: it names no mapping, and must not make a grant look known.
+    pub fn is_mapping_event(self) -> bool {
+        !matches!(
+            self,
+            AccessEventKind::PrivateFieldAccessGranted | AccessEventKind::PrivateFieldAccessRevoked
+        )
+    }
 
     /// The event type's name in the admin bounded context.
     pub fn name(self) -> &'static str {
@@ -62,6 +83,8 @@ impl AccessEventKind {
             AccessEventKind::CapabilityRevoked => "CapabilityRevoked",
             AccessEventKind::DelegableCapabilitiesSet => "DelegableCapabilitiesSet",
             AccessEventKind::AccessBaselined => "AccessBaselined",
+            AccessEventKind::PrivateFieldAccessGranted => "PrivateFieldAccessGranted",
+            AccessEventKind::PrivateFieldAccessRevoked => "PrivateFieldAccessRevoked",
         }
     }
 
@@ -79,6 +102,8 @@ impl AccessEventKind {
                 ("level", "string", true),
                 ("can_read_sensitive", "boolean", true),
                 ("scope", "string", false),
+                ("capabilities", "array", false),
+                ("delegable", "array", false),
             ],
             AccessEventKind::AccessRevoked => &[
                 ("actor_role_id", "string", false),
@@ -101,6 +126,16 @@ impl AccessEventKind {
                 ("capabilities", "array", true),
                 ("delegable", "array", true),
             ],
+            AccessEventKind::PrivateFieldAccessGranted => &[
+                ("actor_role_id", "string", false),
+                ("grant_id", "string", true),
+                ("event_sequence", "integer", false),
+                ("command_id", "string", false),
+            ],
+            AccessEventKind::PrivateFieldAccessRevoked => &[
+                ("actor_role_id", "string", false),
+                ("grant_id", "string", true),
+            ],
         }
     }
 }
@@ -114,8 +149,8 @@ pub fn access_event_schema(kind: AccessEventKind) -> String {
     for (name, ty, is_required) in kind.extra_fields() {
         let property = if *ty == "array" {
             json!({ "type": "array", "items": { "type": "string" } })
-        } else if *name == "actor_role_id" || *name == "scope" {
-            json!({ "type": ["string", "null"] })
+        } else if !*is_required {
+            json!({ "type": [ty, "null"] })
         } else {
             json!({ "type": ty })
         };
@@ -184,25 +219,54 @@ pub struct AccessChange {
 }
 
 impl AccessChange {
-    /// `AccessGranted`.
+    /// `AccessGranted`: `mapping` as it is made. Its capabilities and
+    /// delegable set are recorded too, since the fold starts both from the
+    /// event (a grant made with none records empty sets).
     pub fn granted(
-        role_id: &str,
-        bounded_context: &str,
+        mapping: &crate::access_control::RoleAccessMapping,
         actor_role_id: Option<&str>,
-        level: AccessLevel,
-        can_read_sensitive: bool,
-        scope: Option<&str>,
     ) -> Self {
         Self::new(
             AccessEventKind::AccessGranted,
-            role_id,
-            bounded_context,
+            &mapping.role.id,
+            &mapping.bounded_context.name,
             actor_role_id,
             json!({
-                "level": level_str(level),
-                "can_read_sensitive": can_read_sensitive,
-                "scope": scope,
+                "level": level_str(mapping.level),
+                "can_read_sensitive": mapping.can_read_sensitive,
+                "scope": mapping.scope,
+                "capabilities": mapping.capabilities,
+                "delegable": mapping.delegable,
             }),
+        )
+    }
+
+    /// `PrivateFieldAccessGranted`: `grant` as it is made. `role_id` is the
+    /// grantee, whose access it is, and the actor is the grantor. Both
+    /// record fields empty is a blanket grant.
+    pub fn private_field_granted(grant: &crate::access_control::PrivateFieldGrant) -> Self {
+        Self::new(
+            AccessEventKind::PrivateFieldAccessGranted,
+            &grant.grantee.id,
+            &grant.bounded_context.name,
+            Some(&grant.grantor.id),
+            json!({
+                "grant_id": grant.id,
+                "event_sequence": grant.event_sequence,
+                "command_id": grant.command_id,
+            }),
+        )
+    }
+
+    /// `PrivateFieldAccessRevoked`. Only the grantor can revoke, so it is
+    /// the actor.
+    pub fn private_field_revoked(grant: &crate::access_control::PrivateFieldGrant) -> Self {
+        Self::new(
+            AccessEventKind::PrivateFieldAccessRevoked,
+            &grant.grantee.id,
+            &grant.bounded_context.name,
+            Some(&grant.grantor.id),
+            json!({ "grant_id": grant.id }),
         )
     }
 
@@ -219,6 +283,35 @@ impl AccessChange {
             bounded_context,
             Some(actor_role_id),
             json!({ "reason": if role_revoked { "role_revoked" } else { "grant_revoked" } }),
+        )
+    }
+
+    /// `AccessRevoked` with reason `bounded_context_deleted`: the grant
+    /// ended because its bounded context was deleted, by `actor_role_id`.
+    pub fn context_ended(role_id: &str, bounded_context: &str, actor_role_id: &str) -> Self {
+        Self::new(
+            AccessEventKind::AccessRevoked,
+            role_id,
+            bounded_context,
+            Some(actor_role_id),
+            json!({ "reason": "bounded_context_deleted" }),
+        )
+    }
+
+    /// `PrivateFieldAccessRevoked` for a grant that ended with its bounded
+    /// context, so the actor is whoever deleted it rather than the grantor.
+    pub fn private_field_ended(
+        grant_id: &str,
+        grantee_id: &str,
+        bounded_context: &str,
+        actor_role_id: &str,
+    ) -> Self {
+        Self::new(
+            AccessEventKind::PrivateFieldAccessRevoked,
+            grantee_id,
+            bounded_context,
+            Some(actor_role_id),
+            json!({ "grant_id": grant_id, "reason": "bounded_context_deleted" }),
         )
     }
 
@@ -395,7 +488,10 @@ fn string_set(value: Option<&Value>) -> BTreeSet<String> {
 /// delegable set are empty until a new grant begins.
 pub fn fold_access_events(events: &[AccessEventRecord], as_of: DateTime<Utc>) -> AccessHistory {
     let mut state = AccessHistory::default();
-    for event in events.iter().filter(|event| event.created_at <= as_of) {
+    for event in events
+        .iter()
+        .filter(|event| event.kind.is_mapping_event() && event.created_at <= as_of)
+    {
         state.known = true;
         let payload = &event.payload;
         match event.kind {
@@ -426,6 +522,9 @@ pub fn fold_access_events(events: &[AccessEventRecord], as_of: DateTime<Utc>) ->
             AccessEventKind::DelegableCapabilitiesSet => {
                 state.delegable = string_set(payload.get("delegable"));
             }
+            // Filtered out above: not part of a mapping's history.
+            AccessEventKind::PrivateFieldAccessGranted
+            | AccessEventKind::PrivateFieldAccessRevoked => {}
         }
     }
     state

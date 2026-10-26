@@ -35,7 +35,7 @@ use crate::access_control::{
     AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
     ExternalEventToken, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
-use crate::access_trail::{AccessChange, AccessEventKind, AccessEventRecord};
+use crate::access_trail::{fold_access_events, AccessChange, AccessEventKind, AccessEventRecord};
 use crate::approvals::{CommandApprovalPolicy, CommandProposal, CommandProposalStatus};
 use crate::bootstrap::ContextCreator;
 use crate::encryption::{self, DataKey, EncryptionMasterKey};
@@ -1333,13 +1333,24 @@ impl PrivateFieldGrantRow {
 const PRIVATE_FIELD_GRANT_COLUMNS: &str =
     "id, grantor_role_id, grantee_role_id, event_sequence, command_id, status, created_at, revoked_at";
 
+/// Inserts the grant and records nothing: how tests seed one.
+/// [`grant_private_field_access_with_trail`] is the write that also
+/// records `PrivateFieldAccessGranted`.
 #[tracing::instrument(skip_all)]
 pub async fn insert_private_field_grant(
     pool: &Pool,
     grant: &PrivateFieldGrant,
 ) -> crate::error::Result<()> {
-    let schema = schema_ident(&grant.bounded_context.name);
-    let command_id = match grant.command_id.as_deref() {
+    let command_id = private_field_grant_command_id(pool, grant).await?;
+    insert_private_field_grant_row(pool, grant, command_id).await
+}
+
+/// The internal id of the command a grant names, if it names one.
+async fn private_field_grant_command_id(
+    pool: &Pool,
+    grant: &PrivateFieldGrant,
+) -> crate::error::Result<Option<i64>> {
+    Ok(match grant.command_id.as_deref() {
         Some(external_id) => Some(
             command_internal_id(pool, &grant.bounded_context.name, external_id)
                 .await?
@@ -1348,7 +1359,15 @@ pub async fn insert_private_field_grant(
                 ),
         ),
         None => None,
-    };
+    })
+}
+
+async fn insert_private_field_grant_row<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    grant: &PrivateFieldGrant,
+    command_id: Option<i64>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(&grant.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
@@ -1361,7 +1380,7 @@ pub async fn insert_private_field_grant(
     .bind(token_status_to_str(grant.status))
     .bind(grant.created_at)
     .bind(grant.revoked_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -1516,21 +1535,66 @@ pub async fn get_private_field_grant(
 /// has, addressed by `id` rather than a composite key since a grant's
 /// own `id` is already unambiguous (see `PrivateFieldGrant.id`'s own doc
 /// comment).
+/// `true` when an active grant was updated, `false` when there was none
+/// (already revoked by a concurrent request): the trail records a
+/// revocation only on `true`.
 #[tracing::instrument(skip_all)]
-pub async fn update_private_field_grant(
-    pool: &Pool,
+pub async fn update_private_field_grant<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     grant: &PrivateFieldGrant,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<bool> {
     let schema = schema_ident(&grant.bounded_context.name);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "UPDATE {schema}.private_field_grants SET status = $1, revoked_at = $2 WHERE id = $3"
+    let done = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.private_field_grants SET status = $1, revoked_at = $2 \
+         WHERE id = $3 AND status = 'active'"
     )))
     .bind(token_status_to_str(grant.status))
     .bind(grant.revoked_at)
     .bind(&grant.id)
-    .execute(pool)
+    .execute(executor)
     .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// `GrantPrivateFieldAccessForEvent`/`ForCommand`'s write: inserts the
+/// grant and records `PrivateFieldAccessGranted` in one transaction, so the
+/// admin context's log and the grant table cannot disagree (§229). Fails,
+/// and grants nothing, when the admin bounded context is missing.
+#[tracing::instrument(skip_all)]
+pub async fn grant_private_field_access_with_trail(
+    pool: &Pool,
+    grant: &PrivateFieldGrant,
+) -> crate::error::Result<()> {
+    let admin = require_admin_bounded_context(pool).await?;
+    let command_id = private_field_grant_command_id(pool, grant).await?;
+    let mut tx = pool.begin().await?;
+    insert_private_field_grant_row(&mut *tx, grant, command_id).await?;
+    record_access_event(&mut tx, &admin, AccessChange::private_field_granted(grant)).await?;
+    tx.commit().await?;
     Ok(())
+}
+
+/// `RevokePrivateFieldAccess`'s write: ends the active grant and records
+/// `PrivateFieldAccessRevoked` in one transaction. Nothing is recorded, and
+/// `false` is returned, when the grant was no longer active.
+#[tracing::instrument(skip_all)]
+pub async fn revoke_private_field_access_with_trail(
+    pool: &Pool,
+    revoked: &PrivateFieldGrant,
+) -> crate::error::Result<bool> {
+    let admin = require_admin_bounded_context(pool).await?;
+    let mut tx = pool.begin().await?;
+    if !update_private_field_grant(&mut *tx, revoked).await? {
+        return Ok(false);
+    }
+    record_access_event(
+        &mut tx,
+        &admin,
+        AccessChange::private_field_revoked(revoked),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// `idempotency_keys` - a caller-supplied idempotency key on command
@@ -3447,6 +3511,63 @@ pub async fn ensure_event_read_token_start_from_column(
 pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::error::Result<()> {
     let schema = schema_ident(name);
     let mut tx = pool.begin().await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM bounded_contexts WHERE name = $1")
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    notify_registration_changed(pool).await;
+    Ok(())
+}
+
+/// [`hard_delete_bounded_context`] that also ends the context's grants in
+/// the access trail (docs/architecture.md §229): in the deleting
+/// transaction, an `AccessRevoked` (reason `bounded_context_deleted`) for
+/// every active mapping and a `PrivateFieldAccessRevoked` for every active
+/// private-field grant, with `actor_role_id` as the actor. Without them
+/// `capabilityHistory` would keep saying a deleted context's grants are
+/// held. A context nobody was granted anything in records nothing.
+#[tracing::instrument(skip_all, fields(name = %name))]
+pub async fn hard_delete_bounded_context_with_trail(
+    pool: &Pool,
+    name: &str,
+    actor_role_id: &str,
+) -> crate::error::Result<()> {
+    let admin = require_admin_bounded_context(pool).await?;
+    let schema = schema_ident(name);
+    let mut tx = pool.begin().await?;
+    let mapped: Vec<(String,)> = sqlx::query_as(
+        "SELECT role_id FROM role_access_mappings \
+         WHERE bounded_context = $1 AND status = 'active' ORDER BY role_id",
+    )
+    .bind(name)
+    .fetch_all(&mut *tx)
+    .await?;
+    let private: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, grantee_role_id FROM {schema}.private_field_grants \
+         WHERE status = 'active' ORDER BY id"
+    )))
+    .fetch_all(&mut *tx)
+    .await?;
+    for (role_id,) in &mapped {
+        record_access_event(
+            &mut tx,
+            &admin,
+            AccessChange::context_ended(role_id, name, actor_role_id),
+        )
+        .await?;
+    }
+    for (grant_id, grantee_id) in &private {
+        record_access_event(
+            &mut tx,
+            &admin,
+            AccessChange::private_field_ended(grant_id, grantee_id, name, actor_role_id),
+        )
+        .await?;
+    }
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&mut *tx)
         .await?;
@@ -8560,14 +8681,7 @@ pub async fn grant_role_access_mapping_with_trail(
     record_access_event(
         &mut tx,
         &admin,
-        AccessChange::granted(
-            &mapping.role.id,
-            &mapping.bounded_context.name,
-            actor_role_id,
-            mapping.level,
-            mapping.can_read_sensitive,
-            mapping.scope.as_deref(),
-        ),
+        AccessChange::granted(mapping, actor_role_id),
     )
     .await?;
     tx.commit().await?;
@@ -8575,7 +8689,9 @@ pub async fn grant_role_access_mapping_with_trail(
 }
 
 /// `RevokeRoleAccessMapping`'s write: revokes the active mapping and
-/// records `AccessRevoked` in one transaction.
+/// records `AccessRevoked` in one transaction. Nothing is recorded when
+/// there was no active mapping to revoke (two requests racing, a stale
+/// list): `false`, as for [`change_mapping_capability_with_trail`].
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn revoke_role_access_mapping_with_trail(
     pool: &Pool,
@@ -8583,10 +8699,12 @@ pub async fn revoke_role_access_mapping_with_trail(
     bounded_context: &str,
     revoked_at: DateTime<Utc>,
     actor_role_id: &str,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<bool> {
     let admin = require_admin_bounded_context(pool).await?;
     let mut tx = pool.begin().await?;
-    revoke_active_role_access_mapping(&mut *tx, role_id, bounded_context, revoked_at).await?;
+    if !revoke_active_role_access_mapping(&mut *tx, role_id, bounded_context, revoked_at).await? {
+        return Ok(false);
+    }
     record_access_event(
         &mut tx,
         &admin,
@@ -8594,7 +8712,7 @@ pub async fn revoke_role_access_mapping_with_trail(
     )
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// The capability mutations' write: applies the grant or revoke and, only
@@ -8760,23 +8878,13 @@ pub async fn baseline_access_events(pool: &Pool) -> crate::error::Result<usize> 
         )))
         .execute(&mut *tx)
         .await?;
-        let has_events: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT EXISTS (SELECT 1 FROM {schema}.events \
-             WHERE event_type_name = ANY($1) \
-             AND payload::jsonb ->> 'role_id' = $2 \
-             AND payload::jsonb ->> 'bounded_context' = $3)"
-        )))
-        .bind(
-            AccessEventKind::ALL
-                .iter()
-                .map(|kind| kind.name())
-                .collect::<Vec<_>>(),
-        )
-        .bind(&mapping.role.id)
-        .bind(&mapping.bounded_context.name)
-        .fetch_one(&mut *tx)
-        .await?;
-        if has_events {
+        // Covered means the trail already says the grant is held, not that
+        // some event names it: a grant a raw writer made and a capability
+        // change then touched has a `CapabilityGranted` and no start, and
+        // one raw-re-granted after an `AccessRevoked` folds to not held.
+        let records =
+            access_event_records(&mut *tx, &mapping.role.id, &mapping.bounded_context.name).await?;
+        if fold_access_events(&records, DateTime::<Utc>::MAX_UTC).held {
             continue;
         }
         record_access_event(&mut tx, &admin, AccessChange::baselined(&mapping)).await?;
@@ -8794,34 +8902,56 @@ pub async fn list_access_event_records(
     role_id: &str,
     bounded_context: &str,
 ) -> crate::error::Result<Vec<AccessEventRecord>> {
+    access_event_records(pool, role_id, bounded_context).await
+}
+
+/// [`list_access_event_records`] on any executor, so the baseline can read
+/// a grant's history inside the transaction that holds the admin context's
+/// sequence lock. One grant's history is one tagged read: the events whose
+/// `role` tag is the Role and whose `bounded_context` tag is the context,
+/// through `event_tags` (§210) rather than a scan of the payloads. A row
+/// that does not parse is an error, not a gap: an audit read that silently
+/// dropped a revocation would answer wrongly.
+async fn access_event_records<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    role_id: &str,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<AccessEventRecord>> {
     let schema = schema_ident(crate::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME);
     let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT event_type_name, payload, metadata_created_at FROM {schema}.events \
-         WHERE event_type_name = ANY($1) \
-         AND payload::jsonb ->> 'role_id' = $2 \
-         AND payload::jsonb ->> 'bounded_context' = $3 \
-         ORDER BY sequence"
+        "SELECT e.event_type_name, e.payload, e.metadata_created_at FROM {schema}.events e \
+         WHERE e.sequence IN (SELECT sequence FROM {schema}.event_tags \
+             WHERE tag_key = 'role' AND tag_value = $2 AND event_type_name = ANY($1)) \
+         AND e.sequence IN (SELECT sequence FROM {schema}.event_tags \
+             WHERE tag_key = 'bounded_context' AND tag_value = $3 AND event_type_name = ANY($1)) \
+         ORDER BY e.sequence"
     )))
     .bind(
         AccessEventKind::ALL
             .iter()
+            .filter(|kind| kind.is_mapping_event())
             .map(|kind| kind.name())
             .collect::<Vec<_>>(),
     )
     .bind(role_id)
     .bind(bounded_context)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows
         .into_iter()
-        .filter_map(|(name, payload, created_at)| {
-            Some(AccessEventRecord {
-                kind: AccessEventKind::from_name(&name)?,
-                payload: serde_json::from_str(&payload).ok()?,
+        .map(|(name, payload, created_at)| {
+            let kind = AccessEventKind::from_name(&name).ok_or_else(|| {
+                sqlx::Error::Decode(format!("{name} is not an access event type").into())
+            })?;
+            let payload =
+                serde_json::from_str(&payload).map_err(|e| sqlx::Error::Decode(e.into()))?;
+            Ok(AccessEventRecord {
+                kind,
+                payload,
                 created_at,
             })
         })
-        .collect())
+        .collect::<Result<Vec<_>, sqlx::Error>>()?)
 }
 
 /// Every `RoleAccessMapping` this engine currently knows of, active or
@@ -8983,14 +9113,17 @@ pub async fn list_active_role_access_mappings_for_role(
 /// reads by - safe without needing a synthetic id, since at most one row
 /// can ever match (see the migration's own partial unique index). `impl
 /// PgExecutor` - same reasoning as `update_role`'s own doc comment.
+/// `true` when an active mapping was revoked, `false` when there was none
+/// (already revoked by a concurrent request, or never made): the trail
+/// records a revocation only on `true`.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn revoke_active_role_access_mapping<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     role_id: &str,
     bounded_context: &str,
     revoked_at: DateTime<Utc>,
-) -> crate::error::Result<()> {
-    sqlx::query(
+) -> crate::error::Result<bool> {
+    let done = sqlx::query(
         "UPDATE role_access_mappings SET status = 'revoked', revoked_at = $1 \
          WHERE role_id = $2 AND bounded_context = $3 AND status = 'active'",
     )
@@ -8999,7 +9132,7 @@ pub async fn revoke_active_role_access_mapping<'e>(
     .bind(bounded_context)
     .execute(executor)
     .await?;
-    Ok(())
+    Ok(done.rows_affected() == 1)
 }
 
 /// `rule RevokeRole`'s own atomic whole - the role's own status update
@@ -9026,13 +9159,16 @@ pub async fn revoke_role_and_mappings(
         let revoked_at = mapping
             .revoked_at
             .expect("revoke_role always stamps revoked_at on every mapping it returns");
-        revoke_active_role_access_mapping(
+        if !revoke_active_role_access_mapping(
             &mut *tx,
             &role.id,
             &mapping.bounded_context.name,
             revoked_at,
         )
-        .await?;
+        .await?
+        {
+            continue;
+        }
         record_access_event(
             &mut tx,
             &admin,

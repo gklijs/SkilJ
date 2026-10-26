@@ -413,8 +413,12 @@ pub fn create_bounded_context_from_template_field(n: &Naming) -> Field {
                     Ok(with_mappings) => with_mappings,
                     Err(err) => {
                         if let Err(cleanup_err) =
-                            skilj_core::db::hard_delete_bounded_context(&state.pool, &tenant.name)
-                                .await
+                            skilj_core::db::hard_delete_bounded_context_with_trail(
+                                &state.pool,
+                                &tenant.name,
+                                &caller.id,
+                            )
+                            .await
                         {
                             tracing::warn!(
                                 error = %cleanup_err,

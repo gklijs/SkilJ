@@ -99,17 +99,22 @@ async fn provision() -> Option<TestDb> {
     }
     // The admin context and its access trail, which the grant writers
     // that record history (`revoke_role_and_mappings` and friends) append to.
+    // A failure here is the code under test failing, so it fails the run.
     let admin = skilj_core::bootstrap::stamp_admin_bounded_context(
         db::get_bounded_context(&pool, skilj_core::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME)
             .await
-            .ok()?
+            .expect("reading the admin bounded context")
             .as_ref(),
         Utc::now(),
     );
     if let Some(admin) = admin {
-        db::insert_bounded_context(&pool, &admin).await.ok()?;
+        db::insert_bounded_context(&pool, &admin)
+            .await
+            .expect("creating the admin bounded context");
     }
-    db::ensure_access_trail(&pool).await.ok()?;
+    db::ensure_access_trail(&pool)
+        .await
+        .expect("ensuring the access trail");
     Some(TestDb { pool })
 }
 

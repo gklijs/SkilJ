@@ -42,9 +42,13 @@ pub fn field(n: &Naming) -> Field {
 
                 skilj_core::bootstrap::delete_bounded_context(&caller, &bounded_context)
                     .map_err(to_graphql_error)?;
-                skilj_core::db::hard_delete_bounded_context(&state.pool, &name)
-                    .await
-                    .map_err(to_graphql_error)?;
+                skilj_core::db::hard_delete_bounded_context_with_trail(
+                    &state.pool,
+                    &name,
+                    &caller.id,
+                )
+                .await
+                .map_err(to_graphql_error)?;
 
                 Ok(Some(FieldValue::owned_any(with_mappings)))
             })

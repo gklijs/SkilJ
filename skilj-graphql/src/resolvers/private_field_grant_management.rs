@@ -67,7 +67,7 @@ pub fn grant_private_field_access_for_event_field(n: &Naming) -> Field {
                     chrono::Utc::now(),
                 )
                 .map_err(to_graphql_error)?;
-                skilj_core::db::insert_private_field_grant(&state.pool, &grant)
+                skilj_core::db::grant_private_field_access_with_trail(&state.pool, &grant)
                     .await
                     .map_err(to_graphql_error)?;
 
@@ -137,7 +137,7 @@ pub fn grant_private_field_access_for_command_field(n: &Naming) -> Field {
                     chrono::Utc::now(),
                 )
                 .map_err(to_graphql_error)?;
-                skilj_core::db::insert_private_field_grant(&state.pool, &grant)
+                skilj_core::db::grant_private_field_access_with_trail(&state.pool, &grant)
                     .await
                     .map_err(to_graphql_error)?;
 
@@ -188,9 +188,15 @@ pub fn revoke_private_field_access_field(n: &Naming) -> Field {
                     chrono::Utc::now(),
                 )
                 .map_err(to_graphql_error)?;
-                skilj_core::db::update_private_field_grant(&state.pool, &revoked)
+                // False when a concurrent revoke got there first.
+                if !skilj_core::db::revoke_private_field_access_with_trail(&state.pool, &revoked)
                     .await
-                    .map_err(to_graphql_error)?;
+                    .map_err(to_graphql_error)?
+                {
+                    return Err(to_graphql_error(
+                        skilj_core::access_control::Error::PrivateFieldGrantNotActive,
+                    ));
+                }
 
                 Ok(Some(FieldValue::owned_any(revoked)))
             })

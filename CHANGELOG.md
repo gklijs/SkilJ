@@ -61,13 +61,18 @@ README.md, "Status and stability").
   its context, never to its own.
 
 - The access trail (docs/architecture.md §229): every grant, revoke, capability
-  change and `delegable` change is also an event in the `admin` bounded
+  change and `delegable` change of a `RoleAccessMapping` is also an event in the `admin` bounded
   context, written in the same transaction as the change, with the acting
   Role in the payload. GraphQL `capabilityHistory(roleId, boundedContext,
   asOf)` (superadmin) answers what a grant held at a past instant. Grants
   from before the upgrade get one `AccessBaselined` event at startup, so
   history begins at the upgrade and says so for earlier times. Events carry
-  a new origin, `SKILJ_RECORDED`.
+  a new origin, `SKILJ_RECORDED`. Sharing the private fields of a record
+  (`grantPrivateFieldAccessFor...`, `revokePrivateFieldAccess`) is recorded
+  too, as `PrivateFieldAccessGranted` and `PrivateFieldAccessRevoked`. Deleting
+  a bounded context records the end of each of its active grants (`AccessRevoked`
+  with reason `bounded_context_deleted`, and `PrivateFieldAccessRevoked`), so
+  `capabilityHistory` stops reporting them as held. Archiving records nothing.
 
 - Ordered batch submission (#116, docs/architecture.md §227): GraphQL
   `submitCommands`, `POST /v1/commands/trigger/batch` and
