@@ -105,7 +105,10 @@ fi
 # would have said, or that they would have skipped.
 log_output="${CI_TEST_LOG:-/tmp/test-output.log}"
 test_exit=0
-cargo test --workspace --no-fail-fast -- --nocapture >"$log_output" 2>&1 || test_exit=$?
+# CI_CARGO_TEST swaps the runner for the coverage job (`cargo llvm-cov
+# --no-report`), which then reuses this skip guard.
+# shellcheck disable=SC2086 # the command is meant to word-split
+${CI_CARGO_TEST:-cargo test} --workspace --no-fail-fast -- --nocapture >"$log_output" 2>&1 || test_exit=$?
 cat "$log_output"
 
 if grep -qE 'skipping: ' "$log_output"; then

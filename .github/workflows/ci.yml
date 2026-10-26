@@ -42,6 +42,19 @@ jobs:
       # headings (a past renumbering silently broke ~600 of them).
       - run: scripts/check-section-refs.sh
 
+  check-spec:
+    runs-on: ubuntu-24.04
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # specs/skilj.allium is the source of truth for behavior. Fails on a
+      # checker error, or on more warnings than the script accepts.
+      - run: cargo install allium-cli --locked --version 3.5.3
+      - run: scripts/check-spec.sh
+
   check-template:
     # On the bare runner, not in rust:1-bookworm: the script runs the
     # README's quickstart, and as a normal user (not root) skilj's local
@@ -88,6 +101,44 @@ jobs:
       # which would compile cargo-deny itself on every run.
       - run: curl -sSfL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
       - run: /tmp/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny check
+
+  semver:
+    # Only on a pull request: the question is what this change does to the
+    # public API of the library crates against what is published, and the
+    # answer is only useful before a merge. A breaking change that is meant
+    # (the crates are 0.x) shows up as a failure that asks for the minor
+    # bump in the same diff.
+    if: github.event_name == 'pull_request'
+    # Reports without blocking for now: the capabilities change (issue #17)
+    # removed `Projection::TEAM_ONLY` and more since 0.1.1, so this fails
+    # until the next release bumps to 0.2.0. Drop this line then.
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    container: rust:1-bookworm
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The library crates, compared with their latest release on crates.io.
+      - run: cargo semver-checks --package skilj --package skilj-core --package skilj-graphql --package skilj-rest --package skilj-retry --package skilj-macros
+
+  machete:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # A dependency nothing uses still has to be built, audited and
+      # licensed. Reads the sources, so it needs no build.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete@0.9.2
+      - run: cargo machete
 
   msrv:
     runs-on: ubuntu-24.04
@@ -199,3 +250,89 @@ jobs:
       # this container job reaches through its mounted socket. ci-test.sh
       # fails the build if any test skipped anyway (§223).
       - run: bash scripts/ci-test.sh
+
+  # Line coverage of the same run as `test`, reported in the job summary
+  # and attached as lcov. Informational: it never fails the build, and
+  # there is no threshold until there is a baseline to hold.
+  coverage:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    container:
+      image: rust:1-bookworm
+      # The runner's preinstalled SDKs, mounted so the first step can
+      # delete them: the workspace's ~110 integration-test binaries ran a
+      # CI disk full before (see CARGO_PROFILE_DEV_DEBUG below), and these
+      # directories are most of the runner's used space.
+      volumes:
+        - /usr/share/dotnet:/host/dotnet
+        - /usr/local/lib/android:/host/android
+        - /opt/ghc:/host/ghc
+        - /opt/hostedtoolcache/CodeQL:/host/codeql
+    # The Postgres the tests run against. A service's name is its
+    # hostname from inside a container job, and the health check makes
+    # the job wait until it accepts connections.
+    services:
+      skilj-postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # Trust removes any client/server password mismatch, which is
+          # invisible from the job's side. Safe for what this is: a
+          # per-job container on a private network with no published
+          # ports, holding throwaway test databases.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # ci-test.sh reads this to find the service; its credentials default
+      # to postgres/postgres/postgres, which is also what the service gets.
+      CI_POSTGRES_HOST: skilj-postgres
+      # Disk, not speed: no run reuses the incremental cache, and line
+      # tables keep file:line in panic backtraces while dropping the
+      # variable/type debug info that is most of each binary's size.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - name: Free runner disk space
+        run: rm -rf /host/dotnet/* /host/android/* /host/ghc/* /host/codeql/* && df -h /
+      - uses: actions/checkout@v5
+      # cmake and libcurl4-openssl-dev: skilj-kafka's rdkafka vendors
+      # librdkafka via cmake, and that source #includes curl/curl.h even
+      # with curl support compiled out. `postgresql` is the server: the
+      # failover test (skilj_test_support::FailoverServer, docs/architecture.md
+      # §176) runs a primary and a standby of its own, as the `postgres`
+      # user this package creates, since Postgres refuses to run as root.
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev postgresql-client postgresql
+      # Settle the database first, so a missing one shows in seconds
+      # rather than after the whole workspace is built. Prefers the
+      # service and falls back to a Postgres inside this container.
+      - run: bash scripts/ci-test.sh --setup-only
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.6.16
+      - run: rustup component add llvm-tools-preview
+      - name: Test with coverage
+        env:
+          CI_CARGO_TEST: cargo llvm-cov --no-report
+        run: bash scripts/ci-test.sh
+      - name: Report
+        run: |
+          cargo llvm-cov report --lcov --output-path lcov.info
+          {
+            echo '### Line coverage'
+            echo '```'
+            cargo llvm-cov report --summary-only --ignore-filename-regex '(/tests/|skilj-demo|skilj-test)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info

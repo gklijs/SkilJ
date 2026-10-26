@@ -1,0 +1,87 @@
+## Mutation testing of the access trail (docs/architecture.md §229), weekly.
+##
+## cargo-mutants changes the code one way at a time (a comparison flipped,
+## a function body replaced) and reruns the tests; a mutant the tests
+## survive is a behavior nothing checks. It is scoped to the access trail
+## and the `*_with_trail` writers in db/mod.rs, run only against the
+## `access_trail` test binary: those are the paths where a silent change
+## means a wrong audit record. Too slow for every push, and informational:
+## it never fails a build. Surviving mutants are in the job summary and in
+## the `mutants-out` artifact.
+
+name: Mutants
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 360
+    container:
+      image: rust:1-bookworm
+    services:
+      skilj-postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # Each test binary makes a database of its own on this server.
+      DATABASE_URL: postgres://postgres:postgres@skilj-postgres:5432/postgres
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v5
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@25.3.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --regex filters every selected file, so the two scopes are two runs.
+      - name: Access trail module
+        run: >-
+          cargo mutants --package skilj-core
+          --file skilj-core/src/access_trail/mod.rs
+          --output mutants-trail
+          -- --test access_trail
+      - name: The *_with_trail writers
+        run: >-
+          cargo mutants --package skilj-core
+          --file skilj-core/src/db/mod.rs --re 'with_trail'
+          --output mutants-writers
+          -- --test access_trail
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Surviving mutants'
+            for d in mutants-trail mutants-writers; do
+              echo "#### $d"
+              echo '```'
+              cat "$d/mutants.out/missed.txt" 2>/dev/null || echo 'none recorded'
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-out
+          path: |
+            mutants-trail
+            mutants-writers
