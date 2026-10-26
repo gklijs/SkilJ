@@ -124,7 +124,10 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
+      # libsasl2-dev: semver-checks builds every feature not named like
+      # `unstable`, so skilj-kafka's `gssapi` (Kerberos, issue #124) too,
+      # and its sasl2-sys links the system libsasl2.
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev libsasl2-dev
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks@0.51.0

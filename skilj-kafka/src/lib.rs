@@ -166,7 +166,8 @@
 //!   statically, so a `FROM scratch` image still works. With
 //!   `default-features = false` they fail when the client is created;
 //!   add `ssl` to link the system OpenSSL instead. Kerberos (`GSSAPI`)
-//!   needs `gssapi`.
+//!   needs `gssapi`, which links the system libsasl2 (`libsasl2-dev` on
+//!   Debian, `cyrus-sasl-devel` on RHEL).
 //!
 //! ```rust,no_run
 //! use rdkafka::producer::FutureProducer;
