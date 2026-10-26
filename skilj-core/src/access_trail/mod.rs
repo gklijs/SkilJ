@@ -135,6 +135,7 @@ impl AccessEventKind {
             AccessEventKind::PrivateFieldAccessRevoked => &[
                 ("actor_role_id", "string", false),
                 ("grant_id", "string", true),
+                ("reason", "string", false),
             ],
         }
     }

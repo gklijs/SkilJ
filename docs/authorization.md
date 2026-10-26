@@ -503,5 +503,7 @@ flowchart LR
 - Deleting a bounded context ends its active grants in the trail (`AccessRevoked` with reason
   `bounded_context_deleted`), so `capabilityHistory` stops reporting them as held. Archiving
   ends nothing and records nothing.
+- Revoking a Role ends its grants and records each, but leaves the private-field shares it made or
+  holds as they are, with no event (the Role can no longer authenticate).
 - Not recorded: denied attempts, reads of gated projections, the other admin operations
-  (bounded contexts, tokens, type registration).
+  (tokens, type registration, and adding or archiving a bounded context).

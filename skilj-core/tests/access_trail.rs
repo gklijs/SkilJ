@@ -735,6 +735,113 @@ fn deleting_a_bounded_context_nobody_was_granted_in_records_nothing() {
 }
 
 #[test]
+fn a_baseline_does_not_resurrect_a_grant_revoked_after_it_listed() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let _serial = BASELINES.lock().await;
+        let role = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        // A raw grant, which only the baseline would record.
+        db::insert_role_access_mapping(&pool, &mapping(&role, &bc, AccessLevel::Read))
+            .await
+            .unwrap();
+
+        // A revoke in flight: the row is locked and already revoked in its
+        // transaction, so the baseline's listing still sees it active.
+        let mut revoke = pool.begin().await.unwrap();
+        assert!(
+            db::revoke_active_role_access_mapping(&mut *revoke, &role.id, &bc.name, now())
+                .await
+                .unwrap()
+        );
+        let baseline = tokio::spawn({
+            let pool = pool.clone();
+            async move { db::baseline_access_events(&pool).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        revoke.commit().await.unwrap();
+        baseline.await.unwrap().unwrap();
+
+        assert!(
+            trail(&pool, &role, &bc).await.is_empty(),
+            "a grant revoked before the baseline got to it is not baselined"
+        );
+    });
+}
+
+#[test]
+fn a_deletion_waits_for_a_private_field_grant_in_flight_and_records_it() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let deleter = seed_role(&pool).await;
+        let grantor = seed_role(&pool).await;
+        let grantee = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        let grant_id = generate_token_id();
+
+        // A grant inserted and not yet committed when the deletion starts.
+        let mut share = pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO \"bc_{}\".private_field_grants \
+             (id, grantor_role_id, grantee_role_id, status, created_at) \
+             VALUES ($1, $2, $3, 'active', now())",
+            bc.name
+        )))
+        .bind(&grant_id)
+        .bind(&grantor.id)
+        .bind(&grantee.id)
+        .execute(&mut *share)
+        .await
+        .unwrap();
+        let deletion = tokio::spawn({
+            let pool = pool.clone();
+            let name = bc.name.clone();
+            let deleter = deleter.id.clone();
+            async move { db::hard_delete_bounded_context_with_trail(&pool, &name, &deleter).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!deletion.is_finished(), "the deletion waits for the grant");
+        share.commit().await.unwrap();
+        deletion.await.unwrap().unwrap();
+
+        let events = private_field_events(&pool, &grant_id).await;
+        assert_eq!(
+            events.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["PrivateFieldAccessRevoked"],
+            "the grant committed before the drop is ended in the trail"
+        );
+    });
+}
+
+#[test]
+fn a_stale_registered_schema_is_refreshed_at_startup() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let admin = db::require_admin_bounded_context(&pool).await.unwrap();
+        let kind = AccessEventKind::PrivateFieldAccessRevoked;
+        let wanted = skilj_core::access_trail::access_event_type(&admin, kind);
+        let mut stale = wanted.clone();
+        stale.schema = r#"{"type":"object"}"#.to_string();
+        db::upsert_event_type(&pool, &stale).await.unwrap();
+
+        db::register_access_event_types(&pool).await.unwrap();
+
+        let stored = db::get_event_type(&pool, &admin.name, kind.name())
+            .await
+            .unwrap()
+            .unwrap();
+        let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert_eq!(parse(&stored.schema), parse(&wanted.schema));
+    });
+}
+
+#[test]
 fn the_fold_ignores_private_field_events() {
     use serde_json::json;
     let events = vec![record(
@@ -952,6 +1059,8 @@ fn a_stored_event_that_does_not_parse_is_an_error_not_a_gap() {
         let Some(pool) = test_pool().await else {
             return;
         };
+        // Excludes every baseline while an admin payload is broken below.
+        let _serial = BASELINES.lock().await;
         let role = seed_role(&pool).await;
         let actor = seed_role(&pool).await;
         let bc = seed_bounded_context(&pool).await;

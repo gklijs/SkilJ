@@ -446,7 +446,7 @@ pub fn archive_bounded_context(
 /// `archive_bounded_context`'s identical guard.
 ///
 /// Only decides *whether* the deletion is allowed - the caller runs
-/// `db::hard_delete_bounded_context` only after this returns `Ok`, the
+/// `db::hard_delete_bounded_context_with_trail` only after this returns `Ok`, the
 /// same pure-decision/impure-effect split every rule in this crate keeps.
 pub fn delete_bounded_context(
     caller: &Role,

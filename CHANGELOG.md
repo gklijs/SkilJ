@@ -30,7 +30,7 @@ README.md, "Status and stability").
 ### Upgrading from 0.1
 
 - Startup widens the `admin` bounded context's `events.origin_kind` check,
-  registers six access event types there and baselines existing grants. A
+  registers eight access event types there (and brings the schema of one already registered up to date) and baselines existing grants. A
   grant made by writing `role_access_mappings` directly (as local mode's
   seed does) has no history until the next start baselines it.
 - Run the new migration (`0007`, applied at startup); existing grants get
