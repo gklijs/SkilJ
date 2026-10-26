@@ -517,6 +517,17 @@ pub fn spawn_live_events(
     rx
 }
 
+/// Makes sure rustls has a process-level crypto provider before a
+/// `wss://` handshake. rustls picks one by itself only when exactly one of
+/// its `aws-lc-rs` and `ring` features is enabled; built alongside crates
+/// that enable `ring` too (a workspace build, or an application embedding
+/// this crate), it finds both and panics instead. `aws-lc-rs` is the one
+/// reqwest already uses here. A provider installed earlier - by the
+/// application, or by a previous call - is left as it is.
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 async fn run_subscription(
     ws_endpoint: reqwest::Url,
     token: String,
@@ -524,6 +535,7 @@ async fn run_subscription(
     variables: Value,
     tx: &mpsc::UnboundedSender<Result<Value, ClientError>>,
 ) -> Result<(), ClientError> {
+    ensure_crypto_provider();
     let mut request = ws_endpoint
         .to_string()
         .into_client_request()
