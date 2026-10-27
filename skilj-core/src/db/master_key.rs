@@ -73,6 +73,9 @@ pub struct MasterKeyState {
     pub created_by_skilj: bool,
     /// When the key, used by no bounded context, is deleted or let go.
     pub delete_after: Option<DateTime<Utc>>,
+    /// Raised by every assignment to the key: a rewrap is marked done only
+    /// when it is still the one read before the assignments were.
+    pub assignment_epoch: i64,
 }
 
 type StateRow = (
@@ -85,6 +88,7 @@ type StateRow = (
     i32,
     bool,
     Option<DateTime<Utc>>,
+    i64,
 );
 
 fn to_state(row: StateRow) -> MasterKeyState {
@@ -98,6 +102,7 @@ fn to_state(row: StateRow) -> MasterKeyState {
         retired_below,
         created_by_skilj,
         delete_after,
+        assignment_epoch,
     ) = row;
     MasterKeyState {
         provider,
@@ -109,11 +114,12 @@ fn to_state(row: StateRow) -> MasterKeyState {
         retired_below: u32::try_from(retired_below).unwrap_or(0),
         created_by_skilj,
         delete_after,
+        assignment_epoch,
     }
 }
 
 const STATE_COLUMNS: &str = "provider, key, version, rotated_at, retire_immediately, \
-     rewrapped_at, retired_below, created_by_skilj, delete_after";
+     rewrapped_at, retired_below, created_by_skilj, delete_after, assignment_epoch";
 
 /// Every master key's state row, the default key's first.
 #[tracing::instrument(skip_all)]
@@ -292,19 +298,25 @@ pub async fn rotate_master_key(
 }
 
 /// Marks the rewrap of `provider`'s key to `version` done, when `version`
-/// is still the one in use. Answers whether it did.
+/// is still the one in use and no bounded context was assigned the key
+/// since `epoch` was read - read before the assignments the rewrap went by,
+/// so a context assigned meanwhile, which that rewrap didn't cover, keeps
+/// it pending. Answers whether it did.
 pub async fn mark_data_keys_rewrapped(
     pool: &Pool,
     provider: &str,
     version: u32,
+    epoch: i64,
 ) -> crate::error::Result<bool> {
     let updated = sqlx::query(
         "UPDATE encryption_master_keys SET rewrapped_at = $1 \
-         WHERE provider = $2 AND version = $3 AND rewrapped_at IS NULL",
+         WHERE provider = $2 AND version = $3 AND rewrapped_at IS NULL \
+         AND assignment_epoch = $4",
     )
     .bind(Utc::now())
     .bind(provider)
     .bind(version_column(version)?)
+    .bind(epoch)
     .execute(pool)
     .await?;
     Ok(updated.rows_affected() == 1)
@@ -448,20 +460,44 @@ pub async fn assign_encryption_key(
     } else {
         false
     };
-    // Refuses a key that doesn't exist or can't be reached before anything
-    // is recorded, and records its first use.
-    rotate_master_key(
-        pool,
-        provider.as_ref(),
-        key,
-        Rotation::Record(RotationReason::Adopted),
-        false,
-        actor_role_id,
-        None,
-    )
-    .await?;
+    // Asked before anything is written: refuses a key that doesn't exist or
+    // can't be reached, with nothing recorded.
+    let versions = provider.versions().await?;
     let admin = require_admin_bounded_context(pool).await?;
     let mut tx = pool.begin().await?;
+    // The key's first recording and the assignment are one transaction,
+    // under the key's lock: a check must never see the key's state without
+    // its assignment - an unused key, to be deleted (docs/architecture.md
+    // §230).
+    lock_key(&mut tx, provider.name()).await?;
+    let current = locked_state(&mut tx, provider.name()).await?;
+    if current.is_none() {
+        sqlx::query(
+            "INSERT INTO encryption_master_keys \
+             (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \
+              retired_below) VALUES ($1, $2, $3, $4, false, NULL, $5)",
+        )
+        .bind(provider.name())
+        .bind(key)
+        .bind(version_column(versions.latest)?)
+        .bind(Utc::now())
+        .bind(version_column(versions.min_decryption)?)
+        .execute(&mut *tx)
+        .await?;
+        record(
+            &mut tx,
+            &admin,
+            MasterKeyChange::rotated(
+                provider.name(),
+                versions.latest,
+                None,
+                RotationReason::Adopted,
+                false,
+                actor_role_id,
+            ),
+        )
+        .await?;
+    }
     let previous: Option<String> = sqlx::query_scalar(
         "SELECT provider FROM encryption_key_assignments WHERE bounded_context = $1 FOR UPDATE",
     )
@@ -493,7 +529,8 @@ pub async fn assign_encryption_key(
     }
     sqlx::query(
         "UPDATE encryption_master_keys SET rewrapped_at = NULL, delete_after = NULL, \
-         created_by_skilj = created_by_skilj OR $2 WHERE provider = $1",
+         created_by_skilj = created_by_skilj OR $2, \
+         assignment_epoch = assignment_epoch + 1 WHERE provider = $1",
     )
     .bind(provider.name())
     .bind(created)

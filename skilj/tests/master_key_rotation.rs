@@ -143,8 +143,9 @@ async fn wait_for_state(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!(
-        "timed out waiting for {what}: {:?}",
-        db::master_key_state(pool, provider).await.unwrap()
+        "timed out waiting for {what}: {:?}\nevery key: {:#?}",
+        db::master_key_state(pool, provider).await.unwrap(),
+        db::master_key_states(pool).await.unwrap()
     );
 }
 
@@ -627,7 +628,7 @@ async fn rotate_end_to_end(
         open_for(pool, &bc_b, "2", &keys, &sealed_b).await,
         "2@example.com"
     );
-    drop(skilj);
+    skilj.shutdown(Duration::from_secs(10)).await;
 }
 
 #[test]
@@ -1107,7 +1108,7 @@ async fn events_about(pool: &Pool, name: &str, bounded_context: &str) -> Vec<Val
 }
 
 /// Waits until `check` holds, polling.
-async fn wait_until<F, Fut>(what: &str, check: F)
+async fn wait_until<F, Fut>(pool: &Pool, what: &str, check: F)
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -1118,7 +1119,25 @@ where
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("timed out waiting for {what}");
+    panic!("timed out waiting for {what}\n{}", dump(pool).await);
+}
+
+/// Every key's state and every admin event's type, for a timeout's message.
+async fn dump(pool: &Pool) -> String {
+    let events: Vec<String> = db::list_events_for_bounded_context(pool, ADMIN_BOUNDED_CONTEXT_NAME)
+        .await
+        .map(|events| {
+            events
+                .into_iter()
+                .map(|e| format!("{} {}", e.event_type.name, e.payload))
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "keys: {:#?}\nevents: {:#?}",
+        db::master_key_states(pool).await.unwrap_or_default(),
+        events
+    )
 }
 
 #[test]
@@ -1212,7 +1231,7 @@ fn a_bounded_context_with_its_own_key_is_moved_rotated_and_its_key_deleted_with_
         db::hard_delete_bounded_context(&pool, &tenant)
             .await
             .unwrap();
-        wait_until("the tenant key's deletion", || async {
+        wait_until(&pool, "the tenant key's deletion", || async {
             !admin_events(&pool, "EncryptionKeyDeleted").await.is_empty()
         })
         .await;
@@ -1275,7 +1294,7 @@ fn a_key_a_superadmin_brought_is_let_go_of_but_not_deleted() {
         db::assign_encryption_key(&pool, &keys, &bc, None, false, None)
             .await
             .unwrap();
-        wait_until("their key let go of", || async {
+        wait_until(&pool, "their key let go of", || async {
             !admin_events(&pool, "EncryptionKeyDeleted").await.is_empty()
         })
         .await;
@@ -1390,7 +1409,7 @@ fn a_data_key_wrapped_under_an_old_version_after_the_rewrap_holds_up_the_retirem
         // The retirement check finds it and sends the key back to the
         // rewrap; the rewrap's end restarts the grace period, so nothing is
         // retired yet.
-        wait_until("the straggler rewrapped", || async {
+        wait_until(&pool, "the straggler rewrapped", || async {
             events_about(&pool, "EncryptionDataKeysRewrapped", &bc)
                 .await
                 .len()
@@ -1524,7 +1543,7 @@ fn a_key_is_not_deleted_while_a_data_key_is_wrapped_by_it() {
         .build()
         .await
         .unwrap();
-        drop(_skilj);
+        _skilj.shutdown(Duration::from_secs(10)).await;
         let provider = InMemoryKeyProvider::new();
         let keys = KeyService::new(provider.clone());
         db::assign_encryption_key(&pool, &keys, &bc, Some("tenant"), true, None)
@@ -1615,7 +1634,7 @@ fn another_vault_under_the_same_key_path_refuses_startup_once_checked_per_key() 
             .build()
             .await
             .unwrap();
-        drop(skilj);
+        skilj.shutdown(Duration::from_secs(10)).await;
         let after = fake
             .lock()
             .unwrap()
@@ -1664,7 +1683,7 @@ fn another_vault_under_the_same_key_path_refuses_startup_once_checked_per_key() 
             .build()
             .await
             .unwrap();
-        drop(skilj);
+        skilj.shutdown(Duration::from_secs(10)).await;
         let _ = contexts;
     });
 }
@@ -1684,7 +1703,7 @@ fn a_deletion_waits_for_a_provisioning_holding_the_key_and_then_finds_its_data_k
         .build()
         .await
         .unwrap();
-        drop(skilj);
+        skilj.shutdown(Duration::from_secs(10)).await;
         let keys = KeyService::new(InMemoryKeyProvider::new());
         db::assign_encryption_key(&pool, &keys, &bc, Some("tenant"), true, None)
             .await
@@ -1748,10 +1767,17 @@ fn a_key_is_not_retired_while_a_context_moving_off_it_still_has_data_keys_under_
         let keys = KeyService::new(provider.clone()).with_cache(Duration::ZERO, 0);
         let sealed = seal_for(&pool, &moving, "1", &keys).await;
         seal_for(&pool, &staying, "2", &keys).await;
-        let (_skilj, _) = builder(&url, keys.clone(), quick(Duration::ZERO))
-            .build()
-            .await
-            .unwrap();
+        // An instance that checks once, at its start, and not again: it sets
+        // up the admin context, and nothing moves while the scene is set.
+        let (setup, _) = builder(
+            &url,
+            keys.clone(),
+            quick(Duration::ZERO).check_interval(Duration::from_secs(3600)),
+        )
+        .build()
+        .await
+        .unwrap();
+        setup.shutdown(Duration::from_secs(10)).await;
 
         // The context is given its own key, which then can't be reached:
         // its data keys stay under the default key's version 1.
@@ -1772,6 +1798,11 @@ fn a_key_is_not_retired_while_a_context_moving_off_it_still_has_data_keys_under_
         )
         .await
         .unwrap();
+        // Only now an instance that checks often.
+        let (_skilj, _) = builder(&url, keys.clone(), quick(Duration::ZERO))
+            .build()
+            .await
+            .unwrap();
         wait_for_state(
             &pool,
             keys.provider_name(),
@@ -1980,5 +2011,64 @@ fn a_brought_key_is_followed_but_never_rotated_or_retired_by_skilj() {
         assert_eq!((versions.latest, versions.min_decryption), (2, 1));
         // The default key, skilj's, was rotated on the schedule meanwhile.
         assert!(keys.provider().versions().await.unwrap().latest > 1);
+    });
+}
+
+#[test]
+fn a_rewrap_is_not_marked_done_over_an_assignment_it_did_not_see() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_epoch_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&pool).await;
+        let keys = KeyService::new(InMemoryKeyProvider::new());
+        let (setup, _) = builder(
+            &url,
+            keys.clone(),
+            quick(Duration::ZERO).check_interval(Duration::from_secs(3600)),
+        )
+        .build()
+        .await
+        .unwrap();
+        setup.shutdown(Duration::from_secs(10)).await;
+        db::assign_encryption_key(&pool, &keys, &bc, Some("tenant"), true, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE encryption_master_keys SET rewrapped_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A check reads the default key's epoch and the assignments...
+        let read = db::master_key_state(&pool, keys.provider_name())
+            .await
+            .unwrap()
+            .unwrap();
+        // ...then the context is given the default key back...
+        db::assign_encryption_key(&pool, &keys, &bc, None, false, None)
+            .await
+            .unwrap();
+        // ...so that check's rewrap, which didn't cover it, isn't done.
+        assert!(!db::mark_data_keys_rewrapped(
+            &pool,
+            keys.provider_name(),
+            read.version,
+            read.assignment_epoch
+        )
+        .await
+        .unwrap());
+        let now = db::master_key_state(&pool, keys.provider_name())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(now.rewrapped_at.is_none());
+        assert!(db::mark_data_keys_rewrapped(
+            &pool,
+            keys.provider_name(),
+            now.version,
+            now.assignment_epoch
+        )
+        .await
+        .unwrap());
     });
 }
