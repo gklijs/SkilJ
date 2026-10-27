@@ -320,16 +320,34 @@ async fn serve_transit() -> (String, Fake) {
                 }
                 let mut t = f.lock().unwrap();
                 t.calls.push("rewrap".into());
-                let results: Vec<Value> = body["batch_input"]
-                    .as_array()
-                    .unwrap()
+                let inputs: Vec<Value> = match body.get("batch_input") {
+                    Some(batch) => batch.as_array().unwrap().clone(),
+                    None => vec![json!({ "ciphertext": body["ciphertext"] })],
+                };
+                let results: Vec<Value> = inputs
                     .iter()
                     .map(|item| match decrypt(&t, item["ciphertext"].as_str().unwrap()) {
                         Ok(plaintext) => json!({ "ciphertext": encrypt(&t, &plaintext), "key_version": t.latest }),
                         Err(e) => json!({ "error": e }),
                     })
                     .collect();
-                (StatusCode::OK, Json(json!({ "data": { "batch_results": results } })))
+                // As Vault: a batch with a failed item answers 400 - unless
+                // `partial_failure_response_code` says otherwise and some
+                // item succeeded - and a single (non-batch) request that
+                // fails answers 400 with the error.
+                let failed = results.iter().filter(|r| r.get("error").is_some()).count();
+                if body.get("batch_input").is_none() {
+                    return match results[0].get("error") {
+                        Some(e) => (StatusCode::BAD_REQUEST, Json(json!({ "errors": [e] }))),
+                        None => (StatusCode::OK, Json(json!({ "data": results[0] }))),
+                    };
+                }
+                let status = match (failed, body["partial_failure_response_code"].as_u64()) {
+                    (0, _) => StatusCode::OK,
+                    (f, Some(code)) if f < results.len() => StatusCode::from_u16(code as u16).unwrap(),
+                    _ => StatusCode::BAD_REQUEST,
+                };
+                (status, Json(json!({ "data": { "batch_results": results } })))
             }),
         )
         .route(
@@ -1611,6 +1629,19 @@ fn another_vault_under_the_same_key_path_refuses_startup_once_checked_per_key() 
             "the key is checked once, not per context"
         );
 
+        // The default key's own name as a context's key: refused, it would
+        // be one key under two lifecycles.
+        assert!(db::assign_encryption_key(
+            &pool,
+            &vault(),
+            &contexts[0],
+            Some("skilj"),
+            false,
+            None
+        )
+        .await
+        .is_err());
+
         // Another Vault with a key at the same path: refused.
         let (other_address, _) = serve_transit().await;
         let other = KeyService::new(VaultTransitProvider::new(
@@ -1702,5 +1733,252 @@ fn a_deletion_waits_for_a_provisioning_holding_the_key_and_then_finds_its_data_k
         provisioning.commit().await.unwrap();
         assert!(!deletion.await.unwrap().unwrap());
         assert!(tenant.versions().await.is_ok(), "the key is still there");
+    });
+}
+
+#[test]
+fn a_key_is_not_retired_while_a_context_moving_off_it_still_has_data_keys_under_it() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_moving_retire_test").await else {
+            return;
+        };
+        let moving = insert_bounded_context(&pool).await;
+        let staying = insert_bounded_context(&pool).await;
+        let provider = InMemoryKeyProvider::new();
+        let keys = KeyService::new(provider.clone()).with_cache(Duration::ZERO, 0);
+        let sealed = seal_for(&pool, &moving, "1", &keys).await;
+        seal_for(&pool, &staying, "2", &keys).await;
+        let (_skilj, _) = builder(&url, keys.clone(), quick(Duration::ZERO))
+            .build()
+            .await
+            .unwrap();
+
+        // The context is given its own key, which then can't be reached:
+        // its data keys stay under the default key's version 1.
+        db::assign_encryption_key(&pool, &keys, &moving, Some("tenant"), true, None)
+            .await
+            .unwrap();
+        provider.key("tenant").unwrap().delete().await.unwrap();
+
+        // A leak response on the default key: rotate and retire at once.
+        db::rotate_master_key(
+            &pool,
+            keys.provider(),
+            None,
+            db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_state(
+            &pool,
+            keys.provider_name(),
+            "the default key's rewrap",
+            |s| s.version == 2 && s.rewrapped_at.is_some(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Version 1 still wraps the moving context's data key, so it is not
+        // retired, and the data key still opens.
+        let state = db::master_key_state(&pool, keys.provider_name())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.retired_below, 1,
+            "retired under a context still on it"
+        );
+        assert_eq!(
+            open_for(&pool, &moving, "1", &keys, &sealed).await,
+            "1@example.com"
+        );
+    });
+}
+
+#[test]
+fn one_bad_data_key_in_a_vault_batch_is_marked_and_the_rest_rewrapped() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_vault_partial_test").await else {
+            return;
+        };
+        let (address, _) = serve_transit().await;
+        let keys = KeyService::new(VaultTransitProvider::new(&address, "skilj", "test-token"))
+            .with_cache(Duration::ZERO, 0);
+        let bc = insert_bounded_context(&pool).await;
+        for subject in ["a", "b", "c"] {
+            seal_for(&pool, &bc, subject, &keys).await;
+        }
+        // One corrupt ciphertext among them, and then one where every item
+        // fails: Vault answers 400 to both batches.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"bc_{bc}\".encryption_keys SET wrapped_key = convert_to('vault:v1:x.00', 'UTF8') \
+             WHERE subject_value = 'b'"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_skilj, _) = builder(&url, keys.clone(), quick(Duration::ZERO))
+            .build()
+            .await
+            .unwrap();
+        db::rotate_master_key(
+            &pool,
+            keys.provider(),
+            None,
+            db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_state(&pool, keys.provider_name(), "the retirement", |s| {
+            s.version == 2 && s.retired_below == 2
+        })
+        .await;
+        let rewrapped = events_about(&pool, "EncryptionDataKeysRewrapped", &bc).await;
+        assert_eq!(rewrapped.len(), 1, "{rewrapped:?}");
+        assert_eq!((rewrapped[0]["rewrapped"].clone(), rewrapped[0]["unreadable"].clone()), (json!(2), json!(1)));
+    });
+}
+
+/// A provider whose `wrap` waits until released: a slow key service.
+#[derive(Clone)]
+struct Slow {
+    inner: InMemoryKeyProvider,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl KeyProvider for Slow {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn wrap<'a>(
+        &'a self,
+        data_key: &'a [u8; 32],
+    ) -> skilj::BoxFuture<'a, Result<WrappedDataKey, encryption::Error>> {
+        Box::pin(async move {
+            let _permit = self.gate.acquire().await.unwrap();
+            self.inner.wrap(data_key).await
+        })
+    }
+    fn unwrap<'a>(
+        &'a self,
+        wrapped: &'a WrappedDataKey,
+    ) -> skilj::BoxFuture<'a, Result<[u8; 32], encryption::Error>> {
+        self.inner.unwrap(wrapped)
+    }
+    fn versions(&self) -> skilj::BoxFuture<'_, Result<skilj::KeyVersions, encryption::Error>> {
+        self.inner.versions()
+    }
+    fn rotate(&self) -> skilj::BoxFuture<'_, Result<u32, encryption::Error>> {
+        self.inner.rotate()
+    }
+    fn retire_below(&self, version: u32) -> skilj::BoxFuture<'_, Result<(), encryption::Error>> {
+        self.inner.retire_below(version)
+    }
+    fn key(&self, key: &str) -> Result<Arc<dyn KeyProvider>, encryption::Error> {
+        self.inner.key(key)
+    }
+    fn create(&self) -> skilj::BoxFuture<'_, Result<bool, encryption::Error>> {
+        self.inner.create()
+    }
+    fn delete(&self) -> skilj::BoxFuture<'_, Result<(), encryption::Error>> {
+        self.inner.delete()
+    }
+}
+
+#[test]
+fn a_slow_key_provider_does_not_hold_pool_connections() {
+    runtime().block_on(async {
+        let Some((url, setup)) = test_db("skilj_master_key_slow_provider_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&setup).await;
+        let pool = skilj_core::db::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect(&url)
+            .await
+            .unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let keys = KeyService::new(Slow {
+            inner: InMemoryKeyProvider::new(),
+            gate: Arc::clone(&gate),
+        });
+        // Four provisionings, each waiting on the provider.
+        let waiting: Vec<_> = (0..4)
+            .map(|i| {
+                let pool = pool.clone();
+                let keys = keys.clone();
+                let bc = bc.clone();
+                tokio::spawn(async move {
+                    db::get_or_create_encryption_key(&pool, &bc, "user", &format!("s{i}"), &keys)
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The pool still serves: none of them holds a connection meanwhile.
+        let answered: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(answered, 1);
+        gate.add_permits(4);
+        for provisioning in waiting {
+            provisioning.await.unwrap().unwrap();
+        }
+    });
+}
+
+#[test]
+fn a_brought_key_is_followed_but_never_rotated_or_retired_by_skilj() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_brought_lifecycle_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&pool).await;
+        let provider = InMemoryKeyProvider::new();
+        let keys = KeyService::new(provider.clone());
+        let theirs = provider.key("customer").unwrap();
+        theirs.create().await.unwrap();
+        seal_for(&pool, &bc, "1", &keys).await;
+        // A schedule that would rotate every key at every check, and no
+        // grace period.
+        let (_skilj, _) = builder(
+            &url,
+            keys.clone(),
+            quick(Duration::ZERO).every(Duration::from_millis(100)),
+        )
+        .build()
+        .await
+        .unwrap();
+        db::assign_encryption_key(&pool, &keys, &bc, Some("customer"), false, None)
+            .await
+            .unwrap();
+        wait_for_state(&pool, "in-memory:customer", "the move to their key", |s| {
+            s.rewrapped_at.is_some()
+        })
+        .await;
+        // Their own rotation is followed: recorded and rewrapped...
+        theirs.rotate().await.unwrap();
+        wait_for_state(
+            &pool,
+            "in-memory:customer",
+            "their rotation followed",
+            |s| s.version == 2 && s.rewrapped_at.is_some(),
+        )
+        .await;
+        assert_eq!(wraps(&pool, &bc).await[0].2, Some(2));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // ...but skilj neither rotated it on schedule nor retired version 1.
+        let versions = theirs.versions().await.unwrap();
+        assert_eq!((versions.latest, versions.min_decryption), (2, 1));
+        // The default key, skilj's, was rotated on the schedule meanwhile.
+        assert!(keys.provider().versions().await.unwrap().latest > 1);
     });
 }

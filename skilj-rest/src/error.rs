@@ -188,6 +188,10 @@ fn status_for(err: &CoreError) -> StatusCode {
         // A misconfigured/missing key_service or a corrupted
         // wrapped key are both operator-facing configuration/data-integrity
         // problems, never a caller-facing 4xx.
+        // A key provider that doesn't answer: worth retrying (§230).
+        CoreError::Encryption(skilj_core::encryption::Error::ProviderUnavailable { .. }) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         CoreError::Encryption(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // This instance can't hash a blind tag another instance can - the
         // same status `NoDeciderRegistered` gives "can't decide here".

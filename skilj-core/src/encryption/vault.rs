@@ -183,6 +183,46 @@ impl VaultTransitProvider {
             .map_err(|(_, err)| err)
     }
 
+    /// One request answering its HTTP status and parsed body whatever the
+    /// status, except a 5xx, a 429 or no answer, which are
+    /// [`Error::ProviderUnavailable`]: for a caller that reads a refusal's
+    /// body, as `rewrap` does a batch's.
+    async fn request_with_body(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), Error> {
+        let url = format!("{}/v1/{}/{}", self.address, self.mount, path);
+        let mut request = self.client.request(method, &url);
+        if let Some(body) = &body {
+            request = request.json(body);
+        }
+        let mut request = request.header("X-Vault-Token", self.token()?);
+        if let Some(namespace) = &self.namespace {
+            request = request.header("X-Vault-Namespace", namespace);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| self.unavailable(format!("{path}: {e}")))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| self.unavailable(format!("{path}: {e}")))?;
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(self.unavailable(format!("{path}: {status} {}", errors(&text))));
+        }
+        let body = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text)
+                .map_err(|e| self.refused(format!("{path}: {status}, not JSON: {e}")))?
+        };
+        Ok((status.as_u16(), body))
+    }
+
     /// [`request`](Self::request), with the HTTP status of a refusal kept
     /// next to the error - `None` when there was no answer - so a caller can
     /// tell "the key refused this" from "Vault refused the request".
@@ -246,6 +286,12 @@ impl VaultTransitProvider {
 fn version_of(ciphertext: &str) -> Option<u32> {
     let rest = ciphertext.strip_prefix("vault:v")?;
     rest.split(':').next()?.parse().ok()
+}
+
+/// A parsed body's `errors`, or the body.
+fn errors_of(body: &Value) -> String {
+    body.get("errors")
+        .map_or_else(|| body.to_string(), Value::to_string)
 }
 
 /// Vault's `errors` array, or the body as it came.
@@ -320,6 +366,14 @@ impl KeyProvider for VaultTransitProvider {
         })
     }
 
+    /// Transit's batch `rewrap`, the data keys never leaving Vault. Vault
+    /// answers a batch in which an item failed with HTTP 400 - unless
+    /// `partial_failure_response_code` (Vault 1.14+, OpenBao) is set and some
+    /// item succeeded - so a 400 still carries `batch_results`, read item by
+    /// item: one bad ciphertext must not fail the batch, or a context's
+    /// rewrap would stall on it forever. A failed item is the key refusing
+    /// that ciphertext ([`Error::DecryptFailed`], or
+    /// [`Error::KeyVersionRetired`] for "too old").
     fn rewrap<'a>(
         &'a self,
         wrapped: &'a [WrappedDataKey],
@@ -332,27 +386,43 @@ impl KeyProvider for VaultTransitProvider {
                 .iter()
                 .map(|w| json!({ "ciphertext": String::from_utf8_lossy(&w.ciphertext) }))
                 .collect();
-            let data = self
-                .call(
-                    &format!("rewrap/{}", self.key),
-                    Some(json!({ "batch_input": batch })),
-                )
-                .await?;
-            let results = data
+            let path = format!("rewrap/{}", self.key);
+            let body = json!({ "batch_input": batch, "partial_failure_response_code": 200 });
+            let data = match self
+                .request_with_body(reqwest::Method::POST, &path, Some(body))
+                .await?
+            {
+                (status, body) if status == 200 || status == 400 => {
+                    body.get("data").cloned().unwrap_or(Value::Null)
+                }
+                (status, body) => {
+                    return Err(self.refused(format!("{path}: {status} {}", errors_of(&body))))
+                }
+            };
+            let Some(results) = data
                 .get("batch_results")
                 .and_then(Value::as_array)
                 .filter(|r| r.len() == wrapped.len())
-                .ok_or_else(|| self.refused("rewrap answered a batch of another size"))?;
+            else {
+                return Err(self.refused("rewrap answered no batch of the right size"));
+            };
             Ok(results
                 .iter()
-                .map(|result| match str_field(result, "ciphertext") {
-                    Some(ciphertext) if str_field(result, "error").is_none_or(str::is_empty) => {
-                        self.wrapped_from(ciphertext)
+                .zip(wrapped)
+                .map(|(result, input)| {
+                    let error = str_field(result, "error").filter(|e| !e.is_empty());
+                    match (str_field(result, "ciphertext"), error) {
+                        (Some(ciphertext), None) => self.wrapped_from(ciphertext),
+                        (_, Some(error))
+                            if error.contains("too old")
+                                || error.contains("disallowed by policy") =>
+                        {
+                            Err(Error::KeyVersionRetired {
+                                version: input.version,
+                            })
+                        }
+                        _ => Err(Error::DecryptFailed),
                     }
-                    _ => Err(self.refused(format!(
-                        "rewrap: {}",
-                        str_field(result, "error").unwrap_or("no ciphertext")
-                    ))),
                 })
                 .collect())
         })

@@ -132,6 +132,24 @@ pub fn rotate_master_key_field(n: &Naming) -> Field {
                 let provider = key_service
                     .provider_for(key.as_deref())
                     .map_err(to_graphql_error)?;
+                // skilj retires only keys it manages: the default key and
+                // keys it created; a key a superadmin brought is retired by
+                // whoever owns it.
+                if retire_immediately && key.is_some() {
+                    let key_state = skilj_core::db::master_key_state(&state.pool, provider.name())
+                        .await
+                        .map_err(to_graphql_error)?;
+                    if !key_state.is_some_and(|s| s.created_by_skilj) {
+                        return Err(to_graphql_error(
+                            skilj_core::encryption::Error::ProviderRefused {
+                                provider: provider.name().to_string(),
+                                message: "skilj didn't create this key, so it doesn't retire \
+                                          its versions; retire them where the key is managed"
+                                    .into(),
+                            },
+                        ));
+                    }
+                }
                 skilj_core::db::rotate_master_key(
                     &state.pool,
                     provider.as_ref(),

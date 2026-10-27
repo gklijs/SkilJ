@@ -294,9 +294,11 @@ pub use skilj_core::blind::{normalize, BlindIndexKey};
 /// `sqlx`'s pool options, for [`SkiljBuilder::pool_options`] - re-exported
 /// here because `skilj_core::db` is internal (docs/architecture.md §220).
 pub use skilj_core::db::PgPoolOptions;
+// A key provider of your own implements `KeyProvider` with these.
+pub use skilj_core::encryption::provider::BoxFuture;
 pub use skilj_core::encryption::{
     EncryptionMasterKey, InMemoryKeyProvider, KeyFileProvider, KeyProvider, KeyService,
-    VaultTransitProvider,
+    KeyVersions, VaultTransitProvider, WrappedDataKey,
 };
 pub use skilj_core::plugin::{
     requires_role, BlindErasure, BlindTag, CancelDeadline, CommandType, CrossContextRoute,
@@ -1560,7 +1562,15 @@ async fn key_lifecycle(
     use skilj_core::db::Rotation;
     use skilj_core::encryption::trail::RotationReason;
     record_key_in_use(pool, provider, key).await?;
-    if let Some(every) = rotation.every {
+    // A key a superadmin brought - a customer's, say - is theirs to rotate
+    // and retire: skilj follows its rotations (step 1) and rewraps (step
+    // 3), but neither rotates it on schedule nor retires its versions,
+    // which could break whatever else uses it (docs/architecture.md §230).
+    let managed = match skilj_core::db::master_key_state(pool, provider.name()).await? {
+        Some(state) => state.key.is_none() || state.created_by_skilj,
+        None => key.is_none(),
+    };
+    if let (true, Some(every)) = (managed, rotation.every) {
         let every = chrono::Duration::from_std(every).unwrap_or(chrono::Duration::MAX);
         if let Some(version) = skilj_core::db::rotate_master_key(
             pool,
@@ -1616,7 +1626,7 @@ async fn key_lifecycle(
                 continue;
             }
             let started = std::time::Instant::now();
-            let outcome = skilj_core::db::rewrap_data_keys(
+            let Some(outcome) = skilj_core::db::rewrap_data_keys_once(
                 pool,
                 bounded_context,
                 key_service,
@@ -1624,7 +1634,12 @@ async fn key_lifecycle(
                 state.version,
                 state.rotated_at,
             )
-            .await?;
+            .await?
+            else {
+                // Another instance is rewrapping it: not done yet.
+                still_behind = true;
+                continue;
+            };
             tracing::info!(
                 bounded_context = %bounded_context,
                 provider = provider.name(),
@@ -1648,7 +1663,7 @@ async fn key_lifecycle(
         }
         return Ok(());
     };
-    if state.retired_below >= state.version {
+    if !managed || state.retired_below >= state.version {
         return Ok(());
     }
     let grace = if state.retire_immediately {
