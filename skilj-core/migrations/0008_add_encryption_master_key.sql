@@ -28,7 +28,11 @@ CREATE TABLE encryption_master_keys (
     created_by_skilj BOOLEAN NOT NULL DEFAULT false,
     -- When an unused bounded-context key is deleted (or let go): the
     -- grace period after its last bounded context stopped using it.
-    delete_after TIMESTAMPTZ
+    delete_after TIMESTAMPTZ,
+    -- Raised by every assignment of a bounded context to the key: a check
+    -- that read the assignments before the latest one may not mark the
+    -- rewrap done.
+    assignment_epoch BIGINT NOT NULL DEFAULT 0
 );
 
 -- Bounded contexts with a key of their own; every other one uses the

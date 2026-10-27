@@ -1454,6 +1454,13 @@ async fn master_key_tick(
         .map(|bc| bc.name)
         .collect();
     skilj_core::db::forget_assignments_of_deleted_contexts(pool, &existing).await?;
+    // Each key's assignment epoch, read before the assignments: a key's
+    // rewrap is marked done only if no assignment came after this read.
+    let epochs: BTreeMap<String, i64> = skilj_core::db::master_key_states(pool)
+        .await?
+        .into_iter()
+        .map(|state| (state.provider, state.assignment_epoch))
+        .collect();
     let assignments = skilj_core::db::encryption_key_assignments(pool).await?;
     let mut keys: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
     keys.insert(None, Vec::new());
@@ -1470,6 +1477,7 @@ async fn master_key_tick(
             provider.as_ref(),
             key.as_deref(),
             bounded_contexts,
+            epochs.get(provider.name()).copied(),
             rotation,
         )
         .instrument(tracing::info_span!(
@@ -1557,6 +1565,7 @@ async fn key_lifecycle(
     provider: &dyn KeyProvider,
     key: Option<&str>,
     bounded_contexts: &[String],
+    epoch: Option<i64>,
     rotation: &MasterKeyRotation,
 ) -> Result<(), skilj_core::Error> {
     use skilj_core::db::Rotation;
@@ -1651,8 +1660,13 @@ async fn key_lifecycle(
             );
             still_behind |= behind(bounded_context).await?;
         }
+        // Without an epoch read before the assignments - the key had no
+        // state yet - this check can't tell; the next one marks it.
+        let Some(epoch) = epoch else {
+            return Ok(());
+        };
         if !still_behind
-            && skilj_core::db::mark_data_keys_rewrapped(pool, provider.name(), state.version)
+            && skilj_core::db::mark_data_keys_rewrapped(pool, provider.name(), state.version, epoch)
                 .await?
         {
             tracing::info!(
