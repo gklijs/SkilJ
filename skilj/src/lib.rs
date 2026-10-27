@@ -1030,6 +1030,7 @@ impl Skilj {
             max_items_per_batch: skilj_core::command_batcher::DEFAULT_MAX_ITEMS_PER_BATCH,
             command_batch_max_concurrent_leaders: None,
             encryption_master_key: None,
+            previous_encryption_master_keys: Vec::new(),
             event_broadcast_capacity: 1024,
             event_cache_warm_up_count: 1000,
             pool_options: None,
@@ -1832,6 +1833,141 @@ async fn rotate_blind_tags(
     Ok(())
 }
 
+/// What startup found about the encryption master key
+/// (docs/architecture.md §230): the fingerprint of the key in use, and the
+/// bounded contexts with a data key not yet recorded as wrapped under this
+/// process's current key.
+struct MasterKeyStatus {
+    in_use: String,
+    behind: Vec<String>,
+}
+
+/// Refuses to start when the master key in use is none of the configured
+/// keys (`encryption_master_key_changed`), or a data key is wrapped under
+/// one that isn't configured (`encryption_master_key_unknown`), whether or
+/// not this process reconciles: it would wrap new data keys under a key
+/// nothing else has, or be unable to read old ones. The first process
+/// with a master key records the one in use: the key the data keys from
+/// before fingerprints unwrap under, else its own - with an
+/// `EncryptionMasterKeyActivated` event. Returns the key in use and the
+/// bounded contexts behind the current key.
+async fn check_encryption_master_key(
+    pool: &Pool,
+    master_key: &EncryptionMasterKey,
+) -> Result<MasterKeyStatus, skilj_core::Error> {
+    let recorded = skilj_core::db::encryption_master_key_in_use(pool).await?;
+    if let Some(in_use) = &recorded {
+        if !master_key.knows(in_use) {
+            return Err(skilj_core::encryption::Error::MasterKeyChanged {
+                fingerprint: in_use.clone(),
+            }
+            .into());
+        }
+    }
+    let mut unrecorded = None;
+    let mut behind = Vec::new();
+    for bounded_context in skilj_core::db::list_bounded_contexts(pool).await? {
+        let bc = bounded_context.name;
+        let wraps = match skilj_core::db::check_data_key_wraps(pool, &bc, master_key).await {
+            Ok(wraps) => wraps,
+            // Deleted since the listing (docs/architecture.md §157).
+            Err(skilj_core::Error::Database(err))
+                if err
+                    .as_database_error()
+                    .and_then(|e| e.code())
+                    .is_some_and(|code| code == "42P01" || code == "3F000") =>
+            {
+                continue
+            }
+            Err(err) => return Err(err),
+        };
+        if unrecorded.is_none() {
+            unrecorded.clone_from(&wraps.unrecorded);
+        }
+        if wraps.behind(master_key.fingerprint()) {
+            behind.push(bc);
+        }
+    }
+    let in_use = match recorded {
+        Some(in_use) => in_use,
+        None => {
+            let first = unrecorded.unwrap_or_else(|| master_key.fingerprint().to_string());
+            skilj_core::db::activate_encryption_master_key(pool, &first, None, true).await?;
+            let in_use = skilj_core::db::encryption_master_key_in_use(pool)
+                .await?
+                .unwrap_or(first);
+            // Another instance's first start may have recorded another key.
+            if !master_key.knows(&in_use) {
+                return Err(skilj_core::encryption::Error::MasterKeyChanged {
+                    fingerprint: in_use,
+                }
+                .into());
+            }
+            in_use
+        }
+    };
+    Ok(MasterKeyStatus { in_use, behind })
+}
+
+/// The rotation itself (docs/architecture.md §230), for a process with a
+/// reconciliation role: switches the key in use to this process's current
+/// key, recorded as `EncryptionMasterKeyActivated`, then rewraps each
+/// bounded context behind it that the Role administers - itself, or for a
+/// tenant its template - recorded as `EncryptionDataKeysRewrapped`. One it
+/// doesn't administer is reported in `skipped_no_access` and keeps its
+/// data keys under the previous key, which is why that key must stay
+/// configured until a Role that does administer it has run.
+async fn rotate_encryption_master_key(
+    pool: &Pool,
+    role: &Role,
+    master_key: &EncryptionMasterKey,
+    status: MasterKeyStatus,
+    template_cache: &skilj_core::template_cache::TemplateCache,
+    report: &mut ReconciliationReport,
+) -> Result<(), skilj_core::Error> {
+    if status.in_use != master_key.fingerprint()
+        && skilj_core::db::activate_encryption_master_key(
+            pool,
+            master_key.fingerprint(),
+            Some(&role.id),
+            false,
+        )
+        .await?
+    {
+        tracing::info!(
+            master_key = master_key.fingerprint(),
+            previous = %status.in_use,
+            "encryption master key rotated: new data keys are wrapped under the new key"
+        );
+    }
+    for bc in status.behind {
+        let template = template_cache.effective_bounded_context(&bc);
+        let administers = resolve_bounded_context_and_admin_mapping(pool, &role.id, &bc)
+            .await?
+            .is_some()
+            || (template != bc
+                && resolve_bounded_context_and_admin_mapping(pool, &role.id, &template)
+                    .await?
+                    .is_some());
+        if !administers {
+            report
+                .skipped_no_access
+                .push(format!("{bc} (encryption master key rotation)"));
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let outcome = skilj_core::db::rewrap_data_keys(pool, &bc, master_key, &role.id).await?;
+        tracing::info!(
+            bounded_context = %bc,
+            rewrapped = outcome.rewrapped,
+            unreadable = outcome.unreadable,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "data keys rewrapped under the current encryption master key"
+        );
+    }
+    Ok(())
+}
+
 /// Records every declared `BlindTag` in its bounded context's
 /// `blind_tags` (docs/architecture.md §205), for each bounded context the
 /// reconciliation Role administers - the same gate the types after it
@@ -2416,6 +2552,7 @@ pub struct SkiljBuilder {
     max_items_per_batch: usize,
     command_batch_max_concurrent_leaders: Option<usize>,
     encryption_master_key: Option<EncryptionMasterKey>,
+    previous_encryption_master_keys: Vec<EncryptionMasterKey>,
     event_broadcast_capacity: usize,
     event_cache_warm_up_count: usize,
     pool_options: Option<PgPoolOptions>,
@@ -2843,9 +2980,39 @@ impl SkiljBuilder {
     /// (`encryption::Error::MasterKeyNotConfigured`), not a silent bypass.
     /// A consuming application owns keeping this value stable across
     /// restarts - losing it makes every already-provisioned
-    /// `EncryptionKey` permanently unrecoverable.
+    /// `EncryptionKey` permanently unrecoverable. Startup refuses a key
+    /// other than the one in use (`encryption_master_key_changed`);
+    /// changing it on purpose is a rotation, see
+    /// [`previous_encryption_master_keys`](Self::previous_encryption_master_keys).
     pub fn encryption_master_key(mut self, master_key: EncryptionMasterKey) -> Self {
         self.encryption_master_key = Some(master_key);
+        self
+    }
+
+    /// The encryption master keys [`encryption_master_key`](Self::encryption_master_key)
+    /// replaced, newest first - how the master key is rotated
+    /// (docs/architecture.md §230). Every data key is stored with the
+    /// fingerprint of the master key it is wrapped under, and unwrapped
+    /// with whichever configured key has it. Startup records which key is
+    /// in use; until a process with a reconciliation role switches it to
+    /// the current key, new data keys are still wrapped under the one in
+    /// use, so instances that only have it keep working. The switch is
+    /// recorded as an `EncryptionMasterKeyActivated` event in the admin
+    /// bounded context, and that process then rewraps every data key under
+    /// the new key, one `EncryptionDataKeysRewrapped` event per bounded
+    /// context. No event, command or secret is rewritten: their data keys
+    /// stay the same.
+    ///
+    /// To rotate a leaked key: configure a new key as `encryption_master_key`
+    /// and the old one here on every instance, then start one with the
+    /// reconciliation role. Once it has rewrapped every bounded context,
+    /// the old key can be removed; startup refuses to while a data key is
+    /// still wrapped under it.
+    pub fn previous_encryption_master_keys(
+        mut self,
+        keys: impl IntoIterator<Item = EncryptionMasterKey>,
+    ) -> Self {
+        self.previous_encryption_master_keys = keys.into_iter().collect();
         self
     }
 
@@ -3060,6 +3227,14 @@ impl SkiljBuilder {
                 "previous_blind_index_keys is configured without a blind_index_key to rotate to",
             ));
         }
+        // docs/architecture.md §230.
+        if !self.previous_encryption_master_keys.is_empty() && self.encryption_master_key.is_none()
+        {
+            return Err(skilj_core::Error::configuration(
+                "previous_encryption_master_keys is configured without an encryption_master_key \
+                 to rotate to",
+            ));
+        }
         // docs/architecture.md §205.
         validate_blind_tags(
             &self.blind_tags,
@@ -3201,7 +3376,11 @@ impl SkiljBuilder {
         let read_cursor_checkout_lease = self.read_cursor_checkout_lease;
         let max_events_per_read = self.max_events_per_read;
         let graphql_limits = self.graphql_limits;
-        let encryption_master_key = self.encryption_master_key;
+        // docs/architecture.md §230: the previous keys travel with the
+        // current one, so every path that unwraps a data key can use them.
+        let encryption_master_key = self
+            .encryption_master_key
+            .map(|key| key.with_previous(self.previous_encryption_master_keys));
         let event_broadcaster = EventBroadcaster::new(self.event_broadcast_capacity);
         let revocation_broadcaster = RevocationBroadcaster::new();
 
@@ -3458,6 +3637,12 @@ impl SkiljBuilder {
         // reconciliation reads each declared bounded context's
         // registration tables, which a bounded context from an older
         // version only has every column of once they've run.
+        // docs/architecture.md §230: after the access trail, whose admin
+        // context records the key in use.
+        let master_key_status = match &encryption_master_key {
+            Some(master_key) => Some(check_encryption_master_key(&pool, master_key).await?),
+            None => None,
+        };
         let pending_rotations =
             check_stored_blind_tags(&pool, &self.blind_tags, &blind_index, &template_cache).await?;
         let mut report = ReconciliationReport::default();
@@ -3471,6 +3656,17 @@ impl SkiljBuilder {
             // Before the types, which map the blind keys (docs/architecture.md §205).
             reconcile_blind_tags(&pool, &role, &self.blind_tags, &blind_index, &mut report).await?;
             rotate_blind_tags(&pool, &role, pending_rotations, &blind_index, &mut report).await?;
+            if let (Some(master_key), Some(status)) = (&encryption_master_key, master_key_status) {
+                rotate_encryption_master_key(
+                    &pool,
+                    &role,
+                    master_key,
+                    status,
+                    &template_cache,
+                    &mut report,
+                )
+                .await?;
+            }
             let version = RegistrationVersion::new(self.application_version);
             reconcile_event_types(
                 &pool,
@@ -3496,6 +3692,25 @@ impl SkiljBuilder {
             )
             .await?;
         } else {
+            // docs/architecture.md §230: wrapping under the key in use
+            // meanwhile, which provisioning reads.
+            if let (Some(master_key), Some(status)) = (&encryption_master_key, &master_key_status) {
+                if status.in_use != master_key.fingerprint() {
+                    tracing::warn!(
+                        master_key = master_key.fingerprint(),
+                        in_use = %status.in_use,
+                        "the encryption master key in use is a previous one; an instance with a \
+                         reconciliation role switches to the current key at startup"
+                    );
+                }
+                for bc in &status.behind {
+                    tracing::warn!(
+                        bounded_context = %bc,
+                        "data keys not wrapped under the current encryption master key; an \
+                         instance with a reconciliation role rewraps them at startup"
+                    );
+                }
+            }
             // docs/architecture.md §209: hashing at the stored generation
             // meanwhile, which `check_stored_blind_tags` loaded.
             for rotation in &pending_rotations {

@@ -1154,3 +1154,27 @@ fn the_registered_types_are_the_eight_and_registering_again_changes_nothing() {
         db::ensure_admin_events_origin_kind(&pool).await.unwrap();
     });
 }
+
+/// The master-key trail's two types (docs/architecture.md §230) are
+/// registered next to these, as closed to every creation path.
+#[test]
+fn the_master_key_types_are_registered_closed() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        db::register_master_key_event_types(&pool).await.unwrap();
+        db::register_master_key_event_types(&pool).await.unwrap();
+        for kind in skilj_core::encryption::trail::MasterKeyEventKind::ALL {
+            let registered = db::get_event_type(&pool, ADMIN_BOUNDED_CONTEXT_NAME, kind.name())
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{} is registered", kind.name()));
+            assert!(!registered.external_creation_allowed);
+            assert!(!registered.direct_creation_allowed);
+            assert!(!registered.system_triggered_allowed);
+            assert!(!registered.event_read_allowed);
+            assert!(skilj_core::access_trail::AccessEventKind::from_name(kind.name()).is_none());
+        }
+    });
+}

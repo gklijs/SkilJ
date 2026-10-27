@@ -12,6 +12,20 @@ README.md, "Status and stability").
 
 ### Added
 
+- Encryption master key rotation (docs/architecture.md §230).
+  `SkiljBuilder::previous_encryption_master_keys(...)` (and
+  `EncryptionMasterKey::with_previous`) keep the replaced keys able to
+  unwrap. Every data key is now stored with the fingerprint of the master
+  key it is wrapped under, and the key in use is recorded. A process with a
+  reconciliation role switches to its current key and rewraps every data key
+  of each bounded context it administers; events, commands and secrets are
+  not rewritten. Both steps are events in the `admin` bounded context:
+  `EncryptionMasterKeyActivated` and `EncryptionDataKeysRewrapped`.
+- Startup now refuses a master key that isn't the one in use
+  (`encryption_master_key_changed`), or a data key wrapped under a key that
+  isn't configured (`encryption_master_key_unknown`), instead of starting and
+  wrapping new data keys under the wrong key. `encryption_master_key_unknown`
+  joins `skilj_retry::ANOTHER_INSTANCE_CODES`.
 - `EventOrigin::Unknown { kind }`: an event whose origin was written by a
   newer skilj version sharing the database - mid rolling deploy, or after
   a rollback - reads back with that origin's kind instead of panicking
@@ -35,6 +49,16 @@ README.md, "Status and stability").
 - `skilj-tui`'s live views work against an `https://` endpoint: its
   websocket client is now built with TLS, so subscriptions over `wss://`
   no longer fail with "TLS support not compiled in".
+
+### Upgrading
+
+- Migration `0008` (applied at startup) adds `encryption_master_key`, and
+  startup adds `encryption_keys.master_key_fingerprint` and its index to
+  every bounded context. The first start with a master key records it as
+  the one in use. Data keys from before have no fingerprint and are still
+  read; the first start with a reconciliation role rewraps them, which
+  records their fingerprint (one `EncryptionDataKeysRewrapped` per bounded
+  context).
 
 ## [0.2.0] - 2026-10-26
 

@@ -25,17 +25,19 @@ use std::time::Duration;
 /// declare the command type's `decide()`, a sync projection the
 /// resulting event feeds, or the blind tag a payload must be hashed under
 /// (docs/architecture.md §205), or the blind-index key it was rotated to
-/// (§209) - ordinary mid rolling deploy - or a key rotation committed
-/// while the command was being decided twice in a row (§209). A caller retrying
+/// (§209), or the encryption master key in use (§230) - ordinary mid
+/// rolling deploy - or a key rotation committed while the command was
+/// being decided twice in a row (§209). A caller retrying
 /// on one of these waits [`ANOTHER_INSTANCE_RETRY_DELAY`] instead of
 /// spending an attempt of its [`RetryPolicy`], and never parks for it
 /// (docs/architecture.md §161).
-pub const ANOTHER_INSTANCE_CODES: [&str; 5] = [
+pub const ANOTHER_INSTANCE_CODES: [&str; 6] = [
     "no_decider_registered",
     "sync_projection_not_declared",
     "blind_tag_not_declared",
     "blind_index_key_not_configured",
     "blind_tags_rotated",
+    "encryption_master_key_unknown",
 ];
 
 /// Whether `code` is one of [`ANOTHER_INSTANCE_CODES`].

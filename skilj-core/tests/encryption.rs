@@ -45,6 +45,88 @@ fn generate_and_wrap_then_unwrap_recovers_the_same_data_key() {
     assert_eq!(plaintext, "hello");
 }
 
+// --- rotating the master key (docs/architecture.md §230) ---
+
+#[test]
+fn a_fingerprint_tells_keys_apart_and_is_stable() {
+    assert_eq!(master_key(1).fingerprint(), master_key(1).fingerprint());
+    assert_ne!(master_key(1).fingerprint(), master_key(2).fingerprint());
+    assert_eq!(master_key(1).fingerprint().len(), 32);
+}
+
+#[test]
+fn a_rewrapped_data_key_is_the_same_key_under_the_new_master_key() {
+    let old = master_key(1);
+    let new = master_key(2).with_previous([old.clone()]);
+    let (data_key, wrapped, nonce) = encryption::generate_and_wrap_data_key(&old);
+    let ciphertext = encryption::encrypt_leaf(&data_key, "hello");
+
+    let (unwrapped, under) =
+        encryption::unwrap_data_key_under(&new, Some(old.fingerprint()), &wrapped, &nonce).unwrap();
+    assert_eq!(under, old.fingerprint());
+    let (rewrapped, rewrap_nonce) =
+        encryption::rewrap_data_key(&new, new.fingerprint(), &unwrapped).unwrap();
+
+    // The new key alone opens it, and what was sealed before still opens.
+    let (again, _) = encryption::unwrap_data_key_under(
+        &master_key(2),
+        Some(master_key(2).fingerprint()),
+        &rewrapped,
+        &rewrap_nonce,
+    )
+    .unwrap();
+    assert_eq!(
+        encryption::decrypt_leaf(&again, &ciphertext).unwrap(),
+        "hello"
+    );
+}
+
+#[test]
+fn a_data_key_under_a_key_that_is_not_configured_is_refused_by_name() {
+    let (_, wrapped, nonce) = encryption::generate_and_wrap_data_key(&master_key(1));
+    match encryption::unwrap_data_key_under(
+        &master_key(2),
+        Some(master_key(1).fingerprint()),
+        &wrapped,
+        &nonce,
+    ) {
+        Err(encryption::Error::MasterKeyUnknown { fingerprint }) => {
+            assert_eq!(fingerprint, master_key(1).fingerprint())
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+        Ok(_) => panic!("a key that is not configured unwrapped a data key"),
+    }
+    assert!(encryption::generate_and_wrap_data_key_under(
+        &master_key(2),
+        master_key(1).fingerprint()
+    )
+    .is_err());
+}
+
+#[test]
+fn an_unrecorded_data_key_is_tried_under_every_configured_key() {
+    let (_, wrapped, nonce) = encryption::generate_and_wrap_data_key(&master_key(1));
+    let keyring = master_key(3).with_previous([master_key(2), master_key(1)]);
+    let (_, under) = encryption::unwrap_data_key_under(&keyring, None, &wrapped, &nonce).unwrap();
+    assert_eq!(under, master_key(1).fingerprint());
+    assert_eq!(
+        keyring.fingerprints().collect::<Vec<_>>(),
+        vec![
+            master_key(3).fingerprint(),
+            master_key(2).fingerprint(),
+            master_key(1).fingerprint()
+        ]
+    );
+    // A key given twice is kept once.
+    assert_eq!(
+        master_key(3)
+            .with_previous([master_key(3), master_key(1), master_key(1)])
+            .fingerprints()
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn unwrap_data_key_fails_under_the_wrong_master_key() {
     let master = master_key(1);

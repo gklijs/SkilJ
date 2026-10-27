@@ -84,7 +84,15 @@ changed casually - generate them once and keep them in the secret store:
 
 - `.encryption_master_key(...)` when any type has `sensitive_fields()` -
   without it, writing a sensitive payload is refused with
-  `encryption_master_key_not_configured`.
+  `encryption_master_key_not_configured`. Startup refuses a key other than
+  the one in use (`encryption_master_key_changed`). A leaked one is rotated
+  (`docs/architecture.md` §230): configure the new key here and the old one
+  in `.previous_encryption_master_keys([...])` on every instance, roll that
+  out, then start an instance with the reconciliation role - it switches to
+  the new key and rewraps every data key, recorded as
+  `EncryptionMasterKeyActivated` / `EncryptionDataKeysRewrapped` events in
+  the `admin` context. Remove the old key once `skipped_no_access` is empty;
+  startup refuses to while a data key is still wrapped under it.
 - `.blind_index_key(...)` when any `BlindTag` is declared (a uniqueness
   rule on personal data) - `build()` refuses a `BlindTag` without it,
   and an instance missing the `BlindTag` refuses those commands with

@@ -577,7 +577,8 @@ async fn provision_bounded_context_schema(
             created_at TIMESTAMPTZ NOT NULL,
             destroyed_at TIMESTAMPTZ,
             wrapped_key BYTEA,
-            wrap_nonce BYTEA
+            wrap_nonce BYTEA,
+            master_key_fingerprint TEXT
         )"
     )))
     .execute(&mut **tx)
@@ -585,6 +586,11 @@ async fn provision_bounded_context_schema(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE UNIQUE INDEX encryption_keys_unique_active ON {schema}.encryption_keys \
          (subject_key, subject_value) WHERE status = 'active'"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(encryption_keys_master_key_index_ddl(
+        &schema,
     )))
     .execute(&mut **tx)
     .await?;
@@ -2563,6 +2569,48 @@ pub async fn ensure_blind_tags_table<'e>(
     Ok(())
 }
 
+/// The index startup's check and a rotation's rewrap read
+/// `encryption_keys` through (docs/architecture.md §230): the active rows
+/// by the master key they are wrapped under, so the distinct keys in use
+/// and the newest row without a fingerprint are each a few index probes.
+fn encryption_keys_master_key_index_ddl(schema: &str) -> String {
+    format!(
+        "CREATE INDEX encryption_keys_master_key ON {schema}.encryption_keys \
+         (master_key_fingerprint, id) WHERE status = 'active'"
+    )
+}
+
+/// `encryption_keys.master_key_fingerprint` and its index
+/// (docs/architecture.md §230), for a bounded context provisioned before
+/// them. Rows already there keep `NULL`: wrapped before fingerprints were
+/// recorded, under whatever key was configured then. A call that finds
+/// both there takes no table lock (§158).
+pub async fn ensure_encryption_key_fingerprint_column(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "encryption_keys",
+        &["master_key_fingerprint"],
+        format!(
+            "ALTER TABLE {schema}.encryption_keys \
+             ADD COLUMN IF NOT EXISTS master_key_fingerprint TEXT"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "encryption_keys_master_key",
+        encryption_keys_master_key_index_ddl(&schema),
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Records `declaration` as one of `bounded_context`'s blind tags
 /// (docs/architecture.md §205), or checks it against the stored one: the
 /// normalizer version must match, and the key fingerprint too when both
@@ -3000,6 +3048,7 @@ pub async fn make_bounded_context_current(
     ensure_consistency_query_column(pool, &bounded_context.name).await?;
     ensure_event_tags_index(pool, &bounded_context.name).await?;
     ensure_blind_tags_table(pool, &bounded_context.name).await?;
+    ensure_encryption_key_fingerprint_column(pool, &bounded_context.name).await?;
     drop_events_by_tags_index(pool, &bounded_context.name).await?;
     current_bounded_contexts()
         .lock()
@@ -5821,6 +5870,9 @@ struct EncryptionKeyRow {
     destroyed_at: Option<DateTime<Utc>>,
     wrapped_key: Option<Vec<u8>>,
     wrap_nonce: Option<Vec<u8>>,
+    /// The master key `wrapped_key` is wrapped under (docs/architecture.md
+    /// §230), `NULL` for one wrapped before fingerprints were recorded.
+    master_key_fingerprint: Option<String>,
 }
 
 impl EncryptionKeyRow {
@@ -5836,8 +5888,8 @@ impl EncryptionKeyRow {
     }
 }
 
-const ENCRYPTION_KEY_COLUMNS: &str =
-    "id, subject_key, subject_value, status, created_at, destroyed_at, wrapped_key, wrap_nonce";
+const ENCRYPTION_KEY_COLUMNS: &str = "id, subject_key, subject_value, status, created_at, \
+     destroyed_at, wrapped_key, wrap_nonce, master_key_fingerprint";
 
 /// `event_store::protect_sensitive_fields`'s own get-or-create - "each key
 /// provisioned exactly once... idempotent... repeat calls find the key
@@ -5875,14 +5927,25 @@ pub async fn get_or_create_encryption_key(
         return Err(secrets::Error::ReservedSubjectKey.into());
     }
     let bc = require_bounded_context(pool, bounded_context).await?;
-    get_or_create_encryption_key_on(
-        &mut *pool.acquire().await?,
-        bc,
-        subject_key,
-        subject_value,
-        master_key,
-    )
-    .await
+    if !master_key.has_previous() {
+        return get_or_create_encryption_key_on(
+            &mut *pool.acquire().await?,
+            bc,
+            subject_key,
+            subject_value,
+            master_key,
+        )
+        .await;
+    }
+    // A rotation may be under way: the master key in use is read under a
+    // share lock, which must last until the new key's row is committed
+    // (docs/architecture.md §230).
+    let mut tx = pool.begin().await?;
+    let provisioned =
+        get_or_create_encryption_key_on(&mut tx, bc, subject_key, subject_value, master_key)
+            .await?;
+    tx.commit().await?;
+    Ok(provisioned)
 }
 
 /// [`get_or_create_encryption_key`] on a connection the caller holds,
@@ -5919,12 +5982,15 @@ async fn get_or_create_encryption_key_on(
             return Ok((row.to_domain(bc), row.id, data_key));
         }
 
-        let (data_key, wrapped, nonce) = encryption::generate_and_wrap_data_key(master_key);
+        let fingerprint = master_key_to_wrap_under(&mut *conn, master_key).await?;
+        let (data_key, wrapped, nonce) =
+            encryption::generate_and_wrap_data_key_under(master_key, &fingerprint)?;
         let now = Utc::now();
         let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.encryption_keys \
-             (subject_key, subject_value, status, created_at, wrapped_key, wrap_nonce) \
-             VALUES ($1, $2, 'active', $3, $4, $5) \
+             (subject_key, subject_value, status, created_at, wrapped_key, wrap_nonce, \
+             master_key_fingerprint) \
+             VALUES ($1, $2, 'active', $3, $4, $5, $6) \
              ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \
              RETURNING {ENCRYPTION_KEY_COLUMNS}"
         )))
@@ -5933,6 +5999,7 @@ async fn get_or_create_encryption_key_on(
         .bind(now)
         .bind(&wrapped)
         .bind(&nonce)
+        .bind(&fingerprint)
         .fetch_optional(&mut *conn)
         .await?;
 
@@ -5958,7 +6025,34 @@ fn unwrap_row(
         .wrap_nonce
         .as_deref()
         .expect("an active encryption_keys row always still has its wrap nonce");
-    Ok(encryption::unwrap_data_key(master_key, wrapped, nonce)?)
+    let (data_key, _) = encryption::unwrap_data_key_under(
+        master_key,
+        row.master_key_fingerprint.as_deref(),
+        wrapped,
+        nonce,
+    )?;
+    Ok(data_key)
+}
+
+/// The fingerprint of the master key a new data key is wrapped under
+/// (docs/architecture.md §230). With no previous keys configured, this
+/// process's key: startup refused it unless it is the one in use. With
+/// previous keys, a rotation may be under way, so the one recorded as in
+/// use - read `FOR SHARE`, so a rotation's switch waits for the caller's
+/// transaction and its rewrap then sees the new row. Before any process
+/// recorded one, this process's key.
+async fn master_key_to_wrap_under(
+    conn: &mut sqlx::PgConnection,
+    master_key: &EncryptionMasterKey,
+) -> crate::error::Result<String> {
+    if !master_key.has_previous() {
+        return Ok(master_key.fingerprint().to_string());
+    }
+    let in_use: Option<String> =
+        sqlx::query_scalar("SELECT fingerprint FROM encryption_master_key WHERE id = 1 FOR SHARE")
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(in_use.unwrap_or_else(|| master_key.fingerprint().to_string()))
 }
 
 /// The pre-resolution step every `event_store::protect_sensitive_fields`
@@ -8878,14 +8972,316 @@ pub async fn ensure_admin_events_origin_kind(pool: &Pool) -> crate::error::Resul
 }
 
 /// The whole of the trail's startup: the admin events table accepts
-/// `skilj_recorded`, the six event types are registered, and every grant
+/// `skilj_recorded`, the access trail's event types and the master-key
+/// trail's (docs/architecture.md §230) are registered, and every grant
 /// without history is baselined. Returns how many it baselined. Needs the
 /// admin bounded context to exist.
 #[tracing::instrument(skip_all)]
 pub async fn ensure_access_trail(pool: &Pool) -> crate::error::Result<usize> {
     ensure_admin_events_origin_kind(pool).await?;
     register_access_event_types(pool).await?;
+    register_master_key_event_types(pool).await?;
     baseline_access_events(pool).await
+}
+
+/// Registers the master-key trail's event types in the admin bounded
+/// context (docs/architecture.md §230), the way
+/// [`register_access_event_types`] registers the access trail's.
+#[tracing::instrument(skip_all)]
+pub async fn register_master_key_event_types(pool: &Pool) -> crate::error::Result<()> {
+    use crate::encryption::trail::{master_key_event_type, MasterKeyEventKind};
+    let admin = require_admin_bounded_context(pool).await?;
+    for kind in MasterKeyEventKind::ALL {
+        let wanted = master_key_event_type(&admin, kind);
+        let current = get_event_type(pool, &admin.name, kind.name()).await?;
+        let up_to_date = current.as_ref().is_some_and(|current| {
+            let parse = |schema: &str| serde_json::from_str::<serde_json::Value>(schema).ok();
+            parse(&current.schema).is_some() && parse(&current.schema) == parse(&wanted.schema)
+        });
+        if !up_to_date {
+            upsert_event_type(pool, &wanted).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Records `change` in the admin bounded context, inside `tx`.
+async fn record_master_key_event(
+    tx: &mut Transaction<'_, Postgres>,
+    admin: &BoundedContext,
+    change: crate::encryption::trail::MasterKeyChange,
+) -> crate::error::Result<()> {
+    let sequence = next_sequence(&mut **tx, &admin.name).await?;
+    let event = change.into_event(admin, sequence, Utc::now());
+    insert_event(&mut **tx, &event, None).await
+}
+
+/// The fingerprint of the master key in use: the one new data keys are
+/// wrapped under (docs/architecture.md §230), `None` before any process
+/// with a master key started.
+#[tracing::instrument(skip_all)]
+pub async fn encryption_master_key_in_use(pool: &Pool) -> crate::error::Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT fingerprint FROM encryption_master_key WHERE id = 1")
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+/// Makes `fingerprint` the master key in use and records
+/// `EncryptionMasterKeyActivated` in the admin bounded context, in one
+/// transaction (docs/architecture.md §230). `actor_role_id` is the
+/// reconciliation Role that rotated, `None` for recording the key a
+/// deployment already uses. With `only_if_unset`, nothing changes once
+/// any key is recorded - two instances starting together for the first
+/// time record one. Taking the row `FOR UPDATE` waits for every
+/// transaction that read it `FOR SHARE` to wrap a new data key, so a
+/// rewrap that starts after this commits sees every key wrapped under the
+/// old one. Answers whether it changed anything.
+#[tracing::instrument(skip_all)]
+pub async fn activate_encryption_master_key(
+    pool: &Pool,
+    fingerprint: &str,
+    actor_role_id: Option<&str>,
+    only_if_unset: bool,
+) -> crate::error::Result<bool> {
+    let admin = require_admin_bounded_context(pool).await?;
+    let mut tx = pool.begin().await?;
+    // A missing row can't be locked: two first starts take turns here.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('skilj_encryption_master_key'))")
+        .execute(&mut *tx)
+        .await?;
+    let in_use: Option<String> =
+        sqlx::query_scalar("SELECT fingerprint FROM encryption_master_key WHERE id = 1 FOR UPDATE")
+            .fetch_optional(&mut *tx)
+            .await?;
+    if in_use.as_deref() == Some(fingerprint) || (only_if_unset && in_use.is_some()) {
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO encryption_master_key (id, fingerprint, activated_at) VALUES (1, $1, $2) \
+         ON CONFLICT (id) DO UPDATE SET fingerprint = EXCLUDED.fingerprint, \
+         activated_at = EXCLUDED.activated_at",
+    )
+    .bind(fingerprint)
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await?;
+    record_master_key_event(
+        &mut tx,
+        &admin,
+        crate::encryption::trail::MasterKeyChange::activated(
+            fingerprint,
+            in_use.as_deref(),
+            actor_role_id,
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// What startup found about the master keys one bounded context's active
+/// data keys are wrapped under (docs/architecture.md §230).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DataKeyWraps {
+    /// The fingerprints recorded on its active data keys, every one of them
+    /// a configured key's.
+    pub fingerprints: Vec<String>,
+    /// For data keys wrapped before fingerprints were recorded, the
+    /// configured key that unwraps the newest of them.
+    pub unrecorded: Option<String>,
+}
+
+impl DataKeyWraps {
+    /// Whether any active data key is not yet recorded as wrapped under
+    /// `fingerprint`: what a rewrap to it would change.
+    pub fn behind(&self, fingerprint: &str) -> bool {
+        self.unrecorded.is_some() || self.fingerprints.iter().any(|f| f != fingerprint)
+    }
+}
+
+/// Startup's check of one bounded context's data keys against
+/// `master_key` (docs/architecture.md §230): refused with
+/// `encryption_master_key_unknown` when one is recorded as wrapped under a
+/// key that isn't configured, and with `encryption_master_key_changed`
+/// when the newest one wrapped before fingerprints were recorded unwraps
+/// under none. Reads the `(master_key_fingerprint, id)` index: one probe
+/// per distinct key, and one for the newest unrecorded row - startup cost
+/// doesn't grow with the number of data keys.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn check_data_key_wraps(
+    pool: &Pool,
+    bounded_context: &str,
+    master_key: &EncryptionMasterKey,
+) -> crate::error::Result<DataKeyWraps> {
+    let schema = schema_ident(bounded_context);
+    let fingerprints: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "WITH RECURSIVE wraps(fingerprint) AS ( \
+             (SELECT master_key_fingerprint FROM {schema}.encryption_keys \
+              WHERE status = 'active' AND master_key_fingerprint IS NOT NULL \
+              ORDER BY master_key_fingerprint LIMIT 1) \
+             UNION ALL \
+             SELECT (SELECT k.master_key_fingerprint FROM {schema}.encryption_keys k \
+                     WHERE k.status = 'active' AND k.master_key_fingerprint > wraps.fingerprint \
+                     ORDER BY k.master_key_fingerprint LIMIT 1) \
+             FROM wraps WHERE wraps.fingerprint IS NOT NULL \
+         ) SELECT fingerprint FROM wraps WHERE fingerprint IS NOT NULL"
+    )))
+    .fetch_all(pool)
+    .await?;
+    if let Some(unknown) = fingerprints.iter().find(|f| !master_key.knows(f)) {
+        return Err(encryption::Error::MasterKeyUnknown {
+            fingerprint: unknown.clone(),
+        }
+        .into());
+    }
+    let newest_unrecorded: Option<(Vec<u8>, Vec<u8>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT wrapped_key, wrap_nonce FROM {schema}.encryption_keys \
+             WHERE status = 'active' AND master_key_fingerprint IS NULL \
+             AND wrapped_key IS NOT NULL ORDER BY id DESC LIMIT 1"
+        )))
+        .fetch_optional(pool)
+        .await?;
+    let unrecorded = match newest_unrecorded {
+        None => None,
+        Some((wrapped, nonce)) => {
+            match encryption::unwrap_data_key_under(master_key, None, &wrapped, &nonce) {
+                Ok((_, fingerprint)) => Some(fingerprint),
+                Err(_) => {
+                    return Err(encryption::Error::MasterKeyChanged {
+                        fingerprint: format!("unrecorded, of {bounded_context}'s data keys"),
+                    }
+                    .into())
+                }
+            }
+        }
+    };
+    Ok(DataKeyWraps {
+        fingerprints,
+        unrecorded,
+    })
+}
+
+/// What [`rewrap_data_keys`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RewrapOutcome {
+    /// Active data keys now wrapped under the current master key.
+    pub rewrapped: u64,
+    /// Active data keys no configured master key unwraps, left as they
+    /// were.
+    pub unreadable: u64,
+}
+
+/// How many data keys one rewrap transaction covers.
+const REWRAP_BATCH: i64 = 500;
+
+/// Rewraps every active data key of `bounded_context` not yet recorded as
+/// wrapped under `master_key`'s current key (docs/architecture.md §230):
+/// unwrapped with the key it is recorded under (any configured key, for
+/// one from before fingerprints), wrapped anew under the current one, and
+/// stored with its fingerprint. The data key stays the same, so no event,
+/// command or secret is rewritten. In batches, each its own transaction,
+/// and each row updated only while it is still active and still wrapped
+/// as read: a concurrent `forgetSubject` or another instance's rewrap wins.
+/// Then, when anything changed, records `EncryptionDataKeysRewrapped` in
+/// the admin bounded context.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn rewrap_data_keys(
+    pool: &Pool,
+    bounded_context: &str,
+    master_key: &EncryptionMasterKey,
+    actor_role_id: &str,
+) -> crate::error::Result<RewrapOutcome> {
+    let schema = schema_ident(bounded_context);
+    let target = master_key.fingerprint().to_string();
+    let mut outcome = RewrapOutcome::default();
+    let mut after = 0i64;
+    loop {
+        type Wrapped = (i64, Vec<u8>, Vec<u8>, Option<String>);
+        let rows: Vec<Wrapped> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT id, wrapped_key, wrap_nonce, master_key_fingerprint \
+             FROM {schema}.encryption_keys \
+             WHERE status = 'active' AND wrapped_key IS NOT NULL \
+             AND master_key_fingerprint IS DISTINCT FROM $1 AND id > $2 \
+             ORDER BY id LIMIT $3"
+        )))
+        .bind(&target)
+        .bind(after)
+        .bind(REWRAP_BATCH)
+        .fetch_all(pool)
+        .await?;
+        let Some(last) = rows.last() else {
+            break;
+        };
+        after = last.0;
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut previous = Vec::with_capacity(rows.len());
+        let mut wrapped_keys = Vec::with_capacity(rows.len());
+        let mut nonces = Vec::with_capacity(rows.len());
+        for (id, wrapped, nonce, fingerprint) in rows {
+            let unwrapped = encryption::unwrap_data_key_under(
+                master_key,
+                fingerprint.as_deref(),
+                &wrapped,
+                &nonce,
+            );
+            let Ok((data_key, _)) = unwrapped else {
+                tracing::warn!(
+                    encryption_key_id = id,
+                    master_key = fingerprint.as_deref().unwrap_or("unrecorded"),
+                    "data key unwraps under no configured master key, left as it was"
+                );
+                outcome.unreadable += 1;
+                continue;
+            };
+            let (rewrapped, rewrap_nonce) =
+                encryption::rewrap_data_key(master_key, &target, &data_key)?;
+            ids.push(id);
+            previous.push(fingerprint);
+            wrapped_keys.push(rewrapped);
+            nonces.push(rewrap_nonce);
+        }
+        if ids.is_empty() {
+            continue;
+        }
+        let updated = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.encryption_keys k \
+             SET wrapped_key = u.wrapped_key, wrap_nonce = u.wrap_nonce, \
+                 master_key_fingerprint = $1 \
+             FROM UNNEST($2::BIGINT[], $3::TEXT[], $4::BYTEA[], $5::BYTEA[]) \
+                 AS u(id, previous, wrapped_key, wrap_nonce) \
+             WHERE k.id = u.id AND k.status = 'active' \
+             AND k.master_key_fingerprint IS NOT DISTINCT FROM u.previous"
+        )))
+        .bind(&target)
+        .bind(&ids)
+        .bind(&previous)
+        .bind(&wrapped_keys)
+        .bind(&nonces)
+        .execute(pool)
+        .await?;
+        outcome.rewrapped += updated.rows_affected();
+    }
+    if outcome != RewrapOutcome::default() {
+        let admin = require_admin_bounded_context(pool).await?;
+        let mut tx = pool.begin().await?;
+        record_master_key_event(
+            &mut tx,
+            &admin,
+            crate::encryption::trail::MasterKeyChange::rewrapped(
+                &target,
+                bounded_context,
+                outcome.rewrapped,
+                outcome.unreadable,
+                actor_role_id,
+            ),
+        )
+        .await?;
+        tx.commit().await?;
+    }
+    Ok(outcome)
 }
 
 /// `rule BaselineAccessEvents`: one `AccessBaselined` event for each
