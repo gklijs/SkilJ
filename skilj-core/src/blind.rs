@@ -15,7 +15,7 @@
 //! Each constraint - one `(bounded context, tag key)` pair, declared once
 //! by a [`crate::plugin::BlindTag`] - gets its own HMAC key, derived with
 //! HKDF-SHA256 from the process's [`BlindIndexKey`]. The root key is
-//! separate from the [`crate::encryption::EncryptionMasterKey`], so either
+//! separate from the [`crate::encryption::KeyService`], so either
 //! can be rotated or kept elsewhere without touching the other; deriving
 //! per constraint means the same value hashes differently under two
 //! constraints or two bounded contexts, so the hashes can't be correlated

@@ -294,7 +294,10 @@ pub use skilj_core::blind::{normalize, BlindIndexKey};
 /// `sqlx`'s pool options, for [`SkiljBuilder::pool_options`] - re-exported
 /// here because `skilj_core::db` is internal (docs/architecture.md §220).
 pub use skilj_core::db::PgPoolOptions;
-pub use skilj_core::encryption::EncryptionMasterKey;
+pub use skilj_core::encryption::{
+    EncryptionMasterKey, InMemoryKeyProvider, KeyFileProvider, KeyProvider, KeyService,
+    VaultTransitProvider,
+};
 pub use skilj_core::plugin::{
     requires_role, BlindErasure, BlindTag, CancelDeadline, CommandType, CrossContextRoute,
     EventType, MissedRunPolicy, Projection, RecurrenceSpec, ScheduleDeadline, Snapshot,
@@ -453,12 +456,12 @@ pub struct Skilj {
     graphql_federation: Option<Arc<skilj_graphql::federation::FederationOptions>>,
     graphql_naming: skilj_graphql::naming::Naming,
     /// `protect_sensitive_fields`'s own envelope-encryption master key -
-    /// see `SkiljBuilder::encryption_master_key`'s own doc comment.
+    /// see `SkiljBuilder::key_provider`'s own doc comment.
     /// `None` when never configured - fine as long as no bounded context
     /// this process registers ever declares a real `sensitive_fields`
     /// entry; `db::resolve_encryption_keys` is what actually raises the
     /// configuration error the first time one does.
-    encryption_master_key: Option<EncryptionMasterKey>,
+    key_service: Option<KeyService>,
     /// `EventSubscription`'s own real-time delivery source - see
     /// `SkiljBuilder::event_broadcast_capacity`'s own doc comment. One
     /// shared, process-wide broadcaster, constructed once in `.build()`
@@ -1029,7 +1032,9 @@ impl Skilj {
             command_batch_max_size: skilj_core::command_batcher::DEFAULT_MAX_BATCH_SIZE,
             max_items_per_batch: skilj_core::command_batcher::DEFAULT_MAX_ITEMS_PER_BATCH,
             command_batch_max_concurrent_leaders: None,
-            encryption_master_key: None,
+            key_service: None,
+            legacy_encryption_master_key: None,
+            master_key_rotation: MasterKeyRotation::default(),
             event_broadcast_capacity: 1024,
             event_cache_warm_up_count: 1000,
             pool_options: None,
@@ -1128,7 +1133,7 @@ impl Skilj {
             self.command_dispatcher(),
             self.projection_dispatcher(),
             self.snapshot_dispatcher(),
-            self.encryption_master_key.clone(),
+            self.key_service.clone(),
             self.event_broadcaster.clone(),
             self.event_cache.clone(),
             // issue #25 (docs/architecture.md §53) -
@@ -1206,7 +1211,7 @@ impl Skilj {
             projection_query_wait_timeout: self.projection_query_wait_timeout,
             max_events_per_read: self.max_events_per_read,
             limits: self.graphql_limits,
-            encryption_master_key: self.encryption_master_key.clone(),
+            key_service: self.key_service.clone(),
             event_broadcaster: self.event_broadcaster.clone(),
             revocation_broadcaster: self.revocation_broadcaster.clone(),
             event_cache: self.event_cache.clone(),
@@ -1271,6 +1276,243 @@ pub struct ReconciliationReport {
     /// process registers. Removing a protection deliberately takes the
     /// explicit GraphQL registration mutation.
     pub kept_protections: Vec<String>,
+}
+
+/// When the encryption master key is rotated, and when a version rotated
+/// away from is retired (docs/architecture.md §230) - for
+/// [`SkiljBuilder::master_key_rotation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasterKeyRotation {
+    every: Option<std::time::Duration>,
+    retire_after: std::time::Duration,
+    check_interval: std::time::Duration,
+}
+
+impl Default for MasterKeyRotation {
+    fn default() -> Self {
+        Self {
+            every: None,
+            retire_after: std::time::Duration::from_secs(30 * 24 * 60 * 60),
+            check_interval: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
+impl MasterKeyRotation {
+    /// Rotated only on request, and retired 30 days after the rewrap.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Rotates the master key automatically this long after the last
+    /// rotation (`every(Duration::from_secs(30 * 24 * 3600))` for monthly).
+    /// A rotation never starts while the previous one's rewrap is still
+    /// running.
+    pub fn every(mut self, interval: std::time::Duration) -> Self {
+        self.every = Some(interval);
+        self
+    }
+
+    /// How long after every data key was rewrapped the versions below are
+    /// retired at the provider - long enough to restore a backup taken
+    /// before the rotation, since a retired version no longer unwraps the
+    /// data keys in it. A rotation requested with `retireImmediately`
+    /// skips it.
+    pub fn retire_after(mut self, grace: std::time::Duration) -> Self {
+        self.retire_after = grace;
+        self
+    }
+
+    /// How often each instance checks whether something is due: a
+    /// scheduled rotation, a rewrap, a retirement. A minute by default.
+    pub fn check_interval(mut self, interval: std::time::Duration) -> Self {
+        self.check_interval = interval;
+        self
+    }
+}
+
+/// Startup's check of the stored data keys against the key service
+/// (docs/architecture.md §230), for every bounded context, whether or not
+/// this process reconciles: refused when one was wrapped by another
+/// provider or key, or when legacy ones are stored and no legacy master key
+/// reads them - this process could not read them, and would wrap new ones
+/// where nothing else can. Then the first process with a provider records
+/// the version in use (`EncryptionMasterKeyRotated`, reason `adopted`). A
+/// provider that can't be reached is logged, not refused: the background
+/// task records the version once it answers, and writes that need a key
+/// fail until then.
+async fn check_encryption_keys(
+    pool: &Pool,
+    key_service: &KeyService,
+) -> Result<(), skilj_core::Error> {
+    for bounded_context in skilj_core::db::list_bounded_contexts(pool).await? {
+        match skilj_core::db::check_data_key_wraps(pool, &bounded_context.name, key_service).await {
+            Ok(wraps) if wraps.legacy => tracing::info!(
+                bounded_context = %bounded_context.name,
+                "data keys from before key providers are stored; they are rewrapped in the background"
+            ),
+            Ok(_) => {}
+            Err(skilj_core::Error::Database(err))
+                if err
+                    .as_database_error()
+                    .and_then(|e| e.code())
+                    .is_some_and(|code| code == "42P01" || code == "3F000") => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if let Err(err) = record_master_key_in_use(pool, key_service).await {
+        tracing::error!(
+            provider = key_service.provider_name(),
+            error = %err,
+            "the key provider did not answer at startup; sensitive writes fail until it does"
+        );
+    }
+    Ok(())
+}
+
+/// Records the provider's latest version as the one in use when none is
+/// recorded yet, or a rotation made outside skilj (docs/architecture.md
+/// §230).
+async fn record_master_key_in_use(
+    pool: &Pool,
+    key_service: &KeyService,
+) -> Result<(), skilj_core::Error> {
+    use skilj_core::db::Rotation;
+    use skilj_core::encryption::trail::RotationReason;
+    let reason = match skilj_core::db::master_key_state(pool).await? {
+        Some(state) if state.provider == key_service.provider_name() => RotationReason::External,
+        _ => RotationReason::Adopted,
+    };
+    if let Some(version) = skilj_core::db::rotate_master_key(
+        pool,
+        key_service,
+        Rotation::Record(reason),
+        false,
+        None,
+        None,
+    )
+    .await?
+    {
+        tracing::info!(
+            provider = key_service.provider_name(),
+            version,
+            reason = reason.as_str(),
+            "encryption master key version recorded as in use"
+        );
+    }
+    Ok(())
+}
+
+/// One check of the master key's lifecycle (docs/architecture.md §230),
+/// run by every instance every `check_interval`; the steps are idempotent
+/// and coordinated through the state row, so instances running it
+/// together do each step once:
+/// 1. a version the provider has past the recorded one is recorded - a
+///    rotation made outside skilj, or one that reached the provider but
+///    not the database;
+/// 2. a scheduled rotation that is due is made;
+/// 3. while the rewrap is pending, every bounded context behind the
+///    version in use is rewrapped, and once none is, the rewrap is done;
+/// 4. once the grace period after it has passed (at once, for a rotation
+///    asked to retire immediately), and nothing is found behind again,
+///    the versions below are retired at the provider.
+async fn master_key_tick(
+    pool: &Pool,
+    key_service: &KeyService,
+    rotation: &MasterKeyRotation,
+) -> Result<(), skilj_core::Error> {
+    use skilj_core::db::Rotation;
+    use skilj_core::encryption::trail::RotationReason;
+    record_master_key_in_use(pool, key_service).await?;
+    if let Some(every) = rotation.every {
+        let every = chrono::Duration::from_std(every).unwrap_or(chrono::Duration::MAX);
+        if let Some(version) = skilj_core::db::rotate_master_key(
+            pool,
+            key_service,
+            Rotation::Rotate(RotationReason::Scheduled),
+            false,
+            None,
+            Some(every),
+        )
+        .await?
+        {
+            tracing::info!(version, "encryption master key rotated on schedule");
+        }
+    }
+    let Some(state) = skilj_core::db::master_key_state(pool).await? else {
+        return Ok(());
+    };
+    let Some(rewrapped_at) = state.rewrapped_at else {
+        for bounded_context in
+            skilj_core::db::bounded_contexts_behind(pool, key_service, state.version).await?
+        {
+            let started = std::time::Instant::now();
+            match skilj_core::db::rewrap_data_keys(
+                pool,
+                &bounded_context,
+                key_service,
+                state.version,
+            )
+            .await
+            {
+                Ok(outcome) => tracing::info!(
+                    bounded_context = %bounded_context,
+                    version = state.version,
+                    rewrapped = outcome.rewrapped,
+                    unreadable = outcome.unreadable,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "data keys rewrapped under the current master key version"
+                ),
+                Err(err)
+                    if skilj_core::db::get_bounded_context(pool, &bounded_context)
+                        .await?
+                        .is_none() =>
+                {
+                    tracing::info!(bounded_context = %bounded_context, error = %err, "bounded context deleted during the rewrap");
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if skilj_core::db::bounded_contexts_behind(pool, key_service, state.version)
+            .await?
+            .is_empty()
+            && skilj_core::db::mark_data_keys_rewrapped(pool, state.version).await?
+        {
+            tracing::info!(
+                version = state.version,
+                "every data key is wrapped under the current master key version"
+            );
+        }
+        return Ok(());
+    };
+    if state.retired_below >= state.version {
+        return Ok(());
+    }
+    let grace = if state.retire_immediately {
+        chrono::Duration::zero()
+    } else {
+        chrono::Duration::from_std(rotation.retire_after).unwrap_or(chrono::Duration::MAX)
+    };
+    if rewrapped_at + grace > chrono::Utc::now() {
+        return Ok(());
+    }
+    // A data key wrapped under an older version while the rewrap ran - an
+    // instance that hadn't seen the rotation - is caught here: rewrap
+    // again before anything is retired.
+    if !skilj_core::db::bounded_contexts_behind(pool, key_service, state.version)
+        .await?
+        .is_empty()
+    {
+        skilj_core::db::mark_data_keys_behind(pool, state.version).await?;
+        return Ok(());
+    }
+    if skilj_core::db::retire_master_key_versions(pool, key_service, state.version).await? {
+        tracing::info!(
+            below = state.version,
+            "encryption master key versions retired at the provider"
+        );
+    }
+    Ok(())
 }
 
 /// docs/architecture.md §193: each bounded context brings its own
@@ -2415,7 +2657,9 @@ pub struct SkiljBuilder {
     command_batch_max_size: usize,
     max_items_per_batch: usize,
     command_batch_max_concurrent_leaders: Option<usize>,
-    encryption_master_key: Option<EncryptionMasterKey>,
+    key_service: Option<KeyService>,
+    legacy_encryption_master_key: Option<EncryptionMasterKey>,
+    master_key_rotation: MasterKeyRotation,
     event_broadcast_capacity: usize,
     event_cache_warm_up_count: usize,
     pool_options: Option<PgPoolOptions>,
@@ -2834,18 +3078,44 @@ impl SkiljBuilder {
         self
     }
 
-    /// `protect_sensitive_fields`'s own envelope-encryption master key -
-    /// see `skilj_core::encryption`'s own module doc comment for the full
-    /// design. Optional: a bounded context with no real `sensitive_fields`
-    /// entry never needs one; declaring a sensitive field and then
-    /// actually writing an event/command that references it without one
-    /// configured is a genuine, actionable configuration error
-    /// (`encryption::Error::MasterKeyNotConfigured`), not a silent bypass.
-    /// A consuming application owns keeping this value stable across
-    /// restarts - losing it makes every already-provisioned
-    /// `EncryptionKey` permanently unrecoverable.
-    pub fn encryption_master_key(mut self, master_key: EncryptionMasterKey) -> Self {
-        self.encryption_master_key = Some(master_key);
+    /// Where the encryption master key lives (docs/architecture.md §230):
+    /// every subject's data key is wrapped by `provider`, and the master
+    /// key itself never enters this process when the provider is a key
+    /// service - [`VaultTransitProvider`] for Vault or OpenBao. For local
+    /// development, [`KeyFileProvider`] keeps the key in a file it creates.
+    /// Optional: a bounded context with no real `sensitive_fields` entry
+    /// never needs one; writing a sensitive field without one is refused
+    /// (`encryption_master_key_not_configured`), never silently bypassed.
+    /// Rotating is [`master_key_rotation`](Self::master_key_rotation)'s
+    /// schedule, or the `rotateEncryptionMasterKey` mutation.
+    pub fn key_provider(self, provider: impl KeyProvider) -> Self {
+        self.key_service(KeyService::new(provider))
+    }
+
+    /// [`key_provider`](Self::key_provider) with a [`KeyService`] of your
+    /// own - to share one provider, or set its data-key cache
+    /// ([`KeyService::with_cache`]).
+    pub fn key_service(mut self, key_service: KeyService) -> Self {
+        self.key_service = Some(key_service);
+        self
+    }
+
+    /// The raw master key a version of skilj before key providers wrapped
+    /// data keys under (docs/architecture.md §230): read only to unwrap
+    /// those, until the rotation task has rewrapped them with the
+    /// provider - after which it can be removed. Startup refuses to start
+    /// without it while such data keys are stored
+    /// (`encryption_legacy_master_key_required`).
+    pub fn legacy_encryption_master_key(mut self, master_key: EncryptionMasterKey) -> Self {
+        self.legacy_encryption_master_key = Some(master_key);
+        self
+    }
+
+    /// When the master key is rotated and when a rotated-away version is
+    /// retired (docs/architecture.md §230). By default: rotated only on
+    /// request, retired 30 days after every data key was rewrapped.
+    pub fn master_key_rotation(mut self, rotation: MasterKeyRotation) -> Self {
+        self.master_key_rotation = rotation;
         self
     }
 
@@ -3060,6 +3330,13 @@ impl SkiljBuilder {
                 "previous_blind_index_keys is configured without a blind_index_key to rotate to",
             ));
         }
+        // docs/architecture.md §230.
+        if self.legacy_encryption_master_key.is_some() && self.key_service.is_none() {
+            return Err(skilj_core::Error::configuration(
+                "legacy_encryption_master_key is configured without a key_provider to rewrap \
+                 its data keys with",
+            ));
+        }
         // docs/architecture.md §205.
         validate_blind_tags(
             &self.blind_tags,
@@ -3201,7 +3478,14 @@ impl SkiljBuilder {
         let read_cursor_checkout_lease = self.read_cursor_checkout_lease;
         let max_events_per_read = self.max_events_per_read;
         let graphql_limits = self.graphql_limits;
-        let encryption_master_key = self.encryption_master_key;
+        // docs/architecture.md §230: the legacy key travels with the
+        // service, so every path that unwraps a data key can read the old
+        // ones.
+        let key_service = match (self.key_service, self.legacy_encryption_master_key) {
+            (Some(service), Some(legacy)) => Some(service.with_legacy_master_key(legacy)),
+            (service, _) => service,
+        };
+        let master_key_rotation = self.master_key_rotation.clone();
         let event_broadcaster = EventBroadcaster::new(self.event_broadcast_capacity);
         let revocation_broadcaster = RevocationBroadcaster::new();
 
@@ -3458,6 +3742,11 @@ impl SkiljBuilder {
         // reconciliation reads each declared bounded context's
         // registration tables, which a bounded context from an older
         // version only has every column of once they've run.
+        // docs/architecture.md §230: after the access trail, whose admin
+        // context records the master key's events.
+        if let Some(key_service) = &key_service {
+            check_encryption_keys(&pool, key_service).await?;
+        }
         let pending_rotations =
             check_stored_blind_tags(&pool, &self.blind_tags, &blind_index, &template_cache).await?;
         let mut report = ReconciliationReport::default();
@@ -3546,7 +3835,7 @@ impl SkiljBuilder {
                 projection_query_wait_timeout,
                 max_events_per_read,
                 limits: graphql_limits,
-                encryption_master_key: encryption_master_key.clone(),
+                key_service: key_service.clone(),
                 event_broadcaster: event_broadcaster.clone(),
                 revocation_broadcaster: revocation_broadcaster.clone(),
                 event_cache: event_cache.clone(),
@@ -3577,7 +3866,7 @@ impl SkiljBuilder {
             graphql_limits,
             graphql_federation,
             graphql_naming,
-            encryption_master_key,
+            key_service,
             event_broadcaster,
             revocation_broadcaster,
             event_cache,
@@ -3842,7 +4131,7 @@ impl SkiljBuilder {
         let route_snapshot_dispatcher = skilj.snapshot_dispatcher();
         let route_broadcaster = skilj.event_broadcaster.clone();
         let route_event_cache = skilj.event_cache.clone();
-        let route_encryption_master_key = skilj.encryption_master_key.clone();
+        let route_encryption_master_key = skilj.key_service.clone();
         let route_dispatcher: Arc<dyn skilj_core::plugin::CrossContextRouteDispatcher> =
             Arc::new(CrossContextRouteDispatcherImpl {
                 routes: Arc::new(self.cross_context_routes),
@@ -4079,7 +4368,7 @@ impl SkiljBuilder {
         let deadline_fire_snapshot_dispatcher = skilj.snapshot_dispatcher();
         let deadline_fire_broadcaster = skilj.event_broadcaster.clone();
         let deadline_fire_event_cache = skilj.event_cache.clone();
-        let deadline_fire_encryption_master_key = skilj.encryption_master_key.clone();
+        let deadline_fire_encryption_master_key = skilj.key_service.clone();
         let deadline_retry_policy = self.deadline_retry_policy;
         background.spawn("fire_deadlines", move |mut stop| async move {
             let fire_cancels = fire_cancels;
@@ -4121,12 +4410,33 @@ impl SkiljBuilder {
         // one included, so a `skip`-policy type this process finds
         // already behind on its very first look is caught up right then,
         // not held for a second tick.
+        // docs/architecture.md §230: the master key's lifecycle - a
+        // scheduled rotation, the rewrap after any rotation, and the
+        // retirement after the grace period - checked on every instance.
+        if let Some(key_service) = skilj.key_service.clone() {
+            let rotation_pool = skilj.pool.clone();
+            let rotation = master_key_rotation.clone();
+            background.spawn("master_key_rotation", move |mut stop| async move {
+                loop {
+                    if let Err(err) = master_key_tick(&rotation_pool, &key_service, &rotation)
+                        .instrument(tracing::info_span!("master_key_tick"))
+                        .await
+                    {
+                        tracing::warn!(error = %err, "master key lifecycle check failed; retrying");
+                    }
+                    if stop.sleep(rotation.check_interval).await {
+                        return;
+                    }
+                }
+            });
+        }
+
         let scheduler_pool = skilj.pool.clone();
         let scheduler_projection_dispatcher = skilj.projection_dispatcher();
         let scheduler_event_dispatcher = skilj.event_dispatcher();
         let scheduler_broadcaster = skilj.event_broadcaster.clone();
         let scheduler_event_cache = skilj.event_cache.clone();
-        let scheduler_encryption_master_key = skilj.encryption_master_key.clone();
+        let scheduler_encryption_master_key = skilj.key_service.clone();
         let scheduler_interval = self.scheduler_poll_interval;
         background.spawn("system_event_scheduler", move |mut stop| async move {
             loop {
@@ -4529,7 +4839,7 @@ async fn deadline_fire_tick(
     snapshot_dispatcher: &dyn skilj_core::plugin::SnapshotDispatcher,
     broadcaster: &EventBroadcaster,
     event_cache: &EventCache,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: chrono::DateTime<chrono::Utc>,
     retry_policy: &skilj_retry::RetryPolicy,
     cancels: &[skilj_core::plugin::CancelDeadlineInfo],
@@ -4563,7 +4873,7 @@ async fn deadline_fire_tick(
                     event_cache,
                     &bc.name,
                     now,
-                    encryption_master_key,
+                    key_service,
                     retry_policy,
                     cancels,
                 )
@@ -4662,7 +4972,7 @@ async fn scheduler_tick(
     event_dispatcher: &dyn skilj_core::plugin::EventDispatcher,
     broadcaster: &EventBroadcaster,
     event_cache: &EventCache,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: chrono::DateTime<chrono::Utc>,
 ) {
     let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
@@ -4697,7 +5007,7 @@ async fn scheduler_tick(
                     event_dispatcher,
                     broadcaster,
                     event_cache,
-                    encryption_master_key,
+                    key_service,
                     now,
                     bc,
                 ),
@@ -4717,7 +5027,7 @@ async fn scheduler_tick_for_bounded_context(
     event_dispatcher: &dyn skilj_core::plugin::EventDispatcher,
     broadcaster: &EventBroadcaster,
     event_cache: &EventCache,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: chrono::DateTime<chrono::Utc>,
     bc: &skilj_core::event_store::BoundedContext,
 ) {
@@ -4775,7 +5085,7 @@ async fn scheduler_tick_for_bounded_context(
                 &et.name,
                 last_due,
                 now,
-                encryption_master_key,
+                key_service,
             )
             .await
             {
@@ -4846,7 +5156,7 @@ async fn scheduler_tick_for_bounded_context(
                 &et.name,
                 occurrence_at,
                 now,
-                encryption_master_key,
+                key_service,
             )
             .await
             {

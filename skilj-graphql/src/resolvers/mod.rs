@@ -67,6 +67,7 @@ pub mod command_type_admin_operations;
 pub mod event_query;
 pub mod event_subscription;
 pub mod event_type_admin_operations;
+pub mod master_key_rotation;
 pub mod parked_deliveries;
 pub mod private_field_grant_management;
 pub mod projection_query;
@@ -85,7 +86,7 @@ use skilj_core::access_control::{
     AccessLevel, EventReadStartPosition, PrivateFieldGrant, Role, RoleAccessMapping,
 };
 use skilj_core::db::Pool;
-use skilj_core::encryption::{DataKey, EncryptionMasterKey};
+use skilj_core::encryption::{DataKey, KeyService};
 use skilj_core::event_store::MissedOccurrencePolicy;
 use skilj_core::shared::{
     Filter, FilterOperator, PrivateField, PrivateFieldKind, SensitiveField, TagMapping,
@@ -137,7 +138,7 @@ pub async fn resolve_read_data_keys(
     sensitive_fields: &[SensitiveField],
     payload: &str,
     access_mapping: &RoleAccessMapping,
-    master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     resolved: &mut std::collections::HashMap<(String, String), Option<DataKey>>,
 ) -> async_graphql::Result<()> {
     skilj_core::db::resolve_data_keys_for_reading(
@@ -146,7 +147,7 @@ pub async fn resolve_read_data_keys(
         sensitive_fields,
         payload,
         access_mapping,
-        master_key,
+        key_service,
         resolved,
     )
     .await

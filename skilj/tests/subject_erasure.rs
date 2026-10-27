@@ -19,7 +19,7 @@ use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use skilj::{EncryptionMasterKey, EventType, IdpConfig, SigningAlgorithm, Skilj};
+use skilj::{EventType, IdpConfig, SigningAlgorithm, Skilj};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
@@ -343,7 +343,9 @@ fn subject_erasure_end_to_end() {
             .event_type::<AccountOpened>()
             .command_type::<EmailUser>()
             .reconciliation_role(admin_subject)
-            .encryption_master_key(EncryptionMasterKey::from_bytes([42u8; 32]))
+            .key_provider(skilj_core::encryption::InMemoryKeyProvider::from_bytes(
+                [42u8; 32],
+            ))
             .build()
             .await
             .unwrap();
@@ -710,7 +712,7 @@ fn forgetting_a_subject_forgets_its_pending_proposals() {
             .event_type::<AccountOpened>()
             .command_type::<ProposeEmail>()
             .reconciliation_role(admin_subject)
-            .encryption_master_key(EncryptionMasterKey::from_bytes([42u8; 32]))
+            .key_provider(skilj_core::encryption::InMemoryKeyProvider::from_bytes([42u8; 32]))
             .build()
             .await
             .unwrap();

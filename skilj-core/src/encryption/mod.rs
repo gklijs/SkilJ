@@ -10,10 +10,10 @@
 //!
 //! Two-layer (envelope) scheme: each `EncryptionKey` row gets its own
 //! random 256-bit AES-256-GCM `DataKey`, generated once and never
-//! persisted in the clear - it's wrapped (encrypted) under a single,
-//! process-wide `EncryptionMasterKey` (supplied once via
-//! `SkiljBuilder::encryption_master_key`, the same register `IdpConfig`
-//! already lives in) and only the wrapped bytes are stored
+//! persisted in the clear - it's wrapped (encrypted) under the
+//! key provider's master key (`provider`, `SkiljBuilder::key_provider`;
+//! docs/architecture.md §230 - originally a process-wide
+//! `EncryptionMasterKey`) and only the wrapped bytes are stored
 //! (`db::get_or_create_encryption_key`). A sensitive field's own
 //! plaintext leaf is sealed under the *data* key, not the master key
 //! directly - destroying one subject's `EncryptionKey` (nulling its
@@ -38,6 +38,17 @@
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
 
+pub mod provider;
+pub mod service;
+pub mod trail;
+pub mod vault;
+
+pub use provider::{
+    InMemoryKeyProvider, KeyFileProvider, KeyProvider, KeyVersions, WrappedDataKey,
+};
+pub use service::{KeyService, StoredWrap};
+pub use vault::VaultTransitProvider;
+
 const KEY_LEN: usize = 32; // AES-256
 
 /// Library-level errors this module's own operations reject for.
@@ -45,10 +56,10 @@ const KEY_LEN: usize = 32; // AES-256
 #[non_exhaustive]
 pub enum Error {
     #[error(
-        "sensitive_fields declares a field to encrypt, but no encryption_master_key was \
-         configured (SkiljBuilder::encryption_master_key)"
+        "sensitive_fields declares a field to encrypt, but no key provider was configured \
+         (SkiljBuilder::key_provider)"
     )]
-    /// A type declares sensitive fields, but no encryption master key is
+    /// A type declares sensitive fields, but no key provider is
     /// configured.
     MasterKeyNotConfigured,
 
@@ -59,6 +70,60 @@ pub enum Error {
     /// design, so neither case can say more than "this didn't verify."
     #[error("AEAD decryption failed - corrupted or tampered ciphertext, or the wrong key")]
     DecryptFailed,
+
+    /// The key provider could not be reached, or failed
+    /// (docs/architecture.md §230). Worth retrying.
+    #[error("key provider {provider} is unavailable: {message}")]
+    ProviderUnavailable {
+        /// The provider.
+        provider: String,
+        /// What went wrong.
+        message: String,
+    },
+
+    /// The key provider refused the request: a permission it lacks, a key
+    /// that doesn't exist, a ciphertext it doesn't accept.
+    #[error("key provider {provider} refused: {message}")]
+    ProviderRefused {
+        /// The provider.
+        provider: String,
+        /// Its answer.
+        message: String,
+    },
+
+    /// A data key is wrapped under a master key version that was retired
+    /// (docs/architecture.md §230): it can no longer be unwrapped.
+    #[error("the master key version {version} this data key is wrapped under is retired")]
+    KeyVersionRetired {
+        /// The retired version.
+        version: u32,
+    },
+
+    /// Data keys were wrapped by another key provider, or another key,
+    /// than the configured one (docs/architecture.md §230).
+    #[error(
+        "data keys are wrapped by key provider {stored}, but {configured} is configured: \
+         configure the provider, and the key, that wrapped them"
+    )]
+    ProviderChanged {
+        /// The provider the data keys name.
+        stored: String,
+        /// The configured provider.
+        configured: String,
+    },
+
+    /// Data keys from before key providers are stored, and no legacy master
+    /// key is configured to read them (docs/architecture.md §230).
+    #[error(
+        "data keys wrapped before key providers are stored: configure the master key they were \
+         wrapped under with SkiljBuilder::legacy_encryption_master_key until they are rewrapped"
+    )]
+    LegacyMasterKeyRequired,
+
+    /// The configured legacy master key doesn't unwrap the data keys
+    /// stored before key providers.
+    #[error("the legacy encryption master key does not unwrap the data keys stored before key providers")]
+    LegacyMasterKeyChanged,
 }
 
 impl crate::error::SkiljRejection for Error {
@@ -66,6 +131,12 @@ impl crate::error::SkiljRejection for Error {
         match self {
             Error::MasterKeyNotConfigured => "encryption_master_key_not_configured",
             Error::DecryptFailed => "encryption_decrypt_failed",
+            Error::ProviderUnavailable { .. } => "encryption_key_provider_unavailable",
+            Error::ProviderRefused { .. } => "encryption_key_provider_refused",
+            Error::KeyVersionRetired { .. } => "encryption_key_version_retired",
+            Error::ProviderChanged { .. } => "encryption_key_provider_changed",
+            Error::LegacyMasterKeyRequired => "encryption_legacy_master_key_required",
+            Error::LegacyMasterKeyChanged => "encryption_legacy_master_key_changed",
         }
     }
 
@@ -74,7 +145,11 @@ impl crate::error::SkiljRejection for Error {
     }
 }
 
-/// A process-wide symmetric key wrapping every per-subject `DataKey` this
+/// The raw master key skilj used before key providers
+/// (docs/architecture.md §230): now only read, through
+/// `SkiljBuilder::legacy_encryption_master_key`, to unwrap the data keys it
+/// wrapped until they are rewrapped by the provider. Originally: a
+/// process-wide symmetric key wrapping every per-subject `DataKey` this
 /// process ever provisions - supplied once, at `SkiljBuilder::
 /// encryption_master_key(...)` time. Never itself persisted; a consuming
 /// application owns keeping this value stable across restarts - losing it
@@ -105,6 +180,13 @@ impl std::fmt::Debug for EncryptionMasterKey {
 /// `Debug` impl - nothing should ever have a reason to print one.
 #[derive(Clone)]
 pub struct DataKey([u8; KEY_LEN]);
+
+impl DataKey {
+    /// The key's bytes, for wrapping by a key provider.
+    pub(crate) fn bytes(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
+}
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let rng = SystemRandom::new();

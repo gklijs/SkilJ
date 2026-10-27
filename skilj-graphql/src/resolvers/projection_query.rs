@@ -236,7 +236,7 @@ async fn projection_instance(
             &state.pool,
             bounded_context_name,
             key,
-            state.encryption_master_key.as_ref(),
+            state.key_service.as_ref(),
         )
         .await
         .map_err(to_graphql_error)?

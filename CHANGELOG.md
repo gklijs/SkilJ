@@ -10,7 +10,31 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- The encryption master key lives in a key provider (docs/architecture.md
+  §230). `SkiljBuilder::encryption_master_key` is replaced by
+  `key_provider(...)`: `VaultTransitProvider` keeps the key in a Vault or
+  OpenBao Transit key and it never enters the process; `KeyFileProvider` is a
+  key file skilj manages, for local use (`skilj::local::key_file`);
+  `InMemoryKeyProvider` is for tests. `KeyService` replaces
+  `EncryptionMasterKey` as the handle in `GraphqlState` and the core APIs.
+
 ### Added
+
+- Master key rotation without restarts: `master_key_rotation(MasterKeyRotation::new().every(..).retire_after(..))`
+  for a schedule, and the superadmin mutation
+  `rotateEncryptionMasterKey(retireImmediately)` for a leak; the
+  `encryptionMasterKey` query shows where it stands. Every instance rewraps
+  the data keys in the background (Vault rewraps them without the data key
+  leaving it) and, after the grace period (30 days by default) or at once,
+  retires the old versions at the provider so they no longer unwrap
+  anything. A rotation made at the provider directly is picked up too.
+  Recorded as `EncryptionMasterKeyRotated`, `EncryptionDataKeysRewrapped` and
+  `EncryptionMasterKeyRetired` events in the `admin` context.
+- Startup refuses data keys wrapped by another provider
+  (`encryption_key_provider_changed`), and data keys from before key
+  providers without the key that wrapped them.
 
 - `EventOrigin::Unknown { kind }`: an event whose origin was written by a
   newer skilj version sharing the database - mid rolling deploy, or after
@@ -35,6 +59,20 @@ README.md, "Status and stability").
 - `skilj-tui`'s live views work against an `https://` endpoint: its
   websocket client is now built with TLS, so subscriptions over `wss://`
   no longer fail with "TLS support not compiled in".
+
+### Upgrading
+
+- Replace `.encryption_master_key(EncryptionMasterKey::from_bytes(key))` with
+  a `.key_provider(...)`, and keep the old key as
+  `.legacy_encryption_master_key(EncryptionMasterKey::from_bytes(key))` until
+  the background task has moved every existing data key to the provider (one
+  `EncryptionDataKeysRewrapped` event per bounded context, and
+  `encryptionMasterKey.rewrapPending` false). Startup refuses to start
+  without it while such data keys are stored
+  (`encryption_legacy_master_key_required`).
+- Migration `0008` (applied at startup) adds `encryption_master_key`;
+  startup adds `encryption_keys.key_provider`, `master_key_version` and their
+  index to every bounded context.
 
 ## [0.2.0] - 2026-10-26
 

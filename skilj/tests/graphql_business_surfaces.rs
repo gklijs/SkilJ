@@ -3237,8 +3237,8 @@ fn with_ledger_types(builder: skilj::SkiljBuilder) -> skilj::SkiljBuilder {
 }
 
 fn with_ledger(builder: skilj::SkiljBuilder) -> skilj::SkiljBuilder {
-    with_ledger_types(builder).encryption_master_key(
-        skilj_core::encryption::EncryptionMasterKey::from_bytes([7u8; 32]),
+    with_ledger_types(builder).key_provider(
+        skilj_core::encryption::InMemoryKeyProvider::from_bytes([7u8; 32]),
     )
 }
 

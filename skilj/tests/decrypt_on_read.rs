@@ -20,7 +20,7 @@ use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use skilj::{EncryptionMasterKey, EventType, IdpConfig, SigningAlgorithm, Skilj};
+use skilj::{EventType, IdpConfig, SigningAlgorithm, Skilj};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
@@ -334,7 +334,9 @@ fn decrypt_on_read_end_to_end() {
             .bounded_context(bc_name.clone())
             .event_type::<AccountOpened>()
             .reconciliation_role(admin_subject)
-            .encryption_master_key(EncryptionMasterKey::from_bytes([42u8; 32]))
+            .key_provider(skilj_core::encryption::InMemoryKeyProvider::from_bytes(
+                [42u8; 32],
+            ))
             .build()
             .await
             .unwrap();

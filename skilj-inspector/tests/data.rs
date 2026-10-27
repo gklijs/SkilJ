@@ -12,7 +12,7 @@
 use chrono::SubsecRound;
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
-use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::encryption::{InMemoryKeyProvider, KeyService};
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, EventBroadcaster};
 use skilj_core::plugin::ProjectionDispatcher;
@@ -258,7 +258,7 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
             .await
             .unwrap();
 
-        let master_key = EncryptionMasterKey::from_bytes([7u8; 32]);
+        let master_key = KeyService::new(InMemoryKeyProvider::from_bytes([7u8; 32]));
         let plaintext_email = "definitely-plaintext@example.test";
         skilj_core::db::create_and_insert_direct_event(
             &pool,

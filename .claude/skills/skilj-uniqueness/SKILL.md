@@ -122,7 +122,7 @@ annotated version. In short:
    ```rust
    Skilj::builder(url)
        .auto_register()
-       .encryption_master_key(master_key)
+       .key_provider(VaultTransitProvider::from_env("skilj")?)
        .blind_index_key(BlindIndexKey::from_bytes(blind_key_bytes))
    ```
 
@@ -154,7 +154,8 @@ The `decide_*` functions stay hand-written. Complete example:
 ## The key
 
 `blind_index_key` is a root secret every constraint's HMAC key is derived
-from. Treat it like the encryption master key, and keep it separate:
+from. Keep it apart from the encryption master key (which lives in a key
+provider - see the `skilj-bootstrap` skill):
 
 - **Identical on every instance, never changed casually.** Stored hashes only
   match new ones under the same key. skilj stores a fingerprint of each
@@ -182,9 +183,9 @@ from. Treat it like the encryption master key, and keep it separate:
   constraint key is derived from the same root key, so it's exactly as
   exposed.
 - **Losing it** loses the guarantee for every value claimed so far. Back
-  it up with the master key, in the same secret store.
+  it up in your secret store.
 - **Loading it** is the application's: `BlindIndexKey::from_bytes` takes
-  `[u8; 32]`, like `EncryptionMasterKey`. Decode it from a secret, e.g.
+  `[u8; 32]`. Decode it from a secret, e.g.
 with the `hex` crate:
 
   ```rust

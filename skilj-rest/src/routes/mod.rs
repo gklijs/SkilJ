@@ -63,7 +63,7 @@ use skilj_core::access_control::{
 };
 use skilj_core::command_batcher::CommandBatcher;
 use skilj_core::db::{self, AccessTokenKind, Pool};
-use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::encryption::KeyService;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{self, AckMode, Event, EventBroadcaster};
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher, SnapshotDispatcher};
@@ -88,7 +88,7 @@ struct AppState {
     dispatcher: Arc<dyn CommandDispatcher>,
     projection_dispatcher: Arc<dyn ProjectionDispatcher>,
     snapshot_dispatcher: Arc<dyn SnapshotDispatcher>,
-    encryption_master_key: Option<EncryptionMasterKey>,
+    key_service: Option<KeyService>,
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
     /// `ConsumeEvents`' own `manual_ack` claim lease - see
@@ -199,7 +199,7 @@ pub fn router(
     dispatcher: Arc<dyn CommandDispatcher>,
     projection_dispatcher: Arc<dyn ProjectionDispatcher>,
     snapshot_dispatcher: Arc<dyn SnapshotDispatcher>,
-    encryption_master_key: Option<EncryptionMasterKey>,
+    key_service: Option<KeyService>,
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
     read_cursor_checkout_lease: chrono::Duration,
@@ -229,7 +229,7 @@ pub fn router(
             dispatcher,
             projection_dispatcher,
             snapshot_dispatcher,
-            encryption_master_key,
+            key_service,
             event_broadcaster,
             event_cache,
             read_cursor_checkout_lease,
@@ -995,7 +995,7 @@ async fn post_events_external(
         body.causation_id,
         dedupe,
         Utc::now(),
-        state.encryption_master_key.as_ref(),
+        state.key_service.as_ref(),
         &state.dispatcher.blind_index(),
     )
     .await?;
@@ -1069,7 +1069,7 @@ async fn post_events_external_batch(
         &state.event_cache,
         &token,
         items,
-        state.encryption_master_key.as_ref(),
+        state.key_service.as_ref(),
         &state.dispatcher.blind_index(),
         stop_at_first_failure,
     )
@@ -1137,7 +1137,7 @@ async fn post_events_direct(
         body.correlation_id,
         body.causation_id,
         Utc::now(),
-        state.encryption_master_key.as_ref(),
+        state.key_service.as_ref(),
         &state.dispatcher.blind_index(),
     )
     .await?;
@@ -1508,7 +1508,7 @@ async fn post_commands_trigger(
             &authorised.client_id,
             authorised.correlation_id.as_deref(),
             authorised.causation_id.as_deref(),
-            state.encryption_master_key.as_ref(),
+            state.key_service.as_ref(),
             Utc::now(),
             idempotency_key,
         )
@@ -1634,7 +1634,7 @@ async fn post_commands_trigger_batch(
             state.snapshot_dispatcher.as_ref(),
             &state.event_broadcaster,
             &state.event_cache,
-            state.encryption_master_key.as_ref(),
+            state.key_service.as_ref(),
             &bounded_context_name,
             queued,
             stop_at_first_failure,
@@ -1684,7 +1684,7 @@ async fn propose_unless_key_used(
         authorised,
         policy,
         idempotency_key,
-        state.encryption_master_key.as_ref(),
+        state.key_service.as_ref(),
         Utc::now(),
     )
     .await?;
@@ -1789,7 +1789,7 @@ async fn post_commands_dry_run(
         &authorised.command_type,
         &authorised.payload,
         &authorised.client_id,
-        state.encryption_master_key.as_ref(),
+        state.key_service.as_ref(),
         chrono::Utc::now(),
     )
     .await?;

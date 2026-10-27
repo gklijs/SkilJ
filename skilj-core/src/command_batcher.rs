@@ -56,7 +56,7 @@ use crate::db::{
     BatchedCommand, BatchedCommandResult, OwnedSnapshotContext, Pool, SnapshotContext,
     SubmitCommandOutcome,
 };
-use crate::encryption::EncryptionMasterKey;
+use crate::encryption::KeyService;
 use crate::error::{Error, Result};
 use crate::event_cache::EventCache;
 use crate::event_store::{CommandType, Event, EventBroadcaster};
@@ -294,7 +294,7 @@ impl CommandBatcher {
         consistency_tags: &[Tag],
         matching_events: &[Event],
         initial_decision: CommandDecision,
-        encryption_master_key: Option<&EncryptionMasterKey>,
+        key_service: Option<&KeyService>,
         now: DateTime<Utc>,
         snapshot: Option<SnapshotContext<'_>>,
         snapshot_states: &[crate::plugin::SnapshotState],
@@ -312,7 +312,7 @@ impl CommandBatcher {
             consistency_tags,
             matching_events,
             initial_decision,
-            encryption_master_key,
+            key_service,
             now,
             snapshot,
             snapshot_states,
@@ -327,7 +327,7 @@ impl CommandBatcher {
                 projection_dispatcher,
                 broadcaster,
                 event_cache,
-                encryption_master_key,
+                key_service,
                 &command_type.bounded_context.name,
                 vec![command],
             )
@@ -355,7 +355,7 @@ impl CommandBatcher {
         consistency_tags: &[Tag],
         matching_events: &[Event],
         initial_decision: CommandDecision,
-        encryption_master_key: Option<&EncryptionMasterKey>,
+        key_service: Option<&KeyService>,
         now: DateTime<Utc>,
         snapshot: Option<SnapshotContext<'_>>,
         snapshot_states: &[crate::plugin::SnapshotState],
@@ -368,7 +368,7 @@ impl CommandBatcher {
             command_type,
             payload,
             &initial_decision,
-            encryption_master_key,
+            key_service,
         )
         .await?;
 
@@ -407,7 +407,7 @@ impl CommandBatcher {
         projection_dispatcher: &Arc<dyn ProjectionDispatcher>,
         broadcaster: &EventBroadcaster,
         event_cache: &EventCache,
-        encryption_master_key: Option<&EncryptionMasterKey>,
+        key_service: Option<&KeyService>,
         bounded_context_name: &str,
         commands: Vec<BatchedCommand>,
     ) -> Vec<oneshot::Receiver<BatchedCommandResult>> {
@@ -448,7 +448,7 @@ impl CommandBatcher {
             let projection_dispatcher = projection_dispatcher.clone();
             let broadcaster = broadcaster.clone();
             let event_cache = event_cache.clone();
-            let encryption_master_key = encryption_master_key.cloned();
+            let key_service = key_service.cloned();
             let bounded_context_name = bounded_context_name.to_string();
             tokio::spawn(
                 async move {
@@ -459,7 +459,7 @@ impl CommandBatcher {
                             projection_dispatcher.as_ref(),
                             &broadcaster,
                             &event_cache,
-                            encryption_master_key.as_ref(),
+                            key_service.as_ref(),
                             &bounded_context_name,
                             &queue,
                         )
@@ -505,7 +505,7 @@ impl CommandBatcher {
         snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
         broadcaster: &EventBroadcaster,
         event_cache: &EventCache,
-        encryption_master_key: Option<&EncryptionMasterKey>,
+        key_service: Option<&KeyService>,
         bounded_context_name: &str,
         commands: Vec<CommandBatchItem>,
         stop_at_first_failure: bool,
@@ -540,7 +540,7 @@ impl CommandBatcher {
                     &resolved.consistency_tags,
                     &resolved.matching_events,
                     resolved.decision,
-                    encryption_master_key,
+                    key_service,
                     now,
                     resolved
                         .snapshot_context
@@ -582,7 +582,7 @@ impl CommandBatcher {
                 projection_dispatcher,
                 broadcaster,
                 event_cache,
-                encryption_master_key,
+                key_service,
                 bounded_context_name,
                 queued,
             )
@@ -622,7 +622,7 @@ impl CommandBatcher {
         client_id: &str,
         correlation_id: Option<&str>,
         causation_id: Option<&str>,
-        encryption_master_key: Option<&EncryptionMasterKey>,
+        key_service: Option<&KeyService>,
         now: DateTime<Utc>,
         idempotency_key: Option<&str>,
     ) -> Result<SubmitCommandOutcome> {
@@ -643,7 +643,7 @@ impl CommandBatcher {
                     client_id,
                     correlation_id,
                     causation_id,
-                    encryption_master_key,
+                    key_service,
                     now,
                     idempotency_key,
                 )
@@ -671,7 +671,7 @@ impl CommandBatcher {
         client_id: &str,
         correlation_id: Option<&str>,
         causation_id: Option<&str>,
-        encryption_master_key: Option<&EncryptionMasterKey>,
+        key_service: Option<&KeyService>,
         now: DateTime<Utc>,
         idempotency_key: Option<&str>,
     ) -> Result<SubmitCommandOutcome> {
@@ -702,7 +702,7 @@ impl CommandBatcher {
             &resolved.consistency_tags,
             &resolved.matching_events,
             resolved.decision,
-            encryption_master_key,
+            key_service,
             now,
             resolved
                 .snapshot_context
@@ -758,7 +758,7 @@ impl CommandBatcher {
         projection_dispatcher: &dyn ProjectionDispatcher,
         broadcaster: &EventBroadcaster,
         event_cache: &EventCache,
-        encryption_master_key: Option<&EncryptionMasterKey>,
+        key_service: Option<&KeyService>,
         bounded_context_name: &str,
         queue: &Queue,
     ) {
@@ -813,7 +813,7 @@ impl CommandBatcher {
                         leader_tx,
                         dispatcher,
                         projection_dispatcher,
-                        encryption_master_key,
+                        key_service,
                         batch,
                         Some(&self.slow),
                     )

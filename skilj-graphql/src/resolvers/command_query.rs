@@ -148,7 +148,7 @@ pub fn fetch_commands_field(n: &Naming) -> Field {
                         &c.command_type.sensitive_fields,
                         &c.payload,
                         &access_mapping,
-                        state.encryption_master_key.as_ref(),
+                        state.key_service.as_ref(),
                         &mut data_keys,
                     )
                     .await?;

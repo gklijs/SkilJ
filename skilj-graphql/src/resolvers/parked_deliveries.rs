@@ -142,7 +142,7 @@ async fn redrive_parked_delivery(
                     &client_id,
                     None,
                     None,
-                    state.encryption_master_key.as_ref(),
+                    state.key_service.as_ref(),
                     Utc::now(),
                     Some(&idempotency_key),
                 )
@@ -205,7 +205,7 @@ async fn redrive_parked_delivery(
                 redrive.causation_id,
                 Some(dedupe),
                 Utc::now(),
-                state.encryption_master_key.as_ref(),
+                state.key_service.as_ref(),
                 &state.dispatcher.blind_index(),
             )
             .await?;
@@ -269,7 +269,7 @@ async fn redrive_parked_delivery(
                     &client_id,
                     authorised.correlation_id.as_deref(),
                     authorised.causation_id.as_deref(),
-                    state.encryption_master_key.as_ref(),
+                    state.key_service.as_ref(),
                     Utc::now(),
                     Some(&idempotency_key),
                 )

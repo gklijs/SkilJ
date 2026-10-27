@@ -177,7 +177,7 @@ pub fn query_events_field(n: &Naming) -> Field {
                         &e.event_type.sensitive_fields,
                         &e.payload,
                         &access_mapping,
-                        state.encryption_master_key.as_ref(),
+                        state.key_service.as_ref(),
                         &mut data_keys,
                     )
                     .await?;
@@ -381,7 +381,7 @@ pub fn inspect_event_field(n: &Naming) -> Field {
                     &event.event_type.sensitive_fields,
                     &event.payload,
                     &access_mapping,
-                    state.encryption_master_key.as_ref(),
+                    state.key_service.as_ref(),
                     &mut data_keys,
                 )
                 .await?;
@@ -395,7 +395,7 @@ pub fn inspect_event_field(n: &Naming) -> Field {
                         &command.command_type.sensitive_fields,
                         &command.payload,
                         &access_mapping,
-                        state.encryption_master_key.as_ref(),
+                        state.key_service.as_ref(),
                         &mut data_keys,
                     )
                     .await?;

@@ -157,7 +157,7 @@ pub fn submit_command_field(n: &Naming) -> Field {
                         &item.client_id,
                         item.correlation_id.as_deref(),
                         item.causation_id.as_deref(),
-                        state.encryption_master_key.as_ref(),
+                        state.key_service.as_ref(),
                         Utc::now(),
                         item.idempotency_key.as_deref(),
                     )
@@ -310,7 +310,7 @@ async fn prepare_command(
             &authorised,
             &policy,
             args.idempotency_key.as_deref(),
-            state.encryption_master_key.as_ref(),
+            state.key_service.as_ref(),
             Utc::now(),
         )
         .await
@@ -521,7 +521,7 @@ pub fn submit_commands_field(n: &Naming) -> Field {
                         state.snapshot_dispatcher.as_ref(),
                         &state.event_broadcaster,
                         &state.event_cache,
-                        state.encryption_master_key.as_ref(),
+                        state.key_service.as_ref(),
                         &bounded_context_name,
                         queued,
                         false,
@@ -606,7 +606,7 @@ async fn render_matching_events(
             &e.event_type.sensitive_fields,
             &e.payload,
             access_mapping,
-            state.encryption_master_key.as_ref(),
+            state.key_service.as_ref(),
             &mut data_keys,
         )
         .await?;
@@ -704,7 +704,7 @@ pub fn dry_run_command_field(n: &Naming) -> Field {
                     &authorised.command_type,
                     &authorised.payload,
                     &authorised.client_id,
-                    state.encryption_master_key.as_ref(),
+                    state.key_service.as_ref(),
                     chrono::Utc::now(),
                 )
                 .await

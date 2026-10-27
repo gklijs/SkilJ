@@ -303,6 +303,21 @@ pub fn capability_history_object(n: &Naming) -> Object {
     })
 }
 
+/// The encryption master key version in use and where its rotation
+/// stands (docs/architecture.md §230). Names the provider and versions,
+/// never a key.
+pub fn encryption_master_key_object(n: &Naming) -> Object {
+    gql_object!(skilj_core::db::MasterKeyState => n.ty("EncryptionMasterKey") {
+        scalar "provider": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.provider.clone()),
+        scalar "version": TypeRef::named_nn(TypeRef::INT) => |k| Value::from(k.version),
+        scalar "rotatedAt": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.rotated_at.to_rfc3339()),
+        scalar "rewrapPending": TypeRef::named_nn(TypeRef::BOOLEAN) => |k| Value::from(k.rewrapped_at.is_none()),
+        scalar "rewrappedAt": TypeRef::named(TypeRef::STRING) => |k| optional_timestamp(k.rewrapped_at),
+        scalar "retireImmediately": TypeRef::named_nn(TypeRef::BOOLEAN) => |k| Value::from(k.retire_immediately),
+        scalar "retiredBelow": TypeRef::named_nn(TypeRef::INT) => |k| Value::from(k.retired_below),
+    })
+}
+
 /// `entity ContextCreator`. `kind` stands in for the Rust sum type's own
 /// variant tag (the same "the enum variant tag is the field" treatment
 /// the Rust side already gives it - see `ContextCreator`'s own doc
