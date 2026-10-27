@@ -1329,6 +1329,22 @@ impl MasterKeyRotation {
         self.check_interval = interval;
         self
     }
+
+    /// `build()` refuses a zero `check_interval` (a busy loop) and a zero
+    /// `every` (a rotation at every check).
+    fn validate(&self) -> Result<(), skilj_core::Error> {
+        if self.check_interval.is_zero() {
+            return Err(skilj_core::Error::configuration(
+                "master_key_rotation's check_interval must be more than zero",
+            ));
+        }
+        if self.every.is_some_and(|every| every.is_zero()) {
+            return Err(skilj_core::Error::configuration(
+                "master_key_rotation's every must be more than zero",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Startup's check of the stored data keys against the key service
@@ -1453,28 +1469,59 @@ async fn master_key_tick(
             tracing::warn!(provider = provider.name(), error = %err, "master key lifecycle check failed; retrying");
         }
     }
-    let grace = chrono::Duration::from_std(rotation.retire_after).unwrap_or(chrono::Duration::MAX);
+    // By provider name: two keys with the same name on different
+    // providers are different keys.
+    let in_use: BTreeSet<String> = keys
+        .keys()
+        .map(|key| {
+            key_service
+                .provider_for(key.as_deref())
+                .map(|p| p.name().to_string())
+        })
+        .collect::<Result<_, _>>()?;
     for state in skilj_core::db::master_key_states(pool).await? {
-        let Some(key) = &state.key else { continue };
-        if keys.contains_key(&Some(key.clone())) {
+        let Some(key) = state.key.clone() else {
+            continue;
+        };
+        if in_use.contains(&state.provider) {
             continue;
         }
-        // Its bounded contexts' data keys move to their new key first.
-        if skilj_core::db::key_in_use(pool, &state.provider).await? {
-            continue;
+        // One key that can't be deleted - a token without the right, say -
+        // doesn't hold up the others.
+        if let Err(err) = retire_unused_key(pool, key_service, rotation, &state, &key).await {
+            tracing::warn!(provider = %state.provider, error = %err, "unused key not deleted yet; retrying");
         }
-        match state.delete_after {
-            None => {
-                let at = chrono::Utc::now()
-                    .checked_add_signed(grace)
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
-                skilj_core::db::schedule_key_deletion(pool, &state.provider, at).await?;
-            }
-            Some(_) => {
-                let provider = key_service.provider_for(Some(key))?;
-                if skilj_core::db::delete_unused_key(pool, provider.as_ref()).await? {
-                    tracing::info!(provider = %state.provider, "unused bounded-context key deleted");
-                }
+    }
+    Ok(())
+}
+
+/// One unused bounded-context key's way out: once no data key is wrapped
+/// by it, its deletion is scheduled `retire_after` ahead; once due, it is
+/// deleted (`db::delete_unused_key` checks again under the key's lock).
+async fn retire_unused_key(
+    pool: &Pool,
+    key_service: &KeyService,
+    rotation: &MasterKeyRotation,
+    state: &skilj_core::db::MasterKeyState,
+    key: &str,
+) -> Result<(), skilj_core::Error> {
+    // Its bounded contexts' data keys move to their new key first.
+    if skilj_core::db::key_in_use(pool, &state.provider).await? {
+        return Ok(());
+    }
+    match state.delete_after {
+        None => {
+            let grace =
+                chrono::Duration::from_std(rotation.retire_after).unwrap_or(chrono::Duration::MAX);
+            let at = chrono::Utc::now()
+                .checked_add_signed(grace)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+            skilj_core::db::schedule_key_deletion(pool, &state.provider, at).await?;
+        }
+        Some(_) => {
+            let provider = key_service.provider_for(Some(key))?;
+            if skilj_core::db::delete_unused_key(pool, key_service, provider.as_ref()).await? {
+                tracing::info!(provider = %state.provider, "unused bounded-context key deleted");
             }
         }
     }
@@ -1534,6 +1581,7 @@ async fn key_lifecycle(
                 &bounded_context,
                 provider.name(),
                 state.version,
+                state.rotated_at,
             )
             .await
             {
@@ -1564,6 +1612,7 @@ async fn key_lifecycle(
                 key_service,
                 provider,
                 state.version,
+                state.rotated_at,
             )
             .await?;
             tracing::info!(
@@ -3442,6 +3491,7 @@ impl SkiljBuilder {
             ));
         }
         // docs/architecture.md §230.
+        self.master_key_rotation.validate()?;
         if self.legacy_encryption_master_key.is_some() && self.key_service.is_none() {
             return Err(skilj_core::Error::configuration(
                 "legacy_encryption_master_key is configured without a key_provider to rewrap \

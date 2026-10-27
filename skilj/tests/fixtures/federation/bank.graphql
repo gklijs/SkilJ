@@ -260,6 +260,20 @@ type BankInspectedSnapshot @inaccessible {
 	updatedAt: String!
 }
 
+type BankMasterKey @inaccessible {
+	provider: String!
+	key: String
+	version: Int!
+	rotatedAt: String!
+	rewrapPending: Boolean!
+	rewrappedAt: String
+	retireImmediately: Boolean!
+	retiredBelow: Int!
+	createdBySkilj: Boolean!
+	deleteAfter: String
+	boundedContexts: [String!]!
+}
+
 type BankMatchingEvent {
 	sequence: Int!
 	eventTypeName: String!
@@ -471,6 +485,8 @@ type Bankfed_published_AccountBalance @key(fields: "projectionKey") {
 
 type Mutation {
 	bankCreateSuperadmin(bootstrapSecret: String!, name: String!, externalSubject: String!): BankCreatedSuperadmin! @inaccessible
+	bankRotateMasterKey(boundedContext: String, retireImmediately: Boolean): BankMasterKey! @inaccessible
+	bankAssignMasterKey(boundedContext: String!, key: String, create: Boolean): BankMasterKey! @inaccessible
 	bankCreateRole(name: String!, superadmin: Boolean!, externalSubject: String!): BankRole! @inaccessible
 	bankRevokeRole(roleId: ID!): BankRole! @inaccessible
 	bankGrantRoleAccessMapping(roleId: ID!, boundedContext: String!, level: BankAccessLevel!, canReadSensitive: Boolean!, scope: String): BankRoleAccessMapping! @inaccessible
@@ -509,6 +525,7 @@ type Query {
 	bankBoundedContexts: [BankBoundedContext!]! @inaccessible
 	bankCapabilityOverview: [BankCapabilityOverviewEntry!]! @inaccessible
 	bankCapabilityHistory(roleId: ID!, boundedContext: String!, asOf: String): BankCapabilityHistory! @inaccessible
+	bankMasterKeys: [BankMasterKey!]! @inaccessible
 	bankCapabilityDelegation(boundedContext: String!): BankCapabilityDelegation! @inaccessible
 	bankProjections(boundedContext: String!): [BankProjection!]! @inaccessible
 	bankScheduledEventTypes(boundedContext: String!): [BankEventType!]! @inaccessible

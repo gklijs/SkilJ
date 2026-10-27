@@ -113,6 +113,21 @@ pub enum Error {
         configured: String,
     },
 
+    /// A key answers to the name the data keys record, but unwraps none of
+    /// the newest of a bounded context's (docs/architecture.md §230): other
+    /// key material under the same name - a key file recreated at its path,
+    /// another Vault cluster with the same key path.
+    #[error(
+        "key {provider} unwraps none of {bounded_context}'s newest data keys: it is not the key \
+         that wrapped them (a key file recreated, another Vault cluster?) - restore that key"
+    )]
+    KeyMaterialChanged {
+        /// The key's name.
+        provider: String,
+        /// The bounded context whose data keys it doesn't unwrap.
+        bounded_context: String,
+    },
+
     /// Data keys from before key providers are stored, and no legacy master
     /// key is configured to read them (docs/architecture.md §230).
     #[error(
@@ -143,6 +158,7 @@ impl crate::error::SkiljRejection for Error {
             Error::ProviderRefused { .. } => "encryption_key_provider_refused",
             Error::KeyVersionRetired { .. } => "encryption_key_version_retired",
             Error::ProviderChanged { .. } => "encryption_key_provider_changed",
+            Error::KeyMaterialChanged { .. } => "encryption_key_material_changed",
             Error::LegacyMasterKeyRequired => "encryption_legacy_master_key_required",
             Error::LegacyMasterKeyChanged { .. } => "encryption_legacy_master_key_changed",
         }
