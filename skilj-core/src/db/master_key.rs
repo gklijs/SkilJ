@@ -349,6 +349,20 @@ pub async fn bounded_context_key<'e>(
     )
 }
 
+/// Whether skilj keeps state for the key named `provider` - false once it
+/// was deleted.
+pub(super) async fn key_recorded<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    provider: &str,
+) -> crate::error::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM encryption_master_keys WHERE provider = $1)",
+    )
+    .bind(provider)
+    .fetch_one(executor)
+    .await?)
+}
+
 /// Every bounded context with a key of its own, by its key's name.
 pub async fn encryption_key_assignments(
     pool: &Pool,
@@ -592,15 +606,23 @@ pub struct DataKeyWraps {
 /// (docs/architecture.md §230): refused with
 /// `encryption_key_provider_changed` when one was wrapped by a key
 /// `key_service` doesn't know (another provider, or a key nothing records),
-/// with `encryption_legacy_master_key_required` when legacy ones are stored
-/// and no legacy master key is configured, and with
+/// with `encryption_key_material_changed` when a key answers to the right
+/// name but unwraps none of the newest data keys it is recorded on, with
+/// `encryption_legacy_master_key_required` when legacy ones are stored and
+/// no legacy master key is configured, and with
 /// `encryption_legacy_master_key_changed` when it doesn't unwrap the newest
 /// of them. Call [`register_known_keys`] first.
+///
+/// `settled` holds the keys already checked this startup - verified, or
+/// with no verdict because the provider didn't answer - so each key costs
+/// a few unwraps once per startup, not once per bounded context, and an
+/// unreachable provider one timeout, not one per bounded context.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn check_data_key_wraps(
     pool: &Pool,
     bounded_context: &str,
     key_service: &KeyService,
+    settled: &mut BTreeSet<String>,
 ) -> crate::error::Result<DataKeyWraps> {
     let (providers, legacy) = stored_providers(pool, bounded_context).await?;
     if let Some(stored) = providers
@@ -618,8 +640,11 @@ pub async fn check_data_key_wraps(
     // same path, or another Vault cluster with the same key path, names its
     // key alike. Unwrapping a few of the newest data keys tells them apart
     // before anything is wrapped by, or marked unreadable under, the wrong
-    // key. A provider that can't answer is no verdict on its key.
-    for provider in &providers {
+    // key. Only a refusal of the ciphertext counts against the key: a data
+    // key under a retired version says nothing about the key's material
+    // (the rewrap marks it), and a provider that can't answer is no verdict.
+    let pending: Vec<&String> = providers.iter().filter(|p| !settled.contains(*p)).collect();
+    for provider in pending {
         let newest: Vec<(Vec<u8>, i32)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT wrapped_key, master_key_version FROM {schema}.encryption_keys \
              WHERE status = 'active' AND key_provider = $1 AND wrapped_key IS NOT NULL \
@@ -628,7 +653,8 @@ pub async fn check_data_key_wraps(
         .bind(provider)
         .fetch_all(pool)
         .await?;
-        let mut mismatched = false;
+        let mut refused = 0;
+        let mut settle = false;
         for (wrapped, version) in &newest {
             let probe = key_service
                 .unwrap(StoredWrap {
@@ -640,30 +666,32 @@ pub async fn check_data_key_wraps(
                 .await;
             match probe {
                 Ok(_) => {
-                    mismatched = false;
+                    settle = true;
                     break;
                 }
-                Err(
-                    encryption::Error::DecryptFailed | encryption::Error::KeyVersionRetired { .. },
-                ) => mismatched = true,
+                Err(encryption::Error::DecryptFailed) => refused += 1,
+                Err(encryption::Error::KeyVersionRetired { .. }) => {}
                 Err(err) => {
                     tracing::warn!(
-                        bounded_context,
                         provider = %provider,
                         error = %err,
                         "could not check the key's data keys at startup"
                     );
-                    mismatched = false;
+                    settle = true;
                     break;
                 }
             }
         }
-        if mismatched {
+        if !settle && refused > 0 {
             return Err(encryption::Error::KeyMaterialChanged {
                 provider: provider.clone(),
                 bounded_context: bounded_context.to_string(),
             }
             .into());
+        }
+        // Only retired ones, or none: nothing told; another context may.
+        if settle {
+            settled.insert(provider.clone());
         }
     }
     if !legacy {
@@ -781,7 +809,12 @@ async fn key_in_use_on(
         .await
         .map_err(crate::error::Error::from);
         match used {
-            Ok(true) => return Ok(true),
+            Ok(true) => {
+                sqlx::query("RELEASE SAVEPOINT key_in_use")
+                    .execute(&mut *conn)
+                    .await?;
+                return Ok(true);
+            }
             Ok(false) => {}
             Err(err) if super::is_missing_schema(&err) => {
                 sqlx::query("ROLLBACK TO SAVEPOINT key_in_use")
@@ -790,6 +823,9 @@ async fn key_in_use_on(
             }
             Err(err) => return Err(err),
         }
+        sqlx::query("RELEASE SAVEPOINT key_in_use")
+            .execute(&mut *conn)
+            .await?;
     }
     Ok(false)
 }

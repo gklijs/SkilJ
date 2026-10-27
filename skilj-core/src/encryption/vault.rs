@@ -178,35 +178,57 @@ impl VaultTransitProvider {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, Error> {
+        self.request_with_status(method, path, body)
+            .await
+            .map_err(|(_, err)| err)
+    }
+
+    /// [`request`](Self::request), with the HTTP status of a refusal kept
+    /// next to the error - `None` when there was no answer - so a caller can
+    /// tell "the key refused this" from "Vault refused the request".
+    async fn request_with_status(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, (Option<u16>, Error)> {
+        let fail = |status: Option<u16>| move |err: Error| (status, err);
         let url = format!("{}/v1/{}/{}", self.address, self.mount, path);
         let mut request = self.client.request(method, &url);
         if let Some(body) = &body {
             request = request.json(body);
         }
-        let mut request = request.header("X-Vault-Token", self.token()?);
+        let mut request = request.header("X-Vault-Token", self.token().map_err(fail(None))?);
         if let Some(namespace) = &self.namespace {
             request = request.header("X-Vault-Namespace", namespace);
         }
         let response = request
             .send()
             .await
-            .map_err(|e| self.unavailable(format!("{path}: {e}")))?;
+            .map_err(|e| (None, self.unavailable(format!("{path}: {e}"))))?;
         let status = response.status();
+        let code = Some(status.as_u16());
         let text = response
             .text()
             .await
-            .map_err(|e| self.unavailable(format!("{path}: {e}")))?;
+            .map_err(|e| (None, self.unavailable(format!("{path}: {e}"))))?;
         if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(self.unavailable(format!("{path}: {status} {}", errors(&text))));
+            return Err((
+                code,
+                self.unavailable(format!("{path}: {status} {}", errors(&text))),
+            ));
         }
         if !status.is_success() {
-            return Err(self.refused(format!("{path}: {status} {}", errors(&text))));
+            return Err((
+                code,
+                self.refused(format!("{path}: {status} {}", errors(&text))),
+            ));
         }
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
         let value: Value = serde_json::from_str(&text)
-            .map_err(|e| self.refused(format!("{path}: not JSON: {e}")))?;
+            .map_err(|e| (code, self.refused(format!("{path}: not JSON: {e}"))))?;
         Ok(value.get("data").cloned().unwrap_or(Value::Null))
     }
 
@@ -257,25 +279,39 @@ impl KeyProvider for VaultTransitProvider {
         })
     }
 
+    /// Transit's answers are told apart: a 400 or 404 is this key refusing
+    /// this ciphertext - wrong key material, a corrupt ciphertext, or a key
+    /// that doesn't exist at this Vault - which is
+    /// [`Error::DecryptFailed`], or [`Error::KeyVersionRetired`] for a
+    /// version below `min_decryption_version`; a 403 is the token's
+    /// permissions, and no verdict on the data key
+    /// ([`Error::ProviderRefused`]); 5xx, 429 and no answer are
+    /// [`Error::ProviderUnavailable`] (docs/architecture.md §230).
     fn unwrap<'a>(&'a self, wrapped: &'a WrappedDataKey) -> BoxFuture<'a, Result<[u8; 32], Error>> {
         Box::pin(async move {
-            let ciphertext = std::str::from_utf8(&wrapped.ciphertext)
-                .map_err(|_| self.refused("a stored ciphertext is not UTF-8"))?;
+            let ciphertext =
+                std::str::from_utf8(&wrapped.ciphertext).map_err(|_| Error::DecryptFailed)?;
             let data = match self
-                .call(
+                .request_with_status(
+                    reqwest::Method::POST,
                     &format!("decrypt/{}", self.key),
                     Some(json!({ "ciphertext": ciphertext })),
                 )
                 .await
             {
-                Err(Error::ProviderRefused { message, .. })
-                    if message.contains("disallowed by policy") || message.contains("too old") =>
-                {
-                    return Err(Error::KeyVersionRetired {
-                        version: wrapped.version,
-                    })
+                Ok(data) => data,
+                Err((Some(400 | 404), err)) => {
+                    let retired = matches!(&err, Error::ProviderRefused { message, .. }
+                        if message.contains("disallowed by policy") || message.contains("too old"));
+                    return Err(if retired {
+                        Error::KeyVersionRetired {
+                            version: wrapped.version,
+                        }
+                    } else {
+                        Error::DecryptFailed
+                    });
                 }
-                other => other?,
+                Err((_, err)) => return Err(err),
             };
             let plaintext = str_field(&data, "plaintext")
                 .and_then(crate::base64::decode)
@@ -372,10 +408,16 @@ impl KeyProvider for VaultTransitProvider {
     /// created it.
     fn create(&self) -> BoxFuture<'_, Result<bool, Error>> {
         Box::pin(async move {
-            match self.versions().await {
+            // Only a 404 says the key isn't there: a 403 - a token that may
+            // create but not read - must not be taken for it, or an existing
+            // key would be claimed as created.
+            match self
+                .request_with_status(reqwest::Method::GET, &format!("keys/{}", self.key), None)
+                .await
+            {
                 Ok(_) => return Ok(false),
-                Err(Error::ProviderRefused { .. }) => {}
-                Err(err) => return Err(err),
+                Err((Some(404), _)) => {}
+                Err((_, err)) => return Err(err),
             }
             self.call(
                 &format!("keys/{}", self.key),

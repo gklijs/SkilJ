@@ -1362,8 +1362,18 @@ async fn check_encryption_keys(
     key_service: &KeyService,
 ) -> Result<(), skilj_core::Error> {
     skilj_core::db::register_known_keys(pool, key_service).await?;
+    // Each key is checked once per startup, whatever the number of bounded
+    // contexts using it.
+    let mut settled = BTreeSet::new();
     for bounded_context in skilj_core::db::list_bounded_contexts(pool).await? {
-        match skilj_core::db::check_data_key_wraps(pool, &bounded_context.name, key_service).await {
+        match skilj_core::db::check_data_key_wraps(
+            pool,
+            &bounded_context.name,
+            key_service,
+            &mut settled,
+        )
+        .await
+        {
             Ok(wraps) if wraps.legacy => tracing::info!(
                 bounded_context = %bounded_context.name,
                 "data keys from before key providers are stored; they are rewrapped in the background"
