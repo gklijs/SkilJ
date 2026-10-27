@@ -1,0 +1,26 @@
+# Configuration for Call Graph Analyzer (CGA) - finds panic paths in the
+# monomorphized MIR call graph. Local and optional, not a CI check yet.
+# How to install and run it: AGENTS.md, "Panic analysis (CGA)".
+#
+# Rule semantics, from cga_data/src/cmd.rs:
+# - whitelist: a finding is dropped when ANY function in its backtrace
+#   matches. So never whitelist whole runtime crates (core, std, tokio,
+#   axum, ...): every panic goes through core, and every handler runs
+#   under tokio, so that would hide everything. Whitelist specific
+#   functions that are known not to panic in practice instead.
+# - blacklist: a `cga::blacklisted` finding when the leaf of a backtrace
+#   matches (and no whitelist rule applies).
+# - rule kinds: { path = "<regex>" } on the simplified path,
+#   { canonical = "<regex>" } on the full path including generics,
+#   { crate = "<name>" } as an exact crate name.
+
+whitelist = []
+
+blacklist = []
+
+[options]
+# Every async block has an implicit panic path (polled after completion);
+# with tokio and axum everywhere that is pure noise.
+allow_async_panic = true
+# Keep assert!/debug_assert! and compiler-inserted assertions visible.
+allow_assert = false

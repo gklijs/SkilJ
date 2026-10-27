@@ -55,6 +55,30 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 Every public enum of the library crates is `#[non_exhaustive]` (docs/architecture.md §217, §219), and a new one must be too: match one from another crate with a `_` arm that answers `skilj_core::Error::Unsupported` (or the bridge's `BridgeError::Unsupported`). Adding a variant therefore compiles everywhere - search for the enum's matches in the other crates and handle it there.
 
+## Panic analysis (CGA)
+
+Optional and local only, not part of CI. [Call Graph Analyzer](https://github.com/OpenDevicePartnership/cga) walks the monomorphized MIR call graph from a crate's entrypoints and reports every reachable panic, with a backtrace back into our code. The REST and GraphQL surfaces take untrusted input, so a reachable panic there is a denial-of-service risk.
+
+CGA is a rustc driver pinned to its own nightly, so it is installed from a checkout rather than crates.io. skilj itself stays on stable:
+
+```sh
+git clone https://github.com/OpenDevicePartnership/cga
+cd cga && cargo install --path .   # rustup fetches the pinned nightly (with rustc-dev) on first use
+```
+
+It only starts from entrypoints (`fn main`, or `no_mangle`/`export_name` symbols), so the library crates can't be checked on their own. Check them through `skilj-demo`'s `server` binary, which pulls in skilj-core, skilj-graphql and skilj-rest; code the demo never calls is not covered. From the workspace root:
+
+```sh
+cargo cga check -p skilj-demo --profile cga --config-path cga.toml
+cargo cga extract -p skilj-demo --profile cga -Tdot -o target/cga/callgraph.dot   # the raw graph
+```
+
+`skilj-tui` and `skilj-inspector` are binaries too and can be checked the same way.
+
+- CGA builds std from source (`-Z build-std`) into `target/cga`, and is 2-3x slower than `cargo check`. If cargo says `build-std` needs an explicit target, add `--target x86_64-unknown-linux-gnu` (or your host triple).
+- `[profile.cga]` in `Cargo.toml` is release with opt-level 2, which CGA recommends.
+- `cga.toml` explains its rules. Most important: a whitelist rule hides a finding when any function in the backtrace matches, so whitelist specific functions, never whole crates like `core`, `std` or `tokio`.
+
 ## CI checks
 
 The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each (12-15 and 17 are their own jobs; 16 is a weekly workflow):

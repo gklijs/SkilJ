@@ -198,3 +198,12 @@ skilj-codegen = { path = "skilj-codegen", version = "0.2.0" }
 skilj-test-fixture = { path = "skilj-test-fixture", version = "0.2.0" }
 skilj-retry = { path = "skilj-retry", version = "0.2.0" }
 skilj-bridge = { path = "skilj-bridge", version = "0.2.0" }
+
+# Only for Call Graph Analyzer (`cargo cga check --profile cga`, see
+# AGENTS.md). Release semantics (no overflow checks, no debug
+# assertions), at opt-level 2 as CGA's README recommends: at "s"/"z"
+# unreachable checks stay in the MIR and show up as false positives.
+# Not used by any normal build.
+[profile.cga]
+inherits = "release"
+opt-level = 2
