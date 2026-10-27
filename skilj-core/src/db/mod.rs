@@ -6118,7 +6118,7 @@ impl std::ops::DerefMut for Held<'_> {
 impl Db<'_> {
     async fn conn(&mut self) -> crate::error::Result<Held<'_>> {
         Ok(match self {
-            Db::Conn(conn) => Held::Borrowed(&mut **conn),
+            Db::Conn(conn) => Held::Borrowed(conn),
             Db::Pool(pool) => Held::Owned(pool.acquire().await?),
         })
     }
