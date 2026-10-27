@@ -5893,6 +5893,8 @@ struct EncryptionKeyRow {
     key_provider: Option<String>,
     /// The master key version it is wrapped under, `NULL` for a legacy one.
     master_key_version: Option<i32>,
+    /// When a rewrap found no configured key unwraps it.
+    unreadable_since: Option<DateTime<Utc>>,
 }
 
 impl EncryptionKeyRow {
@@ -5909,7 +5911,7 @@ impl EncryptionKeyRow {
 }
 
 const ENCRYPTION_KEY_COLUMNS: &str = "id, subject_key, subject_value, status, created_at, \
-     destroyed_at, wrapped_key, wrap_nonce, key_provider, master_key_version";
+     destroyed_at, wrapped_key, wrap_nonce, key_provider, master_key_version, unreadable_since";
 
 /// `event_store::protect_sensitive_fields`'s own get-or-create - "each key
 /// provisioned exactly once... idempotent... repeat calls find the key
@@ -5987,7 +5989,7 @@ async fn get_or_create_encryption_key_on(
             get_active_encryption_key_row(&mut *conn, bounded_context, subject_key, subject_value)
                 .await?
         {
-            let data_key = unwrap_row(&mut *conn, key_service, &row).await?;
+            let data_key = unwrap_row(&mut *conn, bounded_context, key_service, &row).await?;
             return Ok((row.to_domain(bc), row.id, data_key));
         }
 
@@ -5998,11 +6000,23 @@ async fn get_or_create_encryption_key_on(
         let provider = key_service.provider_for(key.as_deref())?;
         let (data_key, wrapped) = key_service.generate_with(provider.as_ref()).await?;
         let now = Utc::now();
+        // A bounded context's own key is stored only while its state row
+        // is there, taken `FOR SHARE` in the same statement: a deletion of
+        // the key waits for this, and one that came first leaves nothing to
+        // take, so nothing is inserted and the next pass reads the bounded
+        // context's key again (docs/architecture.md §230). The default key
+        // is never deleted.
+        let guard = if key.is_some() {
+            "SELECT 1 FROM encryption_master_keys WHERE provider = $5 FOR SHARE"
+        } else {
+            "SELECT 1"
+        };
         let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO {schema}.encryption_keys \
+            "WITH kept AS ({guard}) \
+             INSERT INTO {schema}.encryption_keys \
              (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \
              master_key_version) \
-             VALUES ($1, $2, 'active', $3, $4, $5, $6) \
+             SELECT $1, $2, 'active', $3, $4, $5, $6 FROM kept \
              ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \
              RETURNING {ENCRYPTION_KEY_COLUMNS}"
         )))
@@ -6041,8 +6055,13 @@ fn version_column(version: u32) -> crate::error::Result<i32> {
 /// master key for a row from before providers. A key this process hasn't
 /// used yet - one another instance gave a bounded context - is looked up
 /// once among the keys skilj records, on `executor`, and tried again.
-async fn unwrap_row<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+///
+/// A row marked unreadable that unwraps after all - its key was put right -
+/// has its mark cleared, so it counts again for the rewrap, the retirement
+/// and the key's deletion.
+async fn unwrap_row(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
     key_service: &KeyService,
     row: &EncryptionKeyRow,
 ) -> crate::error::Result<DataKey> {
@@ -6056,13 +6075,25 @@ async fn unwrap_row<'e>(
         ciphertext: wrapped,
         nonce: row.wrap_nonce.as_deref(),
     };
-    match key_service.unwrap(stored).await {
+    let data_key = match key_service.unwrap(stored).await {
         Err(encryption::Error::ProviderChanged { .. }) => {
-            master_key::register_known_keys(executor, key_service).await?;
-            Ok(key_service.unwrap(stored).await?)
+            master_key::register_known_keys(&mut *conn, key_service).await?;
+            key_service.unwrap(stored).await?
         }
-        other => Ok(other?),
+        other => other?,
+    };
+    if row.unreadable_since.is_some() {
+        let schema = schema_ident(bounded_context);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.encryption_keys SET unreadable_since = NULL \
+             WHERE id = $1 AND wrapped_key = $2"
+        )))
+        .bind(row.id)
+        .bind(wrapped)
+        .execute(&mut *conn)
+        .await?;
     }
+    Ok(data_key)
 }
 
 /// The pre-resolution step every `event_store::protect_sensitive_fields`
@@ -6282,7 +6313,15 @@ async fn get_active_data_key_on(
     key_service: &KeyService,
 ) -> crate::error::Result<Option<DataKey>> {
     match get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value).await? {
-        Some(row) => Ok(Some(unwrap_row(pool, key_service, &row).await?)),
+        Some(row) => Ok(Some(
+            unwrap_row(
+                &mut *pool.acquire().await?,
+                bounded_context,
+                key_service,
+                &row,
+            )
+            .await?,
+        )),
         None => Ok(None),
     }
 }
@@ -6329,8 +6368,9 @@ pub async fn list_active_data_keys_for_subject_value(
     }
     let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?;
     let mut data_keys = Vec::with_capacity(rows.len());
+    let mut conn = pool.acquire().await?;
     for row in &rows {
-        data_keys.push(unwrap_row(pool, key_service, row).await?);
+        data_keys.push(unwrap_row(&mut conn, bounded_context, key_service, row).await?);
     }
     Ok(data_keys)
 }

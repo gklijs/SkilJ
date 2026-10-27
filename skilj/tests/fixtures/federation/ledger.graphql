@@ -260,6 +260,20 @@ type LedgerInspectedSnapshot @inaccessible {
 	updatedAt: String!
 }
 
+type LedgerMasterKey @inaccessible {
+	provider: String!
+	key: String
+	version: Int!
+	rotatedAt: String!
+	rewrapPending: Boolean!
+	rewrappedAt: String
+	retireImmediately: Boolean!
+	retiredBelow: Int!
+	createdBySkilj: Boolean!
+	deleteAfter: String
+	boundedContexts: [String!]!
+}
+
 type LedgerMatchingEvent {
 	sequence: Int!
 	eventTypeName: String!
@@ -471,6 +485,8 @@ type Ledgerfed_published_AccountBalance @key(fields: "projectionKey") {
 
 type Mutation {
 	ledgerCreateSuperadmin(bootstrapSecret: String!, name: String!, externalSubject: String!): LedgerCreatedSuperadmin! @inaccessible
+	ledgerRotateMasterKey(boundedContext: String, retireImmediately: Boolean): LedgerMasterKey! @inaccessible
+	ledgerAssignMasterKey(boundedContext: String!, key: String, create: Boolean): LedgerMasterKey! @inaccessible
 	ledgerCreateRole(name: String!, superadmin: Boolean!, externalSubject: String!): LedgerRole! @inaccessible
 	ledgerRevokeRole(roleId: ID!): LedgerRole! @inaccessible
 	ledgerGrantRoleAccessMapping(roleId: ID!, boundedContext: String!, level: LedgerAccessLevel!, canReadSensitive: Boolean!, scope: String): LedgerRoleAccessMapping! @inaccessible
@@ -509,6 +525,7 @@ type Query {
 	ledgerBoundedContexts: [LedgerBoundedContext!]! @inaccessible
 	ledgerCapabilityOverview: [LedgerCapabilityOverviewEntry!]! @inaccessible
 	ledgerCapabilityHistory(roleId: ID!, boundedContext: String!, asOf: String): LedgerCapabilityHistory! @inaccessible
+	ledgerMasterKeys: [LedgerMasterKey!]! @inaccessible
 	ledgerCapabilityDelegation(boundedContext: String!): LedgerCapabilityDelegation! @inaccessible
 	ledgerProjections(boundedContext: String!): [LedgerProjection!]! @inaccessible
 	ledgerScheduledEventTypes(boundedContext: String!): [LedgerEventType!]! @inaccessible

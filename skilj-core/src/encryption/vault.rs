@@ -366,16 +366,23 @@ impl KeyProvider for VaultTransitProvider {
         Ok(std::sync::Arc::new(other))
     }
 
-    /// `vault write -f transit/keys/<key>` - an AES-256-GCM key; writing
-    /// one that exists changes nothing.
-    fn create(&self) -> BoxFuture<'_, Result<(), Error>> {
+    /// `vault write -f transit/keys/<key>` - an AES-256-GCM key - unless
+    /// reading the key finds it there already: Vault answers a write to an
+    /// existing key with success too, so only the read tells whether this
+    /// created it.
+    fn create(&self) -> BoxFuture<'_, Result<bool, Error>> {
         Box::pin(async move {
+            match self.versions().await {
+                Ok(_) => return Ok(false),
+                Err(Error::ProviderRefused { .. }) => {}
+                Err(err) => return Err(err),
+            }
             self.call(
                 &format!("keys/{}", self.key),
                 Some(json!({ "type": "aes256-gcm96" })),
             )
             .await?;
-            Ok(())
+            Ok(true)
         })
     }
 

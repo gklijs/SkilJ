@@ -13,8 +13,8 @@
 //!
 //! **Sensitive fields are never decrypted, ever** (confirmed with the
 //! project owner before building this - see the module's own design
-//! note in [docs/architecture.md §14](../../docs/architecture.md#skilj-inspector)): this crate never accepts an
-//! `EncryptionMasterKey` and has no decryption code path at all. A
+//! note in [docs/architecture.md §14](../../docs/architecture.md#skilj-inspector)): this crate never accepts a
+//! key provider or master key and has no decryption code path at all. A
 //! sensitive field's ciphertext is already what
 //! `skilj_core::encryption::encrypt_leaf` substitutes directly into the
 //! stored payload at write time, so every event/command row `data`

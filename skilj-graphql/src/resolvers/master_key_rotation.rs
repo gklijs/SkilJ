@@ -91,9 +91,10 @@ pub fn master_keys_field(n: &Naming) -> Field {
 }
 
 /// `rotateMasterKey(boundedContext: String, retireImmediately: Boolean = false): MasterKey!` -
-/// a new version of the bounded context's key at the provider (the
-/// default key's, without one - which every bounded context without a key
-/// of its own uses), recorded as `EncryptionMasterKeyRotated` with the
+/// a new version of the bounded context's key at the provider - its own,
+/// or the default key every bounded context without one shares; without
+/// `boundedContext`, the default key. A name that is no bounded context is
+/// refused, rather than read as one without a key of its own. Recorded as `EncryptionMasterKeyRotated` with the
 /// caller as actor. The rewrap follows in the background, and the old
 /// versions are retired once it is done: after the grace period, or at
 /// once with `retireImmediately` - what a leaked key calls for.
@@ -108,7 +109,20 @@ pub fn rotate_master_key_field(n: &Naming) -> Field {
                 let key_service = key_service(state)?;
                 let retire_immediately = optional_bool(&ctx, "retireImmediately")?;
                 let key = match optional_string(&ctx, "boundedContext")? {
+                    // A name given must name a bounded context: one that
+                    // doesn't would otherwise read as "no key of its own"
+                    // and rotate the default key everyone shares.
                     Some(bounded_context) => {
+                        let exists = !bounded_context.is_empty()
+                            && skilj_core::db::get_bounded_context(&state.pool, &bounded_context)
+                                .await
+                                .map_err(to_graphql_error)?
+                                .is_some();
+                        if !exists {
+                            return Err(
+                                to_graphql_error(skilj_core::error::Error::row_not_found()),
+                            );
+                        }
                         skilj_core::db::bounded_context_key(&state.pool, &bounded_context)
                             .await
                             .map_err(to_graphql_error)?

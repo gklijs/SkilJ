@@ -5,7 +5,7 @@
 //! retirement and the deletion of a key no bounded context uses any more.
 
 use super::{
-    get_bounded_context, get_event_type, insert_event, list_bounded_contexts, next_sequence,
+    get_bounded_context, get_event_type, insert_event, next_sequence,
     require_admin_bounded_context, schema_ident, upsert_event_type, version_column, Pool,
 };
 use crate::encryption::provider::{KeyProvider, WrappedDataKey};
@@ -381,9 +381,14 @@ pub async fn assign_encryption_key(
         .await?
         .ok_or_else(crate::error::Error::row_not_found)?;
     let provider = key_service.provider_for(key)?;
-    if create && key.is_some() {
-        provider.create().await?;
-    }
+    // Only a key this call really created is skilj's to delete later: a
+    // provider's `create` answers whether it did, so a key that existed
+    // already - a customer's - is never claimed.
+    let created = if create && key.is_some() {
+        provider.create().await?
+    } else {
+        false
+    };
     // Refuses a key that doesn't exist or can't be reached before anything
     // is recorded, and records its first use.
     rotate_master_key(
@@ -432,7 +437,7 @@ pub async fn assign_encryption_key(
          created_by_skilj = created_by_skilj OR $2 WHERE provider = $1",
     )
     .bind(provider.name())
-    .bind(create && key.is_some())
+    .bind(created)
     .execute(&mut *tx)
     .await?;
     record(
@@ -442,7 +447,7 @@ pub async fn assign_encryption_key(
             provider.name(),
             bounded_context,
             &previous,
-            create && key.is_some(),
+            created,
             actor_role_id,
         ),
     )
@@ -489,10 +494,15 @@ pub async fn schedule_key_deletion(
 /// Deletes an unused bounded-context key once its deletion is due: at the
 /// provider when skilj created it, and its state row either way, recorded
 /// as `EncryptionKeyDeleted`. Under the key's lock, and only while no
-/// bounded context is assigned it again. Answers whether it did.
+/// bounded context is assigned it again and - checked again under that
+/// lock - no data key is wrapped by it. Its state row is taken `FOR
+/// UPDATE`, which waits for any provisioning or rewrap batch that took it
+/// `FOR SHARE` to wrap with the key, so their rows are seen; one that comes
+/// later finds no row and wraps nothing with it. Answers whether it did.
 #[tracing::instrument(skip_all, fields(provider = %provider.name()))]
 pub async fn delete_unused_key(
     pool: &Pool,
+    key_service: &KeyService,
     provider: &dyn KeyProvider,
 ) -> crate::error::Result<bool> {
     let admin = require_admin_bounded_context(pool).await?;
@@ -511,6 +521,14 @@ pub async fn delete_unused_key(
     if state.key.is_none() || assigned || !due {
         return Ok(false);
     }
+    if key_in_use_on(&mut tx, provider.name()).await? {
+        sqlx::query("UPDATE encryption_master_keys SET delete_after = NULL WHERE provider = $1")
+            .bind(provider.name())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
     if state.created_by_skilj {
         provider.delete().await?;
     }
@@ -525,6 +543,7 @@ pub async fn delete_unused_key(
     )
     .await?;
     tx.commit().await?;
+    key_service.clear_cache();
     Ok(true)
 }
 
@@ -585,21 +604,73 @@ pub async fn check_data_key_wraps(
 ) -> crate::error::Result<DataKeyWraps> {
     let (providers, legacy) = stored_providers(pool, bounded_context).await?;
     if let Some(stored) = providers
-        .into_iter()
+        .iter()
         .find(|p| key_service.provider_named(p).is_none())
     {
         return Err(encryption::Error::ProviderChanged {
-            stored,
+            stored: stored.clone(),
             configured: key_service.provider_name().to_string(),
         }
         .into());
+    }
+    let schema = schema_ident(bounded_context);
+    // The same name doesn't prove the same key: a key file recreated at the
+    // same path, or another Vault cluster with the same key path, names its
+    // key alike. Unwrapping a few of the newest data keys tells them apart
+    // before anything is wrapped by, or marked unreadable under, the wrong
+    // key. A provider that can't answer is no verdict on its key.
+    for provider in &providers {
+        let newest: Vec<(Vec<u8>, i32)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT wrapped_key, master_key_version FROM {schema}.encryption_keys \
+             WHERE status = 'active' AND key_provider = $1 AND wrapped_key IS NOT NULL \
+             AND unreadable_since IS NULL ORDER BY id DESC LIMIT {KEY_PROBES}"
+        )))
+        .bind(provider)
+        .fetch_all(pool)
+        .await?;
+        let mut mismatched = false;
+        for (wrapped, version) in &newest {
+            let probe = key_service
+                .unwrap(StoredWrap {
+                    provider: Some(provider),
+                    version: u32::try_from(*version).ok(),
+                    ciphertext: wrapped,
+                    nonce: None,
+                })
+                .await;
+            match probe {
+                Ok(_) => {
+                    mismatched = false;
+                    break;
+                }
+                Err(
+                    encryption::Error::DecryptFailed | encryption::Error::KeyVersionRetired { .. },
+                ) => mismatched = true,
+                Err(err) => {
+                    tracing::warn!(
+                        bounded_context,
+                        provider = %provider,
+                        error = %err,
+                        "could not check the key's data keys at startup"
+                    );
+                    mismatched = false;
+                    break;
+                }
+            }
+        }
+        if mismatched {
+            return Err(encryption::Error::KeyMaterialChanged {
+                provider: provider.clone(),
+                bounded_context: bounded_context.to_string(),
+            }
+            .into());
+        }
     }
     if !legacy {
         return Ok(DataKeyWraps { legacy: false });
     }
     // Several of the newest, not just one: a single corrupt row must not
     // read as the wrong key and keep every instance from starting.
-    let schema = schema_ident(bounded_context);
     let newest: Vec<(Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT wrapped_key, wrap_nonce FROM {schema}.encryption_keys \
          WHERE status = 'active' AND key_provider IS NULL AND wrapped_key IS NOT NULL \
@@ -632,52 +703,91 @@ pub async fn check_data_key_wraps(
 /// the legacy master key on.
 const LEGACY_PROBES: i64 = 5;
 
+/// How many of a bounded context's newest data keys per key startup tries
+/// to unwrap, to tell the key's material apart from another with its name.
+const KEY_PROBES: i64 = 5;
+
+/// The condition for a data key that still counts: not marked unreadable,
+/// or marked before `$since` - the key's last rotation, so each rotation
+/// tries a marked data key once more, in case the cause was a key since
+/// put right.
+fn readable_since(since: &str) -> String {
+    format!("(unreadable_since IS NULL OR unreadable_since < {since})")
+}
+
 /// Whether any of `bounded_context`'s active data keys is not wrapped by
 /// `provider` under `version` or later - leaving out the ones marked
-/// unreadable, which no key will change.
+/// unreadable since `since`, the key's last rotation, which this rotation
+/// already tried.
 pub async fn data_keys_behind(
     pool: &Pool,
     bounded_context: &str,
     provider: &str,
     version: u32,
+    since: DateTime<Utc>,
 ) -> crate::error::Result<bool> {
     let schema = schema_ident(bounded_context);
+    let counts = readable_since("$3");
     let behind: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT EXISTS (SELECT 1 FROM {schema}.encryption_keys \
              WHERE status = 'active' AND key_provider IS NULL AND wrapped_key IS NOT NULL \
-             AND unreadable_since IS NULL) \
+             AND {counts}) \
          OR EXISTS (SELECT 1 FROM {schema}.encryption_keys \
              WHERE status = 'active' AND (key_provider < $1 OR key_provider > $1) \
-             AND unreadable_since IS NULL) \
+             AND {counts}) \
          OR EXISTS (SELECT 1 FROM {schema}.encryption_keys \
              WHERE status = 'active' AND key_provider = $1 AND master_key_version < $2 \
-             AND unreadable_since IS NULL)"
+             AND {counts})"
     )))
     .bind(provider)
     .bind(version_column(version)?)
+    .bind(since)
     .fetch_one(pool)
     .await?;
     Ok(behind)
 }
 
 /// Whether any bounded context still has an active data key wrapped by
-/// `provider` - which keeps it from being deleted. One deleted meanwhile
-/// is skipped.
+/// `provider` - which keeps it from being deleted. One marked unreadable
+/// counts too: the cause may be put right, and deleting the key would make
+/// that impossible. One deleted meanwhile is skipped.
 pub async fn key_in_use(pool: &Pool, provider: &str) -> crate::error::Result<bool> {
-    for bounded_context in list_bounded_contexts(pool).await? {
-        let schema = schema_ident(&bounded_context.name);
+    let mut tx = pool.begin().await?;
+    let used = key_in_use_on(&mut tx, provider).await?;
+    tx.rollback().await?;
+    Ok(used)
+}
+
+async fn key_in_use_on(
+    conn: &mut sqlx::PgConnection,
+    provider: &str,
+) -> crate::error::Result<bool> {
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM bounded_contexts")
+        .fetch_all(&mut *conn)
+        .await?;
+    for name in names {
+        let schema = schema_ident(&name);
+        // A savepoint, so a schema dropped meanwhile doesn't abort a
+        // caller's transaction.
+        sqlx::query("SAVEPOINT key_in_use")
+            .execute(&mut *conn)
+            .await?;
         let used = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
             "SELECT EXISTS (SELECT 1 FROM {schema}.encryption_keys \
-             WHERE status = 'active' AND key_provider = $1 AND unreadable_since IS NULL)"
+             WHERE status = 'active' AND key_provider = $1)"
         )))
         .bind(provider)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(crate::error::Error::from);
         match used {
             Ok(true) => return Ok(true),
             Ok(false) => {}
-            Err(err) if super::is_missing_schema(&err) => {}
+            Err(err) if super::is_missing_schema(&err) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT key_in_use")
+                    .execute(&mut *conn)
+                    .await?;
+            }
             Err(err) => return Err(err),
         }
     }
@@ -724,13 +834,22 @@ fn definitively_unreadable(err: &encryption::Error) -> bool {
 ///
 /// In batches, each its own transaction; each row is updated only if it
 /// still holds what was read, so a concurrent `forgetSubject` or another
-/// instance's rewrap wins. A data key that is definitively unreadable is
-/// marked `unreadable_since` in its batch, once; a provider or
-/// configuration failure ends the run with the error instead, for the next
-/// one to retry. `EncryptionDataKeysRewrapped`, with this run's counts, is
-/// recorded in the transaction of the batch that leaves nothing behind -
-/// so a crash can't leave the work done and the event missing - and only
-/// when the run changed something.
+/// instance's rewrap wins. Each batch takes `target`'s state row `FOR
+/// SHARE` before it writes, so a deletion of the key waits for it, and a
+/// batch after a deletion finds no row and stops instead of storing data
+/// keys wrapped by a deleted key.
+///
+/// A data key that is definitively unreadable is marked `unreadable_since`
+/// in its batch; a provider or configuration failure ends the run with the
+/// error instead, for the next one to retry. A data key marked before
+/// `since` - the key's last rotation - is tried once more, in case the
+/// cause was a key since put right; one that still fails is marked again.
+///
+/// `EncryptionDataKeysRewrapped`, with this run's counts, is recorded in the
+/// transaction of the batch that leaves nothing behind - or, when the rows
+/// left were taken away meanwhile, on its own once the run finds none - so
+/// a crash can't leave the work done and the event missing. Only when the
+/// run changed something.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn rewrap_data_keys(
     pool: &Pool,
@@ -738,27 +857,50 @@ pub async fn rewrap_data_keys(
     key_service: &KeyService,
     target: &dyn KeyProvider,
     version: u32,
+    since: DateTime<Utc>,
 ) -> crate::error::Result<RewrapOutcome> {
+    // Before any batch's transaction: a second pooled connection while one
+    // is held is what §117 rules out.
+    let admin = require_admin_bounded_context(pool).await?;
     let schema = schema_ident(bounded_context);
     let target_name = target.name().to_string();
-    let behind_filter = "status = 'active' AND wrapped_key IS NOT NULL \
-         AND unreadable_since IS NULL \
-         AND (key_provider IS NULL OR key_provider <> $1 OR master_key_version < $2)";
+    let behind_filter = format!(
+        "status = 'active' AND wrapped_key IS NOT NULL AND {} \
+         AND (key_provider IS NULL OR key_provider <> $1 OR master_key_version < $2)",
+        readable_since("$3")
+    );
+    let event = |outcome: RewrapOutcome| {
+        MasterKeyChange::rewrapped(
+            &target_name,
+            version,
+            bounded_context,
+            outcome.rewrapped,
+            outcome.unreadable,
+        )
+    };
     let mut outcome = RewrapOutcome::default();
     let mut after = 0i64;
     loop {
         let rows: Vec<RewrapRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT id, wrapped_key, wrap_nonce, key_provider, master_key_version \
-             FROM {schema}.encryption_keys WHERE {behind_filter} AND id > $3 \
-             ORDER BY id LIMIT $4"
+             FROM {schema}.encryption_keys WHERE {behind_filter} AND id > $4 \
+             ORDER BY id LIMIT $5"
         )))
         .bind(&target_name)
         .bind(version_column(version)?)
+        .bind(since)
         .bind(after)
         .bind(REWRAP_BATCH)
         .fetch_all(pool)
         .await?;
         let Some(last) = rows.last() else {
+            // The rows the last batch saw behind it were taken away
+            // meanwhile (a `forgetSubject`), so no batch recorded the event.
+            if outcome != RewrapOutcome::default() {
+                let mut tx = pool.begin().await?;
+                record(&mut tx, &admin, event(outcome)).await?;
+                tx.commit().await?;
+            }
             break;
         };
         after = last.0;
@@ -817,6 +959,19 @@ pub async fn rewrap_data_keys(
         }
 
         let mut tx = pool.begin().await?;
+        let target_kept: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM encryption_master_keys WHERE provider = $1 FOR SHARE)",
+        )
+        .bind(&target_name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !target_kept {
+            return Err(encryption::Error::ProviderRefused {
+                provider: target_name.clone(),
+                message: "the key was deleted while its data keys were being rewrapped".into(),
+            }
+            .into());
+        }
         if !done.is_empty() {
             let ids: Vec<i64> = done.iter().map(|(id, _, _)| *id).collect();
             let old: Vec<Vec<u8>> = done.iter().map(|(_, old, _)| old.clone()).collect();
@@ -828,7 +983,7 @@ pub async fn rewrap_data_keys(
             let updated = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.encryption_keys k \
                  SET wrapped_key = u.new, wrap_nonce = NULL, key_provider = $1, \
-                     master_key_version = u.version \
+                     master_key_version = u.version, unreadable_since = NULL \
                  FROM UNNEST($2::BIGINT[], $3::BYTEA[], $4::BYTEA[], $5::INTEGER[]) \
                      AS u(id, old, new, version) \
                  WHERE k.id = u.id AND k.status = 'active' AND k.wrapped_key = u.old"
@@ -848,8 +1003,7 @@ pub async fn rewrap_data_keys(
             let marked = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.encryption_keys k SET unreadable_since = $1 \
                  FROM UNNEST($2::BIGINT[], $3::BYTEA[]) AS u(id, old) \
-                 WHERE k.id = u.id AND k.status = 'active' AND k.wrapped_key = u.old \
-                 AND k.unreadable_since IS NULL"
+                 WHERE k.id = u.id AND k.status = 'active' AND k.wrapped_key = u.old"
             )))
             .bind(Utc::now())
             .bind(&ids)
@@ -860,27 +1014,16 @@ pub async fn rewrap_data_keys(
         }
         let more: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT EXISTS (SELECT 1 FROM {schema}.encryption_keys \
-             WHERE {behind_filter} AND id > $3)"
+             WHERE {behind_filter} AND id > $4)"
         )))
         .bind(&target_name)
         .bind(version_column(version)?)
+        .bind(since)
         .bind(after)
         .fetch_one(&mut *tx)
         .await?;
         if !more && outcome != RewrapOutcome::default() {
-            let admin = require_admin_bounded_context(pool).await?;
-            record(
-                &mut tx,
-                &admin,
-                MasterKeyChange::rewrapped(
-                    &target_name,
-                    version,
-                    bounded_context,
-                    outcome.rewrapped,
-                    outcome.unreadable,
-                ),
-            )
-            .await?;
+            record(&mut tx, &admin, event(outcome)).await?;
         }
         tx.commit().await?;
         if !more {

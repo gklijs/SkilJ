@@ -40,8 +40,11 @@ README.md, "Status and stability").
 - Every step is an event in the `admin` context: `EncryptionMasterKeyRotated`,
   `EncryptionDataKeysRewrapped`, `EncryptionMasterKeyRetired`,
   `EncryptionKeyAssigned` and `EncryptionKeyDeleted`. A data key no
-  configured key can unwrap is marked unreadable once and no longer holds up
-  a rotation.
+  configured key can unwrap is marked unreadable and no longer holds up a
+  rotation; the next rotation, or a read that succeeds, clears the mark.
+- Startup refuses a key whose name matches but whose material doesn't
+  (`encryption_key_material_changed`): a key file recreated at its path,
+  another Vault cluster with the same key path.
 - Startup refuses data keys wrapped by another provider
   (`encryption_key_provider_changed`), and data keys from before key
   providers without the key that wrapped them.

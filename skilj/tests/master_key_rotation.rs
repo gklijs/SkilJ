@@ -134,7 +134,7 @@ async fn wait_for_state(
     what: &str,
     done: impl Fn(&db::MasterKeyState) -> bool,
 ) {
-    for _ in 0..200 {
+    for _ in 0..600 {
         if let Some(state) = db::master_key_state(pool, provider).await.unwrap() {
             if done(&state) {
                 return;
@@ -154,8 +154,11 @@ fn quick(grace: Duration) -> MasterKeyRotation {
         .retire_after(grace)
 }
 
+/// A builder with a small pool: this file's tests start many instances at
+/// once against one Postgres, as the other suites' do.
 fn builder(url: &str, keys: KeyService, rotation: MasterKeyRotation) -> SkiljBuilder {
     Skilj::builder(url.to_string())
+        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
         .key_service(keys)
         .master_key_rotation(rotation)
 }
@@ -163,7 +166,12 @@ fn builder(url: &str, keys: KeyService, rotation: MasterKeyRotation) -> SkiljBui
 async fn refused(builder: SkiljBuilder) -> String {
     match builder.build().await {
         Ok(_) => panic!("startup was expected to be refused"),
-        Err(err) => err.code().to_string(),
+        Err(err) => {
+            if err.code() == "database_error" {
+                eprintln!("database error: {err}");
+            }
+            err.code().to_string()
+        }
     }
 }
 
@@ -171,6 +179,8 @@ async fn refused(builder: SkiljBuilder) -> String {
 
 #[derive(Default)]
 struct Transit {
+    /// The keys that exist besides `skilj`.
+    created: Vec<String>,
     /// One entry per version; the "ciphertext" is the plaintext in hex,
     /// since only the version handling is under test here.
     latest: u32,
@@ -256,6 +266,7 @@ fn unb64(text: &str) -> Vec<u8> {
 
 async fn serve_transit() -> (String, Fake) {
     let fake: Fake = Arc::new(Mutex::new(Transit {
+        created: Vec::new(),
         latest: 1,
         min_decryption: 1,
         calls: Vec::new(),
@@ -310,11 +321,14 @@ async fn serve_transit() -> (String, Fake) {
         )
         .route(
             "/v1/transit/keys/{key}",
-            get(|State(f): State<Fake>, headers: HeaderMap, Path(_key): Path<String>| async move {
+            get(|State(f): State<Fake>, headers: HeaderMap, Path(key): Path<String>| async move {
                 if let Some(denied) = denied(&headers) {
                     return denied;
                 }
                 let t = f.lock().unwrap();
+                if key != "skilj" && !t.created.contains(&key) {
+                    return (StatusCode::NOT_FOUND, Json(json!({ "errors": [] })));
+                }
                 (
                     StatusCode::OK,
                     Json(json!({ "data": { "latest_version": t.latest, "min_decryption_version": t.min_decryption } })),
@@ -324,7 +338,9 @@ async fn serve_transit() -> (String, Fake) {
                 if let Some(denied) = denied(&headers) {
                     return denied;
                 }
-                f.lock().unwrap().calls.push(format!("create {key} {}", body["type"].as_str().unwrap_or("")));
+                let mut t = f.lock().unwrap();
+                t.calls.push(format!("create {key} {}", body["type"].as_str().unwrap_or("")));
+                t.created.push(key);
                 (StatusCode::OK, Json(json!({ "data": {} })))
             })
             .delete(|State(f): State<Fake>, headers: HeaderMap, Path(key): Path<String>| async move {
@@ -412,7 +428,15 @@ fn the_vault_provider_wraps_rewraps_in_batches_and_is_refused_a_retired_version(
         // Vault only allows once deletion is allowed on the key.
         let tenant = vault.key("tenant-a").unwrap();
         assert_eq!(tenant.name(), "vault-transit:transit/tenant-a");
-        tenant.create().await.unwrap();
+        assert!(tenant.create().await.unwrap(), "created");
+        assert!(
+            !tenant.create().await.unwrap(),
+            "already there: not created again"
+        );
+        assert!(
+            !vault.create().await.unwrap(),
+            "an existing key is not claimed"
+        );
         tenant.delete().await.unwrap();
         let calls = fake.lock().unwrap().calls.clone();
         assert!(
@@ -977,6 +1001,14 @@ fn a_superadmin_rotates_over_graphql_and_reads_where_it_stands() {
         assert!(refused["errors"].is_array(), "{refused}");
         assert_eq!(keys.provider().versions().await.unwrap().latest, 1);
 
+        // A name that is no bounded context is refused, not read as the
+        // default key's.
+        for typo in ["typo", ""] {
+            let refused = graphql_request(&router, &root, ROTATE, json!({ "bc": typo })).await;
+            assert!(refused["errors"].is_array(), "{refused}");
+        }
+        assert_eq!(keys.provider().versions().await.unwrap().latest, 1);
+
         let rotated = graphql_request(&router, &root, ROTATE, json!({ "now": true })).await;
         let rotated = &rotated["data"]["rotateMasterKey"];
         assert_eq!(rotated["version"], 2, "{rotated}");
@@ -1040,7 +1072,7 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    for _ in 0..200 {
+    for _ in 0..600 {
         if check().await {
             return;
         }
@@ -1178,9 +1210,14 @@ fn a_key_a_superadmin_brought_is_let_go_of_but_not_deleted() {
         assert!(missing.is_err());
         assert!(db::bounded_context_key(&pool, &bc).await.unwrap().is_none());
 
-        db::assign_encryption_key(&pool, &keys, &bc, Some("customer-key"), false, None)
-            .await
-            .unwrap();
+        // Asked to create it, skilj finds it there and claims nothing.
+        let assigned =
+            db::assign_encryption_key(&pool, &keys, &bc, Some("customer-key"), true, None)
+                .await
+                .unwrap();
+        assert!(!assigned.created_by_skilj);
+        let event = events_about(&pool, "EncryptionKeyAssigned", &bc).await;
+        assert_eq!(event[0]["created"], false);
         wait_for_state(
             &pool,
             "in-memory:customer-key",
@@ -1308,21 +1345,202 @@ fn a_data_key_wrapped_under_an_old_version_after_the_rewrap_holds_up_the_retirem
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE encryption_master_keys SET rewrapped_at = now() - interval '2 hours'")
-            .execute(&pool)
+        let aged = "UPDATE encryption_master_keys SET rewrapped_at = now() - interval '2 hours'";
+        sqlx::query(aged).execute(&pool).await.unwrap();
+        // The retirement check finds it and sends the key back to the
+        // rewrap; the rewrap's end restarts the grace period, so nothing is
+        // retired yet.
+        wait_until("the straggler rewrapped", || async {
+            events_about(&pool, "EncryptionDataKeysRewrapped", &bc)
+                .await
+                .len()
+                == 2
+        })
+        .await;
+        wait_for_state(&pool, keys.provider_name(), "the rewrap done again", |s| {
+            s.rewrapped_at
+                .is_some_and(|at| at > chrono::Utc::now() - chrono::Duration::minutes(5))
+        })
+        .await;
+        assert_eq!(wraps(&pool, &bc).await[0].2, Some(2));
+        let state = db::master_key_state(&pool, keys.provider_name())
             .await
+            .unwrap()
             .unwrap();
+        assert_eq!(state.retired_below, 1, "postponed by a new grace period");
+        // Once that one is over too, the old version retires.
+        sqlx::query(aged).execute(&pool).await.unwrap();
         wait_for_state(&pool, keys.provider_name(), "the retirement", |s| {
             s.retired_below == 2
         })
         .await;
-        // It was rewrapped first, so nothing was lost to the retirement.
-        assert_eq!(wraps(&pool, &bc).await[0].2, Some(2));
+    });
+}
+
+#[test]
+fn another_key_under_the_same_name_refuses_startup_and_marks_are_tried_again() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_material_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&pool).await;
+        let path = temp_key_file();
+        let keys = KeyService::new(KeyFileProvider::open(&path).unwrap());
+        let sealed = seal_for(&pool, &bc, "1", &keys).await;
+        seal_for(&pool, &bc, "2", &keys).await;
+
+        // The key file lost and created again at the same path: the same
+        // name, other key material. Refused before anything is marked.
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let recreated = KeyService::new(KeyFileProvider::open(&path).unwrap());
         assert_eq!(
-            events_about(&pool, "EncryptionDataKeysRewrapped", &bc)
-                .await
-                .len(),
-            2
+            refused(builder(&url, recreated, quick(Duration::ZERO))).await,
+            "encryption_key_material_changed"
         );
+        std::fs::write(&path, &original).unwrap();
+
+        let mark = |subject: &'static str| {
+            let pool = pool.clone();
+            let bc = bc.clone();
+            async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE \"bc_{bc}\".encryption_keys SET unreadable_since = now() \
+                     WHERE subject_value = '{subject}'"
+                )))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let marked = |subject: &'static str| {
+            let pool = pool.clone();
+            let bc = bc.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(sqlx::AssertSqlSafe(
+                    format!(
+                        "SELECT unreadable_since FROM \"bc_{bc}\".encryption_keys \
+                         WHERE subject_value = '{subject}'"
+                    ),
+                ))
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .is_some()
+            }
+        };
+        // A data key marked unreadable that unwraps after all - its key was
+        // put right - loses the mark when read...
+        mark("1").await;
+        assert_eq!(
+            open_for(&pool, &bc, "1", &keys, &sealed).await,
+            "1@example.com"
+        );
+        assert!(!marked("1").await);
+
+        // ...and one never read is tried again by the next rotation.
+        mark("2").await;
+        let (_skilj, _) = builder(&url, keys.clone(), quick(Duration::ZERO))
+            .build()
+            .await
+            .unwrap();
+        db::rotate_master_key(
+            &pool,
+            keys.provider(),
+            None,
+            db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_state(&pool, keys.provider_name(), "the retirement", |s| {
+            s.retired_below == 2
+        })
+        .await;
+        assert!(!marked("2").await);
+        assert!(wraps(&pool, &bc)
+            .await
+            .iter()
+            .all(|(_, _, v, _)| *v == Some(2)));
+        std::fs::remove_file(&path).unwrap();
+    });
+}
+
+#[test]
+fn a_key_is_not_deleted_while_a_data_key_is_wrapped_by_it() {
+    runtime().block_on(async {
+        let Some((_url, pool)) = test_db("skilj_master_key_delete_race_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&pool).await;
+        // The admin context, for the events.
+        let (_skilj, _) = builder(
+            &_url,
+            KeyService::new(InMemoryKeyProvider::new()),
+            quick(Duration::from_secs(3600)),
+        )
+        .build()
+        .await
+        .unwrap();
+        drop(_skilj);
+        let provider = InMemoryKeyProvider::new();
+        let keys = KeyService::new(provider.clone());
+        db::assign_encryption_key(&pool, &keys, &bc, Some("tenant"), true, None)
+            .await
+            .unwrap();
+        seal_for(&pool, &bc, "1", &keys).await;
+        assert_eq!(
+            wraps(&pool, &bc).await[0].1.as_deref(),
+            Some("in-memory:tenant")
+        );
+
+        // As if the context had just been given the default key back and
+        // the deletion came due while a data key is still wrapped by its
+        // own key - by a rewrap or a provisioning that read the old
+        // assignment.
+        sqlx::query("DELETE FROM encryption_key_assignments")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE encryption_master_keys SET delete_after = now() - interval '1 minute' \
+             WHERE provider = 'in-memory:tenant'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tenant = keys.provider_for(Some("tenant")).unwrap();
+        assert!(!db::delete_unused_key(&pool, &keys, tenant.as_ref())
+            .await
+            .unwrap());
+        assert!(tenant.versions().await.is_ok(), "still there");
+        let state = db::master_key_state(&pool, "in-memory:tenant")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.delete_after, None, "its deletion starts over");
+    });
+}
+
+#[test]
+fn zero_intervals_are_refused() {
+    runtime().block_on(async {
+        for rotation in [
+            MasterKeyRotation::new().check_interval(Duration::ZERO),
+            MasterKeyRotation::new().every(Duration::ZERO),
+        ] {
+            let err = match Skilj::builder("postgres://unused".to_string())
+                .key_provider(InMemoryKeyProvider::new())
+                .master_key_rotation(rotation)
+                .build()
+                .await
+            {
+                Ok(_) => panic!("a zero interval was accepted"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("more than zero"), "{err}");
+        }
     });
 }

@@ -102,8 +102,10 @@ pub trait KeyProvider: Send + Sync + 'static {
     /// [`create`](Self::create) makes it.
     fn key(&self, key: &str) -> Result<std::sync::Arc<dyn KeyProvider>, Error>;
 
-    /// Creates this key at the provider when it doesn't exist yet.
-    fn create(&self) -> BoxFuture<'_, Result<(), Error>>;
+    /// Creates this key at the provider when it doesn't exist yet, and
+    /// answers whether it did: `false` for a key that already existed,
+    /// which skilj must then never delete (docs/architecture.md §230).
+    fn create(&self) -> BoxFuture<'_, Result<bool, Error>>;
 
     /// Deletes this key at the provider, every version of it: whatever it
     /// wrapped can never be unwrapped again.
@@ -354,14 +356,14 @@ impl KeyProvider for InMemoryKeyProvider {
         }))
     }
 
-    fn create(&self) -> BoxFuture<'_, Result<(), Error>> {
+    fn create(&self) -> BoxFuture<'_, Result<bool, Error>> {
         Box::pin(async move {
-            self.keyrings
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(self.key.clone())
-                .or_insert_with(|| Keyring::new(random_bytes::<32>()));
-            Ok(())
+            let mut keyrings = self.keyrings.lock().unwrap_or_else(|e| e.into_inner());
+            if keyrings.contains_key(&self.key) {
+                return Ok(false);
+            }
+            keyrings.insert(self.key.clone(), Keyring::new(random_bytes::<32>()));
+            Ok(true)
         })
     }
 
@@ -404,15 +406,18 @@ impl KeyFileProvider {
         Ok(provider)
     }
 
-    fn create_file(&self) -> Result<(), Error> {
+    /// Creates the file with a fresh key unless it exists; answers whether
+    /// it did.
+    fn create_file(&self) -> Result<bool, Error> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.path.exists() {
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| self.io_error(e))?;
-            }
-            self.write(&Keyring::new(random_bytes::<32>()))?;
+        if self.path.exists() {
+            return Ok(false);
         }
-        Ok(())
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| self.io_error(e))?;
+        }
+        self.write(&Keyring::new(random_bytes::<32>()))?;
+        Ok(true)
     }
 
     /// The file it reads.
@@ -502,7 +507,7 @@ impl KeyProvider for KeyFileProvider {
         }))
     }
 
-    fn create(&self) -> BoxFuture<'_, Result<(), Error>> {
+    fn create(&self) -> BoxFuture<'_, Result<bool, Error>> {
         Box::pin(async move { self.create_file() })
     }
 
