@@ -179,6 +179,8 @@ async fn refused(builder: SkiljBuilder) -> String {
 
 #[derive(Default)]
 struct Transit {
+    /// Stands in for this Vault's key material: another fake's differs.
+    material: String,
     /// The keys that exist besides `skilj`.
     created: Vec<String>,
     /// One entry per version; the "ciphertext" is the plaintext in hex,
@@ -219,11 +221,21 @@ fn decrypt(transit: &Transit, ciphertext: &str) -> Result<Vec<u8>, String> {
     if version < transit.min_decryption {
         return Err("ciphertext or signature version is disallowed by policy (too old)".into());
     }
+    // Another Vault's key under the same path: its material doesn't match.
+    let (material, payload) = payload.split_once('.').ok_or("not a ciphertext")?;
+    if material != transit.material {
+        return Err("cipher: message authentication failed".into());
+    }
     Ok(unhex(payload))
 }
 
 fn encrypt(transit: &Transit, plaintext: &[u8]) -> String {
-    format!("vault:v{}:{}", transit.latest, hex(plaintext))
+    format!(
+        "vault:v{}:{}.{}",
+        transit.latest,
+        transit.material,
+        hex(plaintext)
+    )
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -266,6 +278,7 @@ fn unb64(text: &str) -> Vec<u8> {
 
 async fn serve_transit() -> (String, Fake) {
     let fake: Fake = Arc::new(Mutex::new(Transit {
+        material: generate_token_id(),
         created: Vec::new(),
         latest: 1,
         min_decryption: 1,
@@ -445,6 +458,15 @@ fn the_vault_provider_wraps_rewraps_in_batches_and_is_refused_a_retired_version(
         );
         assert!(calls.contains(&"delete tenant-a".to_string()), "{calls:?}");
         assert!(vault.key("../escape").is_err(), "key names are checked");
+
+        // Another Vault with a key at the same path: the ciphertext is
+        // refused (400), which is the key's verdict on it, not the token's.
+        let (other_address, _) = serve_transit().await;
+        let other = VaultTransitProvider::new(&other_address, "skilj", "test-token");
+        assert!(matches!(
+            other.unwrap(&new).await,
+            Err(encryption::Error::DecryptFailed)
+        ));
 
         // A bad token is a refusal; a provider that isn't there is unavailable.
         let wrong = VaultTransitProvider::new(&address, "skilj", "nope");
@@ -1542,5 +1564,143 @@ fn zero_intervals_are_refused() {
             };
             assert!(err.to_string().contains("more than zero"), "{err}");
         }
+    });
+}
+
+#[test]
+fn another_vault_under_the_same_key_path_refuses_startup_once_checked_per_key() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_vault_material_test").await else {
+            return;
+        };
+        let (address, fake) = serve_transit().await;
+        let vault = || {
+            KeyService::new(VaultTransitProvider::new(&address, "skilj", "test-token"))
+                .with_cache(Duration::ZERO, 0)
+        };
+        let mut contexts = Vec::new();
+        for subject in ["1", "2", "3"] {
+            let bc = insert_bounded_context(&pool).await;
+            seal_for(&pool, &bc, subject, &vault()).await;
+            contexts.push(bc);
+        }
+
+        // Healthy: one key, three contexts, one startup probe.
+        let before = fake
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|c| *c == "decrypt")
+            .count();
+        let (skilj, _) = builder(&url, vault(), quick(Duration::from_secs(3600)))
+            .build()
+            .await
+            .unwrap();
+        drop(skilj);
+        let after = fake
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|c| *c == "decrypt")
+            .count();
+        assert_eq!(
+            after - before,
+            1,
+            "the key is checked once, not per context"
+        );
+
+        // Another Vault with a key at the same path: refused.
+        let (other_address, _) = serve_transit().await;
+        let other = KeyService::new(VaultTransitProvider::new(
+            &other_address,
+            "skilj",
+            "test-token",
+        ));
+        assert_eq!(
+            refused(builder(&url, other, quick(Duration::from_secs(3600)))).await,
+            "encryption_key_material_changed"
+        );
+
+        // Vault unreachable: no verdict, the start goes on.
+        let down = KeyService::new(VaultTransitProvider::new(
+            "http://127.0.0.1:1",
+            "skilj",
+            "t",
+        ));
+        let (skilj, _) = builder(&url, down, quick(Duration::from_secs(3600)))
+            .build()
+            .await
+            .unwrap();
+        drop(skilj);
+        let _ = contexts;
+    });
+}
+
+#[test]
+fn a_deletion_waits_for_a_provisioning_holding_the_key_and_then_finds_its_data_key() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_interleaving_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&pool).await;
+        let (skilj, _) = builder(
+            &url,
+            KeyService::new(InMemoryKeyProvider::new()),
+            quick(Duration::from_secs(3600)),
+        )
+        .build()
+        .await
+        .unwrap();
+        drop(skilj);
+        let keys = KeyService::new(InMemoryKeyProvider::new());
+        db::assign_encryption_key(&pool, &keys, &bc, Some("tenant"), true, None)
+            .await
+            .unwrap();
+        // The context given the default key back, and the deletion due.
+        sqlx::query("DELETE FROM encryption_key_assignments")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE encryption_master_keys SET delete_after = now() - interval '1 minute' \
+             WHERE provider = 'in-memory:tenant'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A provisioning that read the old assignment holds the key's row,
+        // as its insert does, and has not committed yet.
+        let tenant = keys.provider_for(Some("tenant")).unwrap();
+        let wrapped = tenant.wrap(&[7u8; 32]).await.unwrap();
+        let mut provisioning = pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "WITH kept AS (SELECT 1 FROM encryption_master_keys \
+                 WHERE provider = 'in-memory:tenant' FOR SHARE) \
+             INSERT INTO \"bc_{bc}\".encryption_keys \
+             (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \
+              master_key_version) \
+             SELECT 'user', '1', 'active', now(), $1, 'in-memory:tenant', 1 FROM kept"
+        )))
+        .bind(&wrapped.ciphertext)
+        .execute(&mut *provisioning)
+        .await
+        .unwrap();
+
+        // The deletion waits for it...
+        let deletion = {
+            let pool = pool.clone();
+            let keys = keys.clone();
+            let tenant = Arc::clone(&tenant);
+            tokio::spawn(async move { db::delete_unused_key(&pool, &keys, tenant.as_ref()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!deletion.is_finished(), "waits for the provisioning");
+        // ...and once it commits, sees its data key and keeps the key.
+        provisioning.commit().await.unwrap();
+        assert!(!deletion.await.unwrap().unwrap());
+        assert!(tenant.versions().await.is_ok(), "the key is still there");
     });
 }

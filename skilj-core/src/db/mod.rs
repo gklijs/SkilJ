@@ -5998,7 +5998,27 @@ async fn get_or_create_encryption_key_on(
         // on another instance is used from then on.
         let key = master_key::bounded_context_key(&mut *conn, bounded_context).await?;
         let provider = key_service.provider_for(key.as_deref())?;
-        let (data_key, wrapped) = key_service.generate_with(provider.as_ref()).await?;
+        // A bounded context's own key that is gone - the context was given
+        // another key and this one deleted since the assignment was read -
+        // isn't asked to wrap anything (Vault may even create a missing key
+        // on encrypt): the next pass reads the assignment again.
+        if key.is_some() && !master_key::key_recorded(&mut *conn, provider.name()).await? {
+            continue;
+        }
+        let (data_key, wrapped) = match key_service.generate_with(provider.as_ref()).await {
+            Ok(generated) => generated,
+            // The same, found by the provider: try again only when the
+            // assignment did change meanwhile.
+            Err(err)
+                if key.is_some()
+                    && master_key::bounded_context_key(&mut *conn, bounded_context).await?
+                        != key =>
+            {
+                tracing::info!(error = %err, "bounded context's key changed while wrapping; again");
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         let now = Utc::now();
         // A bounded context's own key is stored only while its state row
         // is there, taken `FOR SHARE` in the same statement: a deletion of

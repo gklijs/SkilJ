@@ -162,10 +162,11 @@ pub fn rotate_master_key_field(n: &Naming) -> Field {
 /// `assignMasterKey(boundedContext: String!, key: String, create: Boolean = false): MasterKey!` -
 /// gives the bounded context the provider's key named `key`, or the
 /// default key back when `key` is null, recorded as
-/// `EncryptionKeyAssigned`. With `create`, skilj creates the key first,
-/// and deletes it once no bounded context uses it any more and the grace
-/// period has passed; without, it must exist already and is only ever let
-/// go of. The bounded context's data keys move to it in the background.
+/// `EncryptionKeyAssigned`. With `create`, skilj creates the key first
+/// when it doesn't exist, and only a key it did create is deleted once no
+/// bounded context uses it any more and the grace period has passed; a key
+/// that existed already - created by `create` or not - must and is only
+/// ever let go of. The bounded context's data keys move to it in the background.
 pub fn assign_master_key_field(n: &Naming) -> Field {
     Field::new(
         n.root("assignMasterKey"),
