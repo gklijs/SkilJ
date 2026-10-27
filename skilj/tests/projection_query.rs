@@ -17,9 +17,7 @@ use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use skilj::{
-    CommandType, EncryptionMasterKey, EventType, IdpConfig, Projection, SigningAlgorithm, Skilj,
-};
+use skilj::{CommandType, EventType, IdpConfig, Projection, SigningAlgorithm, Skilj};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
@@ -1566,7 +1564,9 @@ fn keyed_projection_decrypt_on_read_end_to_end() {
             .event_type::<AccountOpened>()
             .projection::<CustomerProfile>()
             .reconciliation_role(admin_subject)
-            .encryption_master_key(EncryptionMasterKey::from_bytes([7u8; 32]))
+            .key_provider(skilj_core::encryption::InMemoryKeyProvider::from_bytes(
+                [7u8; 32],
+            ))
             .build()
             .await
             .unwrap();

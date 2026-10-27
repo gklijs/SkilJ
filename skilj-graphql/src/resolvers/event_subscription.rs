@@ -677,7 +677,7 @@ async fn deliver_batch(
             &event.event_type.sensitive_fields,
             &event.payload,
             &fresh_mapping,
-            state.encryption_master_key.as_ref(),
+            state.key_service.as_ref(),
             &mut data_keys,
         )
         .await?;

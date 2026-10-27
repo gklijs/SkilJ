@@ -14,8 +14,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use skilj::{
-    normalize, BlindErasure, BlindIndexKey, BlindTag, CommandType, EncryptionMasterKey, EventType,
-    IdpConfig, SigningAlgorithm, Skilj, SkiljBuilder,
+    normalize, BlindErasure, BlindIndexKey, BlindTag, CommandType, EventType, IdpConfig,
+    KeyService, SigningAlgorithm, Skilj, SkiljBuilder,
 };
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
@@ -219,8 +219,10 @@ fn now() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now().trunc_subsecs(6)
 }
 
-fn master_key() -> EncryptionMasterKey {
-    EncryptionMasterKey::from_bytes([7; 32])
+fn master_key() -> KeyService {
+    KeyService::new(skilj_core::encryption::InMemoryKeyProvider::from_bytes(
+        [7; 32],
+    ))
 }
 
 fn blind_key() -> BlindIndexKey {
@@ -305,7 +307,7 @@ fn customer_instance(database_url: &str, bc: &str) -> SkiljBuilder {
         .event_type::<EmailReleased>()
         .command_type::<RegisterCustomer>()
         .command_type::<ChangeEmail>()
-        .encryption_master_key(master_key())
+        .key_service(master_key())
 }
 
 struct Crm {
@@ -761,7 +763,7 @@ fn startup_refuses_a_different_blind_index_key_and_records_a_missing_fingerprint
                 .event_type::<EmailReleased>()
                 .command_type::<RegisterCustomer>()
                 .command_type::<ChangeEmail>()
-                .encryption_master_key(master_key())
+                .key_service(master_key())
                 .blind_tag::<ErasedEmail>()
                 .blind_index_key(key)
                 .build()

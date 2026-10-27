@@ -12,7 +12,7 @@
 //! What this module reuses from the personal-data path, deliberately, rather
 //! than inventing a second crypto scheme: the same envelope encryption
 //! (`crate::encryption` - a per-version `DataKey` wrapped under the
-//! process-wide [`crate::encryption::EncryptionMasterKey`]) and the same
+//! process-wide [`crate::encryption::KeyService`]) and the same
 //! irreversible crypto-shredding (`db::destroy_encryption_key` nulls the
 //! wrapped key, so even someone holding the master key can no longer recover
 //! it). A secret version is provisioned under the `"secret"` subject

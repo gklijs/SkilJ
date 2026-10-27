@@ -1799,9 +1799,7 @@ fn parked_requests_are_masked_and_scoped_per_caller() {
 
         let (skilj, _) = Skilj::builder(database_url)
             .pool_options(db::PgPoolOptions::new().max_connections(4))
-            .encryption_master_key(skilj_core::encryption::EncryptionMasterKey::from_bytes(
-                [7; 32],
-            ))
+            .key_provider(skilj_core::encryption::InMemoryKeyProvider::from_bytes([7; 32]))
             .identity_provider(IdpConfig::new(
                 jwks_url.parse().unwrap(),
                 TEST_ISSUER,

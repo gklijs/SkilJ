@@ -180,6 +180,23 @@ pub struct LocalPostgres {
     cleanup: bool,
 }
 
+/// `<data_dir>.keys.json`: where local mode keeps the encryption master
+/// key, for a [`KeyFileProvider`](crate::KeyFileProvider) - next to the
+/// data it protects, owner-only, created on first use
+/// (docs/architecture.md §230):
+///
+/// ```no_run
+/// # fn example(config: &skilj::local::LocalConfig) -> Result<(), skilj_core::encryption::Error> {
+/// let keys = skilj::KeyFileProvider::open(skilj::local::key_file(&config.data_dir))?;
+/// # let _ = keys; Ok(()) }
+/// ```
+///
+/// Deleting the data directory without it is fine; deleting it without
+/// the data directory makes every sensitive field in that data unreadable.
+pub fn key_file(data_dir: &Path) -> PathBuf {
+    data_dir.with_extension("keys.json")
+}
+
 /// `<data_dir>.pgpass` - outside `data_dir`, because `initdb` refuses a
 /// directory that already has anything in it.
 pub fn password_file(data_dir: &Path) -> PathBuf {

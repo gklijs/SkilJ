@@ -34,7 +34,7 @@ use skilj_core::access_control::{
 };
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, AccessTokenKind, Pool};
-use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::encryption::{InMemoryKeyProvider, KeyService};
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{
     AckMode, BoundedContext, BoundedContextStatus, CommandType, CursorUpdate, EncryptionKeyStatus,
@@ -2138,7 +2138,7 @@ fn get_or_create_encryption_key_provisions_once_then_reuses_the_same_row() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([1u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([1u8; 32]));
 
         let (first, first_id, _data_key) =
             db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
@@ -2186,7 +2186,7 @@ fn destroy_encryption_key_is_irreversible_and_a_later_provision_is_a_new_key() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([2u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([2u8; 32]));
 
         let (_key, original_id, _data_key) =
             db::get_or_create_encryption_key(&pool, &bc.name, "user", "7", &master)
@@ -2225,7 +2225,7 @@ fn get_active_data_key_round_trips_a_provisioned_key() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([3u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([3u8; 32]));
 
         let (_key, _id, provisioned) =
             db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
@@ -2251,7 +2251,7 @@ fn get_active_data_key_is_none_for_an_unknown_subject() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([4u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([4u8; 32]));
         assert!(
             db::get_active_data_key(&pool, &bc.name, "user", "nope", &master)
                 .await
@@ -2272,7 +2272,7 @@ fn get_active_data_key_is_none_for_a_destroyed_key() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([5u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([5u8; 32]));
 
         db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
             .await
@@ -2300,7 +2300,7 @@ fn list_active_data_keys_for_subject_value_finds_every_namespace_for_a_subject()
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([6u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([6u8; 32]));
 
         // Two different subject_key namespaces, the same subject_value -
         // both are real candidates for a projection instance keyed "42".
@@ -2341,7 +2341,7 @@ fn list_active_data_keys_for_subject_value_excludes_a_destroyed_key() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([7u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([7u8; 32]));
 
         db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
             .await
@@ -2385,7 +2385,7 @@ fn list_active_data_keys_for_subject_value_errors_when_master_key_missing_but_a_
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([8u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([8u8; 32]));
 
         db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
             .await
@@ -2418,7 +2418,7 @@ fn resolve_data_keys_for_reading_records_a_forgotten_subject_as_a_miss() {
             can_read_sensitive: true,
             ..seed_active_role_access_mapping(&pool, &role, &bc, AccessLevel::Read).await
         };
-        let master = EncryptionMasterKey::from_bytes([9u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([9u8; 32]));
         let sensitive_fields = [skilj_core::shared::SensitiveField {
             field: "email".into(),
             subject_key: "user".into(),
@@ -2649,7 +2649,7 @@ fn get_or_create_encryption_key_survives_a_key_vanishing_mid_provision() {
         .await
         .unwrap();
 
-        let master = EncryptionMasterKey::from_bytes([4u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([4u8; 32]));
         let (key, _id, _data_key) =
             db::get_or_create_encryption_key(&pool, &bc.name, "user", "7", &master)
                 .await
@@ -2693,7 +2693,7 @@ fn put_secret_value_rotates_and_shreds_the_previous_version_key() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([21u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([21u8; 32]));
         let role = seed_role(&pool, false).await;
         let name = "github-oauth-refresh";
 
@@ -2771,7 +2771,7 @@ fn fetch_secret_value_refuses_an_adapter_without_a_grant() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([22u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([22u8; 32]));
         let granted = seed_role(&pool, false).await;
         let stranger = seed_role(&pool, false).await;
         let name = "payments-api-key";
@@ -2808,7 +2808,7 @@ fn revoke_secret_shreds_and_ends_the_active_version() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([23u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([23u8; 32]));
         let role = seed_role(&pool, false).await;
         let name = "expired-oauth-token";
 
@@ -2864,7 +2864,7 @@ fn secret_metadata_never_carries_the_value() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([24u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([24u8; 32]));
         let name = "stripe-secret";
 
         db::put_secret_value(
@@ -2903,7 +2903,7 @@ fn fetch_secret_value_records_a_last_read_summary() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([25u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([25u8; 32]));
         let role = seed_role(&pool, false).await;
         let name = "audit-me";
 
@@ -2954,7 +2954,7 @@ fn secret_value_is_ciphertext_at_rest() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([26u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([26u8; 32]));
         let name = "at-rest";
 
         db::put_secret_value(
@@ -2992,7 +2992,7 @@ fn concurrent_rotations_of_one_secret_serialize() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([27u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([27u8; 32]));
         let name = "concurrent-rotation";
         let value_a = skilj_core::secrets::SecretValue::new("a");
         let value_b = skilj_core::secrets::SecretValue::new("b");
@@ -3026,7 +3026,7 @@ fn destroy_encryption_key_refuses_a_secret_version_key() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([28u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([28u8; 32]));
         let role = seed_role(&pool, false).await;
         let name = "linkedin-oauth";
 
@@ -3076,7 +3076,7 @@ fn get_or_create_encryption_key_refuses_the_secrets_namespace() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([29u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([29u8; 32]));
 
         match db::get_or_create_encryption_key(
             &pool,
@@ -3105,7 +3105,7 @@ fn get_active_data_key_refuses_the_secrets_namespace() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([30u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([30u8; 32]));
         let name = "unwrap-door";
         db::put_secret_value(
             &pool,
@@ -3148,7 +3148,7 @@ fn list_active_data_keys_for_subject_value_excludes_the_secrets_namespace() {
             return;
         };
         let bc = seed_bounded_context(&pool).await;
-        let master = EncryptionMasterKey::from_bytes([31u8; 32]);
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([31u8; 32]));
         let name = "shadowed";
         let subject_value = secret_subject(name, 1);
 

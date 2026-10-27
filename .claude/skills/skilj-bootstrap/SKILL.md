@@ -77,20 +77,39 @@ This is where the `skilj` skill picks up - which trait to implement for
 a new `EventType`/`CommandType`/`Projection`, `#[auto_register]`, and
 what a rejected registration's error actually means.
 
-## Secrets the builder needs before the first deploy
+## Keys the builder needs before the first deploy
 
-Two keys, both `[u8; 32]`, both identical on every instance and never
-changed casually - generate them once and keep them in the secret store:
-
-- `.encryption_master_key(...)` when any type has `sensitive_fields()` -
-  without it, writing a sensitive payload is refused with
+- `.key_provider(...)` when any type has `sensitive_fields()` - where the
+  encryption master key lives (`docs/architecture.md` §230). Without one,
+  writing a sensitive payload is refused with
   `encryption_master_key_not_configured`.
-- `.blind_index_key(...)` when any `BlindTag` is declared (a uniqueness
-  rule on personal data) - `build()` refuses a `BlindTag` without it,
-  and an instance missing the `BlindTag` refuses those commands with
-  `blind_tag_not_declared`. Startup refuses a key other than the one
-  already used (`blind_index_key_changed`); a leaked one is rotated with
-  `previous_blind_index_keys`. The `skilj-uniqueness` skill covers it.
+  - Production: `VaultTransitProvider::from_env("skilj")` (reads `VAULT_ADDR`
+    and `VAULT_TOKEN` or `VAULT_TOKEN_FILE`), a Vault or OpenBao Transit key
+    created with `vault write -f transit/keys/skilj`. The key never enters
+    the process.
+  - Local / quick start: `KeyFileProvider::open(path)` - a key file skilj
+    creates on first use; with local mode, `skilj::local::key_file(&data_dir)`
+    puts it next to the data. Losing the file loses every sensitive field.
+  - Rotation: `.master_key_rotation(MasterKeyRotation::new().every(..).retire_after(..))`
+    for a schedule, and the superadmin mutation
+    `rotateEncryptionMasterKey(retireImmediately: true)` for a leak. Each
+    instance rewraps the data keys in the background and retires the old
+    version at the provider after the grace period (30 days by default) -
+    then it no longer unwraps anything, a backup taken before included.
+    All of it is recorded as `EncryptionMasterKeyRotated`,
+    `EncryptionDataKeysRewrapped` and `EncryptionMasterKeyRetired` events in
+    the `admin` context; `encryptionMasterKey` shows where it stands.
+  - Upgrading data from before key providers: also configure
+    `.legacy_encryption_master_key(EncryptionMasterKey::from_bytes(old))`
+    until the background task has moved those data keys to the provider;
+    startup refuses without it (`encryption_legacy_master_key_required`).
+- `.blind_index_key(...)`, a `[u8; 32]` identical on every instance, when
+  any `BlindTag` is declared (a uniqueness rule on personal data) -
+  `build()` refuses a `BlindTag` without it, and an instance missing the
+  `BlindTag` refuses those commands with `blind_tag_not_declared`. Startup
+  refuses a key other than the one already used (`blind_index_key_changed`);
+  a leaked one is rotated with `previous_blind_index_keys`. The
+  `skilj-uniqueness` skill covers it.
 
 ## `.identity_provider(...)` is a separate axis, easy to conflate with the above
 

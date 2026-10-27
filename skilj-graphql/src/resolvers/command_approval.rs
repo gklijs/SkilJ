@@ -66,7 +66,7 @@ async fn render_proposal(
         &command_type.sensitive_fields,
         &proposal.payload,
         access_mapping,
-        state.encryption_master_key.as_ref(),
+        state.key_service.as_ref(),
         &mut data_keys,
     )
     .await?;
@@ -212,7 +212,7 @@ pub fn approve_command_field(n: &Naming) -> Field {
                     &bounded_context_name,
                     &proposal_id,
                     &access_mapping,
-                    state.encryption_master_key.as_ref(),
+                    state.key_service.as_ref(),
                     Utc::now(),
                 )
                 .await

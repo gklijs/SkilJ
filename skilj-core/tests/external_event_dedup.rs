@@ -14,7 +14,7 @@ use chrono::Utc;
 use skilj_core::access_control::{self, DirectCreationToken, ExternalEventToken, TokenStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, CreateExternalEventOutcome, DedupeCursor, ExternalEventDedupe, Pool};
-use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::encryption::{InMemoryKeyProvider, KeyService};
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{
@@ -574,7 +574,7 @@ fn a_refused_submission_provisions_no_encryption_key() {
             ..seed_order_placed_event_type(&pool, &bc).await
         };
         db::upsert_event_type(&pool, &et).await.unwrap();
-        let master_key = EncryptionMasterKey::from_bytes([7u8; 32]);
+        let master_key = KeyService::new(InMemoryKeyProvider::from_bytes([7u8; 32]));
         let broadcaster = EventBroadcaster::new(16);
         let event_cache = EventCache::new(1000);
         let active = adapter(et, "adapter-1");

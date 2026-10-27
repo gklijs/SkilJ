@@ -28,7 +28,7 @@ mod stream_gen;
 use opentelemetry::metrics::Histogram;
 use skilj_core::access_control::RevocationBroadcaster;
 use skilj_core::db::Pool;
-use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::encryption::KeyService;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::EventBroadcaster;
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher, SnapshotDispatcher};
@@ -98,10 +98,10 @@ pub struct GraphqlState {
     pub limits: limits::GraphqlLimits,
     /// `submitCommand`'s own bridge into `protect_sensitive_fields` for
     /// the events/command it produces (§SubjectErasure) - the identical
-    /// `Option<EncryptionMasterKey>` `Skilj::rest_router()` hands its own
+    /// `Option<KeyService>` `Skilj::rest_router()` hands its own
     /// event-creation routes, reused here for the same reason
     /// `dispatcher`/`projection_dispatcher` above are.
-    pub encryption_master_key: Option<EncryptionMasterKey>,
+    pub key_service: Option<KeyService>,
     /// `EventSubscription`'s own real-time delivery source
     /// (`resolvers::event_subscription`) - the identical `EventBroadcaster`
     /// `Skilj::rest_router()` hands its own event-creation routes to

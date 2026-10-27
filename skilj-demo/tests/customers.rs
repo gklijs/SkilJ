@@ -6,7 +6,7 @@
 //! the generated `BlindTag`, blind tag mappings and sensitive fields
 //! compile and work against a real Postgres.
 
-use skilj::{BlindIndexKey, EncryptionMasterKey, Skilj};
+use skilj::{BlindIndexKey, KeyService, Skilj};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool, SubmitCommandOutcome};
@@ -82,8 +82,10 @@ fn now() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now().trunc_subsecs(6)
 }
 
-fn master_key() -> EncryptionMasterKey {
-    EncryptionMasterKey::from_bytes([5; 32])
+fn master_key() -> KeyService {
+    KeyService::new(skilj_core::encryption::InMemoryKeyProvider::from_bytes(
+        [5; 32],
+    ))
 }
 
 struct Customers {
@@ -155,7 +157,7 @@ async fn customers() -> Option<Customers> {
     // so reconciliation skips them).
     let (skilj, _) = Skilj::builder(database_url)
         .auto_register()
-        .encryption_master_key(master_key())
+        .key_service(master_key())
         .blind_index_key(BlindIndexKey::from_bytes([9; 32]))
         .reconciliation_role(role.external_subject)
         .build()

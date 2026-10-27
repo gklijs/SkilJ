@@ -31,6 +31,14 @@
 //! `migrations/0001_init.sql`'s own doc comment for the full list of
 //! what's deliberately not here yet (`EncryptionKey`).
 
+mod master_key;
+pub use master_key::{
+    bounded_contexts_behind, check_data_key_wraps, data_keys_behind, mark_data_keys_behind,
+    mark_data_keys_rewrapped, master_key_state, register_master_key_event_types,
+    retire_master_key_versions, rewrap_data_keys, rotate_master_key, DataKeyWraps, MasterKeyState,
+    RewrapOutcome, Rotation,
+};
+
 use crate::access_control::{
     AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
     ExternalEventToken, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
@@ -38,7 +46,7 @@ use crate::access_control::{
 use crate::access_trail::{fold_access_events, AccessChange, AccessEventKind, AccessEventRecord};
 use crate::approvals::{CommandApprovalPolicy, CommandProposal, CommandProposalStatus};
 use crate::bootstrap::ContextCreator;
-use crate::encryption::{self, DataKey, EncryptionMasterKey};
+use crate::encryption::{self, DataKey, KeyService};
 use crate::event_store::{
     AckMode, BoundedContext, BoundedContextStatus, Command, CommandType, CursorUpdate,
     EncryptionKey, EncryptionKeyStatus, Event, EventOrigin, EventType, MissedOccurrencePolicy,
@@ -445,8 +453,17 @@ fn access_level_from_str(s: &str) -> AccessLevel {
 /// time it reaches here. For the quoting to actually be that second line
 /// of defence, an embedded `"` is doubled (Postgres's own escape inside a
 /// quoted identifier) rather than left to close the identifier early.
-fn schema_ident(bounded_context: &str) -> String {
+pub(crate) fn schema_ident(bounded_context: &str) -> String {
     format!("\"bc_{}\"", bounded_context.replace('"', "\"\""))
+}
+
+/// Whether `err` is a bounded context's schema or table gone: deleted
+/// since it was listed (docs/architecture.md §157).
+pub(crate) fn is_missing_schema(err: &crate::error::Error) -> bool {
+    matches!(err, crate::error::Error::Database(e) if e
+        .as_database_error()
+        .and_then(|d| d.code())
+        .is_some_and(|code| code == "42P01" || code == "3F000"))
 }
 
 /// `value` as a SQL string literal.
@@ -577,7 +594,9 @@ async fn provision_bounded_context_schema(
             created_at TIMESTAMPTZ NOT NULL,
             destroyed_at TIMESTAMPTZ,
             wrapped_key BYTEA,
-            wrap_nonce BYTEA
+            wrap_nonce BYTEA,
+            key_provider TEXT,
+            master_key_version INTEGER
         )"
     )))
     .execute(&mut **tx)
@@ -585,6 +604,11 @@ async fn provision_bounded_context_schema(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE UNIQUE INDEX encryption_keys_unique_active ON {schema}.encryption_keys \
          (subject_key, subject_value) WHERE status = 'active'"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(encryption_keys_master_key_index_ddl(
+        &schema,
     )))
     .execute(&mut **tx)
     .await?;
@@ -2563,6 +2587,48 @@ pub async fn ensure_blind_tags_table<'e>(
     Ok(())
 }
 
+/// The index startup's checks, the rewrap and the retirement check read
+/// `encryption_keys` through (docs/architecture.md §230): the active rows
+/// by provider and master key version, so "is anything still wrapped by
+/// another provider, or below this version" is a few index probes.
+fn encryption_keys_master_key_index_ddl(schema: &str) -> String {
+    format!(
+        "CREATE INDEX encryption_keys_master_key ON {schema}.encryption_keys \
+         (key_provider, master_key_version, id) WHERE status = 'active'"
+    )
+}
+
+/// `encryption_keys.key_provider`/`master_key_version` and their index
+/// (docs/architecture.md §230), for a bounded context provisioned before
+/// them. Rows already there keep `NULL`: wrapped by the legacy raw master
+/// key. A call that finds them there takes no table lock (§158).
+pub async fn ensure_encryption_key_provider_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "encryption_keys",
+        &["key_provider", "master_key_version"],
+        format!(
+            "ALTER TABLE {schema}.encryption_keys \
+             ADD COLUMN IF NOT EXISTS key_provider TEXT, \
+             ADD COLUMN IF NOT EXISTS master_key_version INTEGER"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "encryption_keys_master_key",
+        encryption_keys_master_key_index_ddl(&schema),
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Records `declaration` as one of `bounded_context`'s blind tags
 /// (docs/architecture.md §205), or checks it against the stored one: the
 /// normalizer version must match, and the key fingerprint too when both
@@ -3000,6 +3066,7 @@ pub async fn make_bounded_context_current(
     ensure_consistency_query_column(pool, &bounded_context.name).await?;
     ensure_event_tags_index(pool, &bounded_context.name).await?;
     ensure_blind_tags_table(pool, &bounded_context.name).await?;
+    ensure_encryption_key_provider_columns(pool, &bounded_context.name).await?;
     drop_events_by_tags_index(pool, &bounded_context.name).await?;
     current_bounded_contexts()
         .lock()
@@ -4459,7 +4526,7 @@ pub async fn fire_system_event(
     event_type_name: &str,
     occurrence_at: DateTime<Utc>,
     now: DateTime<Utc>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
 ) -> crate::error::Result<Option<Event>> {
     let Some(unlocked_event_type) = get_event_type(pool, bounded_context, event_type_name).await?
     else {
@@ -4475,7 +4542,7 @@ pub async fn fire_system_event(
         bounded_context,
         &unlocked_event_type.sensitive_fields,
         &payload,
-        encryption_master_key,
+        key_service,
         &mut resolved,
     )
     .await?;
@@ -4754,7 +4821,7 @@ pub async fn propose_command(
     authorised: &crate::event_store::CommandAuthorised,
     policy: &CommandApprovalPolicy,
     idempotency_key: Option<&str>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandProposal> {
     let bounded_context_name = &command_type.bounded_context.name;
@@ -4766,7 +4833,7 @@ pub async fn propose_command(
         bounded_context_name,
         &command_type.sensitive_fields,
         &authorised.payload,
-        encryption_master_key,
+        key_service,
         &mut resolved,
     )
     .await?;
@@ -5288,7 +5355,7 @@ pub async fn reveal_command_proposal_payload(
     pool: &Pool,
     command_type: &CommandType,
     proposal: &CommandProposal,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
 ) -> crate::error::Result<String> {
     let subjects = crate::event_store::sensitive_field_subjects(
         &command_type.sensitive_fields,
@@ -5297,7 +5364,7 @@ pub async fn reveal_command_proposal_payload(
     if subjects.is_empty() {
         return Ok(proposal.payload.clone());
     }
-    let master_key = encryption_master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+    let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?;
     let mut keys: std::collections::HashMap<(String, String), Option<DataKey>> =
         std::collections::HashMap::new();
     for (subject_key, subject_value) in subjects {
@@ -5306,7 +5373,7 @@ pub async fn reveal_command_proposal_payload(
             &proposal.bounded_context.name,
             &subject_key,
             &subject_value,
-            master_key,
+            key_service,
         )
         .await?;
         keys.insert((subject_key, subject_value), key);
@@ -5542,7 +5609,7 @@ pub async fn propose_if_approval_required(
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
     idempotency_key: &str,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: DateTime<Utc>,
 ) -> crate::error::Result<bool> {
     let bounded_context = &command_type.bounded_context.name;
@@ -5575,7 +5642,7 @@ pub async fn propose_if_approval_required(
         &authorised,
         &policy,
         Some(idempotency_key),
-        encryption_master_key,
+        key_service,
         now,
     )
     .await?;
@@ -5613,7 +5680,7 @@ pub async fn approve_command_proposal(
     bounded_context: &str,
     id: &str,
     approver: &RoleAccessMapping,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandApprovalOutcome> {
     let proposal = claim_command_proposal(
@@ -5636,13 +5703,8 @@ pub async fn approve_command_proposal(
                 return Err(crate::error::Error::row_not_found());
             }
         };
-    let payload = match reveal_command_proposal_payload(
-        pool,
-        &command_type,
-        &proposal,
-        encryption_master_key,
-    )
-    .await
+    let payload = match reveal_command_proposal_payload(pool, &command_type, &proposal, key_service)
+        .await
     {
         Ok(payload) => payload,
         Err(e) => {
@@ -5699,7 +5761,7 @@ pub async fn approve_command_proposal(
         &proposal.metadata.client_id,
         proposal.metadata.correlation_id.as_deref(),
         proposal.metadata.causation_id.as_deref(),
-        encryption_master_key,
+        key_service,
         now,
         Some(&idempotency_key),
         None,
@@ -5821,6 +5883,11 @@ struct EncryptionKeyRow {
     destroyed_at: Option<DateTime<Utc>>,
     wrapped_key: Option<Vec<u8>>,
     wrap_nonce: Option<Vec<u8>>,
+    /// The key provider that wrapped it (docs/architecture.md §230),
+    /// `NULL` for one wrapped by the legacy raw master key.
+    key_provider: Option<String>,
+    /// The master key version it is wrapped under, `NULL` for a legacy one.
+    master_key_version: Option<i32>,
 }
 
 impl EncryptionKeyRow {
@@ -5836,8 +5903,8 @@ impl EncryptionKeyRow {
     }
 }
 
-const ENCRYPTION_KEY_COLUMNS: &str =
-    "id, subject_key, subject_value, status, created_at, destroyed_at, wrapped_key, wrap_nonce";
+const ENCRYPTION_KEY_COLUMNS: &str = "id, subject_key, subject_value, status, created_at, \
+     destroyed_at, wrapped_key, wrap_nonce, key_provider, master_key_version";
 
 /// `event_store::protect_sensitive_fields`'s own get-or-create - "each key
 /// provisioned exactly once... idempotent... repeat calls find the key
@@ -5869,7 +5936,7 @@ pub async fn get_or_create_encryption_key(
     bounded_context: &str,
     subject_key: &str,
     subject_value: &str,
-    master_key: &EncryptionMasterKey,
+    key_service: &KeyService,
 ) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
     if secrets::is_reserved_subject_key(subject_key) {
         return Err(secrets::Error::ReservedSubjectKey.into());
@@ -5880,7 +5947,7 @@ pub async fn get_or_create_encryption_key(
         bc,
         subject_key,
         subject_value,
-        master_key,
+        key_service,
     )
     .await
 }
@@ -5896,7 +5963,7 @@ async fn get_or_create_encryption_key_on(
     bc: BoundedContext,
     subject_key: &str,
     subject_value: &str,
-    master_key: &EncryptionMasterKey,
+    key_service: &KeyService,
 ) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
     let bounded_context = bc.name.clone();
     let bounded_context = bounded_context.as_str();
@@ -5915,24 +5982,26 @@ async fn get_or_create_encryption_key_on(
             get_active_encryption_key_row(&mut *conn, bounded_context, subject_key, subject_value)
                 .await?
         {
-            let data_key = unwrap_row(master_key, &row)?;
+            let data_key = unwrap_row(key_service, &row).await?;
             return Ok((row.to_domain(bc), row.id, data_key));
         }
 
-        let (data_key, wrapped, nonce) = encryption::generate_and_wrap_data_key(master_key);
+        let (data_key, wrapped) = key_service.generate().await?;
         let now = Utc::now();
         let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.encryption_keys \
-             (subject_key, subject_value, status, created_at, wrapped_key, wrap_nonce) \
-             VALUES ($1, $2, 'active', $3, $4, $5) \
+             (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \
+             master_key_version) \
+             VALUES ($1, $2, 'active', $3, $4, $5, $6) \
              ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \
              RETURNING {ENCRYPTION_KEY_COLUMNS}"
         )))
         .bind(subject_key)
         .bind(subject_value)
         .bind(now)
-        .bind(&wrapped)
-        .bind(&nonce)
+        .bind(&wrapped.ciphertext)
+        .bind(key_service.provider_name())
+        .bind(version_column(wrapped.version)?)
         .fetch_optional(&mut *conn)
         .await?;
 
@@ -5946,19 +6015,36 @@ async fn get_or_create_encryption_key_on(
     Err(crate::error::Error::row_not_found())
 }
 
-fn unwrap_row(
-    master_key: &EncryptionMasterKey,
+/// A master key version as the `master_key_version` column stores it.
+fn version_column(version: u32) -> crate::error::Result<i32> {
+    i32::try_from(version).map_err(|_| {
+        encryption::Error::ProviderRefused {
+            provider: "?".into(),
+            message: format!("master key version {version} is out of range"),
+        }
+        .into()
+    })
+}
+
+/// The data key an active row holds, through the key service
+/// (docs/architecture.md §230): the provider that wrapped it, or the legacy
+/// master key for a row from before providers.
+async fn unwrap_row(
+    key_service: &KeyService,
     row: &EncryptionKeyRow,
 ) -> crate::error::Result<DataKey> {
     let wrapped = row
         .wrapped_key
         .as_deref()
         .expect("an active encryption_keys row always still has its wrapped key");
-    let nonce = row
-        .wrap_nonce
-        .as_deref()
-        .expect("an active encryption_keys row always still has its wrap nonce");
-    Ok(encryption::unwrap_data_key(master_key, wrapped, nonce)?)
+    Ok(key_service
+        .unwrap(encryption::StoredWrap {
+            provider: row.key_provider.as_deref(),
+            version: row.master_key_version.and_then(|v| u32::try_from(v).ok()),
+            ciphertext: wrapped,
+            nonce: row.wrap_nonce.as_deref(),
+        })
+        .await?)
 }
 
 /// The pre-resolution step every `event_store::protect_sensitive_fields`
@@ -5971,10 +6057,10 @@ fn unwrap_row(
 /// and the events it produces, in `process_command`'s case) calls this
 /// once per payload, accumulating into the same map, so a shared subject
 /// resolves to the identical `EncryptionKey` everywhere, exactly as the
-/// spec requires. A no-op, no `master_key` needed, when `sensitive_fields`
+/// spec requires. A no-op, no `key_service` needed, when `sensitive_fields`
 /// is empty or names no subjects actually present in `payload` - the
 /// identical "empty is a no-op" register `protect_sensitive_fields`
-/// itself is in. `master_key: None` with something to resolve is a real,
+/// itself is in. `key_service: None` with something to resolve is a real,
 /// actionable configuration error, not a silent skip.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn resolve_encryption_keys(
@@ -5982,14 +6068,14 @@ pub async fn resolve_encryption_keys(
     bounded_context: &str,
     sensitive_fields: &[SensitiveField],
     payload: &str,
-    master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
 ) -> crate::error::Result<()> {
     let subjects = crate::event_store::sensitive_field_subjects(sensitive_fields, payload);
     if subjects.is_empty() {
         return Ok(());
     }
-    let master_key = master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+    let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?;
     for (subject_key, subject_value) in subjects {
         if resolved.contains_key(&(subject_key.clone(), subject_value.clone())) {
             continue;
@@ -5999,7 +6085,7 @@ pub async fn resolve_encryption_keys(
             bounded_context,
             &subject_key,
             &subject_value,
-            master_key,
+            key_service,
         )
         .await?;
         resolved.insert((subject_key, subject_value), provisioned);
@@ -6019,8 +6105,8 @@ pub async fn resolve_encryption_keys(
 /// Unlike the write side, this **filters by
 /// `event_store::sensitive_field_is_granted` first** - only a subject
 /// this caller is actually granted decrypt access to is ever looked up,
-/// so an unauthorised caller's query needs no `master_key` at all, no
-/// matter how many sensitive fields the payload declares. `master_key:
+/// so an unauthorised caller's query needs no `key_service` at all, no
+/// matter how many sensitive fields the payload declares. `key_service:
 /// None` with at least one *granted* subject to resolve is a real,
 /// actionable configuration error (confirmed via `AskUserQuestion` before
 /// building - mirrors `resolve_encryption_keys`'s own identical
@@ -6041,7 +6127,7 @@ pub async fn resolve_data_keys_for_reading(
     sensitive_fields: &[SensitiveField],
     payload: &str,
     access_mapping: &crate::access_control::RoleAccessMapping,
-    master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     resolved: &mut std::collections::HashMap<(String, String), Option<DataKey>>,
 ) -> crate::error::Result<()> {
     let granted_subjects: Vec<(String, String)> =
@@ -6054,7 +6140,7 @@ pub async fn resolve_data_keys_for_reading(
     if granted_subjects.is_empty() {
         return Ok(());
     }
-    let master_key = master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+    let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?;
     for (subject_key, subject_value) in granted_subjects {
         if resolved.contains_key(&(subject_key.clone(), subject_value.clone())) {
             continue;
@@ -6064,7 +6150,7 @@ pub async fn resolve_data_keys_for_reading(
             bounded_context,
             &subject_key,
             &subject_value,
-            master_key,
+            key_service,
         )
         .await?;
         resolved.insert((subject_key, subject_value), data_key);
@@ -6152,7 +6238,7 @@ pub async fn get_active_data_key(
     bounded_context: &str,
     subject_key: &str,
     subject_value: &str,
-    master_key: &EncryptionMasterKey,
+    key_service: &KeyService,
 ) -> crate::error::Result<Option<DataKey>> {
     if secrets::is_reserved_subject_key(subject_key) {
         return Err(secrets::Error::ReservedSubjectKey.into());
@@ -6162,7 +6248,7 @@ pub async fn get_active_data_key(
         bounded_context,
         subject_key,
         subject_value,
-        master_key,
+        key_service,
     )
     .await
 }
@@ -6175,10 +6261,10 @@ async fn get_active_data_key_on(
     bounded_context: &str,
     subject_key: &str,
     subject_value: &str,
-    master_key: &EncryptionMasterKey,
+    key_service: &KeyService,
 ) -> crate::error::Result<Option<DataKey>> {
     match get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value).await? {
-        Some(row) => Ok(Some(unwrap_row(master_key, &row)?)),
+        Some(row) => Ok(Some(unwrap_row(key_service, &row).await?)),
         None => Ok(None),
     }
 }
@@ -6192,10 +6278,10 @@ async fn get_active_data_key_on(
 /// namespace with an active key for it is a real candidate (see
 /// `encryption::decrypt_ciphertext_leaves`'s own doc comment for why
 /// trying more than one candidate is safe, not a heuristic). Empty when
-/// nothing matches - no `master_key` needed at all in that case, the
+/// nothing matches - no `key_service` needed at all in that case, the
 /// identical "nothing to resolve, no key required" property
 /// `resolve_data_keys_for_reading` already has. A **non-empty** match
-/// with `master_key: None` is the identical hard, actionable
+/// with `key_service: None` is the identical hard, actionable
 /// configuration error `resolve_encryption_keys`/`resolve_data_keys_for_reading`
 /// already raise for the same underlying reason - confirmed with the
 /// user before building real decrypt-on-read at all.
@@ -6209,7 +6295,7 @@ pub async fn list_active_data_keys_for_subject_value(
     pool: &Pool,
     bounded_context: &str,
     subject_value: &str,
-    master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
 ) -> crate::error::Result<Vec<DataKey>> {
     let schema = schema_ident(bounded_context);
     let rows: Vec<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -6223,8 +6309,12 @@ pub async fn list_active_data_keys_for_subject_value(
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let master_key = master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
-    rows.iter().map(|row| unwrap_row(master_key, row)).collect()
+    let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+    let mut data_keys = Vec::with_capacity(rows.len());
+    for row in &rows {
+        data_keys.push(unwrap_row(key_service, row).await?);
+    }
+    Ok(data_keys)
 }
 
 /// Persists `forget_subject`'s outcome - real crypto-shredding, not just
@@ -6534,7 +6624,7 @@ pub async fn put_secret_value(
     name: &str,
     plaintext: &SecretValue,
     expires_at: Option<DateTime<Utc>>,
-    master_key: &EncryptionMasterKey,
+    key_service: &KeyService,
     now: DateTime<Utc>,
 ) -> crate::error::Result<Secret> {
     secrets::validate_secret_name(name).map_err(crate::error::Error::from)?;
@@ -6579,7 +6669,7 @@ pub async fn put_secret_value(
         bc.clone(),
         secrets::SUBJECT_KEY,
         &subject_value,
-        master_key,
+        key_service,
     )
     .await?;
     let ciphertext = encryption::encrypt_leaf(&data_key, plaintext.expose());
@@ -6768,7 +6858,7 @@ pub async fn fetch_secret_value(
     bounded_context: &str,
     name: &str,
     caller_role_id: &str,
-    master_key: &EncryptionMasterKey,
+    key_service: &KeyService,
     now: DateTime<Utc>,
 ) -> crate::error::Result<SecretValue> {
     secrets::validate_secret_name(name).map_err(crate::error::Error::from)?;
@@ -6794,7 +6884,7 @@ pub async fn fetch_secret_value(
         bounded_context,
         secrets::SUBJECT_KEY,
         &subject_value,
-        master_key,
+        key_service,
     )
     .await?
     else {
@@ -8878,13 +8968,15 @@ pub async fn ensure_admin_events_origin_kind(pool: &Pool) -> crate::error::Resul
 }
 
 /// The whole of the trail's startup: the admin events table accepts
-/// `skilj_recorded`, the six event types are registered, and every grant
+/// `skilj_recorded`, the access trail's event types and the master-key
+/// trail's (docs/architecture.md §230) are registered, and every grant
 /// without history is baselined. Returns how many it baselined. Needs the
 /// admin bounded context to exist.
 #[tracing::instrument(skip_all)]
 pub async fn ensure_access_trail(pool: &Pool) -> crate::error::Result<usize> {
     ensure_admin_events_origin_kind(pool).await?;
     register_access_event_types(pool).await?;
+    register_master_key_event_types(pool).await?;
     baseline_access_events(pool).await
 }
 
@@ -11531,7 +11623,7 @@ pub async fn create_and_insert_external_event(
     causation_id: Option<String>,
     dedupe: Option<ExternalEventDedupe<'_>>,
     now: DateTime<Utc>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     blind: &crate::blind::BlindIndex,
 ) -> crate::error::Result<CreateExternalEventOutcome> {
     // Every `requires` first, as the spec orders them: before any key is
@@ -11553,7 +11645,7 @@ pub async fn create_and_insert_external_event(
         &bounded_context_name,
         &adapter.event_type.sensitive_fields,
         &payload,
-        encryption_master_key,
+        key_service,
         &mut resolved,
     )
     .await?;
@@ -11729,7 +11821,7 @@ pub async fn create_and_insert_external_events(
     event_cache: &crate::event_cache::EventCache,
     adapter: &ExternalEventToken,
     items: Vec<ExternalEventBatchItem>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     blind: &crate::blind::BlindIndex,
     stop_at_first_failure: bool,
 ) -> Vec<crate::error::Result<CreateExternalEventOutcome>> {
@@ -11761,7 +11853,7 @@ pub async fn create_and_insert_external_events(
                     &bounded_context_name,
                     &adapter.event_type.sensitive_fields,
                     &item.payload,
-                    encryption_master_key,
+                    key_service,
                     &mut resolved,
                 )
                 .await
@@ -11963,7 +12055,7 @@ pub async fn create_and_insert_direct_event(
     correlation_id: Option<String>,
     causation_id: Option<String>,
     now: DateTime<Utc>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     blind: &crate::blind::BlindIndex,
 ) -> crate::error::Result<Event> {
     // See `create_and_insert_external_event`'s identical check.
@@ -11982,7 +12074,7 @@ pub async fn create_and_insert_direct_event(
         &bounded_context_name,
         &adapter.event_type.sensitive_fields,
         &payload,
-        encryption_master_key,
+        key_service,
         &mut resolved,
     )
     .await?;
@@ -12166,7 +12258,7 @@ pub async fn submit_command(
     consistency_tags: &[Tag],
     matching_events: &[Event],
     initial_decision: crate::shared::CommandDecision,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: DateTime<Utc>,
     snapshot: Option<SnapshotContext<'_>>,
     snapshot_states: &[crate::plugin::SnapshotState],
@@ -12189,7 +12281,7 @@ pub async fn submit_command(
         command_type,
         payload,
         &initial_decision,
-        encryption_master_key,
+        key_service,
     )
     .await?;
 
@@ -12215,7 +12307,7 @@ pub async fn submit_command(
         consistency_tags,
         matching_events,
         initial_decision,
-        encryption_master_key,
+        key_service,
         now,
         snapshot,
         snapshot_states,
@@ -12261,7 +12353,7 @@ pub async fn warm_up_event_types_and_encryption_keys(
     command_type: &CommandType,
     payload: &str,
     initial_decision: &crate::shared::CommandDecision,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
 ) -> crate::error::Result<(
     std::collections::HashMap<String, EventType>,
     std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
@@ -12289,7 +12381,7 @@ pub async fn warm_up_event_types_and_encryption_keys(
             bounded_context_name,
             &command_type.sensitive_fields,
             payload,
-            encryption_master_key,
+            key_service,
             &mut resolved,
         )
         .await?;
@@ -12301,7 +12393,7 @@ pub async fn warm_up_event_types_and_encryption_keys(
                     bounded_context_name,
                     &event_type.sensitive_fields,
                     &spec_payload,
-                    encryption_master_key,
+                    key_service,
                     &mut resolved,
                 )
                 .await?;
@@ -12932,7 +13024,7 @@ async fn provision_missing_encryption_keys(
     event_specs: &[crate::shared::EventSpec],
     event_types_by_name: &std::collections::HashMap<String, EventType>,
     resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
 ) -> crate::error::Result<()> {
     let needed_subjects = missing_encryption_subjects(
         command_type,
@@ -12941,14 +13033,7 @@ async fn provision_missing_encryption_keys(
         event_types_by_name,
         resolved,
     );
-    provision_encryption_subjects(
-        conn,
-        command_type,
-        needed_subjects,
-        resolved,
-        encryption_master_key,
-    )
-    .await
+    provision_encryption_subjects(conn, command_type, needed_subjects, resolved, key_service).await
 }
 
 /// The `(subject_key, subject_value)` pairs `command_type`'s payload and
@@ -12983,17 +13068,17 @@ async fn provision_encryption_subjects(
     command_type: &CommandType,
     needed_subjects: Vec<(String, String)>,
     resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
 ) -> crate::error::Result<()> {
     if !needed_subjects.is_empty() {
-        let master_key = encryption_master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+        let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?;
         for subject in needed_subjects {
             let provisioned = get_or_create_encryption_key_on(
                 &mut *conn,
                 command_type.bounded_context.clone(),
                 &subject.0,
                 &subject.1,
-                master_key,
+                key_service,
             )
             .await?;
             resolved.insert(subject, provisioned);
@@ -13018,7 +13103,7 @@ async fn finish_accepted_command_in_tx(
     client_id: &str,
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: DateTime<Utc>,
     idempotency_key: Option<&str>,
     sync_projections: &[String],
@@ -13044,7 +13129,7 @@ async fn finish_accepted_command_in_tx(
         &event_specs,
         &event_types_by_name,
         &mut resolved,
-        encryption_master_key,
+        key_service,
     )
     .await?;
 
@@ -13153,7 +13238,7 @@ async fn submit_one_command_in_tx(
     consistency_tags: &[Tag],
     matching_events: &[Event],
     initial_decision: crate::shared::CommandDecision,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: DateTime<Utc>,
     snapshot: Option<SnapshotContext<'_>>,
     snapshot_states: &[crate::plugin::SnapshotState],
@@ -13218,7 +13303,7 @@ async fn submit_one_command_in_tx(
         client_id,
         correlation_id,
         causation_id,
-        encryption_master_key,
+        key_service,
         now,
         idempotency_key,
         sync_projections,
@@ -13249,7 +13334,7 @@ pub struct OwnedSnapshotContext {
 /// every other command in its batch is, from the leader's own stack
 /// frame's perspective, a different task's data). The shared collaborators
 /// [`submit_command`]'s own signature also takes - `pool`, `dispatcher`,
-/// `projection_dispatcher`, `encryption_master_key` - are deliberately
+/// `projection_dispatcher`, `key_service` - are deliberately
 /// *not* part of this struct: within one process they are the same
 /// `Arc`/reference for every command a `CommandBatcher` ever processes
 /// (all ultimately sourced from the one `Skilj` instance), so the batch
@@ -13539,7 +13624,7 @@ pub async fn commit_command_batch(
     leader_tx: CommandBatchLeaderTx,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     batch: Vec<BatchedCommand>,
     slow: Option<&crate::slow_command::SlowCommandWarnings>,
 ) -> crate::error::Result<Vec<BatchedCommandResult>> {
@@ -13581,7 +13666,7 @@ pub async fn commit_command_batch(
         &mut savepoint,
         dispatcher,
         projection_dispatcher,
-        encryption_master_key,
+        key_service,
         &batch,
         locked_highest,
         &sync_projections,
@@ -13614,7 +13699,7 @@ pub async fn commit_command_batch(
                 &mut tx,
                 dispatcher,
                 projection_dispatcher,
-                encryption_master_key,
+                key_service,
                 &bounded_context_name,
                 locked_highest,
                 &sync_projections,
@@ -13729,7 +13814,7 @@ async fn write_command_batch_as_set(
     savepoint: &mut AsSetSavepoint,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     batch: &[BatchedCommand],
     locked_highest: i64,
     sync_projections: &[String],
@@ -13808,7 +13893,7 @@ async fn write_command_batch_as_set(
                 &item.command_type,
                 needed_subjects,
                 &mut resolved,
-                encryption_master_key,
+                key_service,
             )
             .await?;
         }
@@ -14408,7 +14493,7 @@ async fn commit_command_batch_per_command(
     tx: &mut Transaction<'static, Postgres>,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     bounded_context_name: &str,
     locked_highest: i64,
     sync_projections: &[String],
@@ -14523,7 +14608,7 @@ async fn commit_command_batch_per_command(
             &item.client_id,
             item.correlation_id.as_deref(),
             item.causation_id.as_deref(),
-            encryption_master_key,
+            key_service,
             item.now,
             item.idempotency_key.as_deref(),
             sync_projections,
@@ -14597,7 +14682,7 @@ pub async fn submit_command_batch(
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     bounded_context_name: &str,
     batch: Vec<BatchedCommand>,
 ) -> crate::error::Result<Vec<BatchedCommandResult>> {
@@ -14606,7 +14691,7 @@ pub async fn submit_command_batch(
         leader_tx,
         dispatcher,
         projection_dispatcher,
-        encryption_master_key,
+        key_service,
         batch,
         None,
     )
@@ -14852,7 +14937,7 @@ pub enum DryRunDecision {
 /// writing: with `UnregisteredEventType` for an event type this bounded
 /// context hasn't registered, and with `MasterKeyNotConfigured` when the
 /// command or a would-be event has a sensitive field to encrypt and no
-/// `encryption_master_key` is configured. The key itself is never
+/// `key_service` is configured. The key itself is never
 /// looked up or provisioned. `client_id` is stamped on each would-be
 /// event, as
 /// `process_command` stamps it: it is what an `Own` private field's
@@ -14866,7 +14951,7 @@ pub async fn dry_run_command(
     command_type: &CommandType,
     payload: &str,
     client_id: &str,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandDryRun> {
     let context = crate::plugin::DecisionContext::at(now);
@@ -14926,7 +15011,7 @@ pub async fn dry_run_command(
                     )
                     .is_empty()
                 });
-            if needs_a_key && encryption_master_key.is_none() {
+            if needs_a_key && key_service.is_none() {
                 return Err(encryption::Error::MasterKeyNotConfigured.into());
             }
             DryRunDecision::Accepted { events }
@@ -14980,7 +15065,7 @@ pub async fn decide_and_submit_command(
     client_id: &str,
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: DateTime<Utc>,
     idempotency_key: Option<&str>,
     deadline: Option<crate::plugin::DeadlineContext>,
@@ -14999,7 +15084,7 @@ pub async fn decide_and_submit_command(
             client_id,
             correlation_id,
             causation_id,
-            encryption_master_key,
+            key_service,
             now,
             idempotency_key,
             deadline,
@@ -15035,7 +15120,7 @@ async fn decide_and_submit_command_once(
     client_id: &str,
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     now: DateTime<Utc>,
     idempotency_key: Option<&str>,
     deadline: Option<crate::plugin::DeadlineContext>,
@@ -15073,7 +15158,7 @@ async fn decide_and_submit_command_once(
         &resolved.consistency_tags,
         &resolved.matching_events,
         resolved.decision,
-        encryption_master_key,
+        key_service,
         now,
         resolved
             .snapshot_context
@@ -16356,7 +16441,7 @@ pub async fn catch_up_cross_context_route(
     snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
     broadcaster: &crate::event_store::EventBroadcaster,
     event_cache: &crate::event_cache::EventCache,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> crate::error::Result<()> {
     // Held for this whole call's duration on a dedicated transaction
@@ -16384,7 +16469,7 @@ pub async fn catch_up_cross_context_route(
         snapshot_dispatcher,
         broadcaster,
         event_cache,
-        encryption_master_key,
+        key_service,
         retry_policy,
     )
     .await;
@@ -16402,7 +16487,7 @@ async fn catch_up_cross_context_route_locked(
     snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
     broadcaster: &crate::event_store::EventBroadcaster,
     event_cache: &crate::event_cache::EventCache,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> crate::error::Result<()> {
     let existing_cursor =
@@ -16574,7 +16659,7 @@ async fn catch_up_cross_context_route_locked(
                     event.metadata.correlation_id.as_deref(),
                     Some(&causation_id),
                     &idempotency_key,
-                    encryption_master_key,
+                    key_service,
                     Utc::now(),
                 )
                 .await
@@ -16592,7 +16677,7 @@ async fn catch_up_cross_context_route_locked(
                         CROSS_CONTEXT_ROUTE_CLIENT_ID,
                         event.metadata.correlation_id.as_deref(),
                         Some(&causation_id),
-                        encryption_master_key,
+                        key_service,
                         Utc::now(),
                         Some(&idempotency_key),
                         None,
@@ -17380,7 +17465,7 @@ pub async fn fire_due_deadlines(
     event_cache: &crate::event_cache::EventCache,
     bounded_context: &str,
     now: DateTime<Utc>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
+    key_service: Option<&KeyService>,
     retry_policy: &skilj_retry::RetryPolicy,
     cancels: &[crate::plugin::CancelDeadlineInfo],
 ) -> crate::error::Result<()> {
@@ -17535,7 +17620,7 @@ pub async fn fire_due_deadlines(
             row.correlation_id.as_deref(),
             None,
             &idempotency_key,
-            encryption_master_key,
+            key_service,
             now,
         )
         .await
@@ -17553,7 +17638,7 @@ pub async fn fire_due_deadlines(
                 DEADLINE_CLIENT_ID,
                 row.correlation_id.as_deref(),
                 None,
-                encryption_master_key,
+                key_service,
                 now,
                 Some(&idempotency_key),
                 Some(deadline_context),
