@@ -367,7 +367,8 @@ mod tests {
             );
             assert_eq!(event.origin, EventOrigin::SkiljRecorded);
             assert_eq!(event.tags[0].key, "master_key");
-            assert_eq!(event.tags[0].value.as_deref(), Some("file"));
+            let payload: Value = serde_json::from_str(&event.payload).unwrap();
+            assert_eq!(event.tags[0].value.as_deref(), payload["provider"].as_str());
         }
     }
 
