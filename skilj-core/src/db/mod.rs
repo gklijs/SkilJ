@@ -33,10 +33,12 @@
 
 mod master_key;
 pub use master_key::{
-    bounded_contexts_behind, check_data_key_wraps, data_keys_behind, mark_data_keys_behind,
-    mark_data_keys_rewrapped, master_key_state, register_master_key_event_types,
-    retire_master_key_versions, rewrap_data_keys, rotate_master_key, DataKeyWraps, MasterKeyState,
-    RewrapOutcome, Rotation,
+    assign_encryption_key, bounded_context_key, check_data_key_wraps, data_keys_behind,
+    delete_unused_key, encryption_key_assignments, forget_assignments_of_deleted_contexts,
+    key_in_use, mark_data_keys_behind, mark_data_keys_rewrapped, master_key_state,
+    master_key_states, register_known_keys, register_master_key_event_types,
+    retire_master_key_versions, rewrap_data_keys, rotate_master_key, schedule_key_deletion,
+    DataKeyWraps, MasterKeyState, RewrapOutcome, Rotation,
 };
 
 use crate::access_control::{
@@ -596,7 +598,8 @@ async fn provision_bounded_context_schema(
             wrapped_key BYTEA,
             wrap_nonce BYTEA,
             key_provider TEXT,
-            master_key_version INTEGER
+            master_key_version INTEGER,
+            unreadable_since TIMESTAMPTZ
         )"
     )))
     .execute(&mut **tx)
@@ -2598,7 +2601,8 @@ fn encryption_keys_master_key_index_ddl(schema: &str) -> String {
     )
 }
 
-/// `encryption_keys.key_provider`/`master_key_version` and their index
+/// `encryption_keys.key_provider`/`master_key_version`/`unreadable_since`
+/// and their index
 /// (docs/architecture.md §230), for a bounded context provisioned before
 /// them. Rows already there keep `NULL`: wrapped by the legacy raw master
 /// key. A call that finds them there takes no table lock (§158).
@@ -2610,11 +2614,12 @@ pub async fn ensure_encryption_key_provider_columns(
     sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
         &schema,
         "encryption_keys",
-        &["key_provider", "master_key_version"],
+        &["key_provider", "master_key_version", "unreadable_since"],
         format!(
             "ALTER TABLE {schema}.encryption_keys \
              ADD COLUMN IF NOT EXISTS key_provider TEXT, \
-             ADD COLUMN IF NOT EXISTS master_key_version INTEGER"
+             ADD COLUMN IF NOT EXISTS master_key_version INTEGER, \
+             ADD COLUMN IF NOT EXISTS unreadable_since TIMESTAMPTZ"
         ),
     )))
     .execute(pool)
@@ -5982,11 +5987,16 @@ async fn get_or_create_encryption_key_on(
             get_active_encryption_key_row(&mut *conn, bounded_context, subject_key, subject_value)
                 .await?
         {
-            let data_key = unwrap_row(key_service, &row).await?;
+            let data_key = unwrap_row(&mut *conn, key_service, &row).await?;
             return Ok((row.to_domain(bc), row.id, data_key));
         }
 
-        let (data_key, wrapped) = key_service.generate().await?;
+        // The bounded context's own key, or the default one
+        // (docs/architecture.md §230) - read every time, so a key assigned
+        // on another instance is used from then on.
+        let key = master_key::bounded_context_key(&mut *conn, bounded_context).await?;
+        let provider = key_service.provider_for(key.as_deref())?;
+        let (data_key, wrapped) = key_service.generate_with(provider.as_ref()).await?;
         let now = Utc::now();
         let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.encryption_keys \
@@ -6000,7 +6010,7 @@ async fn get_or_create_encryption_key_on(
         .bind(subject_value)
         .bind(now)
         .bind(&wrapped.ciphertext)
-        .bind(key_service.provider_name())
+        .bind(provider.name())
         .bind(version_column(wrapped.version)?)
         .fetch_optional(&mut *conn)
         .await?;
@@ -6027,9 +6037,12 @@ fn version_column(version: u32) -> crate::error::Result<i32> {
 }
 
 /// The data key an active row holds, through the key service
-/// (docs/architecture.md §230): the provider that wrapped it, or the legacy
-/// master key for a row from before providers.
-async fn unwrap_row(
+/// (docs/architecture.md §230): the key that wrapped it, or the legacy
+/// master key for a row from before providers. A key this process hasn't
+/// used yet - one another instance gave a bounded context - is looked up
+/// once among the keys skilj records, on `executor`, and tried again.
+async fn unwrap_row<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     key_service: &KeyService,
     row: &EncryptionKeyRow,
 ) -> crate::error::Result<DataKey> {
@@ -6037,14 +6050,19 @@ async fn unwrap_row(
         .wrapped_key
         .as_deref()
         .expect("an active encryption_keys row always still has its wrapped key");
-    Ok(key_service
-        .unwrap(encryption::StoredWrap {
-            provider: row.key_provider.as_deref(),
-            version: row.master_key_version.and_then(|v| u32::try_from(v).ok()),
-            ciphertext: wrapped,
-            nonce: row.wrap_nonce.as_deref(),
-        })
-        .await?)
+    let stored = encryption::StoredWrap {
+        provider: row.key_provider.as_deref(),
+        version: row.master_key_version.and_then(|v| u32::try_from(v).ok()),
+        ciphertext: wrapped,
+        nonce: row.wrap_nonce.as_deref(),
+    };
+    match key_service.unwrap(stored).await {
+        Err(encryption::Error::ProviderChanged { .. }) => {
+            master_key::register_known_keys(executor, key_service).await?;
+            Ok(key_service.unwrap(stored).await?)
+        }
+        other => Ok(other?),
+    }
 }
 
 /// The pre-resolution step every `event_store::protect_sensitive_fields`
@@ -6264,7 +6282,7 @@ async fn get_active_data_key_on(
     key_service: &KeyService,
 ) -> crate::error::Result<Option<DataKey>> {
     match get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value).await? {
-        Some(row) => Ok(Some(unwrap_row(key_service, &row).await?)),
+        Some(row) => Ok(Some(unwrap_row(pool, key_service, &row).await?)),
         None => Ok(None),
     }
 }
@@ -6312,7 +6330,7 @@ pub async fn list_active_data_keys_for_subject_value(
     let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?;
     let mut data_keys = Vec::with_capacity(rows.len());
     for row in &rows {
-        data_keys.push(unwrap_row(key_service, row).await?);
+        data_keys.push(unwrap_row(pool, key_service, row).await?);
     }
     Ok(data_keys)
 }

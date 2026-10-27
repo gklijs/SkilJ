@@ -24,14 +24,24 @@ README.md, "Status and stability").
 
 - Master key rotation without restarts: `master_key_rotation(MasterKeyRotation::new().every(..).retire_after(..))`
   for a schedule, and the superadmin mutation
-  `rotateEncryptionMasterKey(retireImmediately)` for a leak; the
-  `encryptionMasterKey` query shows where it stands. Every instance rewraps
+  `rotateMasterKey(boundedContext, retireImmediately)` for a leak; the
+  `masterKeys` query shows where each key stands. Every instance rewraps
   the data keys in the background (Vault rewraps them without the data key
   leaving it) and, after the grace period (30 days by default) or at once,
   retires the old versions at the provider so they no longer unwrap
   anything. A rotation made at the provider directly is picked up too.
-  Recorded as `EncryptionMasterKeyRotated`, `EncryptionDataKeysRewrapped` and
-  `EncryptionMasterKeyRetired` events in the `admin` context.
+- Keys per bounded context: `assignMasterKey(boundedContext, key, create)`
+  gives a bounded context a key of its own at the provider (created by
+  skilj, or an existing one such as a customer's), or the shared default key
+  back; its data keys move in the background, and it rotates and retires on
+  its own. A key skilj created is deleted at the provider once no bounded
+  context uses it and the grace period has passed - erasing a deleted
+  tenant cryptographically; one it didn't create is only let go of.
+- Every step is an event in the `admin` context: `EncryptionMasterKeyRotated`,
+  `EncryptionDataKeysRewrapped`, `EncryptionMasterKeyRetired`,
+  `EncryptionKeyAssigned` and `EncryptionKeyDeleted`. A data key no
+  configured key can unwrap is marked unreadable once and no longer holds up
+  a rotation.
 - Startup refuses data keys wrapped by another provider
   (`encryption_key_provider_changed`), and data keys from before key
   providers without the key that wrapped them.
@@ -67,12 +77,13 @@ README.md, "Status and stability").
   `.legacy_encryption_master_key(EncryptionMasterKey::from_bytes(key))` until
   the background task has moved every existing data key to the provider (one
   `EncryptionDataKeysRewrapped` event per bounded context, and
-  `encryptionMasterKey.rewrapPending` false). Startup refuses to start
+  `masterKeys[].rewrapPending` false). Startup refuses to start
   without it while such data keys are stored
   (`encryption_legacy_master_key_required`).
-- Migration `0008` (applied at startup) adds `encryption_master_key`;
-  startup adds `encryption_keys.key_provider`, `master_key_version` and their
-  index to every bounded context.
+- Migration `0008` (applied at startup) adds `encryption_master_keys` and
+  `encryption_key_assignments`; startup adds `encryption_keys.key_provider`,
+  `master_key_version`, `unreadable_since` and their index to every bounded
+  context.
 
 ## [0.2.0] - 2026-10-26
 

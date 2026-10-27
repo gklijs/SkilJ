@@ -92,13 +92,22 @@ what a rejected registration's error actually means.
     puts it next to the data. Losing the file loses every sensitive field.
   - Rotation: `.master_key_rotation(MasterKeyRotation::new().every(..).retire_after(..))`
     for a schedule, and the superadmin mutation
-    `rotateEncryptionMasterKey(retireImmediately: true)` for a leak. Each
-    instance rewraps the data keys in the background and retires the old
-    version at the provider after the grace period (30 days by default) -
-    then it no longer unwraps anything, a backup taken before included.
-    All of it is recorded as `EncryptionMasterKeyRotated`,
-    `EncryptionDataKeysRewrapped` and `EncryptionMasterKeyRetired` events in
-    the `admin` context; `encryptionMasterKey` shows where it stands.
+    `rotateMasterKey(boundedContext: "..", retireImmediately: true)` for a
+    leak (without `boundedContext`, the shared default key). Each instance
+    rewraps the data keys in the background and retires the old version at
+    the provider after the grace period (30 days by default) - then it no
+    longer unwraps anything, a backup taken before included.
+  - A bounded context's own key: `assignMasterKey(boundedContext: "..",
+    key: "tenant-a", create: true)` - isolated from the others, rotated on
+    its own, and deleted at the provider after the grace period once its
+    context is deleted (erasing it). Without `create`, an existing key (a
+    customer's) is used and only let go of, never deleted. The Vault token
+    then needs the same rights on those keys, plus `create`/`delete` for
+    keys skilj creates.
+  - Everything is recorded as events in the `admin` context
+    (`EncryptionMasterKeyRotated`, `EncryptionDataKeysRewrapped`,
+    `EncryptionMasterKeyRetired`, `EncryptionKeyAssigned`,
+    `EncryptionKeyDeleted`); `masterKeys` shows where each key stands.
   - Upgrading data from before key providers: also configure
     `.legacy_encryption_master_key(EncryptionMasterKey::from_bytes(old))`
     until the background task has moved those data keys to the provider;

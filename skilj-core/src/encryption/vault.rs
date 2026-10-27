@@ -17,6 +17,10 @@
 //! `transit/decrypt/skilj` and `transit/rewrap/skilj`, `read` on
 //! `transit/keys/skilj`, and - for rotating from skilj -
 //! `update` on `transit/keys/skilj/rotate` and `transit/keys/skilj/config`.
+//! Bounded contexts given keys of their own (docs/architecture.md §230)
+//! need the same on each of those keys - a path glob like
+//! `transit/+/skilj-*` - plus `create` and `delete` on `transit/keys/<key>`
+//! when skilj creates and deletes them.
 
 use super::provider::{BoxFuture, KeyProvider, KeyVersions, WrappedDataKey};
 use super::Error;
@@ -160,12 +164,26 @@ impl VaultTransitProvider {
     /// One Transit call: `body` posted (or a `GET` without one) to
     /// `/v1/<mount>/<path>`, answering the response's `data`.
     async fn call(&self, path: &str, body: Option<Value>) -> Result<Value, Error> {
+        let method = if body.is_some() {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::GET
+        };
+        self.request(method, path, body).await
+    }
+
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, Error> {
         let url = format!("{}/v1/{}/{}", self.address, self.mount, path);
-        let mut request = match &body {
-            Some(body) => self.client.post(&url).json(body),
-            None => self.client.get(&url),
+        let mut request = self.client.request(method, &url);
+        if let Some(body) = &body {
+            request = request.json(body);
         }
-        .header("X-Vault-Token", self.token()?);
+        let mut request = request.header("X-Vault-Token", self.token()?);
         if let Some(namespace) = &self.namespace {
             request = request.header("X-Vault-Namespace", namespace);
         }
@@ -335,6 +353,42 @@ impl KeyProvider for VaultTransitProvider {
                 Some(json!({ "min_decryption_version": version })),
             )
             .await?;
+            Ok(())
+        })
+    }
+
+    /// The Transit key `key` on the same mount, with the same token.
+    fn key(&self, key: &str) -> Result<std::sync::Arc<dyn KeyProvider>, Error> {
+        super::provider::validate_key_name(key)?;
+        let mut other = self.clone();
+        other.key = key.to_string();
+        other.rename();
+        Ok(std::sync::Arc::new(other))
+    }
+
+    /// `vault write -f transit/keys/<key>` - an AES-256-GCM key; writing
+    /// one that exists changes nothing.
+    fn create(&self) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move {
+            self.call(
+                &format!("keys/{}", self.key),
+                Some(json!({ "type": "aes256-gcm96" })),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    /// Allows deletion on the key, then deletes it.
+    fn delete(&self) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move {
+            self.call(
+                &format!("keys/{}/config", self.key),
+                Some(json!({ "deletion_allowed": true })),
+            )
+            .await?;
+            self.request(reqwest::Method::DELETE, &format!("keys/{}", self.key), None)
+                .await?;
             Ok(())
         })
     }
