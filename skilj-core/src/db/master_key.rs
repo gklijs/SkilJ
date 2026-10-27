@@ -181,6 +181,7 @@ pub async fn register_known_keys<'e>(
 
 /// What [`rotate_master_key`] does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Rotation {
     /// Records the provider's latest version as the one in use, without
     /// rotating: a key's first use (`Adopted`), or a rotation made outside
@@ -212,6 +213,22 @@ pub async fn rotate_master_key(
     due: Option<chrono::Duration>,
 ) -> crate::error::Result<Option<u32>> {
     let admin = require_admin_bounded_context(pool).await?;
+    // Recording runs at every check, on every instance, for every key: the
+    // provider is asked first, with no lock held, and nothing is locked at
+    // all when its version is already recorded - the state row's lock
+    // blocks provisioning for the key's contexts, and must not wait on a
+    // network round trip each time (docs/architecture.md §230).
+    let asked = match rotation {
+        Rotation::Record(_) => {
+            let versions = provider.versions().await?;
+            let recorded = master_key_state(pool, provider.name()).await?;
+            if recorded.is_some_and(|s| s.version >= versions.latest) {
+                return Ok(None);
+            }
+            Some(versions)
+        }
+        Rotation::Rotate(_) => None,
+    };
     let mut tx = pool.begin().await?;
     lock_key(&mut tx, provider.name()).await?;
     let current = locked_state(&mut tx, provider.name()).await?;
@@ -221,19 +238,25 @@ pub async fn rotate_master_key(
             return Ok(None);
         }
     }
-    let (version, reason) = match rotation {
-        Rotation::Record(reason) => {
-            let latest = provider.versions().await?.latest;
-            if current.as_ref().is_some_and(|s| s.version >= latest) {
+    let (version, reason, versions) = match (rotation, asked) {
+        (Rotation::Record(reason), Some(versions)) => {
+            if current
+                .as_ref()
+                .is_some_and(|s| s.version >= versions.latest)
+            {
                 return Ok(None);
             }
-            (latest, reason)
+            (versions.latest, reason, Some(versions))
         }
-        Rotation::Rotate(reason) => (provider.rotate().await?, reason),
+        // A rotation is serialised by the lock, so it calls the provider
+        // under it: rare, and asked for.
+        (Rotation::Rotate(reason), _) => (provider.rotate().await?, reason, None),
+        (Rotation::Record(_), None) => unreachable!("a recording asked the provider above"),
     };
-    let retired_below = match &current {
-        Some(state) => state.retired_below,
-        None => provider.versions().await?.min_decryption,
+    let retired_below = match (&current, versions) {
+        (Some(state), _) => state.retired_below,
+        (None, Some(versions)) => versions.min_decryption,
+        (None, None) => provider.versions().await?.min_decryption,
     };
     sqlx::query(
         "INSERT INTO encryption_master_keys \
@@ -301,7 +324,12 @@ pub async fn mark_data_keys_behind(pool: &Pool, provider: &str) -> crate::error:
 /// Retires every version of `provider`'s key below `version` at the
 /// provider and records `EncryptionMasterKeyRetired`, under the key's lock,
 /// so it can't interleave with a rotation. Does nothing when they already
-/// are.
+/// are, or - checked under that lock, across every bounded context, not
+/// just the ones assigned the key - while any data key that still counts is
+/// wrapped by it under an older version: a context moving off the key to a
+/// key of its own keeps its data keys under this one until the move is
+/// done, and retiring would make them unreadable (docs/architecture.md
+/// §230). Answers whether it retired.
 #[tracing::instrument(skip_all, fields(provider = %provider.name()))]
 pub async fn retire_master_key_versions(
     pool: &Pool,
@@ -316,6 +344,14 @@ pub async fn retire_master_key_versions(
         return Ok(false);
     };
     if state.version != version || state.retired_below >= version {
+        return Ok(false);
+    }
+    if key_rows_below_on(&mut tx, provider.name(), version, state.rotated_at).await? {
+        tracing::info!(
+            provider = provider.name(),
+            below = version,
+            "retirement postponed: data keys are still wrapped under an older version"
+        );
         return Ok(false);
     }
     provider.retire_below(version).await?;
@@ -395,6 +431,15 @@ pub async fn assign_encryption_key(
         .await?
         .ok_or_else(crate::error::Error::row_not_found)?;
     let provider = key_service.provider_for(key)?;
+    // A key with the default key's own name - Vault's default key `skilj`,
+    // assigned as `skilj` - would be the default key under two lifecycles.
+    if key.is_some() && provider.name() == key_service.provider_name() {
+        return Err(encryption::Error::ProviderRefused {
+            provider: provider.name().to_string(),
+            message: "that is the default key; assign no key to use it".into(),
+        }
+        .into());
+    }
     // Only a key this call really created is skilj's to delete later: a
     // provider's `create` answers whether it did, so a key that existed
     // already - a customer's - is never claimed.
@@ -786,6 +831,57 @@ pub async fn key_in_use(pool: &Pool, provider: &str) -> crate::error::Result<boo
     Ok(used)
 }
 
+/// Whether any bounded context has a data key that still counts (not
+/// marked unreadable since `since`) wrapped by `provider` under a version
+/// below `version`. A savepoint per context, as in [`key_in_use_on`].
+async fn key_rows_below_on(
+    conn: &mut sqlx::PgConnection,
+    provider: &str,
+    version: u32,
+    since: DateTime<Utc>,
+) -> crate::error::Result<bool> {
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM bounded_contexts")
+        .fetch_all(&mut *conn)
+        .await?;
+    let counts = readable_since("$3");
+    for name in names {
+        let schema = schema_ident(&name);
+        sqlx::query("SAVEPOINT key_rows_below")
+            .execute(&mut *conn)
+            .await?;
+        let below = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {schema}.encryption_keys \
+             WHERE status = 'active' AND key_provider = $1 AND master_key_version < $2 \
+             AND {counts})"
+        )))
+        .bind(provider)
+        .bind(version_column(version)?)
+        .bind(since)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(crate::error::Error::from);
+        match below {
+            Ok(true) => {
+                sqlx::query("RELEASE SAVEPOINT key_rows_below")
+                    .execute(&mut *conn)
+                    .await?;
+                return Ok(true);
+            }
+            Ok(false) => {}
+            Err(err) if super::is_missing_schema(&err) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT key_rows_below")
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            Err(err) => return Err(err),
+        }
+        sqlx::query("RELEASE SAVEPOINT key_rows_below")
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(false)
+}
+
 async fn key_in_use_on(
     conn: &mut sqlx::PgConnection,
     provider: &str,
@@ -858,6 +954,42 @@ fn definitively_unreadable(err: &encryption::Error) -> bool {
             | encryption::Error::KeyVersionRetired { .. }
             | encryption::Error::ProviderChanged { .. }
     )
+}
+
+/// [`rewrap_data_keys`], by one instance at a time for the same key and
+/// bounded context: `None` when another holds it. Instances checking
+/// together would otherwise each rewrap the same rows - twice the provider
+/// calls - and each record an `EncryptionDataKeysRewrapped` with part of
+/// the counts. A session-level advisory lock on one connection, held for
+/// the run: one connection per running rewrap, not one per batch.
+pub async fn rewrap_data_keys_once(
+    pool: &Pool,
+    bounded_context: &str,
+    key_service: &KeyService,
+    target: &dyn KeyProvider,
+    version: u32,
+    since: DateTime<Utc>,
+) -> crate::error::Result<Option<RewrapOutcome>> {
+    let mut lock = pool.acquire().await?;
+    let name = format!("skilj_rewrap:{}:{bounded_context}", target.name());
+    let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+        .bind(&name)
+        .fetch_one(&mut *lock)
+        .await?;
+    if !held {
+        return Ok(None);
+    }
+    let outcome =
+        rewrap_data_keys(pool, bounded_context, key_service, target, version, since).await;
+    let released = sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+        .bind(&name)
+        .execute(&mut *lock)
+        .await;
+    if released.is_err() {
+        // Not given back to the pool holding the lock.
+        lock.detach();
+    }
+    outcome.map(Some)
 }
 
 /// Rewraps every active data key of `bounded_context` that isn't wrapped
@@ -981,11 +1113,9 @@ pub async fn rewrap_data_keys(
             for ((id, old), result) in same_key.into_iter().zip(results) {
                 match result {
                     Ok(rewrapped) => done.push((id, old.ciphertext, rewrapped)),
-                    // A per-item refusal is about that one ciphertext.
-                    Err(err)
-                        if definitively_unreadable(&err)
-                            || matches!(err, encryption::Error::ProviderRefused { .. }) =>
-                    {
+                    // A per-item failure is about that one ciphertext: a
+                    // provider answers it as `DecryptFailed` or retired.
+                    Err(err) if definitively_unreadable(&err) => {
                         tracing::warn!(encryption_key_id = id, error = %err, "data key unreadable, marked");
                         unreadable.push((id, old.ciphertext));
                     }

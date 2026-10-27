@@ -37,8 +37,8 @@ pub use master_key::{
     delete_unused_key, encryption_key_assignments, forget_assignments_of_deleted_contexts,
     key_in_use, mark_data_keys_behind, mark_data_keys_rewrapped, master_key_state,
     master_key_states, register_known_keys, register_master_key_event_types,
-    retire_master_key_versions, rewrap_data_keys, rotate_master_key, schedule_key_deletion,
-    DataKeyWraps, MasterKeyState, RewrapOutcome, Rotation,
+    retire_master_key_versions, rewrap_data_keys, rewrap_data_keys_once, rotate_master_key,
+    schedule_key_deletion, DataKeyWraps, MasterKeyState, RewrapOutcome, Rotation,
 };
 
 use crate::access_control::{
@@ -5949,14 +5949,7 @@ pub async fn get_or_create_encryption_key(
         return Err(secrets::Error::ReservedSubjectKey.into());
     }
     let bc = require_bounded_context(pool, bounded_context).await?;
-    get_or_create_encryption_key_on(
-        &mut *pool.acquire().await?,
-        bc,
-        subject_key,
-        subject_value,
-        key_service,
-    )
-    .await
+    provision_encryption_key(Db::Pool(pool), bc, subject_key, subject_value, key_service).await
 }
 
 /// [`get_or_create_encryption_key`] on a connection the caller holds,
@@ -5967,6 +5960,18 @@ pub async fn get_or_create_encryption_key(
 /// becomes durable with the command that needed it, or not at all.
 async fn get_or_create_encryption_key_on(
     conn: &mut sqlx::PgConnection,
+    bc: BoundedContext,
+    subject_key: &str,
+    subject_value: &str,
+    key_service: &KeyService,
+) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
+    provision_encryption_key(Db::Conn(conn), bc, subject_key, subject_value, key_service).await
+}
+
+/// [`get_or_create_encryption_key_on`] on either a held connection or the
+/// pool (see [`Db`]).
+async fn provision_encryption_key(
+    mut db: Db<'_>,
     bc: BoundedContext,
     subject_key: &str,
     subject_value: &str,
@@ -5985,24 +5990,39 @@ async fn get_or_create_encryption_key_on(
     // error, not a hang.
     const ATTEMPTS: usize = 5;
     for _ in 0..ATTEMPTS {
-        if let Some(row) =
-            get_active_encryption_key_row(&mut *conn, bounded_context, subject_key, subject_value)
-                .await?
-        {
-            let data_key = unwrap_row(&mut *conn, bounded_context, key_service, &row).await?;
+        let existing = get_active_encryption_key_row(
+            &mut *db.conn().await?,
+            bounded_context,
+            subject_key,
+            subject_value,
+        )
+        .await?;
+        if let Some(row) = existing {
+            let data_key = unwrap_row(&mut db, bounded_context, key_service, &row).await?;
             return Ok((row.to_domain(bc), row.id, data_key));
         }
 
         // The bounded context's own key, or the default one
         // (docs/architecture.md §230) - read every time, so a key assigned
         // on another instance is used from then on.
-        let key = master_key::bounded_context_key(&mut *conn, bounded_context).await?;
+        let (key, recorded) = {
+            let mut conn = db.conn().await?;
+            let key = master_key::bounded_context_key(&mut *conn, bounded_context).await?;
+            let recorded = match &key {
+                Some(key) => {
+                    let name = key_service.provider_for(Some(key))?.name().to_string();
+                    master_key::key_recorded(&mut *conn, &name).await?
+                }
+                None => true,
+            };
+            (key, recorded)
+        };
         let provider = key_service.provider_for(key.as_deref())?;
         // A bounded context's own key that is gone - the context was given
         // another key and this one deleted since the assignment was read -
         // isn't asked to wrap anything (Vault may even create a missing key
         // on encrypt): the next pass reads the assignment again.
-        if key.is_some() && !master_key::key_recorded(&mut *conn, provider.name()).await? {
+        if !recorded {
             continue;
         }
         let (data_key, wrapped) = match key_service.generate_with(provider.as_ref()).await {
@@ -6011,7 +6031,8 @@ async fn get_or_create_encryption_key_on(
             // assignment did change meanwhile.
             Err(err)
                 if key.is_some()
-                    && master_key::bounded_context_key(&mut *conn, bounded_context).await?
+                    && master_key::bounded_context_key(&mut *db.conn().await?, bounded_context)
+                        .await?
                         != key =>
             {
                 tracing::info!(error = %err, "bounded context's key changed while wrapping; again");
@@ -6046,7 +6067,7 @@ async fn get_or_create_encryption_key_on(
         .bind(&wrapped.ciphertext)
         .bind(provider.name())
         .bind(version_column(wrapped.version)?)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&mut *db.conn().await?)
         .await?;
 
         if let Some(row) = inserted {
@@ -6057,6 +6078,50 @@ async fn get_or_create_encryption_key_on(
         // was never persisted and would silently disagree with it).
     }
     Err(crate::error::Error::row_not_found())
+}
+
+/// Where a provisioning or a read runs its SQL (docs/architecture.md §230):
+/// on a connection the caller holds - a command's transaction under the
+/// bounded context's `sequence` lock - or on the pool, a connection taken
+/// for each statement and given back before any key provider is called, so
+/// a slow provider doesn't hold pool connections while it answers.
+enum Db<'c> {
+    Conn(&'c mut sqlx::PgConnection),
+    Pool(&'c Pool),
+}
+
+/// A connection for one statement: the caller's, or one from the pool.
+enum Held<'a> {
+    Borrowed(&'a mut sqlx::PgConnection),
+    Owned(sqlx::pool::PoolConnection<Postgres>),
+}
+
+impl std::ops::Deref for Held<'_> {
+    type Target = sqlx::PgConnection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Held::Borrowed(conn) => conn,
+            Held::Owned(conn) => conn,
+        }
+    }
+}
+
+impl std::ops::DerefMut for Held<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Held::Borrowed(conn) => conn,
+            Held::Owned(conn) => conn,
+        }
+    }
+}
+
+impl Db<'_> {
+    async fn conn(&mut self) -> crate::error::Result<Held<'_>> {
+        Ok(match self {
+            Db::Conn(conn) => Held::Borrowed(&mut **conn),
+            Db::Pool(pool) => Held::Owned(pool.acquire().await?),
+        })
+    }
 }
 
 /// A master key version as the `master_key_version` column stores it.
@@ -6080,7 +6145,7 @@ fn version_column(version: u32) -> crate::error::Result<i32> {
 /// has its mark cleared, so it counts again for the rewrap, the retirement
 /// and the key's deletion.
 async fn unwrap_row(
-    conn: &mut sqlx::PgConnection,
+    db: &mut Db<'_>,
     bounded_context: &str,
     key_service: &KeyService,
     row: &EncryptionKeyRow,
@@ -6097,7 +6162,7 @@ async fn unwrap_row(
     };
     let data_key = match key_service.unwrap(stored).await {
         Err(encryption::Error::ProviderChanged { .. }) => {
-            master_key::register_known_keys(&mut *conn, key_service).await?;
+            master_key::register_known_keys(&mut *db.conn().await?, key_service).await?;
             key_service.unwrap(stored).await?
         }
         other => other?,
@@ -6110,7 +6175,7 @@ async fn unwrap_row(
         )))
         .bind(row.id)
         .bind(wrapped)
-        .execute(&mut *conn)
+        .execute(&mut *db.conn().await?)
         .await?;
     }
     Ok(data_key)
@@ -6334,13 +6399,7 @@ async fn get_active_data_key_on(
 ) -> crate::error::Result<Option<DataKey>> {
     match get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value).await? {
         Some(row) => Ok(Some(
-            unwrap_row(
-                &mut *pool.acquire().await?,
-                bounded_context,
-                key_service,
-                &row,
-            )
-            .await?,
+            unwrap_row(&mut Db::Pool(pool), bounded_context, key_service, &row).await?,
         )),
         None => Ok(None),
     }
@@ -6388,9 +6447,9 @@ pub async fn list_active_data_keys_for_subject_value(
     }
     let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?;
     let mut data_keys = Vec::with_capacity(rows.len());
-    let mut conn = pool.acquire().await?;
+    let mut db = Db::Pool(pool);
     for row in &rows {
-        data_keys.push(unwrap_row(&mut conn, bounded_context, key_service, row).await?);
+        data_keys.push(unwrap_row(&mut db, bounded_context, key_service, row).await?);
     }
     Ok(data_keys)
 }

@@ -73,3 +73,6 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jsonwebtoken.workspace = true
 tokio-tungstenite.workspace = true
+# docs/architecture.md §230: the Vault Transit provider against real Vault
+# and OpenBao, in containers, as the broker crates' tests run theirs.
+testcontainers-modules = { version = "0.15", features = ["hashicorp_vault"] }
