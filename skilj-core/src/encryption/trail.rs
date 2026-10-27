@@ -25,6 +25,11 @@ pub enum MasterKeyEventKind {
     DataKeysRewrapped,
     /// Every version below one was made unusable at the provider.
     MasterKeyRetired,
+    /// A bounded context was given a key of its own, or back the default.
+    KeyAssigned,
+    /// A bounded context's own key, used by none any more, was deleted at
+    /// the provider - or, when skilj didn't create it, let go of.
+    KeyDeleted,
 }
 
 /// Why a version came into use.
@@ -56,10 +61,12 @@ impl RotationReason {
 
 impl MasterKeyEventKind {
     /// Every kind, in the order they are registered.
-    pub const ALL: [MasterKeyEventKind; 3] = [
+    pub const ALL: [MasterKeyEventKind; 5] = [
         MasterKeyEventKind::MasterKeyRotated,
         MasterKeyEventKind::DataKeysRewrapped,
         MasterKeyEventKind::MasterKeyRetired,
+        MasterKeyEventKind::KeyAssigned,
+        MasterKeyEventKind::KeyDeleted,
     ];
 
     /// The event type's name in the admin bounded context.
@@ -68,6 +75,8 @@ impl MasterKeyEventKind {
             MasterKeyEventKind::MasterKeyRotated => "EncryptionMasterKeyRotated",
             MasterKeyEventKind::DataKeysRewrapped => "EncryptionDataKeysRewrapped",
             MasterKeyEventKind::MasterKeyRetired => "EncryptionMasterKeyRetired",
+            MasterKeyEventKind::KeyAssigned => "EncryptionKeyAssigned",
+            MasterKeyEventKind::KeyDeleted => "EncryptionKeyDeleted",
         }
     }
 
@@ -93,13 +102,24 @@ impl MasterKeyEventKind {
                 ("provider", "string", true),
                 ("below_version", "integer", true),
             ],
+            MasterKeyEventKind::KeyAssigned => &[
+                ("provider", "string", true),
+                ("bounded_context", "string", true),
+                ("previous_provider", "string", true),
+                ("created", "boolean", true),
+                ("actor_role_id", "string", false),
+            ],
+            MasterKeyEventKind::KeyDeleted => &[
+                ("provider", "string", true),
+                ("deleted_at_provider", "boolean", true),
+            ],
         }
     }
 
     /// The tags, as `(tag key, payload field)`.
     fn tags(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            MasterKeyEventKind::DataKeysRewrapped => &[
+            MasterKeyEventKind::DataKeysRewrapped | MasterKeyEventKind::KeyAssigned => &[
                 ("master_key", "provider"),
                 ("bounded_context", "bounded_context"),
             ],
@@ -223,6 +243,37 @@ impl MasterKeyChange {
         )
     }
 
+    /// `EncryptionKeyAssigned`: `bounded_context` now uses `provider`'s
+    /// key, after `previous`; `created` when skilj created it for this.
+    pub fn assigned(
+        provider: &str,
+        bounded_context: &str,
+        previous: &str,
+        created: bool,
+        actor_role_id: Option<&str>,
+    ) -> Self {
+        Self::new(
+            MasterKeyEventKind::KeyAssigned,
+            json!({
+                "provider": provider,
+                "bounded_context": bounded_context,
+                "previous_provider": previous,
+                "created": created,
+                "actor_role_id": actor_role_id,
+            }),
+        )
+    }
+
+    /// `EncryptionKeyDeleted`: `provider`'s key is used by no bounded
+    /// context any more and was deleted at the provider
+    /// (`deleted_at_provider`), or let go of when skilj didn't create it.
+    pub fn deleted(provider: &str, deleted_at_provider: bool) -> Self {
+        Self::new(
+            MasterKeyEventKind::KeyDeleted,
+            json!({ "provider": provider, "deleted_at_provider": deleted_at_provider }),
+        )
+    }
+
     fn new(kind: MasterKeyEventKind, payload: Value) -> Self {
         let Value::Object(payload) = payload else {
             unreachable!("every constructor above passes a JSON object")
@@ -304,6 +355,8 @@ mod tests {
             ),
             MasterKeyChange::rewrapped("file", 2, "banking", 3, 0),
             MasterKeyChange::retired("file", 2),
+            MasterKeyChange::assigned("file:banking", "banking", "file", true, Some("r")),
+            MasterKeyChange::deleted("file:banking", true),
         ];
         for change in events {
             let event = change.into_event(&admin(), 1, Utc::now());

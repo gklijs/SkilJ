@@ -95,6 +95,37 @@ pub trait KeyProvider: Send + Sync + 'static {
 
     /// Makes every version below `version` unusable for unwrapping.
     fn retire_below(&self, version: u32) -> BoxFuture<'_, Result<(), Error>>;
+
+    /// Another key of the same provider, named `key` - a bounded context's
+    /// own key (docs/architecture.md §230). Its [`name`](Self::name) names
+    /// it apart from this one. The key need not exist yet:
+    /// [`create`](Self::create) makes it.
+    fn key(&self, key: &str) -> Result<std::sync::Arc<dyn KeyProvider>, Error>;
+
+    /// Creates this key at the provider when it doesn't exist yet.
+    fn create(&self) -> BoxFuture<'_, Result<(), Error>>;
+
+    /// Deletes this key at the provider, every version of it: whatever it
+    /// wrapped can never be unwrapped again.
+    fn delete(&self) -> BoxFuture<'_, Result<(), Error>>;
+}
+
+/// Refuses a key name that isn't 1 to 64 ASCII letters, digits, `-` and
+/// `_`: it ends up in a Vault path and a file name.
+pub fn validate_key_name(key: &str) -> Result<(), Error> {
+    let valid = !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::ProviderRefused {
+            provider: "skilj".into(),
+            message: format!("key name {key:?} must be 1 to 64 ASCII letters, digits, '-' or '_'"),
+        })
+    }
 }
 
 fn random_bytes<const N: usize>() -> [u8; N] {
@@ -243,11 +274,14 @@ impl Keyring {
 }
 
 /// A [`KeyProvider`] holding its keys in memory, for tests. Clones share
-/// one keyring, so two instances in a test can rotate together. Nothing
-/// survives the process.
+/// one set of keyrings, so two instances in a test can rotate together,
+/// and [`key`](KeyProvider::key) addresses another keyring in the same set.
+/// Nothing survives the process.
 #[derive(Clone)]
 pub struct InMemoryKeyProvider {
-    keyring: Arc<Mutex<Keyring>>,
+    keyrings: Arc<Mutex<std::collections::HashMap<String, Keyring>>>,
+    key: String,
+    name: String,
 }
 
 impl InMemoryKeyProvider {
@@ -259,13 +293,24 @@ impl InMemoryKeyProvider {
     /// A keyring whose version 1 is `bytes`: two providers made from the
     /// same bytes unwrap each other's version-1 keys.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        let mut keyrings = std::collections::HashMap::new();
+        keyrings.insert(String::new(), Keyring::new(bytes));
         Self {
-            keyring: Arc::new(Mutex::new(Keyring::new(bytes))),
+            keyrings: Arc::new(Mutex::new(keyrings)),
+            key: String::new(),
+            name: "in-memory".into(),
         }
     }
 
-    fn with<T>(&self, f: impl FnOnce(&mut Keyring) -> T) -> T {
-        f(&mut self.keyring.lock().unwrap_or_else(|e| e.into_inner()))
+    fn with<T>(&self, f: impl FnOnce(&mut Keyring) -> T) -> Result<T, Error> {
+        let mut keyrings = self.keyrings.lock().unwrap_or_else(|e| e.into_inner());
+        let keyring = keyrings
+            .get_mut(&self.key)
+            .ok_or_else(|| Error::ProviderRefused {
+                provider: self.name.clone(),
+                message: "the key does not exist".into(),
+            })?;
+        Ok(f(keyring))
     }
 }
 
@@ -277,28 +322,55 @@ impl Default for InMemoryKeyProvider {
 
 impl KeyProvider for InMemoryKeyProvider {
     fn name(&self) -> &str {
-        "in-memory"
+        &self.name
     }
 
     fn wrap<'a>(&'a self, data_key: &'a [u8; 32]) -> BoxFuture<'a, Result<WrappedDataKey, Error>> {
-        Box::pin(async move { self.with(|k| k.wrap(data_key)) })
+        Box::pin(async move { self.with(|k| k.wrap(data_key))? })
     }
 
     fn unwrap<'a>(&'a self, wrapped: &'a WrappedDataKey) -> BoxFuture<'a, Result<[u8; 32], Error>> {
-        Box::pin(async move { self.with(|k| k.unwrap(wrapped)) })
+        Box::pin(async move { self.with(|k| k.unwrap(wrapped))? })
     }
 
     fn versions(&self) -> BoxFuture<'_, Result<KeyVersions, Error>> {
-        Box::pin(async move { Ok(self.with(|k| k.versions())) })
+        Box::pin(async move { self.with(|k| k.versions()) })
     }
 
     fn rotate(&self) -> BoxFuture<'_, Result<u32, Error>> {
-        Box::pin(async move { Ok(self.with(Keyring::rotate)) })
+        Box::pin(async move { self.with(Keyring::rotate) })
     }
 
     fn retire_below(&self, version: u32) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move { self.with(|k| k.retire_below(version)) })
+    }
+
+    fn key(&self, key: &str) -> Result<Arc<dyn KeyProvider>, Error> {
+        validate_key_name(key)?;
+        Ok(Arc::new(Self {
+            keyrings: Arc::clone(&self.keyrings),
+            key: key.to_string(),
+            name: format!("in-memory:{key}"),
+        }))
+    }
+
+    fn create(&self) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
-            self.with(|k| k.retire_below(version));
+            self.keyrings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(self.key.clone())
+                .or_insert_with(|| Keyring::new(random_bytes::<32>()));
+            Ok(())
+        })
+    }
+
+    fn delete(&self) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move {
+            self.keyrings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.key);
             Ok(())
         })
     }
@@ -315,6 +387,7 @@ pub struct KeyFileProvider {
     path: PathBuf,
     /// Serialises this process's read-modify-writes of the file.
     lock: Mutex<()>,
+    name: String,
 }
 
 impl KeyFileProvider {
@@ -324,15 +397,22 @@ impl KeyFileProvider {
         let provider = Self {
             path: path.as_ref().to_path_buf(),
             lock: Mutex::new(()),
+            name: "file".into(),
         };
-        if !provider.path.exists() {
-            if let Some(parent) = provider.path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| provider.io_error(e))?;
-            }
-            provider.write(&Keyring::new(random_bytes::<32>()))?;
-        }
+        provider.create_file()?;
         provider.read()?;
         Ok(provider)
+    }
+
+    fn create_file(&self) -> Result<(), Error> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.path.exists() {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| self.io_error(e))?;
+            }
+            self.write(&Keyring::new(random_bytes::<32>()))?;
+        }
+        Ok(())
     }
 
     /// The file it reads.
@@ -342,7 +422,7 @@ impl KeyFileProvider {
 
     fn io_error(&self, err: impl std::fmt::Display) -> Error {
         Error::ProviderUnavailable {
-            provider: "file".into(),
+            provider: self.name.clone(),
             message: format!("{}: {err}", self.path.display()),
         }
     }
@@ -350,7 +430,7 @@ impl KeyFileProvider {
     fn read(&self) -> Result<Keyring, Error> {
         let text = std::fs::read_to_string(&self.path).map_err(|e| self.io_error(e))?;
         serde_json::from_str(&text).map_err(|e| Error::ProviderRefused {
-            provider: "file".into(),
+            provider: self.name.clone(),
             message: format!("{}: not a skilj key file: {e}", self.path.display()),
         })
     }
@@ -384,7 +464,7 @@ impl KeyFileProvider {
 
 impl KeyProvider for KeyFileProvider {
     fn name(&self) -> &str {
-        "file"
+        &self.name
     }
 
     fn wrap<'a>(&'a self, data_key: &'a [u8; 32]) -> BoxFuture<'a, Result<WrappedDataKey, Error>> {
@@ -405,6 +485,34 @@ impl KeyProvider for KeyFileProvider {
 
     fn retire_below(&self, version: u32) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move { self.change(|k| k.retire_below(version)) })
+    }
+
+    /// The file next to this one, `<stem>-<key>.json`.
+    fn key(&self, key: &str) -> Result<Arc<dyn KeyProvider>, Error> {
+        validate_key_name(key)?;
+        let stem = self
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(Arc::new(Self {
+            path: self.path.with_file_name(format!("{stem}-{key}.json")),
+            lock: Mutex::new(()),
+            name: format!("file:{key}"),
+        }))
+    }
+
+    fn create(&self) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move { self.create_file() })
+    }
+
+    fn delete(&self) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move {
+            match std::fs::remove_file(&self.path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(self.io_error(e)),
+                _ => Ok(()),
+            }
+        })
     }
 }
 

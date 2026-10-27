@@ -66,6 +66,10 @@ impl Cache {
 
 struct Inner {
     provider: Arc<dyn KeyProvider>,
+    /// Every key this process has used, by name - the default one and the
+    /// bounded contexts' own (docs/architecture.md §230) - so a stored
+    /// data key finds the key that wrapped it.
+    providers: Mutex<HashMap<String, Arc<dyn KeyProvider>>>,
     legacy: Option<EncryptionMasterKey>,
     cache: Mutex<Cache>,
 }
@@ -108,9 +112,13 @@ impl KeyService {
         ttl: Duration,
         capacity: usize,
     ) -> Self {
+        // Only called before the service is shared (construction and the
+        // builder-time `with_*`), so nothing remembered is lost.
+        let providers = HashMap::from([(provider.name().to_string(), Arc::clone(&provider))]);
         Self {
             inner: Arc::new(Inner {
                 provider,
+                providers: Mutex::new(providers),
                 legacy,
                 cache: Mutex::new(Cache {
                     entries: HashMap::new(),
@@ -151,9 +159,45 @@ impl KeyService {
         (cache.ttl, cache.capacity)
     }
 
-    /// The provider.
+    /// The default key's provider: the key every bounded context without
+    /// one of its own uses.
     pub fn provider(&self) -> &dyn KeyProvider {
         self.inner.provider.as_ref()
+    }
+
+    /// The default key's provider, shared.
+    pub fn default_provider(&self) -> Arc<dyn KeyProvider> {
+        Arc::clone(&self.inner.provider)
+    }
+
+    /// The provider of the key named `key` (docs/architecture.md §230), or
+    /// of the default key for `None`; remembered, so data keys it wrapped
+    /// are found by [`unwrap`](Self::unwrap) from then on.
+    pub fn provider_for(&self, key: Option<&str>) -> Result<Arc<dyn KeyProvider>, Error> {
+        let Some(key) = key else {
+            return Ok(self.default_provider());
+        };
+        let provider = self.inner.provider.key(key)?;
+        let mut providers = self
+            .inner
+            .providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Ok(Arc::clone(
+            providers
+                .entry(provider.name().to_string())
+                .or_insert(provider),
+        ))
+    }
+
+    /// A key already used by this process, by its provider name.
+    pub fn provider_named(&self, name: &str) -> Option<Arc<dyn KeyProvider>> {
+        self.inner
+            .providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
     /// The provider's name, as stored next to each data key it wraps.
@@ -166,11 +210,19 @@ impl KeyService {
         self.inner.legacy.is_some()
     }
 
-    /// A fresh data key, and its wrapped form to store.
+    /// A fresh data key, and its wrapped form to store, by the default key.
     pub async fn generate(&self) -> Result<(DataKey, WrappedDataKey), Error> {
+        self.generate_with(self.inner.provider.as_ref()).await
+    }
+
+    /// A fresh data key, and its wrapped form to store, by `provider`.
+    pub async fn generate_with(
+        &self,
+        provider: &dyn KeyProvider,
+    ) -> Result<(DataKey, WrappedDataKey), Error> {
         let data_key = DataKey(super::random_bytes::<32>());
-        let wrapped = self.inner.provider.wrap(&data_key.0).await?;
-        self.remember(self.provider_name(), &wrapped, &data_key);
+        let wrapped = provider.wrap(&data_key.0).await?;
+        self.remember(provider.name(), &wrapped, &data_key);
         Ok((data_key, wrapped))
     }
 
@@ -181,12 +233,12 @@ impl KeyService {
     pub async fn unwrap(&self, stored: StoredWrap<'_>) -> Result<DataKey, Error> {
         match (stored.provider, stored.version) {
             (Some(provider), Some(version)) => {
-                if provider != self.provider_name() {
+                let Some(key) = self.provider_named(provider) else {
                     return Err(Error::ProviderChanged {
                         stored: provider.to_string(),
                         configured: self.provider_name().to_string(),
                     });
-                }
+                };
                 let wrapped = WrappedDataKey {
                     version,
                     ciphertext: stored.ciphertext.to_vec(),
@@ -195,7 +247,7 @@ impl KeyService {
                 if let Some(data_key) = self.cached(&cache_key) {
                     return Ok(data_key);
                 }
-                let data_key = DataKey(self.inner.provider.unwrap(&wrapped).await?);
+                let data_key = DataKey(key.unwrap(&wrapped).await?);
                 self.cache_insert(cache_key, &data_key);
                 Ok(data_key)
             }

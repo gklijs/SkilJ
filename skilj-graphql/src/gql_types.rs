@@ -303,18 +303,31 @@ pub fn capability_history_object(n: &Naming) -> Object {
     })
 }
 
-/// The encryption master key version in use and where its rotation
-/// stands (docs/architecture.md §230). Names the provider and versions,
-/// never a key.
-pub fn encryption_master_key_object(n: &Naming) -> Object {
-    gql_object!(skilj_core::db::MasterKeyState => n.ty("EncryptionMasterKey") {
-        scalar "provider": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.provider.clone()),
-        scalar "version": TypeRef::named_nn(TypeRef::INT) => |k| Value::from(k.version),
-        scalar "rotatedAt": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.rotated_at.to_rfc3339()),
-        scalar "rewrapPending": TypeRef::named_nn(TypeRef::BOOLEAN) => |k| Value::from(k.rewrapped_at.is_none()),
-        scalar "rewrappedAt": TypeRef::named(TypeRef::STRING) => |k| optional_timestamp(k.rewrapped_at),
-        scalar "retireImmediately": TypeRef::named_nn(TypeRef::BOOLEAN) => |k| Value::from(k.retire_immediately),
-        scalar "retiredBelow": TypeRef::named_nn(TypeRef::INT) => |k| Value::from(k.retired_below),
+/// One encryption master key and the bounded contexts using it
+/// (docs/architecture.md §230).
+pub struct MasterKeyOverview {
+    /// The key's state.
+    pub state: skilj_core::db::MasterKeyState,
+    /// The bounded contexts whose new data keys it wraps.
+    pub bounded_contexts: Vec<String>,
+}
+
+/// An encryption master key - the default key or a bounded context's own -
+/// and where its rotation stands (docs/architecture.md §230). Names the
+/// provider and versions, never a key.
+pub fn master_key_object(n: &Naming) -> Object {
+    gql_object!(MasterKeyOverview => n.ty("MasterKey") {
+        scalar "provider": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.state.provider.clone()),
+        scalar "key": TypeRef::named(TypeRef::STRING) => |k| optional_string(k.state.key.clone()),
+        scalar "version": TypeRef::named_nn(TypeRef::INT) => |k| Value::from(k.state.version),
+        scalar "rotatedAt": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.state.rotated_at.to_rfc3339()),
+        scalar "rewrapPending": TypeRef::named_nn(TypeRef::BOOLEAN) => |k| Value::from(k.state.rewrapped_at.is_none()),
+        scalar "rewrappedAt": TypeRef::named(TypeRef::STRING) => |k| optional_timestamp(k.state.rewrapped_at),
+        scalar "retireImmediately": TypeRef::named_nn(TypeRef::BOOLEAN) => |k| Value::from(k.state.retire_immediately),
+        scalar "retiredBelow": TypeRef::named_nn(TypeRef::INT) => |k| Value::from(k.state.retired_below),
+        scalar "createdBySkilj": TypeRef::named_nn(TypeRef::BOOLEAN) => |k| Value::from(k.state.created_by_skilj),
+        scalar "deleteAfter": TypeRef::named(TypeRef::STRING) => |k| optional_timestamp(k.state.delete_after),
+        scalar "boundedContexts": TypeRef::named_nn_list_nn(TypeRef::STRING) => |k| string_list(k.bounded_contexts.iter().cloned()),
     })
 }
 

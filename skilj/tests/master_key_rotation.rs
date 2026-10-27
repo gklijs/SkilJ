@@ -128,9 +128,14 @@ async fn admin_events(pool: &Pool, name: &str) -> Vec<Value> {
 }
 
 /// Waits until the master key state satisfies `done`.
-async fn wait_for_state(pool: &Pool, what: &str, done: impl Fn(&db::MasterKeyState) -> bool) {
+async fn wait_for_state(
+    pool: &Pool,
+    provider: &str,
+    what: &str,
+    done: impl Fn(&db::MasterKeyState) -> bool,
+) {
     for _ in 0..200 {
-        if let Some(state) = db::master_key_state(pool).await.unwrap() {
+        if let Some(state) = db::master_key_state(pool, provider).await.unwrap() {
             if done(&state) {
                 return;
             }
@@ -139,7 +144,7 @@ async fn wait_for_state(pool: &Pool, what: &str, done: impl Fn(&db::MasterKeySta
     }
     panic!(
         "timed out waiting for {what}: {:?}",
-        db::master_key_state(pool).await.unwrap()
+        db::master_key_state(pool, provider).await.unwrap()
     );
 }
 
@@ -314,6 +319,27 @@ async fn serve_transit() -> (String, Fake) {
                     StatusCode::OK,
                     Json(json!({ "data": { "latest_version": t.latest, "min_decryption_version": t.min_decryption } })),
                 )
+            })
+            .post(|State(f): State<Fake>, headers: HeaderMap, Path(key): Path<String>, Json(body): Json<Value>| async move {
+                if let Some(denied) = denied(&headers) {
+                    return denied;
+                }
+                f.lock().unwrap().calls.push(format!("create {key} {}", body["type"].as_str().unwrap_or("")));
+                (StatusCode::OK, Json(json!({ "data": {} })))
+            })
+            .delete(|State(f): State<Fake>, headers: HeaderMap, Path(key): Path<String>| async move {
+                if let Some(denied) = denied(&headers) {
+                    return denied;
+                }
+                let mut t = f.lock().unwrap();
+                if !t.calls.iter().any(|c| c == &format!("allow deletion {key}")) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "errors": ["deletion is not allowed for this key"] })),
+                    );
+                }
+                t.calls.push(format!("delete {key}"));
+                (StatusCode::NO_CONTENT, Json(json!(null)))
             }),
         )
         .route(
@@ -330,13 +356,18 @@ async fn serve_transit() -> (String, Fake) {
         )
         .route(
             "/v1/transit/keys/{key}/config",
-            post(|State(f): State<Fake>, headers: HeaderMap, Json(body): Json<Value>| async move {
+            post(|State(f): State<Fake>, headers: HeaderMap, Path(key): Path<String>, Json(body): Json<Value>| async move {
                 if let Some(denied) = denied(&headers) {
                     return denied;
                 }
                 let mut t = f.lock().unwrap();
                 t.calls.push("config".into());
-                t.min_decryption = body["min_decryption_version"].as_u64().unwrap() as u32;
+                if body["deletion_allowed"] == true {
+                    t.calls.push(format!("allow deletion {key}"));
+                }
+                if let Some(min) = body["min_decryption_version"].as_u64() {
+                    t.min_decryption = min as u32;
+                }
                 (StatusCode::OK, Json(json!({ "data": {} })))
             }),
         )
@@ -376,6 +407,20 @@ fn the_vault_provider_wraps_rewraps_in_batches_and_is_refused_a_retired_version(
         let versions = vault.versions().await.unwrap();
         assert_eq!((versions.latest, versions.min_decryption), (2, 2));
         assert!(fake.lock().unwrap().calls.iter().any(|c| c == "rewrap"));
+
+        // Another key on the same mount: created, then deleted - which
+        // Vault only allows once deletion is allowed on the key.
+        let tenant = vault.key("tenant-a").unwrap();
+        assert_eq!(tenant.name(), "vault-transit:transit/tenant-a");
+        tenant.create().await.unwrap();
+        tenant.delete().await.unwrap();
+        let calls = fake.lock().unwrap().calls.clone();
+        assert!(
+            calls.contains(&"create tenant-a aes256-gcm96".to_string()),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&"delete tenant-a".to_string()), "{calls:?}");
+        assert!(vault.key("../escape").is_err(), "key names are checked");
 
         // A bad token is a refusal; a provider that isn't there is unavailable.
         let wrong = VaultTransitProvider::new(&address, "skilj", "nope");
@@ -444,7 +489,8 @@ async fn rotate_end_to_end(
     // own, and the old version still unwraps afterwards.
     db::rotate_master_key(
         pool,
-        &keys,
+        keys.provider(),
+        None,
         db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
         false,
         Some("superadmin-role"),
@@ -452,7 +498,7 @@ async fn rotate_end_to_end(
     )
     .await
     .unwrap();
-    wait_for_state(pool, "the rewrap to version 2", |s| {
+    wait_for_state(pool, &provider, "the rewrap to version 2", |s| {
         s.version == 2 && s.rewrapped_at.is_some()
     })
     .await;
@@ -492,7 +538,8 @@ async fn rotate_end_to_end(
     // A leak: rotated again, retired as soon as the rewrap is done.
     db::rotate_master_key(
         pool,
-        &keys,
+        keys.provider(),
+        None,
         db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
         true,
         None,
@@ -500,7 +547,7 @@ async fn rotate_end_to_end(
     )
     .await
     .unwrap();
-    wait_for_state(pool, "version 3 retiring the ones below", |s| {
+    wait_for_state(pool, &provider, "version 3 retiring the ones below", |s| {
         s.version == 3 && s.retired_below == 3
     })
     .await;
@@ -584,9 +631,12 @@ fn a_scheduled_rotation_runs_on_its_own_and_retires_after_the_grace_period() {
         .build()
         .await
         .unwrap();
-        wait_for_state(&pool, "a scheduled rotation, rewrapped and retired", |s| {
-            s.version >= 2 && s.retired_below >= 2
-        })
+        wait_for_state(
+            &pool,
+            keys.provider_name(),
+            "a scheduled rotation, rewrapped and retired",
+            |s| s.version >= 2 && s.retired_below >= 2,
+        )
         .await;
         let rotated = admin_events(&pool, "EncryptionMasterKeyRotated").await;
         assert!(rotated.iter().any(|e| e["reason"] == "scheduled"));
@@ -612,9 +662,12 @@ fn a_rotation_made_at_the_provider_directly_is_recorded_and_followed() {
             .unwrap();
         // `vault write -f transit/keys/skilj/rotate`, say.
         keys.provider().rotate().await.unwrap();
-        wait_for_state(&pool, "the external rotation's rewrap", |s| {
-            s.version == 2 && s.rewrapped_at.is_some()
-        })
+        wait_for_state(
+            &pool,
+            keys.provider_name(),
+            "the external rotation's rewrap",
+            |s| s.version == 2 && s.rewrapped_at.is_some(),
+        )
         .await;
         let rotated = admin_events(&pool, "EncryptionMasterKeyRotated").await;
         assert_eq!(rotated.last().unwrap()["reason"], "external");
@@ -644,12 +697,32 @@ fn data_keys_from_before_key_providers_need_their_key_and_are_moved_to_the_provi
         .await
         .unwrap();
 
+        // A newer one that is corrupt: it must not read as the wrong key.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO \"bc_{bc}\".encryption_keys \
+             (subject_key, subject_value, status, created_at, wrapped_key, wrap_nonce) \
+             VALUES ('user', '2', 'active', now(), '\\x0001'::bytea, $1)"
+        )))
+        .bind(&nonce)
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let provider = InMemoryKeyProvider::new();
         let keys = || KeyService::new(provider.clone());
         assert_eq!(
             refused(builder(&url, keys(), quick(Duration::ZERO))).await,
             "encryption_legacy_master_key_required"
         );
+        let wrong = match builder(&url, keys(), quick(Duration::ZERO))
+            .legacy_encryption_master_key(EncryptionMasterKey::from_bytes([12u8; 32]))
+            .build()
+            .await
+        {
+            Ok(_) => panic!("the wrong legacy key was accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(wrong.contains(&bc), "names the bounded context: {wrong}");
         assert_eq!(
             refused(
                 builder(&url, keys(), quick(Duration::ZERO))
@@ -663,13 +736,21 @@ fn data_keys_from_before_key_providers_need_their_key_and_are_moved_to_the_provi
             .build()
             .await
             .unwrap();
-        wait_for_state(&pool, "the legacy data keys moved", |s| {
+        wait_for_state(&pool, provider.name(), "the legacy data keys moved", |s| {
             s.rewrapped_at.is_some()
         })
         .await;
         assert_eq!(
             wraps(&pool, &bc).await[0].1.as_deref(),
             Some(provider.name())
+        );
+        let rewrapped = events_about(&pool, "EncryptionDataKeysRewrapped", &bc).await;
+        assert_eq!(
+            (
+                rewrapped[0]["rewrapped"].clone(),
+                rewrapped[0]["unreadable"].clone()
+            ),
+            (json!(1), json!(1))
         );
         // Readable now without the legacy key.
         assert_eq!(
@@ -826,12 +907,16 @@ async fn graphql_request(
     serde_json::from_slice(&body).unwrap()
 }
 
-const ROTATE: &str = "mutation($now: Boolean) { \
-    rotateEncryptionMasterKey(retireImmediately: $now) { \
+const ROTATE: &str = "mutation($now: Boolean, $bc: String) { \
+    rotateMasterKey(boundedContext: $bc, retireImmediately: $now) { \
         provider version rewrapPending retireImmediately retiredBelow \
     } }";
 const STATE: &str =
-    "{ encryptionMasterKey { provider version rewrapPending rewrappedAt retiredBelow } }";
+    "{ masterKeys { provider key version rewrapPending rewrappedAt retiredBelow boundedContexts } }";
+const ASSIGN: &str = "mutation($bc: String!, $key: String, $create: Boolean) { \
+    assignMasterKey(boundedContext: $bc, key: $key, create: $create) { \
+        provider key version createdBySkilj boundedContexts \
+    } }";
 
 #[test]
 fn a_superadmin_rotates_over_graphql_and_reads_where_it_stands() {
@@ -878,14 +963,8 @@ fn a_superadmin_rotates_over_graphql_and_reads_where_it_stands() {
         let root = sign_jwt(&superadmin.external_subject);
 
         let state = graphql_request(&router, &root, STATE, json!({})).await;
-        assert_eq!(
-            state["data"]["encryptionMasterKey"]["version"], 1,
-            "{state}"
-        );
-        assert_eq!(
-            state["data"]["encryptionMasterKey"]["provider"],
-            "in-memory"
-        );
+        assert_eq!(state["data"]["masterKeys"][0]["version"], 1, "{state}");
+        assert_eq!(state["data"]["masterKeys"][0]["provider"], "in-memory");
 
         // Only a superadmin.
         let refused = graphql_request(
@@ -899,7 +978,7 @@ fn a_superadmin_rotates_over_graphql_and_reads_where_it_stands() {
         assert_eq!(keys.provider().versions().await.unwrap().latest, 1);
 
         let rotated = graphql_request(&router, &root, ROTATE, json!({ "now": true })).await;
-        let rotated = &rotated["data"]["rotateEncryptionMasterKey"];
+        let rotated = &rotated["data"]["rotateMasterKey"];
         assert_eq!(rotated["version"], 2, "{rotated}");
         assert_eq!(rotated["rewrapPending"], true);
         assert_eq!(rotated["retireImmediately"], true);
@@ -909,14 +988,341 @@ fn a_superadmin_rotates_over_graphql_and_reads_where_it_stands() {
             superadmin.id.as_str()
         );
 
-        wait_for_state(&pool, "the retirement after the GraphQL rotation", |s| {
-            s.retired_below == 2
-        })
+        wait_for_state(
+            &pool,
+            keys.provider_name(),
+            "the retirement after the GraphQL rotation",
+            |s| s.retired_below == 2,
+        )
         .await;
         let state = graphql_request(&router, &root, STATE, json!({})).await;
-        let state = &state["data"]["encryptionMasterKey"];
+        let state = &state["data"]["masterKeys"][0];
         assert_eq!(state["rewrapPending"], false);
         assert!(state["rewrappedAt"].is_string());
         assert_eq!(state["retiredBelow"], 2);
+
+        // Its own key, then where every key stands.
+        let assigned = graphql_request(
+            &router,
+            &root,
+            ASSIGN,
+            json!({ "bc": bc, "key": "own-key", "create": true }),
+        )
+        .await;
+        let assigned = &assigned["data"]["assignMasterKey"];
+        assert_eq!(assigned["provider"], "in-memory:own-key", "{assigned}");
+        assert_eq!(assigned["createdBySkilj"], true);
+        assert_eq!(assigned["boundedContexts"], json!([bc]));
+        let all = graphql_request(&router, &root, STATE, json!({})).await;
+        let all = all["data"]["masterKeys"].as_array().unwrap().clone();
+        assert_eq!(all.len(), 2);
+        assert!(!all[0]["boundedContexts"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(bc)));
+    });
+}
+
+// --- bounded contexts with keys of their own ---
+
+/// Every event of type `name` about `bounded_context`.
+async fn events_about(pool: &Pool, name: &str, bounded_context: &str) -> Vec<Value> {
+    admin_events(pool, name)
+        .await
+        .into_iter()
+        .filter(|e| e["bounded_context"] == bounded_context)
+        .collect()
+}
+
+/// Waits until `check` holds, polling.
+async fn wait_until<F, Fut>(what: &str, check: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn a_bounded_context_with_its_own_key_is_moved_rotated_and_its_key_deleted_with_it() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_own_key_test").await else {
+            return;
+        };
+        let tenant = insert_bounded_context(&pool).await;
+        let other = insert_bounded_context(&pool).await;
+        let provider = InMemoryKeyProvider::new();
+        let keys = KeyService::new(provider.clone());
+        let sealed = seal_for(&pool, &tenant, "1", &keys).await;
+        seal_for(&pool, &other, "2", &keys).await;
+        let (_skilj, _) = builder(&url, keys.clone(), quick(Duration::ZERO))
+            .build()
+            .await
+            .unwrap();
+
+        // Its own key, created by skilj: its data keys move there.
+        let assigned =
+            db::assign_encryption_key(&pool, &keys, &tenant, Some("tenant-a"), true, Some("root"))
+                .await
+                .unwrap();
+        assert_eq!(assigned.provider, "in-memory:tenant-a");
+        assert!(assigned.created_by_skilj);
+        wait_for_state(
+            &pool,
+            "in-memory:tenant-a",
+            "the move to the tenant's key",
+            |s| s.rewrapped_at.is_some(),
+        )
+        .await;
+        assert_eq!(
+            wraps(&pool, &tenant).await[0].1.as_deref(),
+            Some("in-memory:tenant-a")
+        );
+        assert_eq!(
+            wraps(&pool, &other).await[0].1.as_deref(),
+            Some("in-memory")
+        );
+        let assigned_event = events_about(&pool, "EncryptionKeyAssigned", &tenant).await;
+        assert_eq!(assigned_event.len(), 1);
+        assert_eq!(assigned_event[0]["previous_provider"], "in-memory");
+        assert_eq!(assigned_event[0]["created"], true);
+        // New data keys of the tenant are wrapped by its key.
+        seal_for(&pool, &tenant, "3", &keys).await;
+        assert!(wraps(&pool, &tenant)
+            .await
+            .iter()
+            .all(|(_, p, _, _)| p.as_deref() == Some("in-memory:tenant-a")));
+
+        // Rotating the tenant's key leaves the default key alone.
+        let tenant_key = keys.provider_for(Some("tenant-a")).unwrap();
+        db::rotate_master_key(
+            &pool,
+            tenant_key.as_ref(),
+            Some("tenant-a"),
+            db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_state(
+            &pool,
+            "in-memory:tenant-a",
+            "the tenant key's retirement",
+            |s| s.version == 2 && s.retired_below == 2,
+        )
+        .await;
+        assert_eq!(
+            db::master_key_state(&pool, "in-memory")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+        assert_eq!(wraps(&pool, &other).await[0].2, Some(1));
+
+        // An instance that has never used the tenant's key still reads it.
+        let fresh = KeyService::new(provider.clone());
+        assert_eq!(
+            open_for(&pool, &tenant, "1", &fresh, &sealed).await,
+            "1@example.com"
+        );
+
+        // Deleting the bounded context deletes its key after the grace period.
+        db::hard_delete_bounded_context(&pool, &tenant)
+            .await
+            .unwrap();
+        wait_until("the tenant key's deletion", || async {
+            !admin_events(&pool, "EncryptionKeyDeleted").await.is_empty()
+        })
+        .await;
+        let deleted = admin_events(&pool, "EncryptionKeyDeleted").await;
+        assert_eq!(deleted[0]["provider"], "in-memory:tenant-a");
+        assert_eq!(deleted[0]["deleted_at_provider"], true);
+        assert!(tenant_key.versions().await.is_err(), "gone at the provider");
+        assert!(db::master_key_state(&pool, "in-memory:tenant-a")
+            .await
+            .unwrap()
+            .is_none());
+    });
+}
+
+#[test]
+fn a_key_a_superadmin_brought_is_let_go_of_but_not_deleted() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_byok_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&pool).await;
+        let provider = InMemoryKeyProvider::new();
+        let keys = KeyService::new(provider.clone());
+        seal_for(&pool, &bc, "1", &keys).await;
+        // The customer's key, made outside skilj.
+        let theirs = provider.key("customer-key").unwrap();
+        theirs.create().await.unwrap();
+        let (_skilj, _) = builder(&url, keys.clone(), quick(Duration::ZERO))
+            .build()
+            .await
+            .unwrap();
+
+        // A key that doesn't exist is refused, and nothing is recorded.
+        let missing = db::assign_encryption_key(&pool, &keys, &bc, Some("nope"), false, None).await;
+        assert!(missing.is_err());
+        assert!(db::bounded_context_key(&pool, &bc).await.unwrap().is_none());
+
+        db::assign_encryption_key(&pool, &keys, &bc, Some("customer-key"), false, None)
+            .await
+            .unwrap();
+        wait_for_state(
+            &pool,
+            "in-memory:customer-key",
+            "the move to their key",
+            |s| s.rewrapped_at.is_some(),
+        )
+        .await;
+        assert_eq!(
+            wraps(&pool, &bc).await[0].1.as_deref(),
+            Some("in-memory:customer-key")
+        );
+
+        // Back to the default key: the data keys move back, and their key is
+        // only let go of.
+        db::assign_encryption_key(&pool, &keys, &bc, None, false, None)
+            .await
+            .unwrap();
+        wait_until("their key let go of", || async {
+            !admin_events(&pool, "EncryptionKeyDeleted").await.is_empty()
+        })
+        .await;
+        let deleted = admin_events(&pool, "EncryptionKeyDeleted").await;
+        assert_eq!(deleted[0]["deleted_at_provider"], false);
+        assert_eq!(wraps(&pool, &bc).await[0].1.as_deref(), Some("in-memory"));
+        assert!(
+            theirs.versions().await.is_ok(),
+            "still there at the provider"
+        );
+    });
+}
+
+#[test]
+fn unreadable_data_keys_are_marked_once_and_one_event_covers_every_batch() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_unreadable_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&pool).await;
+        let keys = KeyService::new(InMemoryKeyProvider::new());
+        // More than one rewrap batch.
+        for subject in 0..250 {
+            seal_for(&pool, &bc, &format!("s{subject:03}"), &keys).await;
+        }
+        // One corrupt data key.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"bc_{bc}\".encryption_keys SET wrapped_key = '\\x00010203'::bytea \
+             WHERE subject_value = 's100'"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_skilj, _) = builder(&url, keys.clone(), quick(Duration::ZERO))
+            .build()
+            .await
+            .unwrap();
+        db::rotate_master_key(
+            &pool,
+            keys.provider(),
+            None,
+            db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // The unreadable key holds up neither the rewrap nor the retirement.
+        wait_for_state(&pool, keys.provider_name(), "the retirement", |s| {
+            s.version == 2 && s.retired_below == 2
+        })
+        .await;
+        // Some more checks pass without anything new being recorded.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rewrapped = events_about(&pool, "EncryptionDataKeysRewrapped", &bc).await;
+        assert_eq!(rewrapped.len(), 1, "{rewrapped:?}");
+        assert_eq!(rewrapped[0]["rewrapped"], 249);
+        assert_eq!(rewrapped[0]["unreadable"], 1);
+        let marked: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            format!(
+                "SELECT unreadable_since FROM \"bc_{bc}\".encryption_keys WHERE subject_value = 's100'"
+            ),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(marked.is_some());
+    });
+}
+
+#[test]
+fn a_data_key_wrapped_under_an_old_version_after_the_rewrap_holds_up_the_retirement() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_straggler_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&pool).await;
+        let keys = KeyService::new(InMemoryKeyProvider::new());
+        seal_for(&pool, &bc, "1", &keys).await;
+        let old = wraps(&pool, &bc).await[0].3.clone();
+        let (_skilj, _) = builder(&url, keys.clone(), quick(Duration::from_secs(3600)))
+            .build()
+            .await
+            .unwrap();
+        db::rotate_master_key(
+            &pool,
+            keys.provider(),
+            None,
+            db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_state(&pool, keys.provider_name(), "the rewrap", |s| {
+            s.rewrapped_at.is_some()
+        })
+        .await;
+        // An instance that hadn't seen the rotation wrapped a data key under
+        // version 1 after the rewrap passed it - and the grace period is over.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"bc_{bc}\".encryption_keys SET wrapped_key = $1, master_key_version = 1"
+        )))
+        .bind(&old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE encryption_master_keys SET rewrapped_at = now() - interval '2 hours'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        wait_for_state(&pool, keys.provider_name(), "the retirement", |s| {
+            s.retired_below == 2
+        })
+        .await;
+        // It was rewrapped first, so nothing was lost to the retirement.
+        assert_eq!(wraps(&pool, &bc).await[0].2, Some(2));
+        assert_eq!(
+            events_about(&pool, "EncryptionDataKeysRewrapped", &bc)
+                .await
+                .len(),
+            2
+        );
     });
 }

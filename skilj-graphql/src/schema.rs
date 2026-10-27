@@ -260,9 +260,7 @@ fn root_types(
         .field(admin(
             resolvers::capability_management::capability_history_field(n),
         ))
-        .field(admin(
-            resolvers::master_key_rotation::encryption_master_key_field(n),
-        ))
+        .field(admin(resolvers::master_key_rotation::master_keys_field(n)))
         .field(admin(
             resolvers::capability_management::capability_delegation_field(n),
         ))
@@ -295,7 +293,10 @@ fn root_types(
     let mutation = Object::new("Mutation")
         .field(admin(resolvers::superadmin_bootstrap::field(n)))
         .field(admin(
-            resolvers::master_key_rotation::rotate_encryption_master_key_field(n),
+            resolvers::master_key_rotation::rotate_master_key_field(n),
+        ))
+        .field(admin(
+            resolvers::master_key_rotation::assign_master_key_field(n),
         ))
         .field(admin(resolvers::access_management::create_role_field(n)))
         .field(admin(resolvers::access_management::revoke_role_field(n)))
@@ -396,7 +397,7 @@ fn static_types(n: &Naming) -> Vec<Type> {
         gql_types::capability_delegation_object(n).into(),
         gql_types::capability_overview_entry_object(n).into(),
         gql_types::capability_history_object(n).into(),
-        gql_types::encryption_master_key_object(n).into(),
+        gql_types::master_key_object(n).into(),
         gql_types::context_creator_object(n).into(),
         gql_types::bounded_context_object(n).into(),
         gql_types::role_status_enum(n).into(),

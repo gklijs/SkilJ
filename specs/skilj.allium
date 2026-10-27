@@ -1635,8 +1635,9 @@ variant SkiljRecorded : Event {
     -- actor_role_id, because client_id has nobody to name here either -
     -- see SystemTriggeredClientIdIsSystem, which covers this origin too.
     -- The master-key trail (docs/architecture.md §230) records its event
-    -- types - EncryptionMasterKeyRotated, EncryptionDataKeysRewrapped and
-    -- EncryptionMasterKeyRetired - with this origin too. Like the
+    -- types - EncryptionMasterKeyRotated, EncryptionDataKeysRewrapped,
+    -- EncryptionMasterKeyRetired, EncryptionKeyAssigned and
+    -- EncryptionKeyDeleted - with this origin too. Like the
     -- encryption scheme itself (see EncryptionKey), key providers and
     -- rotation are a black box to this spec; only the events show.
 }

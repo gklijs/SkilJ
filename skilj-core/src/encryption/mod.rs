@@ -10,10 +10,11 @@
 //!
 //! Two-layer (envelope) scheme: each `EncryptionKey` row gets its own
 //! random 256-bit AES-256-GCM `DataKey`, generated once and never
-//! persisted in the clear - it's wrapped (encrypted) under the
-//! key provider's master key (`provider`, `SkiljBuilder::key_provider`;
-//! docs/architecture.md §230 - originally a process-wide
-//! `EncryptionMasterKey`) and only the wrapped bytes are stored
+//! persisted in the clear - it's wrapped (encrypted) under its bounded
+//! context's master key at the key provider - the default key, or the
+//! context's own (`provider`, `SkiljBuilder::key_provider`;
+//! docs/architecture.md §230; originally one process-wide
+//! `EncryptionMasterKey`) - and only the wrapped bytes are stored
 //! (`db::get_or_create_encryption_key`). A sensitive field's own
 //! plaintext leaf is sealed under the *data* key, not the master key
 //! directly - destroying one subject's `EncryptionKey` (nulling its
@@ -120,10 +121,17 @@ pub enum Error {
     )]
     LegacyMasterKeyRequired,
 
-    /// The configured legacy master key doesn't unwrap the data keys
-    /// stored before key providers.
-    #[error("the legacy encryption master key does not unwrap the data keys stored before key providers")]
-    LegacyMasterKeyChanged,
+    /// The configured legacy master key unwraps none of the newest data
+    /// keys a bounded context stored before key providers: not the key they
+    /// were wrapped under.
+    #[error(
+        "the legacy encryption master key unwraps none of {bounded_context}'s newest data keys \
+         from before key providers: configure the master key they were wrapped under"
+    )]
+    LegacyMasterKeyChanged {
+        /// The bounded context whose data keys it doesn't unwrap.
+        bounded_context: String,
+    },
 }
 
 impl crate::error::SkiljRejection for Error {
@@ -136,7 +144,7 @@ impl crate::error::SkiljRejection for Error {
             Error::KeyVersionRetired { .. } => "encryption_key_version_retired",
             Error::ProviderChanged { .. } => "encryption_key_provider_changed",
             Error::LegacyMasterKeyRequired => "encryption_legacy_master_key_required",
-            Error::LegacyMasterKeyChanged => "encryption_legacy_master_key_changed",
+            Error::LegacyMasterKeyChanged { .. } => "encryption_legacy_master_key_changed",
         }
     }
 
