@@ -10,93 +10,7 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
-### Changed (breaking)
-
-- The encryption master key lives in a key provider (docs/architecture.md
-  §230). `SkiljBuilder::encryption_master_key` is replaced by
-  `key_provider(...)`: `VaultTransitProvider` keeps the key in a Vault or
-  OpenBao Transit key and it never enters the process; `KeyFileProvider` is a
-  key file skilj manages, for local use (`skilj::local::key_file`);
-  `InMemoryKeyProvider` is for tests. `KeyService` replaces
-  `EncryptionMasterKey` as the handle in `GraphqlState` and the core APIs.
-
-### Added
-
-- Master key rotation without restarts: `master_key_rotation(MasterKeyRotation::new().every(..).retire_after(..))`
-  for a schedule, and the superadmin mutation
-  `rotateMasterKey(boundedContext, retireImmediately)` for a leak; the
-  `masterKeys` query shows where each key stands. Every instance rewraps
-  the data keys in the background (Vault rewraps them without the data key
-  leaving it) and, after the grace period (30 days by default) or at once,
-  retires the old versions at the provider so they no longer unwrap
-  anything. A rotation made at the provider directly is picked up too.
-- Keys per bounded context: `assignMasterKey(boundedContext, key, create)`
-  gives a bounded context a key of its own at the provider (created by
-  skilj, or an existing one such as a customer's), or the shared default key
-  back; its data keys move in the background, and it rotates and retires on
-  its own. A key skilj created is deleted at the provider once no bounded
-  context uses it and the grace period has passed - erasing a deleted
-  tenant cryptographically; one it didn't create is only let go of.
-- Every step is an event in the `admin` context: `EncryptionMasterKeyRotated`,
-  `EncryptionDataKeysRewrapped`, `EncryptionMasterKeyRetired`,
-  `EncryptionKeyAssigned` and `EncryptionKeyDeleted`. A data key no
-  configured key can unwrap is marked unreadable and no longer holds up a
-  rotation; the next rotation, or a read that succeeds, clears the mark.
-- A key a superadmin brought (`assignMasterKey` without `create`, or one
-  that already existed) is followed - its own rotations recorded and its
-  data keys rewrapped - but never rotated on skilj's schedule or retired by
-  skilj.
-- REST answers 503 when the key provider can't be reached.
-- Startup refuses a key whose name matches but whose material doesn't
-  (`encryption_key_material_changed`): a key file recreated at its path,
-  another Vault cluster with the same key path.
-- Startup refuses data keys wrapped by another provider
-  (`encryption_key_provider_changed`), and data keys from before key
-  providers without the key that wrapped them.
-
-- `EventOrigin::Unknown { kind }`: an event whose origin was written by a
-  newer skilj version sharing the database - mid rolling deploy, or after
-  a rollback - reads back with that origin's kind instead of panicking
-  the reader. GraphQL's `EventOrigin.kind` answers the kind as that
-  version would. Writing an event with an `Unknown` origin is refused with
-  `Unsupported` (issue #121).
-- `skilj-kafka` features `ssl`, `ssl-vendored`, `gssapi` and `zstd`,
-  passing through to rdkafka's, so `security.protocol=SSL`/`SASL_SSL`,
-  `SCRAM-SHA-*`, Kerberos and `compression.type=zstd` no longer need a
-  matching `rdkafka` line in your own manifest. TLS is on by default
-  (`ssl-vendored`: OpenSSL built from source and linked statically, so
-  the binary still runs in a `FROM scratch` image); it needs perl and make
-  at build time, and `default-features = false` drops it (issue #124).
-
-### Fixed
-
-- The template's Dockerfile builds on arm64 as well as amd64: it no
-  longer names `x86_64-unknown-linux-musl`, which Alpine's arm64 Rust
-  image lacks. CI now builds the image (issue #123).
-
-- `skilj-tui`'s live views work against an `https://` endpoint: its
-  websocket client is now built with TLS, so subscriptions over `wss://`
-  no longer fail with "TLS support not compiled in".
-
-### Upgrading
-
-- **Not a rolling upgrade from a 0.2.0 without key providers.** An older
-  instance panics reading a data key a newer one wrapped. Stop every older
-  instance first.
-- Replace `.encryption_master_key(EncryptionMasterKey::from_bytes(key))` with
-  a `.key_provider(...)`, and keep the old key as
-  `.legacy_encryption_master_key(EncryptionMasterKey::from_bytes(key))` until
-  the background task has moved every existing data key to the provider (one
-  `EncryptionDataKeysRewrapped` event per bounded context, and
-  `masterKeys[].rewrapPending` false). Startup refuses to start
-  without it while such data keys are stored
-  (`encryption_legacy_master_key_required`).
-- Migration `0008` (applied at startup) adds `encryption_master_keys` and
-  `encryption_key_assignments`; startup adds `encryption_keys.key_provider`,
-  `master_key_version`, `unreadable_since` and their index to every bounded
-  context.
-
-## [0.2.0] - 2026-10-26
+## [0.2.0] - 2026-10-27
 
 ### Changed (breaking)
 
@@ -114,6 +28,14 @@ README.md, "Status and stability").
   schema unless the caller holds it, and a grant or revoke applies on the
   caller's next request. `registerProjection` takes `requiresCapability`
   and the `Projection` type exposes it.
+
+- The encryption master key lives in a key provider (docs/architecture.md
+  §230). `SkiljBuilder::encryption_master_key` is replaced by
+  `key_provider(...)`: `VaultTransitProvider` keeps the key in a Vault or
+  OpenBao Transit key and it never enters the process; `KeyFileProvider` is a
+  key file skilj manages, for local use (`skilj::local::key_file`);
+  `InMemoryKeyProvider` is for tests. `KeyService` replaces
+  `EncryptionMasterKey` as the handle in `GraphqlState` and the core APIs.
 
 ### Upgrading from 0.1
 
@@ -143,6 +65,18 @@ README.md, "Status and stability").
   `not_on_required_team` is gone.
 - Superadmins no longer pass a gate by being superadmin; grant them the
   capability like anyone else.
+- Replace `.encryption_master_key(EncryptionMasterKey::from_bytes(key))` with
+  a `.key_provider(...)`, and keep the old key as
+  `.legacy_encryption_master_key(EncryptionMasterKey::from_bytes(key))` until
+  the background task has moved every existing data key to the provider (one
+  `EncryptionDataKeysRewrapped` event per bounded context, and
+  `masterKeys[].rewrapPending` false). Startup refuses to start
+  without it while such data keys are stored
+  (`encryption_legacy_master_key_required`).
+- Migration `0008` (applied at startup) adds `encryption_master_keys` and
+  `encryption_key_assignments`; startup adds `encryption_keys.key_provider`,
+  `master_key_version`, `unreadable_since` and their index to every bounded
+  context.
 
 ### Added
 
@@ -193,12 +127,66 @@ README.md, "Status and stability").
   defaults. Against an older skilj without the batch routes, a bridge goes
   on one message at a time.
 
+- Master key rotation without restarts: `master_key_rotation(MasterKeyRotation::new().every(..).retire_after(..))`
+  for a schedule, and the superadmin mutation
+  `rotateMasterKey(boundedContext, retireImmediately)` for a leak; the
+  `masterKeys` query shows where each key stands. Every instance rewraps
+  the data keys in the background (Vault rewraps them without the data key
+  leaving it) and, after the grace period (30 days by default) or at once,
+  retires the old versions at the provider so they no longer unwrap
+  anything. A rotation made at the provider directly is picked up too.
+- Keys per bounded context: `assignMasterKey(boundedContext, key, create)`
+  gives a bounded context a key of its own at the provider (created by
+  skilj, or an existing one such as a customer's), or the shared default key
+  back; its data keys move in the background, and it rotates and retires on
+  its own. A key skilj created is deleted at the provider once no bounded
+  context uses it and the grace period has passed - erasing a deleted
+  tenant cryptographically; one it didn't create is only let go of.
+- Every step is an event in the `admin` context: `EncryptionMasterKeyRotated`,
+  `EncryptionDataKeysRewrapped`, `EncryptionMasterKeyRetired`,
+  `EncryptionKeyAssigned` and `EncryptionKeyDeleted`. A data key no
+  configured key can unwrap is marked unreadable and no longer holds up a
+  rotation; the next rotation, or a read that succeeds, clears the mark.
+- A key a superadmin brought (`assignMasterKey` without `create`, or one
+  that already existed) is followed - its own rotations recorded and its
+  data keys rewrapped - but never rotated on skilj's schedule or retired by
+  skilj.
+- REST answers 503 when the key provider can't be reached.
+- Startup refuses a key whose name matches but whose material doesn't
+  (`encryption_key_material_changed`): a key file recreated at its path,
+  another Vault cluster with the same key path.
+- Startup refuses data keys wrapped by another provider
+  (`encryption_key_provider_changed`), and data keys from before key
+  providers without the key that wrapped them.
+
+- `EventOrigin::Unknown { kind }`: an event whose origin was written by a
+  newer skilj version sharing the database - mid rolling deploy, or after
+  a rollback - reads back with that origin's kind instead of panicking
+  the reader. GraphQL's `EventOrigin.kind` answers the kind as that
+  version would. Writing an event with an `Unknown` origin is refused with
+  `Unsupported` (issue #121).
+- `skilj-kafka` features `ssl`, `ssl-vendored`, `gssapi` and `zstd`,
+  passing through to rdkafka's, so `security.protocol=SSL`/`SASL_SSL`,
+  `SCRAM-SHA-*`, Kerberos and `compression.type=zstd` no longer need a
+  matching `rdkafka` line in your own manifest. TLS is on by default
+  (`ssl-vendored`: OpenSSL built from source and linked statically, so
+  the binary still runs in a `FROM scratch` image); it needs perl and make
+  at build time, and `default-features = false` drops it (issue #124).
+
 ### Fixed
 
 - Local mode ran its Postgres with fsync off - `postgresql_embedded` always
   starts the server with `-F`, and the root path passed `-F` too - so an operating-system crash or power loss
   could lose committed data or corrupt the data directory. It now runs with
   fsync on (docs/architecture.md §226).
+
+- The template's Dockerfile builds on arm64 as well as amd64: it no
+  longer names `x86_64-unknown-linux-musl`, which Alpine's arm64 Rust
+  image lacks. CI now builds the image (issue #123).
+
+- `skilj-tui`'s live views work against an `https://` endpoint: its
+  websocket client is now built with TLS, so subscriptions over `wss://`
+  no longer fail with "TLS support not compiled in".
 
 ## [0.1.1] - 2026-10-22
 
