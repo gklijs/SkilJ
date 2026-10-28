@@ -817,3 +817,54 @@ impl Skilj {
         }
     }
 }
+
+impl Skilj {
+    /// What surface TypeRegistration exposes, for the admin's own context.
+    pub async fn type_registration_view(&self, grant: &Grant) -> Result<Value> {
+        if !grant.has_level(AccessLevel::Admin) {
+            return Err(Error::forbidden("needs an admin grant"));
+        }
+        let bc = &grant.mapping.bounded_context;
+        let reg = self.inner.registry.read().await;
+        let decl = self.decl_for(bc);
+        let event_types: Vec<Value> = reg
+            .event_types_of(bc)
+            .iter()
+            .map(|t| serde_json::to_value(&t.0).unwrap_or_default())
+            .collect();
+        let command_types: Vec<Value> = reg
+            .command_types_of(bc)
+            .iter()
+            .map(|t| {
+                let mut v = serde_json::to_value(&t.0).unwrap_or_default();
+                // As this instance has it deployed, not as registered.
+                let q = decl
+                    .and_then(|d| d.command_types.iter().find(|c| c.name == t.0.name))
+                    .map(|c| serde_json::to_value(&c.consistency_query).unwrap_or_default())
+                    .unwrap_or(Value::Array(vec![]));
+                v["consistency_query"] = q;
+                v
+            })
+            .collect();
+        let projections: Vec<Value> = reg
+            .projections_of(bc)
+            .iter()
+            .map(|p| {
+                let rebuilds: Vec<Value> = reg
+                    .rebuilds
+                    .iter()
+                    .filter(|r| &r.bounded_context == bc && r.projection == p.name)
+                    .map(|r| serde_json::json!({"status": r.status, "schema_version": r.schema_version, "caught_up_to": r.caught_up_to}))
+                    .collect();
+                let mut v = serde_json::to_value(p).unwrap_or_default();
+                v["rebuilds"] = Value::Array(rebuilds);
+                v
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "event_types": event_types,
+            "command_types": command_types,
+            "projections": projections,
+        }))
+    }
+}

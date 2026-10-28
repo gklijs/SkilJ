@@ -322,3 +322,12 @@ pub(crate) fn render_rest(e: &StoredEvent, ty: &EventTypeDef) -> Rendered {
         origin: None,
     }
 }
+
+impl Skilj {
+    /// Render one stored event for a GraphQL caller (e.g. the events its own
+    /// command just triggered).
+    pub async fn render_for(&self, grant: &Grant, e: &StoredEvent) -> Result<Rendered> {
+        let pa = self.private_access(grant).await?;
+        self.render_event(e, grant, &pa).await
+    }
+}
