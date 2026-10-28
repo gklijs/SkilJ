@@ -32,7 +32,7 @@ pub use access::{AccessHistoryAnswer, CapabilityOverviewRow, MintedToken};
 pub use admin::ContextDirectoryEntry;
 pub use commands::{CommandOutcome, CommandRequest, DryRunAnswer};
 pub use events::{ExternalEventItem, ExternalOutcome};
-pub use reads::{EventPage, SubscriptionSpec};
+pub use reads::{EventPage, SubscriptionEnd, SubscriptionKind, SubscriptionSpec};
 pub use registry::{ReconciliationReport, Registry};
 pub use render::Rendered;
 
@@ -328,5 +328,12 @@ async fn read_epoch(pool: &PgPool) -> Result<String> {
                 .fetch_one(pool)
                 .await?)
         }
+    }
+}
+
+impl Skilj {
+    /// Re-read registered state (tests that edit the database directly).
+    pub async fn reload_registry_for_tests(&self) {
+        self.reload_registry().await.expect("reload");
     }
 }
