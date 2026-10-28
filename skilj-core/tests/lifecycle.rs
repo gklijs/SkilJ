@@ -288,6 +288,17 @@ async fn templates_stamp_tenants() {
         .await
         .unwrap()
         .is_empty());
+    // Deleting the template leaves the tenant an ordinary context - still
+    // served by the template's deciders.
+    let tmpl_admin = s.resolve_grant("ops@idp", "tmpl").await.unwrap();
+    s.archive_bounded_context(&tmpl_admin).await.unwrap();
+    s.delete_bounded_context(&env.superadmin, "tmpl").await.unwrap();
+    assert!(s.registry().await.context("tenant1").unwrap().template.is_none());
+    let o = s
+        .submit_command(&g, CommandRequest::new("OpenAccount", open("a2", "acme")))
+        .await
+        .unwrap();
+    assert!(o.is_accepted());
 }
 
 #[tokio::test]
