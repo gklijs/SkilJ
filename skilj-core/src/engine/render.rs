@@ -35,8 +35,16 @@ pub(crate) struct PrivateAccess {
 impl Skilj {
     pub(crate) async fn private_access(&self, grant: &Grant) -> Result<PrivateAccess> {
         let rows = sqlx::query(&format!(
-            "select {} from private_field_grants where bounded_context = $1 and grantee = $2 and active",
+            // A grant stops working when its grantor's Role is revoked: the
+            // spec re-derives the grantor's default-reader standing per
+            // read, but a revoked Role still "created" its records.
+            "select {} from private_field_grants g where g.bounded_context = $1 and g.grantee = $2 and g.active
+               and exists (select 1 from roles r where r.id = g.grantor and r.active)",
             super::rows::GRANT_COLUMNS
+                .split(", ")
+                .map(|c| format!("g.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ))
         .bind(&grant.mapping.bounded_context)
         .bind(&grant.role.id)

@@ -200,6 +200,9 @@ async fn private_fields() {
         s.inspect_event(&other, 0).await.unwrap().payload["note"],
         "secret note"
     );
+    // Revoking the grantor's Role ends its grants' effect.
+    s.revoke_role(&env.superadmin, &creator.role.id).await.unwrap();
+    assert_eq!(s.inspect_event(&other, 0).await.unwrap().payload["note"], serde_json::Value::Null);
     // REST always redacts.
     let t = s
         .mint_token(
@@ -229,7 +232,7 @@ async fn private_fields() {
         )
         .await
         .unwrap();
-    assert!(trail.held);
+    assert!(trail.known && !trail.held, "role revocation is in the trail");
 }
 
 #[tokio::test]
