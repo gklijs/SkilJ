@@ -60,7 +60,7 @@ listed separately here; see that section itself for its own structure.
 - [8. Open for a future pass](#open-for-a-future-pass)
 - [9. Next steps](#next-steps)
 - [10. Dynamic Consistency Boundary (DCB) alignment](#dcb-alignment)
-  - [10.1 The query algebra is narrower than the spec's, deliberately](#101-the-query-algebra-is-narrower-than-the-specs-deliberately)
+  - [10.1 The query algebra was narrower than the spec's, superseded by §198](#101-the-query-algebra-was-narrower-than-the-specs-superseded-by-198)
 - [10b. OpenTelemetry tracing, logging, and metrics](#otel-tracing-logging-metrics)
   - [10b.1 Four smaller follow-ups](#10b1-four-smaller-follow-ups)
 - [11. `skilj-tui` - a Ratatui operator console](#skilj-tui-console)
@@ -2506,15 +2506,28 @@ so what follows is a mapping, not a migration:
 | DCB term (from the [spec](https://dcb.events/specification/)) | skilj's own term | Note |
 |---|---|---|
 | `Event { type, data, tags }` | `Event { event_type, payload, tags: Vec<Tag> }` | DCB's `tags` are opaque strings (conventionally `"key:value"`); skilj's `Tag { key, value: Option<String> }` (`skilj-core/src/shared/mod.rs`) is structured, not opaque - same purpose, different representation |
-| `Query { items: [{ types?, tags? }] }` | `consistency_tags` (derived per command/event via `TagMapping`/`derive_tags`) | skilj never builds an explicit `Query` object; the equivalent selection is computed directly from the payload's own tag mappings - narrower than the spec's `Query`, see §10.1 |
-| `read(query) -> SequencedEvents` | `consistency_boundary_and_matching_events(bounded_context_events, consistency_tags) -> (Option<i64>, Vec<Event>)` (`skilj-core/src/event_store/mod.rs`) | Same "read the relevant slice before deciding" ordering DCB requires; skilj computes the boundary (highest matching sequence) in the same pass |
+| `Query { items: [{ types?, tags? }] }` | `CommandType::consistency_query()`: a list of `QueryItemMapping { event_types, tag_mappings, latest }`, derived per command into `QueryItem`s by `derive_query` | The spec's algebra: items OR'd, an item's types and tags AND'd. skilj adds `latest` per item (only the n newest matches), `QueryItemMapping::nothing()` (§201) and snapshot items (§202). Declaring none keeps the original flat OR of `consistency_tags` (`effective_query`); see §10.1 for that history and [§198](#consistency-query) for the query |
+| `read(query) -> SequencedEvents` | for a declared query, one statement per read (`db::list_events_matching_query_with_bc`, or `list_events_matching_items_with_bc` with snapshot items), then `select_matching_events`/`query_boundary` (`skilj-core/src/event_store/mod.rs`); for the default, `consistency_boundary_and_matching_events` | Same "read the relevant slice before deciding" ordering DCB requires; the boundary is the highest selected sequence |
 | `append(events, condition?)`, `AppendCondition { failIfEventsMatch, after }` | the DCB-conflict recheck inside `db::submit_command` (re-run the read under `next_sequence`'s own row lock, redispatch `decide()` on change) | Mechanistically different: DCB's own model is one declarative condition passed to a single atomic append; skilj gets the identical guarantee via a Postgres row lock plus optimistic-read-then-locked-recheck-and-retry instead of a condition object |
 | the "decision model" (an app-level concept the spec deliberately leaves out of scope) | `CommandType::decide()` | Named independently in skilj's own Allium spec, not borrowed from DCB - same role the DCB examples describe |
 
 Two other Rust event stores - Tephra and Disintegrate - already appear
 in DCB's own [implementation list](https://dcb.events/resources/libraries/)
 
-### 10.1 The query algebra is narrower than the spec's, deliberately
+### 10.1 The query algebra was narrower than the spec's, superseded by §198
+
+**Superseded.** This section records the original design, and its
+conclusion no longer holds. [§198](#consistency-query) gave commands the
+spec's own algebra: `CommandType::consistency_query()` declares items,
+OR'd together, each naming event types and tags that an event must all
+carry, plus a skilj-only `latest` count per item. [§201](#no-history)
+added `QueryItemMapping::nothing()` for a command that decides from its
+payload alone, and §202 made snapshots query items. What drove it was
+performance, not expressiveness: the flat OR of tags described below
+made skilj-helpdesk's `CreateTicket` read, and conflict with, every
+ticket its company had filed. A command type that declares no query
+still gets the flat behaviour below (`effective_query`), so everything
+here remains true of the default. What follows is kept as written.
 
 Raised as issue #24. The DCB [specification](https://dcb.events/specification/)'s
 own `Query` is a list of independently-scoped items, each `{types?,
