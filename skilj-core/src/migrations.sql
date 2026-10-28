@@ -11,7 +11,11 @@ create table if not exists bounded_contexts (
     status text not null check (status in ('active', 'archived')),
     created_at timestamptz not null,
     created_by_role text,
-    template text references bounded_contexts(name) on delete set null
+    template text references bounded_contexts(name) on delete set null,
+    -- Which compiled declaration serves this context's deciders and folds.
+    -- Not in the spec: `template` is cleared when the template is deleted,
+    -- and a tenant must keep processing commands after that.
+    dispatch_template text
 );
 
 create table if not exists sequence_counters (

@@ -36,8 +36,8 @@ impl Skilj {
     ) -> Result<()> {
         validate::valid_bounded_context_name(name)?;
         let n = sqlx::query(
-            "insert into bounded_contexts (name, status, created_at, created_by_role, template)
-             values ($1, 'active', $2, $3, $4) on conflict do nothing",
+            "insert into bounded_contexts (name, status, created_at, created_by_role, template, dispatch_template)
+             values ($1, 'active', $2, $3, $4, $4) on conflict do nothing",
         )
         .bind(name)
         .bind(Self::now())

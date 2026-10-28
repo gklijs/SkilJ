@@ -156,11 +156,14 @@ impl Skilj {
             };
             reg.rebuilds.push(r);
         }
-        *self.inner.templates.write().expect("templates") = reg
-            .contexts
-            .values()
-            .filter_map(|c| c.template.clone().map(|t| (c.name.clone(), t)))
-            .collect();
+        let dispatch: BTreeMap<String, String> =
+            sqlx::query("select name, dispatch_template from bounded_contexts where dispatch_template is not null")
+                .fetch_all(pool)
+                .await?
+                .iter()
+                .map(|r| Ok((r.try_get::<String, _>("name")?, r.try_get::<String, _>("dispatch_template")?)))
+                .collect::<Result<_>>()?;
+        *self.inner.templates.write().expect("templates") = dispatch;
         *self.inner.registry.write().await = reg;
         Ok(())
     }
