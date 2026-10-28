@@ -43,13 +43,27 @@ impl Skilj {
         .fetch_all(&self.inner.pool)
         .await?;
         Ok(PrivateAccess {
-            grants: rows.iter().map(super::rows::pfg_from_row).collect::<Result<_>>()?,
+            grants: rows
+                .iter()
+                .map(super::rows::pfg_from_row)
+                .collect::<Result<_>>()?,
         })
     }
 
     /// render_event(event, access_mapping).
-    pub(crate) async fn render_event(&self, e: &StoredEvent, grant: &Grant, pa: &PrivateAccess) -> Result<Rendered> {
-        let ty = self.inner.registry.read().await.event_type(&e.bounded_context, &e.event_type).ok();
+    pub(crate) async fn render_event(
+        &self,
+        e: &StoredEvent,
+        grant: &Grant,
+        pa: &PrivateAccess,
+    ) -> Result<Rendered> {
+        let ty = self
+            .inner
+            .registry
+            .read()
+            .await
+            .event_type(&e.bounded_context, &e.event_type)
+            .ok();
         let payload = self.decrypt_for(grant, &e.payload).await?;
         let payload = match &ty {
             Some(t) => redact_for(
@@ -78,7 +92,12 @@ impl Skilj {
     }
 
     /// render_command(command, access_mapping).
-    pub(crate) async fn render_command(&self, c: &StoredCommand, grant: &Grant, pa: &PrivateAccess) -> Result<Rendered> {
+    pub(crate) async fn render_command(
+        &self,
+        c: &StoredCommand,
+        grant: &Grant,
+        pa: &PrivateAccess,
+    ) -> Result<Rendered> {
         let ty = self
             .inner
             .registry
@@ -120,11 +139,17 @@ impl Skilj {
         grant: &Grant,
         pa: &PrivateAccess,
     ) -> Result<Rendered> {
-        let ty = self.inner.registry.read().await.event_type(bc, &spec.event_type)?;
+        let ty = self
+            .inner
+            .registry
+            .read()
+            .await
+            .event_type(bc, &spec.event_type)?;
         let mut payload = spec.payload.clone();
         for f in &ty.0.sensitive_fields {
             let subject = read_path(&spec.payload, &f.subject_field).and_then(scalar_tag_value);
-            let granted = grant.mapping.can_read_sensitive || subject.as_deref() == Some(grant.role.external_subject.as_str());
+            let granted = grant.mapping.can_read_sensitive
+                || subject.as_deref() == Some(grant.role.external_subject.as_str());
             if !granted {
                 if let Some(leaf) = read_path_mut(&mut payload, &f.field) {
                     *leaf = Value::Null;
@@ -157,7 +182,14 @@ impl Skilj {
                 .collect(),
         };
         let subjects = self.role_subjects(&only_blanket).await?;
-        let payload = redact_for(&ty.0.private_fields, payload, Record::Event(&fake), grant, &only_blanket, &subjects);
+        let payload = redact_for(
+            &ty.0.private_fields,
+            payload,
+            Record::Event(&fake),
+            grant,
+            &only_blanket,
+            &subjects,
+        );
         Ok(Rendered {
             bounded_context: bc.into(),
             sequence: None,
@@ -176,12 +208,16 @@ impl Skilj {
     pub(crate) async fn decrypt_for(&self, grant: &Grant, v: &Value) -> Result<Value> {
         let all = grant.mapping.can_read_sensitive;
         let me = grant.role.external_subject.clone();
-        self.decrypt_where(v, &move |subject: &str| all || subject == me).await
+        self.decrypt_where(v, &move |subject: &str| all || subject == me)
+            .await
     }
 
     /// External subjects of the grantors of blanket grants (needed to
     /// re-derive their default-reader standing for addressed fields).
-    async fn role_subjects(&self, pa: &PrivateAccess) -> Result<std::collections::BTreeMap<String, String>> {
+    async fn role_subjects(
+        &self,
+        pa: &PrivateAccess,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
         let ids: Vec<String> = pa
             .grants
             .iter()
@@ -197,7 +233,10 @@ impl Skilj {
             .await?;
         let mut m = std::collections::BTreeMap::new();
         for r in rows {
-            m.insert(r.try_get::<String, _>("id")?, r.try_get::<String, _>("external_subject")?);
+            m.insert(
+                r.try_get::<String, _>("id")?,
+                r.try_get::<String, _>("external_subject")?,
+            );
         }
         Ok(m)
     }
@@ -282,7 +321,10 @@ fn redact_for(
                 is_default_private_reader(one, record, &grant.role.id, &grant.role.external_subject)
                     || shared
                     || blankets.iter().any(|g| {
-                        let subj = grantor_subjects.get(&g.grantor_role_id).map(String::as_str).unwrap_or("");
+                        let subj = grantor_subjects
+                            .get(&g.grantor_role_id)
+                            .map(String::as_str)
+                            .unwrap_or("");
                         is_default_private_reader(one, record, &g.grantor_role_id, subj)
                     })
             }

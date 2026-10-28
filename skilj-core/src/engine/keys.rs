@@ -23,7 +23,12 @@ pub struct Protected {
 impl Skilj {
     /// Get or create the active key for a subject, outside any write
     /// transaction (the spec: provisioning before the sequence lock).
-    pub(crate) async fn provision_key(&self, bc: &str, subject_key: &str, subject_value: &str) -> Result<(String, Vec<u8>)> {
+    pub(crate) async fn provision_key(
+        &self,
+        bc: &str,
+        subject_key: &str,
+        subject_value: &str,
+    ) -> Result<(String, Vec<u8>)> {
         loop {
             if let Some(row) = sqlx::query(
                 "select id, wrapped, master_key_id from encryption_keys
@@ -57,7 +62,11 @@ impl Skilj {
             .await?
             .rows_affected();
             if inserted == 1 {
-                self.inner.data_keys.lock().await.insert(id.clone(), Some(data_key.to_vec()));
+                self.inner
+                    .data_keys
+                    .lock()
+                    .await
+                    .insert(id.clone(), Some(data_key.to_vec()));
                 return Ok((id, data_key.to_vec()));
             }
             // Lost the race to a concurrent provisioning: read theirs.
@@ -76,10 +85,11 @@ impl Skilj {
         if let Some(k) = self.inner.data_keys.lock().await.get(id) {
             return Ok(k.clone());
         }
-        let row = sqlx::query("select wrapped, master_key_id, status from encryption_keys where id = $1")
-            .bind(id)
-            .fetch_optional(&self.inner.pool)
-            .await?;
+        let row =
+            sqlx::query("select wrapped, master_key_id, status from encryption_keys where id = $1")
+                .bind(id)
+                .fetch_optional(&self.inner.pool)
+                .await?;
         let key = match row {
             None => None,
             Some(row) => {
@@ -91,16 +101,28 @@ impl Skilj {
                 }
             }
         };
-        self.inner.data_keys.lock().await.insert(id.to_string(), key.clone());
+        self.inner
+            .data_keys
+            .lock()
+            .await
+            .insert(id.to_string(), key.clone());
         Ok(key)
     }
 
     pub(crate) async fn forget_cached_key(&self, id: &str) {
-        self.inner.data_keys.lock().await.insert(id.to_string(), None);
+        self.inner
+            .data_keys
+            .lock()
+            .await
+            .insert(id.to_string(), None);
     }
 
     /// protect_sensitive_fields(type, payload).
-    pub(crate) async fn protect(&self, ty: &(dyn PayloadType + Sync), payload: &Value) -> Result<Protected> {
+    pub(crate) async fn protect(
+        &self,
+        ty: &(dyn PayloadType + Sync),
+        payload: &Value,
+    ) -> Result<Protected> {
         let fields = ty.sensitive_fields();
         if fields.is_empty() {
             return Ok(Protected {
@@ -124,13 +146,17 @@ impl Skilj {
                 }
                 continue;
             };
-            let Some(leaf) = read_path_mut(&mut out, &f.field) else { continue };
+            let Some(leaf) = read_path_mut(&mut out, &f.field) else {
+                continue;
+            };
             if leaf.is_null() {
                 continue;
             }
             let k = (f.subject_key.clone(), subject.clone());
             if !keys.contains_key(&k) {
-                let got = self.provision_key(ty.bounded_context(), &f.subject_key, &subject).await?;
+                let got = self
+                    .provision_key(ty.bounded_context(), &f.subject_key, &subject)
+                    .await?;
                 keys.insert(k.clone(), got);
             }
             let (id, data_key) = &keys[&k];
@@ -158,7 +184,9 @@ impl Skilj {
         }
         let mut usable: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for id in ids {
-            let Some(subject) = self.key_subject(&id).await? else { continue };
+            let Some(subject) = self.key_subject(&id).await? else {
+                continue;
+            };
             if !allow(&subject) {
                 continue;
             }
@@ -171,10 +199,12 @@ impl Skilj {
     }
 
     pub(crate) async fn key_subject(&self, id: &str) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar("select subject_value from encryption_keys where id = $1")
-            .bind(id)
-            .fetch_optional(&self.inner.pool)
-            .await?)
+        Ok(
+            sqlx::query_scalar("select subject_value from encryption_keys where id = $1")
+                .bind(id)
+                .fetch_optional(&self.inner.pool)
+                .await?,
+        )
     }
 }
 

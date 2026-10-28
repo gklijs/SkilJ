@@ -47,9 +47,16 @@ fn is_ip(format: Option<&str>) -> bool {
 }
 
 /// valid_filters(event_type, filters).
-pub fn compile_filters(schema: &Schema, filters: &[Filter], config: &Config) -> Result<Vec<CompiledFilter>> {
+pub fn compile_filters(
+    schema: &Schema,
+    filters: &[Filter],
+    config: &Config,
+) -> Result<Vec<CompiledFilter>> {
     if filters.len() > config.max_filters {
-        return Err(Error::invalid(format!("at most {} filters", config.max_filters)));
+        return Err(Error::invalid(format!(
+            "at most {} filters",
+            config.max_filters
+        )));
     }
     filters.iter().map(|f| compile(schema, f, config)).collect()
 }
@@ -62,7 +69,10 @@ fn compile(schema: &Schema, f: &Filter, config: &Config) -> Result<CompiledFilte
         config.max_filter_value_len
     };
     if f.value.len() > limit {
-        return Err(Error::invalid(format!("filter value on '{}' is too long", f.field)));
+        return Err(Error::invalid(format!(
+            "filter value on '{}' is too long",
+            f.field
+        )));
     }
     let scalar = leaf.scalar().clone();
     let is_list = matches!(leaf, Leaf::ListOfScalars(_));
@@ -102,7 +112,8 @@ fn compile(schema: &Schema, f: &Filter, config: &Config) -> Result<CompiledFilte
         }
         FilterOperator::GreaterThan | FilterOperator::LessThan => {
             let ordered = matches!(scalar.ty, ScalarType::Integer | ScalarType::Number)
-                || (scalar.ty == ScalarType::String && matches!(fmt, Some("date") | Some("date-time")));
+                || (scalar.ty == ScalarType::String
+                    && matches!(fmt, Some("date") | Some("date-time")));
             if is_list || !ordered {
                 return Err(bad());
             }
@@ -112,17 +123,21 @@ fn compile(schema: &Schema, f: &Filter, config: &Config) -> Result<CompiledFilte
             if is_list {
                 return Err(bad());
             }
-            let v: Value = serde_json::from_str(&f.value)
-                .map_err(|_| Error::invalid("an 'in' filter value is a JSON array of candidates"))?;
-            let arr = v
-                .as_array()
-                .ok_or_else(|| Error::invalid("an 'in' filter value is a JSON array of candidates"))?;
+            let v: Value = serde_json::from_str(&f.value).map_err(|_| {
+                Error::invalid("an 'in' filter value is a JSON array of candidates")
+            })?;
+            let arr = v.as_array().ok_or_else(|| {
+                Error::invalid("an 'in' filter value is a JSON array of candidates")
+            })?;
             if arr.is_empty() || arr.len() > 100 {
                 return Err(Error::invalid("an 'in' filter takes 1 to 100 candidates"));
             }
             for x in arr {
                 if !scalar.ty.accepts(x) {
-                    return Err(Error::invalid(format!("'in' candidate {x} is not a {}", scalar.ty.name())));
+                    return Err(Error::invalid(format!(
+                        "'in' candidate {x} is not a {}",
+                        scalar.ty.name()
+                    )));
                 }
             }
             c.candidates = arr.clone();
@@ -151,14 +166,22 @@ fn compile(schema: &Schema, f: &Filter, config: &Config) -> Result<CompiledFilte
                 .split_once(',')
                 .ok_or_else(|| Error::invalid("similar_color takes \"#rrggbb,distance\""))?;
             let rgb = parse_color(hex.trim()).ok_or_else(|| Error::invalid("bad colour"))?;
-            let d: f64 = dist.trim().parse().map_err(|_| Error::invalid("bad colour distance"))?;
+            let d: f64 = dist
+                .trim()
+                .parse()
+                .map_err(|_| Error::invalid("bad colour distance"))?;
             c.color = Some((rgb, d));
         }
         FilterOperator::InSubnet => {
             if is_list || scalar.ty != ScalarType::String || !is_ip(fmt) {
                 return Err(bad());
             }
-            c.net = Some(f.value.trim().parse().map_err(|_| Error::invalid("in_subnet takes a CIDR"))?);
+            c.net = Some(
+                f.value
+                    .trim()
+                    .parse()
+                    .map_err(|_| Error::invalid("in_subnet takes a CIDR"))?,
+            );
         }
     }
     Ok(c)
@@ -167,11 +190,20 @@ fn compile(schema: &Schema, f: &Filter, config: &Config) -> Result<CompiledFilte
 fn parse_scalar(ty: ScalarType, s: &str) -> Result<Value> {
     Ok(match ty {
         ScalarType::String => Value::String(s.to_string()),
-        ScalarType::Integer => Value::from(s.parse::<i64>().map_err(|_| Error::invalid(format!("'{s}' is not an integer")))?),
-        ScalarType::Number => serde_json::Number::from_f64(s.parse::<f64>().map_err(|_| Error::invalid(format!("'{s}' is not a number")))?)
-            .map(Value::Number)
-            .ok_or_else(|| Error::invalid("not a finite number"))?,
-        ScalarType::Boolean => Value::Bool(s.parse::<bool>().map_err(|_| Error::invalid(format!("'{s}' is not a boolean")))?),
+        ScalarType::Integer => Value::from(
+            s.parse::<i64>()
+                .map_err(|_| Error::invalid(format!("'{s}' is not an integer")))?,
+        ),
+        ScalarType::Number => serde_json::Number::from_f64(
+            s.parse::<f64>()
+                .map_err(|_| Error::invalid(format!("'{s}' is not a number")))?,
+        )
+        .map(Value::Number)
+        .ok_or_else(|| Error::invalid("not a finite number"))?,
+        ScalarType::Boolean => Value::Bool(
+            s.parse::<bool>()
+                .map_err(|_| Error::invalid(format!("'{s}' is not a boolean")))?,
+        ),
     })
 }
 
@@ -206,16 +238,22 @@ fn parse_color(s: &str) -> Option<(u8, u8, u8)> {
 fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
     let (lat1, lon1) = (a.0.to_radians(), a.1.to_radians());
     let (lat2, lon2) = (b.0.to_radians(), b.1.to_radians());
-    let h = ((lat2 - lat1) / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * ((lon2 - lon1) / 2.0).sin().powi(2);
+    let h = ((lat2 - lat1) / 2.0).sin().powi(2)
+        + lat1.cos() * lat2.cos() * ((lon2 - lon1) / 2.0).sin().powi(2);
     2.0 * 6371.0 * h.sqrt().asin()
 }
 
 fn compare(a: &Value, b: &str, ty: ScalarType) -> Option<std::cmp::Ordering> {
     match ty {
-        ScalarType::Integer | ScalarType::Number => a.as_f64()?.partial_cmp(&b.parse::<f64>().ok()?),
+        ScalarType::Integer | ScalarType::Number => {
+            a.as_f64()?.partial_cmp(&b.parse::<f64>().ok()?)
+        }
         ScalarType::String => {
             let a = a.as_str()?;
-            match (chrono::DateTime::parse_from_rfc3339(a), chrono::DateTime::parse_from_rfc3339(b)) {
+            match (
+                chrono::DateTime::parse_from_rfc3339(a),
+                chrono::DateTime::parse_from_rfc3339(b),
+            ) {
                 (Ok(x), Ok(y)) => Some(x.cmp(&y)),
                 _ => Some(a.cmp(b)),
             }
@@ -233,20 +271,30 @@ impl CompiledFilter {
         let want = &self.filter.value;
         match self.filter.operator {
             FilterOperator::Equals => match v {
-                Value::Array(items) => items.iter().any(|i| scalar_tag_value(i).as_deref() == Some(want)),
+                Value::Array(items) => items
+                    .iter()
+                    .any(|i| scalar_tag_value(i).as_deref() == Some(want)),
                 other => scalar_eq(other, want, ty),
             },
             FilterOperator::Contains => match v {
-                Value::Array(items) => items.iter().any(|i| scalar_tag_value(i).as_deref() == Some(want)),
+                Value::Array(items) => items
+                    .iter()
+                    .any(|i| scalar_tag_value(i).as_deref() == Some(want)),
                 Value::String(s) => s.contains(want.as_str()),
                 _ => false,
             },
-            FilterOperator::IsLike => v.as_str().is_some_and(|s| self.pattern.as_ref().is_some_and(|p| p.is_match(s))),
-            FilterOperator::GreaterThan => compare(v, want, ty) == Some(std::cmp::Ordering::Greater),
+            FilterOperator::IsLike => v
+                .as_str()
+                .is_some_and(|s| self.pattern.as_ref().is_some_and(|p| p.is_match(s))),
+            FilterOperator::GreaterThan => {
+                compare(v, want, ty) == Some(std::cmp::Ordering::Greater)
+            }
             FilterOperator::LessThan => compare(v, want, ty) == Some(std::cmp::Ordering::Less),
             FilterOperator::In => self.candidates.iter().any(|c| values_equal(c, v)),
             FilterOperator::Near => {
-                let Some((lat, lon, km)) = self.geo else { return false };
+                let Some((lat, lon, km)) = self.geo else {
+                    return false;
+                };
                 v.as_str()
                     .and_then(|s| {
                         let (a, b) = s.split_once(',')?;
@@ -255,11 +303,18 @@ impl CompiledFilter {
                     .is_some_and(|p| haversine_km(p, (lat, lon)) <= km)
             }
             FilterOperator::SimilarColor => {
-                let Some(((r, g, b), d)) = self.color else { return false };
-                v.as_str().and_then(parse_color).is_some_and(|(r2, g2, b2)| {
-                    let dist = ((r as f64 - r2 as f64).powi(2) + (g as f64 - g2 as f64).powi(2) + (b as f64 - b2 as f64).powi(2)).sqrt();
-                    dist <= d
-                })
+                let Some(((r, g, b), d)) = self.color else {
+                    return false;
+                };
+                v.as_str()
+                    .and_then(parse_color)
+                    .is_some_and(|(r2, g2, b2)| {
+                        let dist = ((r as f64 - r2 as f64).powi(2)
+                            + (g as f64 - g2 as f64).powi(2)
+                            + (b as f64 - b2 as f64).powi(2))
+                        .sqrt();
+                        dist <= d
+                    })
             }
             FilterOperator::InSubnet => {
                 let Some(net) = self.net else { return false };
@@ -323,7 +378,9 @@ mod tests {
         let c = Config::default();
         assert!(compile_filters(&s, &[f("name", FilterOperator::GreaterThan, "a")], &c).is_err());
         assert!(compile_filters(&s, &[f("amount", FilterOperator::IsLike, "a")], &c).is_err());
-        assert!(compile_filters(&s, &[f("name", FilterOperator::InSubnet, "10.0.0.0/8")], &c).is_err());
+        assert!(
+            compile_filters(&s, &[f("name", FilterOperator::InSubnet, "10.0.0.0/8")], &c).is_err()
+        );
         let fs = compile_filters(
             &s,
             &[

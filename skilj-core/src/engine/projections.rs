@@ -14,7 +14,10 @@ use crate::model::*;
 
 impl Skilj {
     pub(crate) fn projection_decl(&self, bc: &str, name: &str) -> Option<&ProjectionDecl> {
-        self.decl_for(bc)?.projections.iter().find(|p| p.name == name)
+        self.decl_for(bc)?
+            .projections
+            .iter()
+            .find(|p| p.name == name)
     }
 
     /// Fold one event into one generation of one projection.
@@ -80,7 +83,11 @@ impl Skilj {
     }
 
     /// Inline update of every sync projection consuming this event's type.
-    pub(crate) async fn fold_sync_projections(&self, tx: &mut Transaction<'_, Postgres>, e: &StoredEvent) -> Result<()> {
+    pub(crate) async fn fold_sync_projections(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        e: &StoredEvent,
+    ) -> Result<()> {
         let sync: Vec<ProjectionDef> = self
             .inner
             .registry
@@ -92,12 +99,14 @@ impl Skilj {
             .cloned()
             .collect();
         for p in sync {
-            let decl = self.projection_decl(&e.bounded_context, &p.name).ok_or_else(|| {
-                Error::NotDeclared(format!(
-                    "sync projection {}.{} consumes {} but this process doesn't carry it",
-                    e.bounded_context, p.name, e.event_type
-                ))
-            })?;
+            let decl = self
+                .projection_decl(&e.bounded_context, &p.name)
+                .ok_or_else(|| {
+                    Error::NotDeclared(format!(
+                        "sync projection {}.{} consumes {} but this process doesn't carry it",
+                        e.bounded_context, p.name, e.event_type
+                    ))
+                })?;
             self.fold_event(tx, decl, "live", e).await?;
         }
         Ok(())
@@ -161,7 +170,17 @@ impl Skilj {
                 let def: ProjectionDef = serde_json::from_value(row.try_get("def")?)?;
                 let pos: Option<i64> = row.try_get("caught_up_to")?;
                 if !def.sync {
-                    walked += self.walk(&mut tx, &bc, &decl, &def.consumed_event_types, "live", pos, batch).await?;
+                    walked += self
+                        .walk(
+                            &mut tx,
+                            &bc,
+                            &decl,
+                            &def.consumed_event_types,
+                            "live",
+                            pos,
+                            batch,
+                        )
+                        .await?;
                 }
             }
             tx.commit().await?;
@@ -179,7 +198,15 @@ impl Skilj {
                 let staged: ProjectionRebuild = serde_json::from_value(row.try_get("def")?)?;
                 let pos: Option<i64> = row.try_get("caught_up_to")?;
                 let n = self
-                    .walk(&mut tx, &bc, &decl, &staged.consumed_event_types, "rebuild", pos, batch)
+                    .walk(
+                        &mut tx,
+                        &bc,
+                        &decl,
+                        &staged.consumed_event_types,
+                        "rebuild",
+                        pos,
+                        batch,
+                    )
                     .await?;
                 walked += n;
                 let new_pos: Option<i64> = sqlx::query_scalar(
@@ -239,7 +266,12 @@ impl Skilj {
             } else {
                 "update projection_rebuilds set caught_up_to = $3 where bounded_context = $1 and projection = $2 and status = 'building'"
             };
-            sqlx::query(sql).bind(bc).bind(&decl.name).bind(last).execute(&mut **tx).await?;
+            sqlx::query(sql)
+                .bind(bc)
+                .bind(&decl.name)
+                .bind(last)
+                .execute(&mut **tx)
+                .await?;
         }
         Ok(n)
     }
@@ -252,11 +284,13 @@ impl Skilj {
         staged: &ProjectionRebuild,
         latest: i64,
     ) -> Result<()> {
-        let old: Value = sqlx::query_scalar("select def from projections where bounded_context = $1 and name = $2 for update")
-            .bind(bc)
-            .bind(name)
-            .fetch_one(&mut **tx)
-            .await?;
+        let old: Value = sqlx::query_scalar(
+            "select def from projections where bounded_context = $1 and name = $2 for update",
+        )
+        .bind(bc)
+        .bind(name)
+        .fetch_one(&mut **tx)
+        .await?;
         let mut def: ProjectionDef = serde_json::from_value(old)?;
         def.schema = staged.schema.clone();
         def.schema_version = staged.schema_version;
@@ -302,7 +336,13 @@ impl Skilj {
             return Err(Error::forbidden("grant is revoked"));
         }
         let bc = grant.mapping.bounded_context.clone();
-        let def = self.inner.registry.read().await.projection(&bc, projection)?.clone();
+        let def = self
+            .inner
+            .registry
+            .read()
+            .await
+            .projection(&bc, projection)?
+            .clone();
         let decl = self.projection_decl(&bc, projection);
         // The capability gate covers the projection whole; failing it is
         // answered as "does not exist".
@@ -313,12 +353,16 @@ impl Skilj {
         }
         let key = key.unwrap_or("");
         if let Some(seq) = wait_for_sequence {
-            let next: i64 = sqlx::query_scalar("select next_sequence from sequence_counters where bounded_context = $1")
-                .bind(&bc)
-                .fetch_one(&self.inner.pool)
-                .await?;
+            let next: i64 = sqlx::query_scalar(
+                "select next_sequence from sequence_counters where bounded_context = $1",
+            )
+            .bind(&bc)
+            .fetch_one(&self.inner.pool)
+            .await?;
             if seq >= next {
-                return Err(Error::invalid(format!("sequence {seq} has not been committed")));
+                return Err(Error::invalid(format!(
+                    "sequence {seq} has not been committed"
+                )));
             }
             self.await_caught_up(&bc, projection, seq).await?;
         }
@@ -338,16 +382,21 @@ impl Skilj {
         let owner_key = decl.and_then(|d| d.owner_tag_key.clone());
         if let (Some(scope), Some(_)) = (&grant.mapping.scope, &owner_key) {
             if owner.as_deref() != Some(scope.as_str()) {
-                return Err(Error::not_found(format!("projection instance {bc}.{projection}[{key}]")));
+                return Err(Error::not_found(format!(
+                    "projection instance {bc}.{projection}[{key}]"
+                )));
             }
         }
         let Some(state) = state else { return Ok(None) };
         // read_projection: the instance key is the subject; entitled
         // callers get every leaf encrypted for that subject decrypted.
-        let entitled = !key.is_empty() && (grant.mapping.can_read_sensitive || grant.role.external_subject == key);
+        let entitled = !key.is_empty()
+            && (grant.mapping.can_read_sensitive || grant.role.external_subject == key);
         if entitled {
             let k = key.to_string();
-            Ok(Some(self.decrypt_where(&state, &move |s: &str| s == k).await?))
+            Ok(Some(
+                self.decrypt_where(&state, &move |s: &str| s == k).await?,
+            ))
         } else {
             Ok(Some(state))
         }
@@ -356,12 +405,13 @@ impl Skilj {
     async fn await_caught_up(&self, bc: &str, projection: &str, seq: i64) -> Result<()> {
         let deadline = Instant::now() + self.inner.config.projection_wait;
         loop {
-            let pos: Option<i64> =
-                sqlx::query_scalar("select caught_up_to from projections where bounded_context = $1 and name = $2")
-                    .bind(bc)
-                    .bind(projection)
-                    .fetch_one(&self.inner.pool)
-                    .await?;
+            let pos: Option<i64> = sqlx::query_scalar(
+                "select caught_up_to from projections where bounded_context = $1 and name = $2",
+            )
+            .bind(bc)
+            .bind(projection)
+            .fetch_one(&self.inner.pool)
+            .await?;
             if pos.is_some_and(|p| p >= seq) {
                 return Ok(());
             }

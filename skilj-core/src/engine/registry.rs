@@ -104,23 +104,39 @@ impl Skilj {
     pub(crate) async fn reload_registry(&self) -> Result<()> {
         let pool = &self.inner.pool;
         let mut reg = Registry::default();
-        for row in sqlx::query("select * from bounded_contexts").fetch_all(pool).await? {
+        for row in sqlx::query("select * from bounded_contexts")
+            .fetch_all(pool)
+            .await?
+        {
             let c = context_from_row(&row)?;
             reg.contexts.insert(c.name.clone(), c);
         }
-        for row in sqlx::query("select def from event_types").fetch_all(pool).await? {
+        for row in sqlx::query("select def from event_types")
+            .fetch_all(pool)
+            .await?
+        {
             let def: EventTypeDef = serde_json::from_value(row.try_get("def")?)?;
             let schema = Schema::parse(&def.schema)?;
-            reg.event_types
-                .insert((def.bounded_context.clone(), def.name.clone()), Arc::new((def, schema)));
+            reg.event_types.insert(
+                (def.bounded_context.clone(), def.name.clone()),
+                Arc::new((def, schema)),
+            );
         }
-        for row in sqlx::query("select def from command_types").fetch_all(pool).await? {
+        for row in sqlx::query("select def from command_types")
+            .fetch_all(pool)
+            .await?
+        {
             let def: CommandTypeDef = serde_json::from_value(row.try_get("def")?)?;
             let schema = Schema::parse(&def.schema)?;
-            reg.command_types
-                .insert((def.bounded_context.clone(), def.name.clone()), Arc::new((def, schema)));
+            reg.command_types.insert(
+                (def.bounded_context.clone(), def.name.clone()),
+                Arc::new((def, schema)),
+            );
         }
-        for row in sqlx::query("select def, caught_up_to from projections").fetch_all(pool).await? {
+        for row in sqlx::query("select def, caught_up_to from projections")
+            .fetch_all(pool)
+            .await?
+        {
             let mut def: ProjectionDef = serde_json::from_value(row.try_get("def")?)?;
             def.caught_up_to = row.try_get("caught_up_to")?;
             reg.projections
@@ -150,7 +166,10 @@ impl Skilj {
     }
 
     /// Tell every instance (this one included, via its listener) to reload.
-    pub(crate) async fn notify_registry_changed(&self, tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    pub(crate) async fn notify_registry_changed(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<()> {
         sqlx::query("select pg_notify('skilj_changes', '{\"kind\":\"registry\"}')")
             .execute(&mut **tx)
             .await?;
@@ -179,13 +198,14 @@ impl Skilj {
         this_kind: &str,
         this_name: &str,
     ) -> Result<()> {
-        let blind_keys: BTreeSet<String> =
-            sqlx::query_scalar::<_, String>("select tag_key from blind_tags where bounded_context = $1")
-                .bind(bc)
-                .fetch_all(&mut **tx)
-                .await?
-                .into_iter()
-                .collect();
+        let blind_keys: BTreeSet<String> = sqlx::query_scalar::<_, String>(
+            "select tag_key from blind_tags where bounded_context = $1",
+        )
+        .bind(bc)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .collect();
         for m in mappings {
             if m.blind && !blind_keys.contains(&m.key) {
                 return Err(Error::invalid(format!(
@@ -226,8 +246,14 @@ impl Skilj {
     }
 
     /// RegisterEventType.
-    pub async fn register_event_type(&self, grant: &Grant, bc: &str, decl: &EventTypeDecl) -> Result<bool> {
-        self.register_event_type_as(&Authority::Grant(grant), bc, decl).await
+    pub async fn register_event_type(
+        &self,
+        grant: &Grant,
+        bc: &str,
+        decl: &EventTypeDecl,
+    ) -> Result<bool> {
+        self.register_event_type_as(&Authority::Grant(grant), bc, decl)
+            .await
     }
 
     pub(crate) async fn register_event_type_as(
@@ -239,7 +265,9 @@ impl Skilj {
         self.check_authority(auth, bc)?;
         self.inner.registry.read().await.is_active(bc)?;
         if bc == ADMIN_CONTEXT {
-            return Err(Error::forbidden("the admin context's types are SkilJ's own"));
+            return Err(Error::forbidden(
+                "the admin context's types are SkilJ's own",
+            ));
         }
         validate::valid_type_name(&decl.name)?;
         let schema = Schema::parse(&decl.schema)?;
@@ -259,15 +287,17 @@ impl Skilj {
         };
         let system = decl.schedule.is_some();
         let mut tx = self.inner.pool.begin().await?;
-        self.check_blind_consistency(&mut tx, bc, &decl.tag_mappings, "event", &decl.name).await?;
-        let existing: Option<EventTypeDef> =
-            sqlx::query_scalar::<_, Value>("select def from event_types where bounded_context = $1 and name = $2 for update")
-                .bind(bc)
-                .bind(&decl.name)
-                .fetch_optional(&mut *tx)
-                .await?
-                .map(serde_json::from_value)
-                .transpose()?;
+        self.check_blind_consistency(&mut tx, bc, &decl.tag_mappings, "event", &decl.name)
+            .await?;
+        let existing: Option<EventTypeDef> = sqlx::query_scalar::<_, Value>(
+            "select def from event_types where bounded_context = $1 and name = $2 for update",
+        )
+        .bind(bc)
+        .bind(&decl.name)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(serde_json::from_value)
+        .transpose()?;
         let now = Self::now();
         let def = match &existing {
             Some(old) => {
@@ -300,7 +330,11 @@ impl Skilj {
                     system_triggered_allowed: system,
                     system_triggered_schedule: sched,
                     missed_occurrence_policy: policy,
-                    schedule_position: if newly_enabled { Some(now) } else { old.schedule_position },
+                    schedule_position: if newly_enabled {
+                        Some(now)
+                    } else {
+                        old.schedule_position
+                    },
                     last_fired_at: old.last_fired_at,
                     event_read_allowed: decl.event_read_allowed,
                 }
@@ -343,8 +377,14 @@ impl Skilj {
     }
 
     /// RegisterCommandType.
-    pub async fn register_command_type(&self, grant: &Grant, bc: &str, decl: &CommandTypeDecl) -> Result<bool> {
-        self.register_command_type_as(&Authority::Grant(grant), bc, decl).await
+    pub async fn register_command_type(
+        &self,
+        grant: &Grant,
+        bc: &str,
+        decl: &CommandTypeDecl,
+    ) -> Result<bool> {
+        self.register_command_type_as(&Authority::Grant(grant), bc, decl)
+            .await
     }
 
     pub(crate) async fn register_command_type_as(
@@ -356,7 +396,9 @@ impl Skilj {
         self.check_authority(auth, bc)?;
         self.inner.registry.read().await.is_active(bc)?;
         if bc == ADMIN_CONTEXT {
-            return Err(Error::forbidden("the admin context's types are SkilJ's own"));
+            return Err(Error::forbidden(
+                "the admin context's types are SkilJ's own",
+            ));
         }
         validate::valid_type_name(&decl.name)?;
         let schema = Schema::parse(&decl.schema)?;
@@ -368,15 +410,17 @@ impl Skilj {
             decl.owner_tag_key.as_deref(),
         )?;
         let mut tx = self.inner.pool.begin().await?;
-        self.check_blind_consistency(&mut tx, bc, &decl.tag_mappings, "command", &decl.name).await?;
-        let existing: Option<CommandTypeDef> =
-            sqlx::query_scalar::<_, Value>("select def from command_types where bounded_context = $1 and name = $2 for update")
-                .bind(bc)
-                .bind(&decl.name)
-                .fetch_optional(&mut *tx)
-                .await?
-                .map(serde_json::from_value)
-                .transpose()?;
+        self.check_blind_consistency(&mut tx, bc, &decl.tag_mappings, "command", &decl.name)
+            .await?;
+        let existing: Option<CommandTypeDef> = sqlx::query_scalar::<_, Value>(
+            "select def from command_types where bounded_context = $1 and name = $2 for update",
+        )
+        .bind(bc)
+        .bind(&decl.name)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(serde_json::from_value)
+        .transpose()?;
         let mut version = 1;
         if let Some(old) = &existing {
             schema.is_backwards_compatible_with(&Schema::parse(&old.schema)?)?;
@@ -424,8 +468,14 @@ impl Skilj {
     }
 
     /// RegisterProjection. Returns "created", "updated", "staged" or "unchanged".
-    pub async fn register_projection(&self, grant: &Grant, bc: &str, decl: &ProjectionDecl) -> Result<&'static str> {
-        self.register_projection_as(&Authority::Grant(grant), bc, decl).await
+    pub async fn register_projection(
+        &self,
+        grant: &Grant,
+        bc: &str,
+        decl: &ProjectionDecl,
+    ) -> Result<&'static str> {
+        self.register_projection_as(&Authority::Grant(grant), bc, decl)
+            .await
     }
 
     pub(crate) async fn register_projection_as(
@@ -445,7 +495,9 @@ impl Skilj {
             let reg = self.inner.registry.read().await;
             for et in &decl.consumed_event_types {
                 reg.event_type(bc, et).map_err(|_| {
-                    Error::invalid(format!("projection consumes '{et}', which is not an event type of {bc}"))
+                    Error::invalid(format!(
+                        "projection consumes '{et}', which is not an event type of {bc}"
+                    ))
                 })?;
             }
         }
@@ -461,7 +513,9 @@ impl Skilj {
         let outcome;
         match row {
             None => {
-                let has_history = self.types_have_history(&mut tx, bc, &decl.consumed_event_types).await?;
+                let has_history = self
+                    .types_have_history(&mut tx, bc, &decl.consumed_event_types)
+                    .await?;
                 let def = ProjectionDef {
                     bounded_context: bc.into(),
                     name: decl.name.clone(),
@@ -480,7 +534,8 @@ impl Skilj {
                     .await?;
                 if decl.sync && has_history {
                     // Fold history in now: a sync projection has no consumer.
-                    self.fold_range(&mut tx, bc, decl, "live", -1, latest).await?;
+                    self.fold_range(&mut tx, bc, decl, "live", -1, latest)
+                        .await?;
                     sqlx::query("update projections set caught_up_to = $3 where bounded_context = $1 and name = $2")
                         .bind(bc)
                         .bind(&decl.name)
@@ -563,12 +618,14 @@ impl Skilj {
                     if d == old {
                         return Ok("unchanged");
                     }
-                    sqlx::query("update projections set def = $3 where bounded_context = $1 and name = $2")
-                        .bind(bc)
-                        .bind(&decl.name)
-                        .bind(serde_json::to_value(&d)?)
-                        .execute(&mut *tx)
-                        .await?;
+                    sqlx::query(
+                        "update projections set def = $3 where bounded_context = $1 and name = $2",
+                    )
+                    .bind(bc)
+                    .bind(&decl.name)
+                    .bind(serde_json::to_value(&d)?)
+                    .execute(&mut *tx)
+                    .await?;
                     outcome = "updated";
                 }
             }
@@ -604,7 +661,11 @@ impl Skilj {
         if !grant.has_level(AccessLevel::Admin) {
             return Err(Error::forbidden("needs an admin grant"));
         }
-        self.inner.registry.read().await.projection(bc, projection)?;
+        self.inner
+            .registry
+            .read()
+            .await
+            .projection(bc, projection)?;
         let mut tx = self.inner.pool.begin().await?;
         let building: bool = sqlx::query_scalar(
             "select exists(select 1 from projection_rebuilds where bounded_context = $1 and projection = $2 and status = 'building')",
@@ -614,7 +675,9 @@ impl Skilj {
         .fetch_one(&mut *tx)
         .await?;
         if building {
-            return Err(Error::conflict("a rebuild is already building; trigger the pending one when it finishes"));
+            return Err(Error::conflict(
+                "a rebuild is already building; trigger the pending one when it finishes",
+            ));
         }
         let n = sqlx::query(
             "update projection_rebuilds set status = 'building', caught_up_to = null
@@ -644,7 +707,11 @@ impl Skilj {
         if !grant.has_level(AccessLevel::Admin) {
             return Err(Error::forbidden("needs an admin grant"));
         }
-        self.inner.registry.read().await.projection(bc, projection)?;
+        self.inner
+            .registry
+            .read()
+            .await
+            .projection(bc, projection)?;
         let mut tx = self.inner.pool.begin().await?;
         let n = sqlx::query("delete from projection_rebuilds where bounded_context = $1 and projection = $2 and status = 'pending'")
             .bind(bc)
@@ -682,7 +749,10 @@ impl Skilj {
                 }
                 let fp: Option<String> = row.try_get("key_fingerprint")?;
                 let hmac = self.inner.blind_hmac.as_ref().ok_or_else(|| {
-                    Error::Config(format!("{}.{} is blind but no blind index key is configured", decl.name, b.tag_key))
+                    Error::Config(format!(
+                        "{}.{} is blind but no blind index key is configured",
+                        decl.name, b.tag_key
+                    ))
                 })?;
                 let mine = hmac.fingerprint(&decl.name, &b.tag_key);
                 match fp {
@@ -708,14 +778,20 @@ impl Skilj {
     }
 
     pub(crate) async fn register_blind_tags(&self, bc: &str) -> Result<()> {
-        let Some(decl) = self.inner.decls.get(bc) else { return Ok(()) };
+        let Some(decl) = self.inner.decls.get(bc) else {
+            return Ok(());
+        };
         for b in &decl.blind_tags {
             let reg = self.inner.registry.read().await;
             let plain = reg
                 .event_types_of(bc)
                 .iter()
                 .flat_map(|t| t.0.tag_mappings.clone())
-                .chain(reg.command_types_of(bc).iter().flat_map(|t| t.0.tag_mappings.clone()))
+                .chain(
+                    reg.command_types_of(bc)
+                        .iter()
+                        .flat_map(|t| t.0.tag_mappings.clone()),
+                )
                 .any(|m| m.key == b.tag_key && !m.blind);
             drop(reg);
             if plain {
@@ -724,7 +800,11 @@ impl Skilj {
                     b.tag_key
                 )));
             }
-            let fp = self.inner.blind_hmac.as_ref().map(|h| h.fingerprint(bc, &b.tag_key));
+            let fp = self
+                .inner
+                .blind_hmac
+                .as_ref()
+                .map(|h| h.fingerprint(bc, &b.tag_key));
             sqlx::query(
                 "insert into blind_tags (bounded_context, tag_key, normalizer_version, key_generation, key_fingerprint, erasure_subject_key, erasure_subject_tag)
                  values ($1, $2, $3, 1, $4, $5, $6) on conflict do nothing",

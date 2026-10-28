@@ -13,7 +13,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
 
 pub fn server_url() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432".to_string())
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432".to_string())
 }
 
 /// Create a fresh database and return a pool on it.
@@ -28,7 +29,10 @@ pub async fn fresh_db(name: &str) -> sqlx::PgPool {
         .execute(format!("drop database if exists {db} with (force)").as_str())
         .await
         .unwrap();
-    admin.execute(format!("create database {db}").as_str()).await.unwrap();
+    admin
+        .execute(format!("create database {db}").as_str())
+        .await
+        .unwrap();
     PgPoolOptions::new()
         .max_connections(20)
         .connect(&format!("{}/{db}", server_url()))
@@ -136,15 +140,21 @@ pub fn bank_decl() -> BoundedContextDecl {
     .owner("company")
     .query_item(snapshot_item("balance", "account"));
 
-    let balance_summary = SummaryDecl::new("balance", "account", 1, json!({"balance": 0}), |state, e, _| {
-        let b = state["balance"].as_i64().unwrap_or(0);
-        let a = e.payload["amount"].as_i64().unwrap_or(0);
-        match e.event_type.as_str() {
-            "MoneyDeposited" => json!({"balance": b + a}),
-            "MoneyWithdrawn" => json!({"balance": b - a}),
-            _ => state.clone(),
-        }
-    });
+    let balance_summary = SummaryDecl::new(
+        "balance",
+        "account",
+        1,
+        json!({"balance": 0}),
+        |state, e, _| {
+            let b = state["balance"].as_i64().unwrap_or(0);
+            let a = e.payload["amount"].as_i64().unwrap_or(0);
+            match e.event_type.as_str() {
+                "MoneyDeposited" => json!({"balance": b + a}),
+                "MoneyWithdrawn" => json!({"balance": b - a}),
+                _ => state.clone(),
+            }
+        },
+    );
 
     let balances = ProjectionDecl::new(
         "Balance",
@@ -170,7 +180,9 @@ pub fn bank_decl() -> BoundedContextDecl {
         json!({"type":"object","properties":{"count":{"type":"integer"}}}),
         &["AccountOpened"],
         |_| vec![String::new()],
-        |_, state, _| Some(json!({"count": state.and_then(|s| s["count"].as_i64()).unwrap_or(0) + 1})),
+        |_, state, _| {
+            Some(json!({"count": state.and_then(|s| s["count"].as_i64()).unwrap_or(0) + 1}))
+        },
     )
     .sync();
 
@@ -208,12 +220,25 @@ pub async fn start_with(name: &str, decls: Vec<BoundedContextDecl>, contexts: &[
     }
     let skilj = b.start().await.expect("start");
     let secret = secret.lock().unwrap().clone();
-    let superadmin = skilj.create_superadmin(&secret, "root", "root@idp").await.unwrap();
-    let admin_role = skilj.create_role(&superadmin, "ops", false, "ops@idp").await.unwrap();
+    let superadmin = skilj
+        .create_superadmin(&secret, "root", "root@idp")
+        .await
+        .unwrap();
+    let admin_role = skilj
+        .create_role(&superadmin, "ops", false, "ops@idp")
+        .await
+        .unwrap();
     for c in contexts {
         skilj.add_bounded_context(&superadmin, c).await.unwrap();
         skilj
-            .grant_access(&superadmin, &admin_role.id, c, AccessLevel::Admin, false, None)
+            .grant_access(
+                &superadmin,
+                &admin_role.id,
+                c,
+                AccessLevel::Admin,
+                false,
+                None,
+            )
             .await
             .unwrap();
     }
@@ -234,8 +259,18 @@ pub async fn start(name: &str) -> Env {
 
 impl Env {
     /// A role with a grant on bank.
-    pub async fn role(&self, subject: &str, level: AccessLevel, sensitive: bool, scope: Option<&str>) -> Grant {
-        let r = self.skilj.create_role(&self.superadmin, subject, false, subject).await.unwrap();
+    pub async fn role(
+        &self,
+        subject: &str,
+        level: AccessLevel,
+        sensitive: bool,
+        scope: Option<&str>,
+    ) -> Grant {
+        let r = self
+            .skilj
+            .create_role(&self.superadmin, subject, false, subject)
+            .await
+            .unwrap();
         self.skilj
             .grant_access(&self.superadmin, &r.id, "bank", level, sensitive, scope)
             .await

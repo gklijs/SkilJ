@@ -19,7 +19,9 @@ pub struct NoBlindKeys;
 
 impl BlindHasher for NoBlindKeys {
     fn hash(&self, bc: &str, key: &str, _: &str) -> Result<String> {
-        Err(Error::Config(format!("no blind index key configured for {bc}/{key}")))
+        Err(Error::Config(format!(
+            "no blind index key configured for {bc}/{key}"
+        )))
     }
 }
 
@@ -105,7 +107,10 @@ pub fn derive_query(
 ) -> Result<Vec<QueryItem>> {
     let mut out = Vec::new();
     for item in query {
-        let item_mappings: Vec<&TagMapping> = mappings.iter().filter(|m| item.tag_keys.contains(&m.key)).collect();
+        let item_mappings: Vec<&TagMapping> = mappings
+            .iter()
+            .filter(|m| item.tag_keys.contains(&m.key))
+            .collect();
         if item.snapshot.is_some() {
             // One QueryItem per value the single mapping derives.
             let m = item_mappings
@@ -195,13 +200,20 @@ pub fn select_matching<'a>(
             chosen.insert(e.sequence);
         }
     }
-    candidates.iter().filter(|e| chosen.contains(&e.sequence)).collect()
+    candidates
+        .iter()
+        .filter(|e| chosen.contains(&e.sequence))
+        .collect()
 }
 
 /// tag_owner_scope_satisfied / event_owner_scope_satisfied /
 /// command_owner_scope_satisfied: holds when scope is null, or the type
 /// declares no owner key, or a tag under the owner key equals the scope.
-pub fn owner_scope_satisfied(tags: &BTreeSet<Tag>, owner_tag_key: Option<&str>, scope: Option<&str>) -> bool {
+pub fn owner_scope_satisfied(
+    tags: &BTreeSet<Tag>,
+    owner_tag_key: Option<&str>,
+    scope: Option<&str>,
+) -> bool {
     match (scope, owner_tag_key) {
         (None, _) | (_, None) => true,
         (Some(scope), Some(key)) => tags
@@ -222,20 +234,34 @@ mod tests {
             TagMapping::new("label", "labels"),
             TagMapping::new("country", "address.country"),
         ];
-        let tags = derive_tags("b", &m, &json!({"account_id": "a1", "labels": ["x", "y", "x"]}), &NoBlindKeys).unwrap();
+        let tags = derive_tags(
+            "b",
+            &m,
+            &json!({"account_id": "a1", "labels": ["x", "y", "x"]}),
+            &NoBlindKeys,
+        )
+        .unwrap();
         assert!(tags.contains(&Tag::new("account", "a1")));
         assert!(tags.contains(&Tag::new("label", "x")));
         assert!(tags.contains(&Tag::new("label", "y")));
         assert!(tags.contains(&Tag::none("country")));
         assert_eq!(tags.len(), 4);
-        let tags = derive_tags("b", &m, &json!({"account_id": 7, "labels": []}), &NoBlindKeys).unwrap();
+        let tags = derive_tags(
+            "b",
+            &m,
+            &json!({"account_id": 7, "labels": []}),
+            &NoBlindKeys,
+        )
+        .unwrap();
         assert!(tags.contains(&Tag::new("account", "7")));
         assert!(tags.contains(&Tag::none("label")));
     }
 
     #[test]
     fn owner_scope() {
-        let tags: BTreeSet<Tag> = [Tag::new("company", "c1"), Tag::none("x")].into_iter().collect();
+        let tags: BTreeSet<Tag> = [Tag::new("company", "c1"), Tag::none("x")]
+            .into_iter()
+            .collect();
         assert!(owner_scope_satisfied(&tags, None, Some("c2")));
         assert!(owner_scope_satisfied(&tags, Some("company"), None));
         assert!(owner_scope_satisfied(&tags, Some("company"), Some("c1")));

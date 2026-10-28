@@ -43,26 +43,36 @@ pub fn router(skilj: Skilj, verifier: Verifier) -> Router {
 }
 
 async fn graphiql() -> impl IntoResponse {
-    Html(GraphiQLSource::build().endpoint("/graphql").subscription_endpoint("/graphql/ws").finish())
+    Html(
+        GraphiQLSource::build()
+            .endpoint("/graphql")
+            .subscription_endpoint("/graphql/ws")
+            .finish(),
+    )
 }
 
-async fn graphql_post(State(st): State<AppState>, headers: HeaderMap, req: GraphQLRequest) -> Response {
+async fn graphql_post(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    req: GraphQLRequest,
+) -> Response {
     let identity = match headers.get("authorization").and_then(|v| v.to_str().ok()) {
         None => None,
         Some(h) => match st.verifier.verify_header(Some(h)).await {
             Ok(i) => Some(i),
             Err(e) => {
-                return GraphQLResponse::from(async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(
-                    e.to_string(),
-                    None,
-                )]))
+                return GraphQLResponse::from(async_graphql::Response::from_errors(vec![
+                    async_graphql::ServerError::new(e.to_string(), None),
+                ]))
                 .into_response()
             }
         },
     };
     let schema = match st.schemas.get(&st.skilj).await {
         Ok(s) => s,
-        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     };
     let req = req.into_inner().data(Ctx {
         skilj: st.skilj.clone(),
@@ -71,10 +81,16 @@ async fn graphql_post(State(st): State<AppState>, headers: HeaderMap, req: Graph
     GraphQLResponse::from(schema.execute(req).await).into_response()
 }
 
-async fn graphql_ws(State(st): State<AppState>, protocol: GraphQLProtocol, ws: WebSocketUpgrade) -> Response {
+async fn graphql_ws(
+    State(st): State<AppState>,
+    protocol: GraphQLProtocol,
+    ws: WebSocketUpgrade,
+) -> Response {
     let schema = match st.schemas.get(&st.skilj).await {
         Ok(s) => s,
-        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     };
     ws.protocols(ALL_WEBSOCKET_PROTOCOLS)
         .on_upgrade(move |socket| {

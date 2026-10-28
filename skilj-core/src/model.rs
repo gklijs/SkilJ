@@ -264,10 +264,17 @@ pub struct Metadata {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Origin {
-    CommandTriggered { command_id: String },
-    ExternalTriggered { source_content: String, source_context: Option<String> },
+    CommandTriggered {
+        command_id: String,
+    },
+    ExternalTriggered {
+        source_content: String,
+        source_context: Option<String>,
+    },
     DirectlyCreated,
-    SystemTriggered { occurrence_at: DateTime<Utc> },
+    SystemTriggered {
+        occurrence_at: DateTime<Utc>,
+    },
     SkiljRecorded,
 }
 

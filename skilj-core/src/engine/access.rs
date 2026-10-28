@@ -57,10 +57,12 @@ impl Skilj {
     // ------------------------------------------------------- identity
 
     pub async fn role_by_subject(&self, external_subject: &str) -> Result<Option<Role>> {
-        let row = sqlx::query(&format!("select {ROLE_COLUMNS} from roles where external_subject = $1 and active"))
-            .bind(external_subject)
-            .fetch_optional(&self.inner.pool)
-            .await?;
+        let row = sqlx::query(&format!(
+            "select {ROLE_COLUMNS} from roles where external_subject = $1 and active"
+        ))
+        .bind(external_subject)
+        .fetch_optional(&self.inner.pool)
+        .await?;
         row.as_ref().map(role_from_row).transpose()
     }
 
@@ -119,7 +121,9 @@ impl Skilj {
 
     pub(crate) async fn reload_grant(&self, grant: &Grant) -> Result<Option<Grant>> {
         let role = self.role_by_id(&grant.role.id).await?;
-        let g = self.grant_for_role(&role, &grant.mapping.bounded_context).await?;
+        let g = self
+            .grant_for_role(&role, &grant.mapping.bounded_context)
+            .await?;
         Ok(g.filter(|g| g.mapping.id == grant.mapping.id))
     }
 
@@ -128,11 +132,13 @@ impl Skilj {
         let (id, secret) = bearer
             .split_once('.')
             .ok_or_else(|| Error::forbidden("malformed bearer token"))?;
-        let row = sqlx::query(&format!("select secret_hash, {TOKEN_COLUMNS} from tokens where id = $1"))
-            .bind(id)
-            .fetch_optional(&self.inner.pool)
-            .await?
-            .ok_or_else(|| Error::forbidden("unknown token"))?;
+        let row = sqlx::query(&format!(
+            "select secret_hash, {TOKEN_COLUMNS} from tokens where id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.inner.pool)
+        .await?
+        .ok_or_else(|| Error::forbidden("unknown token"))?;
         let hash: String = row.try_get("secret_hash")?;
         if !crypto::secret_matches(secret, &hash) {
             return Err(Error::forbidden("unknown token"));
@@ -144,8 +150,14 @@ impl Skilj {
         Ok(t)
     }
 
-    async fn notify_access(&self, tx: &mut Transaction<'_, Postgres>, mapping_id: Option<&str>, role_id: Option<&str>) -> Result<()> {
-        let payload = json!({"kind": "access", "mapping_id": mapping_id, "role_id": role_id}).to_string();
+    async fn notify_access(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        mapping_id: Option<&str>,
+        role_id: Option<&str>,
+    ) -> Result<()> {
+        let payload =
+            json!({"kind": "access", "mapping_id": mapping_id, "role_id": role_id}).to_string();
         sqlx::query("select pg_notify('skilj_changes', $1)")
             .bind(payload)
             .execute(&mut **tx)
@@ -164,7 +176,10 @@ impl Skilj {
     ) -> Result<()> {
         tx.commit().await?;
         self.after_commit(&events).await;
-        let _ = self.inner.bus.send(super::BusMessage::AccessChanged { mapping_id, role_id });
+        let _ = self.inner.bus.send(super::BusMessage::AccessChanged {
+            mapping_id,
+            role_id,
+        });
         Ok(())
     }
 
@@ -179,14 +194,24 @@ impl Skilj {
     // ------------------------------------------------------- bootstrap
 
     /// CreateSuperadmin.
-    pub async fn create_superadmin(&self, bootstrap_secret: &str, name: &str, external_subject: &str) -> Result<Role> {
+    pub async fn create_superadmin(
+        &self,
+        bootstrap_secret: &str,
+        name: &str,
+        external_subject: &str,
+    ) -> Result<Role> {
         let mut tx = self.inner.pool.begin().await?;
-        sqlx::query("select pg_advisory_xact_lock(7243912)").execute(&mut *tx).await?;
-        let exists: bool = sqlx::query_scalar("select exists(select 1 from roles where superadmin and active)")
-            .fetch_one(&mut *tx)
+        sqlx::query("select pg_advisory_xact_lock(7243912)")
+            .execute(&mut *tx)
             .await?;
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from roles where superadmin and active)")
+                .fetch_one(&mut *tx)
+                .await?;
         if exists {
-            return Err(Error::forbidden("a superadmin exists; the bootstrap is closed"));
+            return Err(Error::forbidden(
+                "a superadmin exists; the bootstrap is closed",
+            ));
         }
         let ok = match self.inner.bootstrap_hash.lock().await.as_deref() {
             Some(h) => crypto::secret_matches(bootstrap_secret, h),
@@ -195,22 +220,34 @@ impl Skilj {
         if !ok {
             return Err(Error::forbidden("wrong bootstrap secret"));
         }
-        let role = self.insert_role(&mut tx, name, true, external_subject).await?;
+        let role = self
+            .insert_role(&mut tx, name, true, external_subject)
+            .await?;
         tx.commit().await?;
         *self.inner.bootstrap_hash.lock().await = None;
         Ok(role)
     }
 
-    async fn insert_role(&self, tx: &mut Transaction<'_, Postgres>, name: &str, superadmin: bool, subject: &str) -> Result<Role> {
+    async fn insert_role(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        name: &str,
+        superadmin: bool,
+        subject: &str,
+    ) -> Result<Role> {
         if subject.is_empty() {
             return Err(Error::invalid("external_subject may not be empty"));
         }
-        let taken: bool = sqlx::query_scalar("select exists(select 1 from roles where external_subject = $1 and active)")
-            .bind(subject)
-            .fetch_one(&mut **tx)
-            .await?;
+        let taken: bool = sqlx::query_scalar(
+            "select exists(select 1 from roles where external_subject = $1 and active)",
+        )
+        .bind(subject)
+        .fetch_one(&mut **tx)
+        .await?;
         if taken {
-            return Err(Error::conflict("that external identity is already bound to an active role"));
+            return Err(Error::conflict(
+                "that external identity is already bound to an active role",
+            ));
         }
         let role = Role {
             id: crypto::generate_id(),
@@ -233,19 +270,29 @@ impl Skilj {
     }
 
     /// CreateRole.
-    pub async fn create_role(&self, caller: &Role, name: &str, superadmin: bool, external_subject: &str) -> Result<Role> {
+    pub async fn create_role(
+        &self,
+        caller: &Role,
+        name: &str,
+        superadmin: bool,
+        external_subject: &str,
+    ) -> Result<Role> {
         Self::require_superadmin(caller)?;
         let mut tx = self.inner.pool.begin().await?;
-        let r = self.insert_role(&mut tx, name, superadmin, external_subject).await?;
+        let r = self
+            .insert_role(&mut tx, name, superadmin, external_subject)
+            .await?;
         tx.commit().await?;
         Ok(r)
     }
 
     pub async fn list_roles(&self, caller: &Role) -> Result<Vec<Role>> {
         Self::require_superadmin(caller)?;
-        let rows = sqlx::query(&format!("select {ROLE_COLUMNS} from roles order by created_at"))
-            .fetch_all(&self.inner.pool)
-            .await?;
+        let rows = sqlx::query(&format!(
+            "select {ROLE_COLUMNS} from roles order by created_at"
+        ))
+        .fetch_all(&self.inner.pool)
+        .await?;
         rows.iter().map(role_from_row).collect()
     }
 
@@ -253,12 +300,14 @@ impl Skilj {
     pub async fn revoke_role(&self, caller: &Role, role_id: &str) -> Result<()> {
         Self::require_superadmin(caller)?;
         let mut tx = self.inner.pool.begin().await?;
-        let n = sqlx::query("update roles set active = false, revoked_at = $2 where id = $1 and active")
-            .bind(role_id)
-            .bind(Self::now())
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let n = sqlx::query(
+            "update roles set active = false, revoked_at = $2 where id = $1 and active",
+        )
+        .bind(role_id)
+        .bind(Self::now())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         if n == 0 {
             return Err(Error::conflict("role is not active"));
         }
@@ -273,12 +322,19 @@ impl Skilj {
         for m in mappings {
             let m = mapping_from_row(&m)?;
             events.extend(
-                self.record_access_event(&mut tx, "AccessRevoked", role_id, &m.bounded_context, json!({"actor_role_id": caller.id, "reason": "role_revoked"}))
-                    .await?,
+                self.record_access_event(
+                    &mut tx,
+                    "AccessRevoked",
+                    role_id,
+                    &m.bounded_context,
+                    json!({"actor_role_id": caller.id, "reason": "role_revoked"}),
+                )
+                .await?,
             );
         }
         self.notify_access(&mut tx, None, Some(role_id)).await?;
-        self.commit_access(tx, events, None, Some(role_id.into())).await?;
+        self.commit_access(tx, events, None, Some(role_id.into()))
+            .await?;
         // The bootstrap reopens only when no superadmin is left.
         Ok(())
     }
@@ -301,10 +357,20 @@ impl Skilj {
         self.inner.registry.read().await.is_active(bc)?;
         let mut tx = self.inner.pool.begin().await?;
         let (m, events) = self
-            .insert_mapping(&mut tx, &caller.id, &role, bc, level, can_read_sensitive, scope)
+            .insert_mapping(
+                &mut tx,
+                &caller.id,
+                &role,
+                bc,
+                level,
+                can_read_sensitive,
+                scope,
+            )
             .await?;
-        self.notify_access(&mut tx, Some(&m.id), Some(role_id)).await?;
-        self.commit_access(tx, events, Some(m.id.clone()), Some(role_id.into())).await?;
+        self.notify_access(&mut tx, Some(&m.id), Some(role_id))
+            .await?;
+        self.commit_access(tx, events, Some(m.id.clone()), Some(role_id.into()))
+            .await?;
         Ok(m)
     }
 
@@ -327,7 +393,9 @@ impl Skilj {
         .fetch_one(&mut **tx)
         .await?;
         if exists {
-            return Err(Error::conflict("the role already holds an active grant on this context"));
+            return Err(Error::conflict(
+                "the role already holds an active grant on this context",
+            ));
         }
         let m = AccessMapping {
             id: crypto::generate_id(),
@@ -369,16 +437,22 @@ impl Skilj {
     }
 
     async fn mapping(&self, id: &str) -> Result<AccessMapping> {
-        let row = sqlx::query(&format!("select {MAPPING_COLUMNS} from access_mappings where id = $1"))
-            .bind(id)
-            .fetch_optional(&self.inner.pool)
-            .await?
-            .ok_or_else(|| Error::not_found(format!("access mapping {id}")))?;
+        let row = sqlx::query(&format!(
+            "select {MAPPING_COLUMNS} from access_mappings where id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.inner.pool)
+        .await?
+        .ok_or_else(|| Error::not_found(format!("access mapping {id}")))?;
         mapping_from_row(&row)
     }
 
     /// Mappings of a context (superadmin view).
-    pub async fn list_mappings(&self, caller: &Role, bc: Option<&str>) -> Result<Vec<AccessMapping>> {
+    pub async fn list_mappings(
+        &self,
+        caller: &Role,
+        bc: Option<&str>,
+    ) -> Result<Vec<AccessMapping>> {
         Self::require_superadmin(caller)?;
         let rows = sqlx::query(&format!(
             "select {MAPPING_COLUMNS} from access_mappings where ($1::text is null or bounded_context = $1) order by created_at"
@@ -394,20 +468,29 @@ impl Skilj {
         Self::require_superadmin(caller)?;
         let m = self.mapping(mapping_id).await?;
         let mut tx = self.inner.pool.begin().await?;
-        let n = sqlx::query("update access_mappings set active = false, revoked_at = $2 where id = $1 and active")
-            .bind(mapping_id)
-            .bind(Self::now())
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let n = sqlx::query(
+            "update access_mappings set active = false, revoked_at = $2 where id = $1 and active",
+        )
+        .bind(mapping_id)
+        .bind(Self::now())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         if n == 0 {
             return Err(Error::conflict("grant is not active"));
         }
         let events = self
-            .record_access_event(&mut tx, "AccessRevoked", &m.role_id, &m.bounded_context, json!({"actor_role_id": caller.id, "reason": "grant_revoked"}))
+            .record_access_event(
+                &mut tx,
+                "AccessRevoked",
+                &m.role_id,
+                &m.bounded_context,
+                json!({"actor_role_id": caller.id, "reason": "grant_revoked"}),
+            )
             .await?;
         self.notify_access(&mut tx, Some(mapping_id), None).await?;
-        self.commit_access(tx, events, Some(mapping_id.into()), None).await
+        self.commit_access(tx, events, Some(mapping_id.into()), None)
+            .await
     }
 
     async fn change_capability(
@@ -431,10 +514,14 @@ impl Skilj {
                 return Err(Error::not_found(format!("access mapping {target_id}")));
             }
             if target.role_id == admin.role.id {
-                return Err(Error::forbidden("an admin cannot change its own capabilities"));
+                return Err(Error::forbidden(
+                    "an admin cannot change its own capabilities",
+                ));
             }
             if !admin.mapping.delegable.contains(capability) {
-                return Err(Error::forbidden(format!("'{capability}' is not in this admin's delegable set")));
+                return Err(Error::forbidden(format!(
+                    "'{capability}' is not in this admin's delegable set"
+                )));
             }
         }
         if add {
@@ -454,43 +541,101 @@ impl Skilj {
         } else {
             "update access_mappings set capabilities = array_remove(capabilities, $2) where id = $1 and active and $2 = any(capabilities)"
         };
-        let n = sqlx::query(sql).bind(target_id).bind(capability).execute(&mut *tx).await?.rows_affected();
+        let n = sqlx::query(sql)
+            .bind(target_id)
+            .bind(capability)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         if n == 0 {
             return Err(Error::conflict("grant changed concurrently"));
         }
         let events = self
             .record_access_event(
                 &mut tx,
-                if add { "CapabilityGranted" } else { "CapabilityRevoked" },
+                if add {
+                    "CapabilityGranted"
+                } else {
+                    "CapabilityRevoked"
+                },
                 &target.role_id,
                 &target.bounded_context,
                 json!({"actor_role_id": actor_role_id, "capability": capability, "via": via}),
             )
             .await?;
         self.notify_access(&mut tx, Some(target_id), None).await?;
-        self.commit_access(tx, events, Some(target_id.into()), None).await
+        self.commit_access(tx, events, Some(target_id.into()), None)
+            .await
     }
 
-    pub async fn grant_capability_as_superadmin(&self, caller: &Role, mapping_id: &str, capability: &str) -> Result<()> {
+    pub async fn grant_capability_as_superadmin(
+        &self,
+        caller: &Role,
+        mapping_id: &str,
+        capability: &str,
+    ) -> Result<()> {
         Self::require_superadmin(caller)?;
-        self.change_capability(&caller.id, mapping_id, capability, true, "superadmin", None).await
+        self.change_capability(&caller.id, mapping_id, capability, true, "superadmin", None)
+            .await
     }
 
-    pub async fn revoke_capability_as_superadmin(&self, caller: &Role, mapping_id: &str, capability: &str) -> Result<()> {
+    pub async fn revoke_capability_as_superadmin(
+        &self,
+        caller: &Role,
+        mapping_id: &str,
+        capability: &str,
+    ) -> Result<()> {
         Self::require_superadmin(caller)?;
-        self.change_capability(&caller.id, mapping_id, capability, false, "superadmin", None).await
+        self.change_capability(
+            &caller.id,
+            mapping_id,
+            capability,
+            false,
+            "superadmin",
+            None,
+        )
+        .await
     }
 
-    pub async fn grant_capability_as_admin(&self, grant: &Grant, mapping_id: &str, capability: &str) -> Result<()> {
-        self.change_capability(&grant.role.id, mapping_id, capability, true, "admin", Some(grant)).await
+    pub async fn grant_capability_as_admin(
+        &self,
+        grant: &Grant,
+        mapping_id: &str,
+        capability: &str,
+    ) -> Result<()> {
+        self.change_capability(
+            &grant.role.id,
+            mapping_id,
+            capability,
+            true,
+            "admin",
+            Some(grant),
+        )
+        .await
     }
 
-    pub async fn revoke_capability_as_admin(&self, grant: &Grant, mapping_id: &str, capability: &str) -> Result<()> {
-        self.change_capability(&grant.role.id, mapping_id, capability, false, "admin", Some(grant)).await
+    pub async fn revoke_capability_as_admin(
+        &self,
+        grant: &Grant,
+        mapping_id: &str,
+        capability: &str,
+    ) -> Result<()> {
+        self.change_capability(
+            &grant.role.id,
+            mapping_id,
+            capability,
+            false,
+            "admin",
+            Some(grant),
+        )
+        .await
     }
 
     /// The grants of the admin's own context (surface CapabilityDelegation).
-    pub async fn delegation_view(&self, grant: &Grant) -> Result<Vec<(String, String, AccessMapping)>> {
+    pub async fn delegation_view(
+        &self,
+        grant: &Grant,
+    ) -> Result<Vec<(String, String, AccessMapping)>> {
         if !grant.has_level(AccessLevel::Admin) {
             return Err(Error::forbidden("needs an admin grant"));
         }
@@ -515,7 +660,12 @@ impl Skilj {
     }
 
     /// SetDelegableCapabilities.
-    pub async fn set_delegable(&self, caller: &Role, mapping_id: &str, delegable: BTreeSet<String>) -> Result<()> {
+    pub async fn set_delegable(
+        &self,
+        caller: &Role,
+        mapping_id: &str,
+        delegable: BTreeSet<String>,
+    ) -> Result<()> {
         Self::require_superadmin(caller)?;
         for c in &delegable {
             validate::valid_capability_name(c)?;
@@ -547,7 +697,8 @@ impl Skilj {
             )
             .await?;
         self.notify_access(&mut tx, Some(mapping_id), None).await?;
-        self.commit_access(tx, events, Some(mapping_id.into()), None).await
+        self.commit_access(tx, events, Some(mapping_id.into()), None)
+            .await
     }
 
     // ---------------------------------------------------------- tokens
@@ -582,20 +733,36 @@ impl Skilj {
         // A scoped admin mints only within its own scope; omitted inherits.
         if let (Some(mine), Some(asked)) = (&grant.mapping.scope, scope) {
             if mine != asked {
-                return Err(Error::forbidden("a scoped admin mints only tokens of its own scope"));
+                return Err(Error::forbidden(
+                    "a scoped admin mints only tokens of its own scope",
+                ));
             }
         }
-        let minted_scope = scope.map(str::to_string).or_else(|| grant.mapping.scope.clone());
+        let minted_scope = scope
+            .map(str::to_string)
+            .or_else(|| grant.mapping.scope.clone());
         let start = start_from.unwrap_or_default();
-        if purpose != TokenPurpose::EventRead && (start_from.is_some() || start_at_sequence.is_some() || start_at_time.is_some()) {
-            return Err(Error::invalid("only an event read token takes a starting position"));
+        if purpose != TokenPurpose::EventRead
+            && (start_from.is_some() || start_at_sequence.is_some() || start_at_time.is_some())
+        {
+            return Err(Error::invalid(
+                "only an event read token takes a starting position",
+            ));
         }
         match start {
-            EventReadStartPosition::AtSequence if start_at_sequence.is_none() || start_at_time.is_some() => {
-                return Err(Error::invalid("at_sequence needs start_at_sequence and no start_at_time"))
+            EventReadStartPosition::AtSequence
+                if start_at_sequence.is_none() || start_at_time.is_some() =>
+            {
+                return Err(Error::invalid(
+                    "at_sequence needs start_at_sequence and no start_at_time",
+                ))
             }
-            EventReadStartPosition::AtTime if start_at_time.is_none() || start_at_sequence.is_some() => {
-                return Err(Error::invalid("at_time needs start_at_time and no start_at_sequence"))
+            EventReadStartPosition::AtTime
+                if start_at_time.is_none() || start_at_sequence.is_some() =>
+            {
+                return Err(Error::invalid(
+                    "at_time needs start_at_time and no start_at_sequence",
+                ))
             }
             EventReadStartPosition::Beginning | EventReadStartPosition::Latest
                 if start_at_sequence.is_some() || start_at_time.is_some() =>
@@ -671,15 +838,19 @@ impl Skilj {
         }
         if let Some(mine) = &grant.mapping.scope {
             if t.scope.as_deref() != Some(mine.as_str()) {
-                return Err(Error::forbidden("a scoped admin revokes only tokens of its own scope"));
+                return Err(Error::forbidden(
+                    "a scoped admin revokes only tokens of its own scope",
+                ));
             }
         }
-        let n = sqlx::query("update tokens set active = false, revoked_at = $2 where id = $1 and active")
-            .bind(token_id)
-            .bind(Self::now())
-            .execute(&self.inner.pool)
-            .await?
-            .rows_affected();
+        let n = sqlx::query(
+            "update tokens set active = false, revoked_at = $2 where id = $1 and active",
+        )
+        .bind(token_id)
+        .bind(Self::now())
+        .execute(&self.inner.pool)
+        .await?
+        .rows_affected();
         if n == 0 {
             return Err(Error::conflict("token is already revoked"));
         }
@@ -709,16 +880,30 @@ impl Skilj {
         }
         let bc = grant.mapping.bounded_context.clone();
         if let Some(seq) = event_sequence {
-            let row = sqlx::query(&format!("select {EVENT_COLUMNS} from events where bounded_context = $1 and sequence = $2"))
-                .bind(&bc)
-                .bind(seq)
-                .fetch_optional(&self.inner.pool)
-                .await?
-                .ok_or_else(|| Error::not_found(format!("event {bc}#{seq}")))?;
+            let row = sqlx::query(&format!(
+                "select {EVENT_COLUMNS} from events where bounded_context = $1 and sequence = $2"
+            ))
+            .bind(&bc)
+            .bind(seq)
+            .fetch_optional(&self.inner.pool)
+            .await?
+            .ok_or_else(|| Error::not_found(format!("event {bc}#{seq}")))?;
             let e = event_from_row(&row)?;
-            let ty = self.inner.registry.read().await.event_type(&bc, &e.event_type)?;
-            if !is_default_private_reader(&ty.0.private_fields, Record::Event(&e), &grant.role.id, &grant.role.external_subject) {
-                return Err(Error::forbidden("you are not this record's default private reader"));
+            let ty = self
+                .inner
+                .registry
+                .read()
+                .await
+                .event_type(&bc, &e.event_type)?;
+            if !is_default_private_reader(
+                &ty.0.private_fields,
+                Record::Event(&e),
+                &grant.role.id,
+                &grant.role.external_subject,
+            ) {
+                return Err(Error::forbidden(
+                    "you are not this record's default private reader",
+                ));
             }
         }
         if let Some(cid) = command_id {
@@ -729,9 +914,21 @@ impl Skilj {
                 .await?
                 .ok_or_else(|| Error::not_found(format!("command {cid}")))?;
             let c = command_from_row(&row)?;
-            let ty = self.inner.registry.read().await.command_type(&bc, &c.command_type)?;
-            if !is_default_private_reader(&ty.0.private_fields, Record::Command(&c), &grant.role.id, &grant.role.external_subject) {
-                return Err(Error::forbidden("you are not this record's default private reader"));
+            let ty = self
+                .inner
+                .registry
+                .read()
+                .await
+                .command_type(&bc, &c.command_type)?;
+            if !is_default_private_reader(
+                &ty.0.private_fields,
+                Record::Command(&c),
+                &grant.role.id,
+                &grant.role.external_subject,
+            ) {
+                return Err(Error::forbidden(
+                    "you are not this record's default private reader",
+                ));
             }
         }
         let g = PrivateFieldGrant {
@@ -785,17 +982,21 @@ impl Skilj {
             .ok_or_else(|| Error::not_found(format!("grant {grant_id}")))?;
         let g = pfg_from_row(&row)?;
         if g.grantor_role_id != grant.role.id {
-            return Err(Error::forbidden("only the grantor revokes a private-field grant"));
+            return Err(Error::forbidden(
+                "only the grantor revokes a private-field grant",
+            ));
         }
         if !g.active {
             return Err(Error::conflict("grant is already revoked"));
         }
         let mut tx = self.inner.pool.begin().await?;
-        sqlx::query("update private_field_grants set active = false, revoked_at = $2 where id = $1")
-            .bind(grant_id)
-            .bind(Self::now())
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "update private_field_grants set active = false, revoked_at = $2 where id = $1",
+        )
+        .bind(grant_id)
+        .bind(Self::now())
+        .execute(&mut *tx)
+        .await?;
         let events = self
             .record_access_event(
                 &mut tx,
@@ -809,13 +1010,19 @@ impl Skilj {
     }
 
     /// ListPrivateFieldGrants.
-    pub async fn list_private_field_grants(&self, grant: &Grant, grantor: Option<&str>) -> Result<Vec<PrivateFieldGrant>> {
+    pub async fn list_private_field_grants(
+        &self,
+        grant: &Grant,
+        grantor: Option<&str>,
+    ) -> Result<Vec<PrivateFieldGrant>> {
         if !grant.has_level(AccessLevel::Read) {
             return Err(Error::forbidden("grant is revoked"));
         }
         let subject = grantor.unwrap_or(&grant.role.id);
         if subject != grant.role.id && !grant.has_level(AccessLevel::Admin) {
-            return Err(Error::forbidden("listing another role's grants needs an admin grant"));
+            return Err(Error::forbidden(
+                "listing another role's grants needs an admin grant",
+            ));
         }
         let rows = sqlx::query(&format!(
             "select {GRANT_COLUMNS} from private_field_grants where bounded_context = $1 and grantor = $2 order by created_at"
@@ -858,9 +1065,16 @@ impl Skilj {
 
     /// ForgetSubject: destroy the key (and the wrapped key material with
     /// it), and drop the subject's blind tags where erasure is declared.
-    pub async fn forget_subject(&self, grant: &Grant, subject_key: &str, subject_value: &str) -> Result<()> {
+    pub async fn forget_subject(
+        &self,
+        grant: &Grant,
+        subject_key: &str,
+        subject_value: &str,
+    ) -> Result<()> {
         if !grant.has_level(AccessLevel::Admin) {
-            return Err(Error::forbidden("forgetting a subject needs an admin grant"));
+            return Err(Error::forbidden(
+                "forgetting a subject needs an admin grant",
+            ));
         }
         let bc = grant.mapping.bounded_context.clone();
         let mut tx = self.inner.pool.begin().await?;
@@ -874,7 +1088,9 @@ impl Skilj {
         .bind(Self::now())
         .fetch_optional(&mut *tx)
         .await?;
-        let id = id.ok_or_else(|| Error::not_found(format!("active key for {subject_key}={subject_value}")))?;
+        let id = id.ok_or_else(|| {
+            Error::not_found(format!("active key for {subject_key}={subject_value}"))
+        })?;
         let blinds = sqlx::query(
             "select tag_key, erasure_subject_tag from blind_tags where bounded_context = $1 and erasure_subject_key = $2",
         )
@@ -922,7 +1138,10 @@ impl Skilj {
         tx.commit().await?;
         self.forget_cached_key(&id).await;
         sqlx::query("select pg_notify('skilj_changes', $1)")
-            .bind(json!({"kind": "key_destroyed", "id": id, "bc": bc, "invalidate_cache": touched}).to_string())
+            .bind(
+                json!({"kind": "key_destroyed", "id": id, "bc": bc, "invalidate_cache": touched})
+                    .to_string(),
+            )
             .execute(&self.inner.pool)
             .await?;
         if touched {
@@ -941,7 +1160,10 @@ impl Skilj {
                 name: name.into(),
                 schema: access_event_schema(name),
                 schema_version: 1,
-                tag_mappings: vec![TagMapping::new("role", "role_id"), TagMapping::new("bounded_context", "bounded_context")],
+                tag_mappings: vec![
+                    TagMapping::new("role", "role_id"),
+                    TagMapping::new("bounded_context", "bounded_context"),
+                ],
                 owner_tag_key: None,
                 sensitive_fields: vec![],
                 private_fields: vec![],
@@ -965,7 +1187,12 @@ impl Skilj {
     }
 
     /// fold_access_events(role, bounded_context, as_of).
-    async fn fold_access(&self, role_id: &str, bc: &str, as_of: DateTime<Utc>) -> Result<(bool, AccessHistoryAnswer)> {
+    async fn fold_access(
+        &self,
+        role_id: &str,
+        bc: &str,
+        as_of: DateTime<Utc>,
+    ) -> Result<(bool, AccessHistoryAnswer)> {
         let rows = sqlx::query(
             "select event_type, payload from events where bounded_context = 'admin'
                and payload->>'role_id' = $1 and payload->>'bounded_context' = $2
@@ -973,7 +1200,12 @@ impl Skilj {
         )
         .bind(role_id)
         .bind(bc)
-        .bind(&ACCESS_EVENT_TYPES[..6].iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .bind(
+            ACCESS_EVENT_TYPES[..6]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
         .bind(as_of)
         .fetch_all(&self.inner.pool)
         .await?;
@@ -986,7 +1218,11 @@ impl Skilj {
         };
         let set = |v: &Value| -> BTreeSet<String> {
             v.as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         for r in rows {
@@ -1024,12 +1260,16 @@ impl Skilj {
 
     /// BaselineAccessEvents.
     pub(crate) async fn baseline_access_events(&self) -> Result<()> {
-        let rows = sqlx::query(&format!("select {MAPPING_COLUMNS} from access_mappings where active"))
-            .fetch_all(&self.inner.pool)
-            .await?;
+        let rows = sqlx::query(&format!(
+            "select {MAPPING_COLUMNS} from access_mappings where active"
+        ))
+        .fetch_all(&self.inner.pool)
+        .await?;
         for r in rows {
             let m = mapping_from_row(&r)?;
-            let (held, _) = self.fold_access(&m.role_id, &m.bounded_context, Self::now()).await?;
+            let (held, _) = self
+                .fold_access(&m.role_id, &m.bounded_context, Self::now())
+                .await?;
             if held {
                 continue;
             }
@@ -1051,7 +1291,13 @@ impl Skilj {
     }
 
     /// CapabilityHistory.
-    pub async fn capability_history(&self, caller: &Role, role_id: &str, bc: &str, as_of: DateTime<Utc>) -> Result<AccessHistoryAnswer> {
+    pub async fn capability_history(
+        &self,
+        caller: &Role,
+        role_id: &str,
+        bc: &str,
+        as_of: DateTime<Utc>,
+    ) -> Result<AccessHistoryAnswer> {
         Self::require_superadmin(caller)?;
         Ok(self.fold_access(role_id, bc, as_of).await?.1)
     }
@@ -1131,8 +1377,12 @@ fn access_event_schema(name: &str) -> Value {
             "delegable": {"type": "array", "items": {"type": "string"}}
         }),
         "AccessRevoked" => json!({"reason": {"type": "string"}}),
-        "CapabilityGranted" | "CapabilityRevoked" => json!({"capability": {"type": "string"}, "via": {"type": "string"}}),
-        "DelegableCapabilitiesSet" => json!({"delegable": {"type": "array", "items": {"type": "string"}}}),
+        "CapabilityGranted" | "CapabilityRevoked" => {
+            json!({"capability": {"type": "string"}, "via": {"type": "string"}})
+        }
+        "DelegableCapabilitiesSet" => {
+            json!({"delegable": {"type": "array", "items": {"type": "string"}}})
+        }
         _ => json!({
             "grant_id": {"type": "string"},
             "event_sequence": {"type": ["integer", "null"]},

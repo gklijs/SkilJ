@@ -44,7 +44,8 @@ pub(crate) fn command_from_row(row: &PgRow) -> Result<StoredCommand> {
     })
 }
 
-pub(crate) const ROLE_COLUMNS: &str = "id, external_subject, name, superadmin, active, created_at, revoked_at";
+pub(crate) const ROLE_COLUMNS: &str =
+    "id, external_subject, name, superadmin, active, created_at, revoked_at";
 
 pub(crate) fn role_from_row(row: &PgRow) -> Result<Role> {
     Ok(Role {
@@ -68,7 +69,8 @@ pub(crate) fn mapping_from_row(row: &PgRow) -> Result<AccessMapping> {
         id: row.try_get("id")?,
         role_id: row.try_get("role_id")?,
         bounded_context: row.try_get("bounded_context")?,
-        level: AccessLevel::parse(&level).ok_or_else(|| Error::Config(format!("bad level {level}")))?,
+        level: AccessLevel::parse(&level)
+            .ok_or_else(|| Error::Config(format!("bad level {level}")))?,
         can_read_sensitive: row.try_get("can_read_sensitive")?,
         scope: row.try_get("scope")?,
         capabilities: caps.into_iter().collect::<BTreeSet<_>>(),
@@ -86,7 +88,8 @@ pub(crate) fn token_from_row(row: &PgRow) -> Result<AccessToken> {
     let start: String = row.try_get("start_from")?;
     Ok(AccessToken {
         id: row.try_get("id")?,
-        purpose: TokenPurpose::parse(&purpose).ok_or_else(|| Error::Config(format!("bad purpose {purpose}")))?,
+        purpose: TokenPurpose::parse(&purpose)
+            .ok_or_else(|| Error::Config(format!("bad purpose {purpose}")))?,
         bounded_context: row.try_get("bounded_context")?,
         type_name: row.try_get("type_name")?,
         scope: row.try_get("scope")?,
@@ -136,5 +139,7 @@ pub(crate) fn context_from_row(row: &PgRow) -> Result<BoundedContext> {
 }
 
 pub(crate) fn tag_arrays(tags: &BTreeSet<Tag>) -> (Vec<String>, Vec<Option<String>>) {
-    tags.iter().map(|t| (t.key.clone(), t.value.clone())).unzip()
+    tags.iter()
+        .map(|t| (t.key.clone(), t.value.clone()))
+        .unzip()
 }

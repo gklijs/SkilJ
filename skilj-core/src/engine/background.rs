@@ -98,7 +98,9 @@ impl Skilj {
             let v: Value = serde_json::from_str(n.payload()).unwrap_or(Value::Null);
             match n.channel() {
                 "skilj_events" => {
-                    if let (Some(bc), Some(from), Some(to)) = (v["bc"].as_str(), v["from"].as_i64(), v["to"].as_i64()) {
+                    if let (Some(bc), Some(from), Some(to)) =
+                        (v["bc"].as_str(), v["from"].as_i64(), v["to"].as_i64())
+                    {
                         self.dispatch_range(bc, from, to).await?;
                     }
                 }
@@ -133,13 +135,21 @@ impl Skilj {
         reg.event_types
             .iter()
             .filter(|(_, t)| t.0.system_triggered_allowed)
-            .filter(|((bc, _), _)| reg.contexts.get(bc).is_some_and(|c| c.status == ContextStatus::Active))
+            .filter(|((bc, _), _)| {
+                reg.contexts
+                    .get(bc)
+                    .is_some_and(|c| c.status == ContextStatus::Active)
+            })
             .filter(|((bc, name), _)| self.scheduled_payload_fn(bc, name).is_some())
             .map(|(k, _)| k.clone())
             .collect()
     }
 
-    fn scheduled_payload_fn(&self, bc: &str, name: &str) -> Option<crate::decl::ScheduledPayloadFn> {
+    fn scheduled_payload_fn(
+        &self,
+        bc: &str,
+        name: &str,
+    ) -> Option<crate::decl::ScheduledPayloadFn> {
         self.decl_for(bc)?
             .event_types
             .iter()
@@ -152,12 +162,13 @@ impl Skilj {
     pub async fn resume_schedules(&self) -> Result<()> {
         for (bc, name) in self.scheduled_types().await {
             let mut tx = self.inner.pool.begin().await?;
-            let def: Option<Value> =
-                sqlx::query_scalar("select def from event_types where bounded_context = $1 and name = $2 for update")
-                    .bind(&bc)
-                    .bind(&name)
-                    .fetch_optional(&mut *tx)
-                    .await?;
+            let def: Option<Value> = sqlx::query_scalar(
+                "select def from event_types where bounded_context = $1 and name = $2 for update",
+            )
+            .bind(&bc)
+            .bind(&name)
+            .fetch_optional(&mut *tx)
+            .await?;
             let Some(def) = def else { continue };
             let mut def: EventTypeDef = serde_json::from_value(def)?;
             let now = Self::now();
@@ -165,12 +176,14 @@ impl Skilj {
                 && def.schedule_position.is_some_and(|p| p < now)
             {
                 def.schedule_position = Some(now);
-                sqlx::query("update event_types set def = $3 where bounded_context = $1 and name = $2")
-                    .bind(&bc)
-                    .bind(&name)
-                    .bind(serde_json::to_value(&def)?)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(
+                    "update event_types set def = $3 where bounded_context = $1 and name = $2",
+                )
+                .bind(&bc)
+                .bind(&name)
+                .bind(serde_json::to_value(&def)?)
+                .execute(&mut *tx)
+                .await?;
             }
             tx.commit().await?;
         }
@@ -181,7 +194,9 @@ impl Skilj {
     pub async fn step_schedules(&self) -> Result<usize> {
         let mut fired = 0;
         for (bc, name) in self.scheduled_types().await {
-            let Some(payload_fn) = self.scheduled_payload_fn(&bc, &name) else { continue };
+            let Some(payload_fn) = self.scheduled_payload_fn(&bc, &name) else {
+                continue;
+            };
             let mut tx = self.inner.pool.begin().await?;
             let def: Option<Value> = sqlx::query_scalar(
                 "select def from event_types where bounded_context = $1 and name = $2 for update skip locked",
@@ -192,9 +207,11 @@ impl Skilj {
             .await?;
             let Some(def) = def else { continue };
             let mut def: EventTypeDef = serde_json::from_value(def)?;
-            let (Some(expr), Some(policy), Some(mut pos)) =
-                (def.system_triggered_schedule.clone(), def.missed_occurrence_policy, def.schedule_position)
-            else {
+            let (Some(expr), Some(policy), Some(mut pos)) = (
+                def.system_triggered_schedule.clone(),
+                def.missed_occurrence_policy,
+                def.schedule_position,
+            ) else {
                 continue;
             };
             let cron = parse_cron(&expr)?;
@@ -213,7 +230,10 @@ impl Skilj {
                     MissedOccurrencePolicy::Skip => nothing_later_due,
                 };
                 if fire {
-                    written.extend(self.create_system_event(&mut tx, &def, payload_fn(occ), occ).await?);
+                    written.extend(
+                        self.create_system_event(&mut tx, &def, payload_fn(occ), occ)
+                            .await?,
+                    );
                     def.last_fired_at = Some(occ);
                     pos = occ;
                     fired += 1;
@@ -229,12 +249,14 @@ impl Skilj {
             }
             if Some(pos) != def.schedule_position {
                 def.schedule_position = Some(pos);
-                sqlx::query("update event_types set def = $3 where bounded_context = $1 and name = $2")
-                    .bind(&bc)
-                    .bind(&name)
-                    .bind(serde_json::to_value(&def)?)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(
+                    "update event_types set def = $3 where bounded_context = $1 and name = $2",
+                )
+                .bind(&bc)
+                .bind(&name)
+                .bind(serde_json::to_value(&def)?)
+                .execute(&mut *tx)
+                .await?;
             }
             tx.commit().await?;
             self.after_commit(&written).await;

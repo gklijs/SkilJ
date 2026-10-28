@@ -98,7 +98,8 @@ impl Verifier {
         v.set_issuer(&[&self.config.issuer]);
         v.set_audience(&[&self.config.audience]);
         v.set_required_spec_claims(&["exp", "iss", "aud"]);
-        let data = decode::<HashMap<String, Value>>(token, &key, &v).map_err(|e| AuthError::Invalid(e.to_string()))?;
+        let data = decode::<HashMap<String, Value>>(token, &key, &v)
+            .map_err(|e| AuthError::Invalid(e.to_string()))?;
         let subject = data
             .claims
             .get(&self.config.subject_claim)
@@ -106,7 +107,10 @@ impl Verifier {
             .ok_or_else(|| AuthError::Invalid(format!("no '{}' claim", self.config.subject_claim)))?
             .to_string();
         let expires_at = data.claims.get("exp").and_then(Value::as_i64).unwrap_or(0);
-        Ok(Identity { subject, expires_at })
+        Ok(Identity {
+            subject,
+            expires_at,
+        })
     }
 
     /// From an `Authorization: Bearer <jwt>` header value.

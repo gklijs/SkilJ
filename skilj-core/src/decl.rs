@@ -10,7 +10,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    MissedOccurrencePolicy, PrivateField, QueryItemMapping, SensitiveField, StoredEvent, Tag, TagMapping,
+    MissedOccurrencePolicy, PrivateField, QueryItemMapping, SensitiveField, StoredEvent, Tag,
+    TagMapping,
 };
 
 /// One event decide() wants appended.
@@ -64,14 +65,16 @@ pub struct DecisionInput<'a> {
 
 impl DecisionInput<'_> {
     pub fn snapshot(&self, name: &str, tag_value: &str) -> Option<&Value> {
-        self.snapshots.get(&(name.to_string(), tag_value.to_string()))
+        self.snapshots
+            .get(&(name.to_string(), tag_value.to_string()))
     }
 }
 
 pub type DecideFn = Arc<dyn Fn(&DecisionInput<'_>) -> Decision + Send + Sync>;
 pub type ScheduledPayloadFn = Arc<dyn Fn(DateTime<Utc>) -> Value + Send + Sync>;
 pub type ProjectionKeysFn = Arc<dyn Fn(&StoredEvent) -> Vec<String> + Send + Sync>;
-pub type ProjectionFoldFn = Arc<dyn Fn(&str, Option<&Value>, &StoredEvent) -> Option<Value> + Send + Sync>;
+pub type ProjectionFoldFn =
+    Arc<dyn Fn(&str, Option<&Value>, &StoredEvent) -> Option<Value> + Send + Sync>;
 pub type SummaryFoldFn = Arc<dyn Fn(&Value, &StoredEvent, &str) -> Value + Send + Sync>;
 
 #[derive(Clone)]
@@ -393,19 +396,30 @@ impl BoundedContextDecl {
                     }
                 }
                 let is_nothing = item.event_types.is_empty() && item.tag_keys.is_empty();
-                if is_nothing && (q.len() != 1 || item.latest.is_some() || item.snapshot.is_some()) {
+                if is_nothing && (q.len() != 1 || item.latest.is_some() || item.snapshot.is_some())
+                {
                     return Err(Error::Config(format!(
                         "{}.{}: the nothing item must stand alone without latest",
                         self.name, ct.name
                     )));
                 }
                 if item.latest == Some(0) {
-                    return Err(Error::Config(format!("{}.{}: latest must be at least 1", self.name, ct.name)));
+                    return Err(Error::Config(format!(
+                        "{}.{}: latest must be at least 1",
+                        self.name, ct.name
+                    )));
                 }
                 if let Some(s) = &item.snapshot {
-                    let summary = self.summaries.iter().find(|x| &x.name == s).ok_or_else(|| {
-                        Error::Config(format!("{}.{}: snapshot item names undeclared summary '{s}'", self.name, ct.name))
-                    })?;
+                    let summary =
+                        self.summaries
+                            .iter()
+                            .find(|x| &x.name == s)
+                            .ok_or_else(|| {
+                                Error::Config(format!(
+                                    "{}.{}: snapshot item names undeclared summary '{s}'",
+                                    self.name, ct.name
+                                ))
+                            })?;
                     if item.tag_keys.len() != 1
                         || !item.event_types.is_empty()
                         || item.latest.is_some()
@@ -425,5 +439,7 @@ impl BoundedContextDecl {
 
 /// Tags of an event under a key, for projection owner derivation.
 pub fn tag_value<'a>(tags: &'a BTreeSet<Tag>, key: &str) -> Option<&'a str> {
-    tags.iter().find(|t| t.key == key).and_then(|t| t.value.as_deref())
+    tags.iter()
+        .find(|t| t.key == key)
+        .and_then(|t| t.value.as_deref())
 }

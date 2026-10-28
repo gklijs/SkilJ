@@ -47,9 +47,18 @@ impl Skilj {
             return Err(Error::conflict("role is revoked"));
         }
         let mut tx = self.inner.pool.begin().await?;
-        self.insert_context(&mut tx, caller, name, Some(template)).await?;
+        self.insert_context(&mut tx, caller, name, Some(template))
+            .await?;
         let (m, events) = self
-            .insert_mapping(&mut tx, &caller.id, &role, name, level, can_read_sensitive, scope)
+            .insert_mapping(
+                &mut tx,
+                &caller.id,
+                &role,
+                name,
+                level,
+                can_read_sensitive,
+                scope,
+            )
             .await?;
         // Blind tags are part of what a tenant needs to register blind
         // mappings; copy the template's (fingerprint recorded by the first
@@ -84,7 +93,10 @@ impl Skilj {
             if c.status != ContextStatus::Active {
                 return Err(Error::Archived(name.into()));
             }
-            let t = c.template.clone().ok_or_else(|| Error::invalid(format!("{name} has no template")))?;
+            let t = c
+                .template
+                .clone()
+                .ok_or_else(|| Error::invalid(format!("{name} has no template")))?;
             if reg.context(&t)?.status != ContextStatus::Active {
                 return Err(Error::conflict("the template is archived"));
             }
@@ -101,8 +113,16 @@ impl Skilj {
         let mut errors = vec![];
         for t in reg.event_types_of(template) {
             let d = &t.0;
-            let decl = self.inner.decls.get(template).and_then(|c| c.event_types.iter().find(|e| e.name == d.name));
-            let schedule = match (&d.system_triggered_schedule, d.missed_occurrence_policy, decl.and_then(|x| x.schedule.clone())) {
+            let decl = self
+                .inner
+                .decls
+                .get(template)
+                .and_then(|c| c.event_types.iter().find(|e| e.name == d.name));
+            let schedule = match (
+                &d.system_triggered_schedule,
+                d.missed_occurrence_policy,
+                decl.and_then(|x| x.schedule.clone()),
+            ) {
                 (Some(cron), Some(p), Some((_, _, f))) => Some((cron.clone(), p, f)),
                 _ => None,
             };
@@ -118,13 +138,20 @@ impl Skilj {
                 event_read_allowed: d.event_read_allowed,
                 schedule,
             };
-            if let Err(err) = self.register_event_type_as(&Authority::Superadmin, name, &e).await {
+            if let Err(err) = self
+                .register_event_type_as(&Authority::Superadmin, name, &e)
+                .await
+            {
                 errors.push(format!("{}: {err}", d.name));
             }
         }
         for t in reg.command_types_of(template) {
             let d = &t.0;
-            let decl = self.inner.decls.get(template).and_then(|c| c.command_types.iter().find(|x| x.name == d.name));
+            let decl = self
+                .inner
+                .decls
+                .get(template)
+                .and_then(|c| c.command_types.iter().find(|x| x.name == d.name));
             let mut c = match decl {
                 Some(c) => c.clone(),
                 None => CommandTypeDecl::new(d.name.clone(), d.schema.clone(), |_| {
@@ -137,7 +164,10 @@ impl Skilj {
             c.sensitive_fields = d.sensitive_fields.clone();
             c.private_fields = d.private_fields.clone();
             c.rest_trigger_allowed = d.rest_trigger_allowed;
-            if let Err(err) = self.register_command_type_as(&Authority::Superadmin, name, &c).await {
+            if let Err(err) = self
+                .register_command_type_as(&Authority::Superadmin, name, &c)
+                .await
+            {
                 errors.push(format!("{}: {err}", d.name));
             }
         }
@@ -150,13 +180,22 @@ impl Skilj {
                 .cloned();
             let mut pd = match decl {
                 Some(d) => d,
-                None => ProjectionDecl::new(p.name.clone(), p.schema.clone(), &[], |_| vec![], |_, _, _| None),
+                None => ProjectionDecl::new(
+                    p.name.clone(),
+                    p.schema.clone(),
+                    &[],
+                    |_| vec![],
+                    |_, _, _| None,
+                ),
             };
             pd.schema = p.schema.clone();
             pd.consumed_event_types = p.consumed_event_types.clone();
             pd.sync = p.sync;
             pd.requires_capability = p.requires_capability.clone();
-            if let Err(err) = self.register_projection_as(&Authority::Superadmin, name, &pd).await {
+            if let Err(err) = self
+                .register_projection_as(&Authority::Superadmin, name, &pd)
+                .await
+            {
                 errors.push(format!("{}: {err}", p.name));
             }
         }

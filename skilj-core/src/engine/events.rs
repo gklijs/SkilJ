@@ -42,23 +42,31 @@ pub struct ExternalEventItem {
 
 /// What an external submission answers.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ExternalOutcome {
     Created(StoredEvent),
     /// A redelivery: nothing written. The idempotency-key form knows which
     /// event the message became; the watermark form doesn't.
-    Redelivered { sequence: Option<i64> },
+    Redelivered {
+        sequence: Option<i64>,
+    },
     Failed(String, &'static str),
     NotProcessed,
 }
 
 impl Skilj {
     /// Lock the bounded context's sequence row; returns the next sequence.
-    pub(crate) async fn lock_counter(&self, tx: &mut Transaction<'_, Postgres>, bc: &str) -> Result<i64> {
-        let next: Option<i64> =
-            sqlx::query_scalar("select next_sequence from sequence_counters where bounded_context = $1 for update")
-                .bind(bc)
-                .fetch_optional(&mut **tx)
-                .await?;
+    pub(crate) async fn lock_counter(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        bc: &str,
+    ) -> Result<i64> {
+        let next: Option<i64> = sqlx::query_scalar(
+            "select next_sequence from sequence_counters where bounded_context = $1 for update",
+        )
+        .bind(bc)
+        .fetch_optional(&mut **tx)
+        .await?;
         next.ok_or_else(|| Error::not_found(format!("bounded context {bc}")))
     }
 
@@ -115,11 +123,13 @@ impl Skilj {
             written.push(stored);
         }
         if !written.is_empty() {
-            sqlx::query("update sequence_counters set next_sequence = $2 where bounded_context = $1")
-                .bind(bc)
-                .bind(next)
-                .execute(&mut **tx)
-                .await?;
+            sqlx::query(
+                "update sequence_counters set next_sequence = $2 where bounded_context = $1",
+            )
+            .bind(bc)
+            .bind(next)
+            .execute(&mut **tx)
+            .await?;
             sqlx::query(
                 "update projections set caught_up_to = $2
                  where bounded_context = $1 and (def->>'sync')::boolean",
@@ -128,7 +138,8 @@ impl Skilj {
             .bind(next - 1)
             .execute(&mut **tx)
             .await?;
-            let payload = json!({"bc": bc, "from": written[0].sequence, "to": next - 1}).to_string();
+            let payload =
+                json!({"bc": bc, "from": written[0].sequence, "to": next - 1}).to_string();
             sqlx::query("select pg_notify('skilj_events', $1)")
                 .bind(payload)
                 .execute(&mut **tx)
@@ -182,7 +193,9 @@ impl Skilj {
         batch.push(e);
         for ev in batch {
             *expected = Some(ev.sequence + 1);
-            self.inner.cache.append(ev.clone(), self.inner.config.event_cache_size);
+            self.inner
+                .cache
+                .append(ev.clone(), self.inner.config.event_cache_size);
             let _ = self.inner.bus.send(BusMessage::Event(ev));
         }
         Ok(())
@@ -214,7 +227,15 @@ impl Skilj {
     }
 
     pub(crate) async fn warm_cache(&self) -> Result<()> {
-        let contexts: Vec<String> = self.inner.registry.read().await.contexts.keys().cloned().collect();
+        let contexts: Vec<String> = self
+            .inner
+            .registry
+            .read()
+            .await
+            .contexts
+            .keys()
+            .cloned()
+            .collect();
         for bc in contexts {
             self.warm_context(&bc).await?;
         }
@@ -229,7 +250,8 @@ impl Skilj {
         .bind(self.inner.config.event_cache_size as i64)
         .fetch_all(&self.inner.pool)
         .await?;
-        let mut events: Vec<StoredEvent> = rows.iter().map(event_from_row).collect::<Result<_>>()?;
+        let mut events: Vec<StoredEvent> =
+            rows.iter().map(event_from_row).collect::<Result<_>>()?;
         events.reverse();
         let next: i64 = sqlx::query_scalar("select coalesce(max(next_sequence), 0) from sequence_counters where bounded_context = $1")
             .bind(bc)
@@ -237,7 +259,9 @@ impl Skilj {
             .await?;
         let lock = self.inner.dispatch_lock(bc).await;
         let mut expected = lock.lock().await;
-        self.inner.cache.warm(bc, events, self.inner.config.event_cache_size);
+        self.inner
+            .cache
+            .warm(bc, events, self.inner.config.event_cache_size);
         *expected = Some(next);
         Ok(())
     }
@@ -251,7 +275,9 @@ impl Skilj {
         event_type: &str,
         item: ExternalEventItem,
     ) -> Result<ExternalOutcome> {
-        let mut outs = self.submit_external_events(token, event_type, vec![item], false).await?;
+        let mut outs = self
+            .submit_external_events(token, event_type, vec![item], false)
+            .await?;
         match outs.pop() {
             Some(ExternalOutcome::Failed(msg, code)) => Err(error_from_code(code, msg)),
             Some(o) => Ok(o),
@@ -291,25 +317,45 @@ impl Skilj {
         Ok(out)
     }
 
-    async fn external_one(&self, token: &AccessToken, event_type: &str, item: ExternalEventItem) -> Result<ExternalOutcome> {
-        let (bc, ty) = self.token_event_type(token, TokenPurpose::ExternalEvent, event_type).await?;
+    async fn external_one(
+        &self,
+        token: &AccessToken,
+        event_type: &str,
+        item: ExternalEventItem,
+    ) -> Result<ExternalOutcome> {
+        let (bc, ty) = self
+            .token_event_type(token, TokenPurpose::ExternalEvent, event_type)
+            .await?;
         if !ty.0.external_creation_allowed {
-            return Err(Error::forbidden("external creation is not allowed for this event type"));
+            return Err(Error::forbidden(
+                "external creation is not allowed for this event type",
+            ));
         }
         self.inner.registry.read().await.is_active(&bc)?;
         ty.1.validate(&item.payload)?;
         validate::valid_correlation_id(item.correlation_id.as_deref())?;
         validate::valid_correlation_id(item.causation_id.as_deref())?;
         if item.dedupe_partition_key.is_some() != item.dedupe_sequence.is_some() {
-            return Err(Error::invalid("dedupe_partition_key and dedupe_sequence travel as a pair"));
+            return Err(Error::invalid(
+                "dedupe_partition_key and dedupe_sequence travel as a pair",
+            ));
         }
         if item.idempotency_key.is_some() && item.dedupe_partition_key.is_some() {
-            return Err(Error::invalid("name either a dedupe cursor or an idempotency key, not both"));
+            return Err(Error::invalid(
+                "name either a dedupe cursor or an idempotency key, not both",
+            ));
         }
         validate::valid_idempotency_key(item.idempotency_key.as_deref())?;
-        let tags = derive_tags(&bc, &ty.0.tag_mappings, &item.payload, self.inner.blind.as_ref())?;
+        let tags = derive_tags(
+            &bc,
+            &ty.0.tag_mappings,
+            &item.payload,
+            self.inner.blind.as_ref(),
+        )?;
         if !owner_scope_satisfied(&tags, ty.0.owner_tag_key.as_deref(), token.scope.as_deref()) {
-            return Err(Error::forbidden("token scope does not cover this event's owner"));
+            return Err(Error::forbidden(
+                "token scope does not cover this event's owner",
+            ));
         }
         let protected = self.protect(&ty.0, &item.payload).await?;
         let mut tx = self.inner.pool.begin().await?;
@@ -345,7 +391,10 @@ impl Skilj {
             version: ty.0.schema_version,
             client_id: token.id.clone(),
             created_at: Self::now(),
-            correlation_id: item.correlation_id.clone().unwrap_or_else(crypto::generate_id),
+            correlation_id: item
+                .correlation_id
+                .clone()
+                .unwrap_or_else(crypto::generate_id),
             causation_id: item.causation_id.clone(),
         };
         let written = self
@@ -392,7 +441,9 @@ impl Skilj {
         }
         tx.commit().await?;
         self.after_commit(&written).await;
-        Ok(ExternalOutcome::Created(written.into_iter().next().expect("one event")))
+        Ok(ExternalOutcome::Created(
+            written.into_iter().next().expect("one event"),
+        ))
     }
 
     /// CreateDirectEvent.
@@ -404,9 +455,13 @@ impl Skilj {
         correlation_id: Option<String>,
         causation_id: Option<String>,
     ) -> Result<StoredEvent> {
-        let (bc, ty) = self.token_event_type(token, TokenPurpose::DirectCreation, event_type).await?;
+        let (bc, ty) = self
+            .token_event_type(token, TokenPurpose::DirectCreation, event_type)
+            .await?;
         if !ty.0.direct_creation_allowed {
-            return Err(Error::forbidden("direct creation is not allowed for this event type"));
+            return Err(Error::forbidden(
+                "direct creation is not allowed for this event type",
+            ));
         }
         self.inner.registry.read().await.is_active(&bc)?;
         ty.1.validate(&payload)?;
@@ -414,7 +469,9 @@ impl Skilj {
         validate::valid_correlation_id(causation_id.as_deref())?;
         let tags = derive_tags(&bc, &ty.0.tag_mappings, &payload, self.inner.blind.as_ref())?;
         if !owner_scope_satisfied(&tags, ty.0.owner_tag_key.as_deref(), token.scope.as_deref()) {
-            return Err(Error::forbidden("token scope does not cover this event's owner"));
+            return Err(Error::forbidden(
+                "token scope does not cover this event's owner",
+            ));
         }
         let protected = self.protect(&ty.0, &payload).await?;
         let mut tx = self.inner.pool.begin().await?;
@@ -460,7 +517,12 @@ impl Skilj {
         // Not re-checked by the spec (the obligation is on compiled code);
         // checked here because a bad payload would be stored forever.
         schema.validate(&payload)?;
-        let tags = derive_tags(&def.bounded_context, &def.tag_mappings, &payload, self.inner.blind.as_ref())?;
+        let tags = derive_tags(
+            &def.bounded_context,
+            &def.tag_mappings,
+            &payload,
+            self.inner.blind.as_ref(),
+        )?;
         let protected = self.protect(def, &payload).await?;
         let next = self.lock_counter(tx, &def.bounded_context).await?;
         self.append_locked(
@@ -499,11 +561,17 @@ impl Skilj {
         let mut full = payload;
         if let Value::Object(m) = &mut full {
             m.insert("role_id".into(), Value::String(role_id.into()));
-            m.insert("bounded_context".into(), Value::String(bounded_context.into()));
+            m.insert(
+                "bounded_context".into(),
+                Value::String(bounded_context.into()),
+            );
         }
-        let tags: BTreeSet<Tag> = [Tag::new("role", role_id), Tag::new("bounded_context", bounded_context)]
-            .into_iter()
-            .collect();
+        let tags: BTreeSet<Tag> = [
+            Tag::new("role", role_id),
+            Tag::new("bounded_context", bounded_context),
+        ]
+        .into_iter()
+        .collect();
         let next = self.lock_counter(tx, ADMIN_CONTEXT).await?;
         self.append_locked(
             tx,

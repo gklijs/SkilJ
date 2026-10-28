@@ -137,7 +137,8 @@ impl Schema {
     }
 
     pub fn parse_str(s: &str) -> Result<Schema> {
-        let v: Value = serde_json::from_str(s).map_err(|e| Error::invalid(format!("schema is not JSON: {e}")))?;
+        let v: Value = serde_json::from_str(s)
+            .map_err(|e| Error::invalid(format!("schema is not JSON: {e}")))?;
         Schema::parse(&v)
     }
 
@@ -156,11 +157,10 @@ impl Schema {
                 "field path '{path}' must be a name or a two-segment dotted path"
             )));
         }
-        let first = self
-            .root
-            .fields
-            .get(segments[0])
-            .ok_or_else(|| Error::invalid(format!("schema declares no field '{}'", segments[0])))?;
+        let first =
+            self.root.fields.get(segments[0]).ok_or_else(|| {
+                Error::invalid(format!("schema declares no field '{}'", segments[0]))
+            })?;
         let target = if segments.len() == 2 {
             match &first.shape {
                 Shape::Object(o) => o
@@ -208,7 +208,9 @@ impl Schema {
         }
         for (name, new) in &self.root.fields {
             if !existing.root.fields.contains_key(name) && new.required {
-                return Err(Error::invalid(format!("new field '{name}' must be optional")));
+                return Err(Error::invalid(format!(
+                    "new field '{name}' must be optional"
+                )));
             }
         }
         Ok(())
@@ -236,7 +238,9 @@ fn parse_shape(v: &Value, defs: &Map<String, Value>, depth: usize) -> Result<Sha
         .as_object()
         .ok_or_else(|| Error::invalid("schema node must be an object"))?;
     if let Some(r) = obj.get("$ref") {
-        let r = r.as_str().ok_or_else(|| Error::invalid("$ref must be a string"))?;
+        let r = r
+            .as_str()
+            .ok_or_else(|| Error::invalid("$ref must be a string"))?;
         let name = r
             .strip_prefix("#/$defs/")
             .or_else(|| r.strip_prefix("#/definitions/"))
@@ -256,7 +260,9 @@ fn parse_shape(v: &Value, defs: &Map<String, Value>, depth: usize) -> Result<Sha
             let names: Vec<&str> = types.iter().filter_map(Value::as_str).collect();
             let non_null: Vec<&str> = names.iter().copied().filter(|t| *t != "null").collect();
             if non_null.len() != 1 || names.len() != types.len() {
-                return Err(Error::invalid("a type list may only add \"null\" to one type"));
+                return Err(Error::invalid(
+                    "a type list may only add \"null\" to one type",
+                ));
             }
             (non_null[0].to_string(), names.contains(&"null"))
         }
@@ -286,13 +292,17 @@ fn parse_shape(v: &Value, defs: &Map<String, Value>, depth: usize) -> Result<Sha
             };
             for r in &required {
                 if !props.contains_key(r) {
-                    return Err(Error::invalid(format!("required names undeclared field '{r}'")));
+                    return Err(Error::invalid(format!(
+                        "required names undeclared field '{r}'"
+                    )));
                 }
             }
             let mut fields = BTreeMap::new();
             for (name, sub) in props {
                 if name.contains('.') {
-                    return Err(Error::invalid(format!("field name '{name}' may not contain '.'")));
+                    return Err(Error::invalid(format!(
+                        "field name '{name}' may not contain '.'"
+                    )));
                 }
                 let shape = parse_shape(&sub, defs, depth + 1)?;
                 fields.insert(
@@ -303,7 +313,8 @@ fn parse_shape(v: &Value, defs: &Map<String, Value>, depth: usize) -> Result<Sha
                     },
                 );
             }
-            let additional_properties = !matches!(obj.get("additionalProperties"), Some(Value::Bool(false)));
+            let additional_properties =
+                !matches!(obj.get("additionalProperties"), Some(Value::Bool(false)));
             Ok(Shape::Object(ObjectShape {
                 name: None,
                 fields,
@@ -317,13 +328,17 @@ fn parse_shape(v: &Value, defs: &Map<String, Value>, depth: usize) -> Result<Sha
             Ok(Shape::Array(Box::new(parse_shape(items, defs, depth + 1)?)))
         }
         other => {
-            let ty = ScalarType::parse(other).ok_or_else(|| Error::invalid(format!("unsupported type '{other}'")))?;
+            let ty = ScalarType::parse(other)
+                .ok_or_else(|| Error::invalid(format!("unsupported type '{other}'")))?;
             let enum_values = match obj.get("enum") {
                 Some(Value::Array(a)) => Some(a.clone()),
                 Some(_) => return Err(Error::invalid("enum must be an array")),
                 None => None,
             };
-            let format = obj.get("format").and_then(Value::as_str).map(str::to_string);
+            let format = obj
+                .get("format")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             Ok(Shape::Scalar(Scalar {
                 ty,
                 format,
@@ -352,7 +367,10 @@ fn validate_object(shape: &ObjectShape, v: &Value, at: &str) -> Result<()> {
     if !shape.additional_properties {
         for k in obj.keys() {
             if !shape.fields.contains_key(k) {
-                return Err(Error::invalid(format!("unexpected field '{}'", join(at, k))));
+                return Err(Error::invalid(format!(
+                    "unexpected field '{}'",
+                    join(at, k)
+                )));
             }
         }
     }
@@ -370,7 +388,9 @@ fn validate_shape(shape: &Shape, v: &Value, at: &str) -> Result<()> {
             }
             if let Some(allowed) = &s.enum_values {
                 if !allowed.contains(v) {
-                    return Err(Error::invalid(format!("'{at}' is not one of the allowed values")));
+                    return Err(Error::invalid(format!(
+                        "'{at}' is not one of the allowed values"
+                    )));
                 }
             }
             Ok(())
@@ -446,9 +466,12 @@ mod tests {
     #[test]
     fn validates_payloads() {
         let s = account();
-        s.validate(&json!({"account_id": "a", "amount": 5})).unwrap();
+        s.validate(&json!({"account_id": "a", "amount": 5}))
+            .unwrap();
         assert!(s.validate(&json!({"account_id": "a"})).is_err());
-        assert!(s.validate(&json!({"account_id": "a", "amount": 1.5})).is_err());
+        assert!(s
+            .validate(&json!({"account_id": "a", "amount": 1.5}))
+            .is_err());
         s.validate(&json!({"account_id": "a", "amount": 1, "address": {"country": "NL"}}))
             .unwrap();
     }
@@ -457,8 +480,14 @@ mod tests {
     fn resolves_paths() {
         let s = account();
         assert!(matches!(s.resolve("account_id").unwrap(), Leaf::Scalar(_)));
-        assert!(matches!(s.resolve("labels").unwrap(), Leaf::ListOfScalars(_)));
-        assert!(matches!(s.resolve("address.country").unwrap(), Leaf::Scalar(_)));
+        assert!(matches!(
+            s.resolve("labels").unwrap(),
+            Leaf::ListOfScalars(_)
+        ));
+        assert!(matches!(
+            s.resolve("address.country").unwrap(),
+            Leaf::Scalar(_)
+        ));
         assert!(s.resolve("address").is_err());
         assert!(s.resolve("address.country.x").is_err());
         assert!(s.resolve("nope").is_err());

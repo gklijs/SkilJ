@@ -1,0 +1,16 @@
+[package]
+name = "skilj-demo"
+description = "A banking bounded context served over GraphQL and REST"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+skilj-core = { path = "../skilj-core" }
+skilj-server = { path = "../skilj-server" }
+tokio.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+jsonwebtoken.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -71,7 +71,9 @@ impl MasterKeyProvider for LocalMasterKey {
     }
     fn unwrap(&self, key_id: &str, wrapped: &[u8]) -> Result<Vec<u8>> {
         if key_id != self.id {
-            return Err(Error::Crypto(format!("data key wrapped under unknown master key '{key_id}'")));
+            return Err(Error::Crypto(format!(
+                "data key wrapped under unknown master key '{key_id}'"
+            )));
         }
         open(&self.cipher, wrapped, self.id.as_bytes())
     }
@@ -81,7 +83,13 @@ fn seal(cipher: &Aes256Gcm, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let mut nonce = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce);
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| Error::Crypto("encryption failed".into()))?;
     let mut out = nonce.to_vec();
     out.extend(ct);
@@ -106,10 +114,14 @@ pub fn new_data_key() -> [u8; 32] {
 
 /// Encrypt one JSON leaf under a data key.
 pub fn encrypt_leaf(key_id: &str, data_key: &[u8], leaf: &Value) -> Result<String> {
-    let cipher = Aes256Gcm::new_from_slice(data_key).map_err(|_| Error::Crypto("bad data key".into()))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(data_key).map_err(|_| Error::Crypto("bad data key".into()))?;
     let plain = serde_json::to_vec(leaf)?;
     let sealed = seal(&cipher, &plain, key_id.as_bytes())?;
-    Ok(format!("{CIPHERTEXT_PREFIX}{key_id}:{}", STANDARD.encode(sealed)))
+    Ok(format!(
+        "{CIPHERTEXT_PREFIX}{key_id}:{}",
+        STANDARD.encode(sealed)
+    ))
 }
 
 /// The key id a ciphertext leaf was written under, if it is one.
@@ -123,9 +135,14 @@ pub fn decrypt_leaf(data_key: &[u8], v: &Value) -> Result<Value> {
         .as_str()
         .and_then(|s| s.strip_prefix(CIPHERTEXT_PREFIX))
         .ok_or_else(|| Error::Crypto("not a ciphertext leaf".into()))?;
-    let (key_id, b64) = s.split_once(':').ok_or_else(|| Error::Crypto("malformed ciphertext".into()))?;
-    let sealed = STANDARD.decode(b64).map_err(|_| Error::Crypto("malformed ciphertext".into()))?;
-    let cipher = Aes256Gcm::new_from_slice(data_key).map_err(|_| Error::Crypto("bad data key".into()))?;
+    let (key_id, b64) = s
+        .split_once(':')
+        .ok_or_else(|| Error::Crypto("malformed ciphertext".into()))?;
+    let sealed = STANDARD
+        .decode(b64)
+        .map_err(|_| Error::Crypto("malformed ciphertext".into()))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(data_key).map_err(|_| Error::Crypto("bad data key".into()))?;
     let plain = open(&cipher, &sealed, key_id.as_bytes())?;
     Ok(serde_json::from_slice(&plain)?)
 }
@@ -198,7 +215,10 @@ impl BlindHasher for HmacBlindHasher {
     fn hash(&self, bc: &str, key: &str, value: &str) -> Result<String> {
         let mut m = <HmacSha256 as Mac>::new_from_slice(&self.derived(bc, key)).expect("hmac");
         m.update(normalize_v1(value).as_bytes());
-        Ok(format!("blind:{}", URL_SAFE_NO_PAD.encode(m.finalize().into_bytes())))
+        Ok(format!(
+            "blind:{}",
+            URL_SAFE_NO_PAD.encode(m.finalize().into_bytes())
+        ))
     }
 }
 
@@ -236,7 +256,13 @@ mod tests {
     #[test]
     fn blind_normalizes() {
         let h = HmacBlindHasher::new(b"root".to_vec());
-        assert_eq!(h.hash("b", "email", " A@x.nl").unwrap(), h.hash("b", "email", "a@x.nl").unwrap());
-        assert_ne!(h.hash("b", "email", "a@x.nl").unwrap(), h.hash("c", "email", "a@x.nl").unwrap());
+        assert_eq!(
+            h.hash("b", "email", " A@x.nl").unwrap(),
+            h.hash("b", "email", "a@x.nl").unwrap()
+        );
+        assert_ne!(
+            h.hash("b", "email", "a@x.nl").unwrap(),
+            h.hash("c", "email", "a@x.nl").unwrap()
+        );
     }
 }

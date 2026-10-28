@@ -29,19 +29,26 @@ pub fn valid_bounded_context_name(name: &str) -> Result<()> {
 pub fn valid_type_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 100
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if ok {
         Ok(())
     } else {
-        Err(Error::invalid(format!("type name '{name}' is not a valid identifier")))
+        Err(Error::invalid(format!(
+            "type name '{name}' is not a valid identifier"
+        )))
     }
 }
 
 /// Null/empty or at most 200 characters, no charset.
 pub fn valid_correlation_id(id: Option<&str>) -> Result<()> {
     match id {
-        Some(s) if s.chars().count() > 200 => Err(Error::invalid("correlation/causation id longer than 200 characters")),
+        Some(s) if s.chars().count() > 200 => Err(Error::invalid(
+            "correlation/causation id longer than 200 characters",
+        )),
         _ => Ok(()),
     }
 }
@@ -49,7 +56,9 @@ pub fn valid_correlation_id(id: Option<&str>) -> Result<()> {
 /// Idempotency keys: at most 255 characters (ProcessCommand prose).
 pub fn valid_idempotency_key(key: Option<&str>) -> Result<()> {
     match key {
-        Some(s) if s.chars().count() > 255 => Err(Error::invalid("idempotency key longer than 255 characters")),
+        Some(s) if s.chars().count() > 255 => {
+            Err(Error::invalid("idempotency key longer than 255 characters"))
+        }
         Some("") => Err(Error::invalid("idempotency key may not be empty")),
         _ => Ok(()),
     }
@@ -65,7 +74,9 @@ pub fn valid_capability_name(name: &str) -> Result<()> {
     if ok {
         Ok(())
     } else {
-        Err(Error::invalid(format!("capability name '{name}' is malformed")))
+        Err(Error::invalid(format!(
+            "capability name '{name}' is malformed"
+        )))
     }
 }
 
@@ -93,7 +104,9 @@ pub fn validate_field_declarations(
         let blind = keys_seen.contains(&(k, true));
         let plain = keys_seen.contains(&(k, false));
         if blind && plain {
-            return Err(Error::invalid(format!("tag key '{k}' is mapped both blind and plain")));
+            return Err(Error::invalid(format!(
+                "tag key '{k}' is mapped both blind and plain"
+            )));
         }
     }
     // valid_sensitive_fields
@@ -101,7 +114,9 @@ pub fn validate_field_declarations(
         schema.resolve(&s.field)?;
         schema.resolve(&s.subject_field)?;
         if s.subject_key.is_empty() {
-            return Err(Error::invalid("sensitive field subject_key may not be empty"));
+            return Err(Error::invalid(
+                "sensitive field subject_key may not be empty",
+            ));
         }
         if s.field == s.subject_field {
             // Not in the spec. A field that is its own subject would have to
@@ -126,7 +141,10 @@ pub fn validate_field_declarations(
             }
             PrivateFieldKind::Capability => {
                 let cap = p.capability.as_deref().ok_or_else(|| {
-                    Error::invalid(format!("capability-kind private field '{}' needs a capability", p.field))
+                    Error::invalid(format!(
+                        "capability-kind private field '{}' needs a capability",
+                        p.field
+                    ))
                 })?;
                 valid_capability_name(cap)?;
                 if p.addressee_field.is_some() {
@@ -138,7 +156,10 @@ pub fn validate_field_declarations(
             }
             PrivateFieldKind::Addressed => {
                 let a = p.addressee_field.as_deref().ok_or_else(|| {
-                    Error::invalid(format!("addressed private field '{}' needs an addressee_field", p.field))
+                    Error::invalid(format!(
+                        "addressed private field '{}' needs an addressee_field",
+                        p.field
+                    ))
                 })?;
                 schema.resolve(a)?;
                 if p.capability.is_some() {
@@ -184,20 +205,29 @@ pub fn validate_field_declarations(
     }
     for s in sensitive_fields {
         if private_fields.iter().any(|p| p.field == s.field) {
-            return Err(Error::invalid(format!("field '{}' is both sensitive and private", s.field)));
+            return Err(Error::invalid(format!(
+                "field '{}' is both sensitive and private",
+                s.field
+            )));
         }
     }
     // Duplicates within one declaration.
     let mut f = BTreeSet::new();
     for s in sensitive_fields {
         if !f.insert(&s.field) {
-            return Err(Error::invalid(format!("field '{}' declared sensitive twice", s.field)));
+            return Err(Error::invalid(format!(
+                "field '{}' declared sensitive twice",
+                s.field
+            )));
         }
     }
     let mut f = BTreeSet::new();
     for p in private_fields {
         if !f.insert(&p.field) {
-            return Err(Error::invalid(format!("field '{}' declared private twice", p.field)));
+            return Err(Error::invalid(format!(
+                "field '{}' declared private twice",
+                p.field
+            )));
         }
     }
     Ok(())
@@ -221,7 +251,8 @@ mod tests {
     #[test]
     fn overlap_is_refused() {
         let s = Schema::parse(&json!({"type":"object","properties":{
-            "user_id":{"type":"string"},"email":{"type":"string"}}})).unwrap();
+            "user_id":{"type":"string"},"email":{"type":"string"}}}))
+        .unwrap();
         let tags = vec![TagMapping::new("email", "email")];
         let sens = vec![SensitiveField {
             field: "email".into(),

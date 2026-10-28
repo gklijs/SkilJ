@@ -43,10 +43,16 @@ pub enum BusMessage {
     Event(Arc<StoredEvent>),
     /// An access mapping changed (revoked, rescoped ...): subscriptions on it
     /// re-check themselves.
-    AccessChanged { mapping_id: Option<String>, role_id: Option<String> },
+    AccessChanged {
+        mapping_id: Option<String>,
+        role_id: Option<String>,
+    },
     /// This instance may have missed notifications: live subscriptions end.
     Lagged,
 }
+
+/// Receives the bootstrap secret.
+pub type BootstrapCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Builder for [`Skilj`].
 pub struct SkiljBuilder {
@@ -57,7 +63,7 @@ pub struct SkiljBuilder {
     master: Option<Arc<dyn MasterKeyProvider>>,
     blind_root: Option<Vec<u8>>,
     reconcile_as: Option<String>,
-    on_bootstrap: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    on_bootstrap: Option<BootstrapCallback>,
     background: bool,
 }
 
@@ -124,12 +130,19 @@ impl SkiljBuilder {
         for c in &self.contexts {
             c.check()?;
             if c.name == ADMIN_CONTEXT {
-                return Err(Error::Config("the admin bounded context is SkilJ's own".into()));
+                return Err(Error::Config(
+                    "the admin bounded context is SkilJ's own".into(),
+                ));
             }
         }
         let pool = match (self.pool, self.database_url) {
             (Some(p), _) => p,
-            (None, Some(url)) => PgPoolOptions::new().max_connections(16).connect(&url).await?,
+            (None, Some(url)) => {
+                PgPoolOptions::new()
+                    .max_connections(16)
+                    .connect(&url)
+                    .await?
+            }
             (None, None) => return Err(Error::Config("no database configured".into())),
         };
         let master = self
@@ -143,8 +156,11 @@ impl SkiljBuilder {
         migrate(&pool).await?;
         let epoch = read_epoch(&pool).await?;
         let (bus, _) = broadcast::channel(4096);
-        let decls: BTreeMap<String, BoundedContextDecl> =
-            self.contexts.into_iter().map(|c| (c.name.clone(), c)).collect();
+        let decls: BTreeMap<String, BoundedContextDecl> = self
+            .contexts
+            .into_iter()
+            .map(|c| (c.name.clone(), c))
+            .collect();
         let inner = Arc::new(Inner {
             pool,
             config: self.config,
@@ -231,7 +247,13 @@ impl Skilj {
         if let Some(d) = self.inner.decls.get(bc) {
             return Some(d);
         }
-        let t = self.inner.templates.read().expect("templates").get(bc).cloned()?;
+        let t = self
+            .inner
+            .templates
+            .read()
+            .expect("templates")
+            .get(bc)
+            .cloned()?;
         self.inner.decls.get(&t)
     }
 
@@ -268,18 +290,21 @@ impl Skilj {
         .bind(Self::now())
         .execute(&self.inner.pool)
         .await?;
-        sqlx::query("insert into sequence_counters (bounded_context) values ($1) on conflict do nothing")
-            .bind(ADMIN_CONTEXT)
-            .execute(&self.inner.pool)
-            .await?;
+        sqlx::query(
+            "insert into sequence_counters (bounded_context) values ($1) on conflict do nothing",
+        )
+        .bind(ADMIN_CONTEXT)
+        .execute(&self.inner.pool)
+        .await?;
         Ok(())
     }
 
     /// Generate the bootstrap secret while no active superadmin exists.
-    async fn generate_bootstrap_secret(&self, cb: Option<Arc<dyn Fn(&str) + Send + Sync>>) -> Result<()> {
-        let exists: bool = sqlx::query_scalar("select exists(select 1 from roles where superadmin and active)")
-            .fetch_one(&self.inner.pool)
-            .await?;
+    async fn generate_bootstrap_secret(&self, cb: Option<BootstrapCallback>) -> Result<()> {
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from roles where superadmin and active)")
+                .fetch_one(&self.inner.pool)
+                .await?;
         if exists {
             *self.inner.bootstrap_hash.lock().await = None;
             return Ok(());
@@ -296,8 +321,12 @@ impl Skilj {
 
 async fn migrate(pool: &PgPool) -> Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query("select pg_advisory_xact_lock(7243911)").execute(&mut *tx).await?;
-    sqlx::raw_sql(include_str!("../migrations.sql")).execute(&mut *tx).await?;
+    sqlx::query("select pg_advisory_xact_lock(7243911)")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql(include_str!("../migrations.sql"))
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -316,17 +345,25 @@ async fn read_epoch(pool: &PgPool) -> Result<String> {
         Ok(row) => {
             let sys: Option<String> = row.try_get("sys")?;
             let tl: Option<String> = row.try_get("tl")?;
-            Ok(format!("{}.{}", sys.unwrap_or_default(), tl.unwrap_or_default()))
+            Ok(format!(
+                "{}.{}",
+                sys.unwrap_or_default(),
+                tl.unwrap_or_default()
+            ))
         }
         Err(_) => {
             let id = crypto::generate_id();
-            sqlx::query("insert into skilj_meta (key, value) values ('epoch', $1) on conflict do nothing")
-                .bind(&id)
-                .execute(pool)
-                .await?;
-            Ok(sqlx::query_scalar("select value from skilj_meta where key = 'epoch'")
-                .fetch_one(pool)
-                .await?)
+            sqlx::query(
+                "insert into skilj_meta (key, value) values ('epoch', $1) on conflict do nothing",
+            )
+            .bind(&id)
+            .execute(pool)
+            .await?;
+            Ok(
+                sqlx::query_scalar("select value from skilj_meta where key = 'epoch'")
+                    .fetch_one(pool)
+                    .await?,
+            )
         }
     }
 }

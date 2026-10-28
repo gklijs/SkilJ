@@ -47,6 +47,7 @@ impl CommandRequest {
 
 /// What a submission answers.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum CommandOutcome {
     Accepted {
         command: StoredCommand,
@@ -67,19 +68,27 @@ pub enum CommandOutcome {
     },
     /// Refused before decide() (only in batch answers; single submissions
     /// return the error).
-    Refused { code: &'static str, message: String },
+    Refused {
+        code: &'static str,
+        message: String,
+    },
     NotProcessed,
 }
 
 impl CommandOutcome {
     pub fn events(&self) -> &[StoredEvent] {
         match self {
-            CommandOutcome::Accepted { events, .. } | CommandOutcome::Duplicate { events, .. } => events,
+            CommandOutcome::Accepted { events, .. } | CommandOutcome::Duplicate { events, .. } => {
+                events
+            }
             _ => &[],
         }
     }
     pub fn is_accepted(&self) -> bool {
-        matches!(self, CommandOutcome::Accepted { .. } | CommandOutcome::Duplicate { .. })
+        matches!(
+            self,
+            CommandOutcome::Accepted { .. } | CommandOutcome::Duplicate { .. }
+        )
     }
 }
 
@@ -132,18 +141,31 @@ struct Decided {
 
 impl Skilj {
     /// SubmitCommand over GraphQL.
-    pub async fn submit_command(&self, grant: &Grant, req: CommandRequest) -> Result<CommandOutcome> {
+    pub async fn submit_command(
+        &self,
+        grant: &Grant,
+        req: CommandRequest,
+    ) -> Result<CommandOutcome> {
         self.submit_as(Caller::Grant(grant), req).await
     }
 
     /// TriggerCommand over REST.
-    pub async fn trigger_command(&self, token: &AccessToken, command_type: &str, mut req: CommandRequest) -> Result<CommandOutcome> {
+    pub async fn trigger_command(
+        &self,
+        token: &AccessToken,
+        command_type: &str,
+        mut req: CommandRequest,
+    ) -> Result<CommandOutcome> {
         req.command_type = command_type.to_string();
         self.submit_as(Caller::Token(token), req).await
     }
 
     /// SubmitCommands.
-    pub async fn submit_commands(&self, grant: &Grant, reqs: Vec<CommandRequest>) -> Result<Vec<CommandOutcome>> {
+    pub async fn submit_commands(
+        &self,
+        grant: &Grant,
+        reqs: Vec<CommandRequest>,
+    ) -> Result<Vec<CommandOutcome>> {
         self.batch(Caller::Grant(grant), reqs, false).await
     }
 
@@ -162,10 +184,16 @@ impl Skilj {
                 r
             })
             .collect();
-        self.batch(Caller::Token(token), reqs, stop_at_first_failure).await
+        self.batch(Caller::Token(token), reqs, stop_at_first_failure)
+            .await
     }
 
-    async fn batch(&self, caller: Caller<'_>, reqs: Vec<CommandRequest>, stop: bool) -> Result<Vec<CommandOutcome>> {
+    async fn batch(
+        &self,
+        caller: Caller<'_>,
+        reqs: Vec<CommandRequest>,
+        stop: bool,
+    ) -> Result<Vec<CommandOutcome>> {
         if reqs.len() > self.inner.config.max_items_per_batch {
             return Err(Error::invalid(format!(
                 "a batch carries at most {} commands",
@@ -199,14 +227,21 @@ impl Skilj {
 
     /// The two authorisation rules, then ProcessCommand.
     async fn submit_as(&self, caller: Caller<'_>, req: CommandRequest) -> Result<CommandOutcome> {
-        let prepared = self.authorise(&caller, &req.command_type, &req.payload).await?;
+        let prepared = self
+            .authorise(&caller, &req.command_type, &req.payload)
+            .await?;
         validate::valid_idempotency_key(req.idempotency_key.as_deref())?;
         validate::valid_correlation_id(req.correlation_id.as_deref())?;
         validate::valid_correlation_id(req.causation_id.as_deref())?;
         self.process(&caller, prepared, req).await
     }
 
-    async fn authorise(&self, caller: &Caller<'_>, command_type: &str, payload: &Value) -> Result<Prepared> {
+    async fn authorise(
+        &self,
+        caller: &Caller<'_>,
+        command_type: &str,
+        payload: &Value,
+    ) -> Result<Prepared> {
         let bc = match caller {
             Caller::Grant(g) => {
                 if !g.has_level(AccessLevel::Write) {
@@ -224,10 +259,17 @@ impl Skilj {
                 t.bounded_context.clone()
             }
         };
-        let def = self.inner.registry.read().await.command_type(&bc, command_type)?;
+        let def = self
+            .inner
+            .registry
+            .read()
+            .await
+            .command_type(&bc, command_type)?;
         if let Caller::Token(_) = caller {
             if !def.0.rest_trigger_allowed {
-                return Err(Error::forbidden("this command type may not be triggered over REST"));
+                return Err(Error::forbidden(
+                    "this command type may not be triggered over REST",
+                ));
             }
         }
         self.inner.registry.read().await.is_active(&bc)?;
@@ -236,12 +278,24 @@ impl Skilj {
             .decl_for(&bc)
             .and_then(|d| d.command_types.iter().find(|c| c.name == command_type))
             .cloned()
-            .ok_or_else(|| Error::NotDeclared(format!("{bc}.{command_type} has no decider in this process")))?;
+            .ok_or_else(|| {
+                Error::NotDeclared(format!(
+                    "{bc}.{command_type} has no decider in this process"
+                ))
+            })?;
         let tags = derive_tags(&bc, &def.0.tag_mappings, payload, self.inner.blind.as_ref())?;
         if !owner_scope_satisfied(&tags, def.0.owner_tag_key.as_deref(), caller.scope()) {
-            return Err(Error::forbidden("scope does not cover this command's owner"));
+            return Err(Error::forbidden(
+                "scope does not cover this command's owner",
+            ));
         }
-        let query = derive_query(&bc, &def.0.tag_mappings, &decl.consistency_query, payload, self.inner.blind.as_ref())?;
+        let query = derive_query(
+            &bc,
+            &def.0.tag_mappings,
+            &decl.consistency_query,
+            payload,
+            self.inner.blind.as_ref(),
+        )?;
         Ok(Prepared {
             bc,
             def,
@@ -253,7 +307,13 @@ impl Skilj {
 
     /// query_matching_events + snapshot folding + decide(), against the
     /// pool or a transaction.
-    async fn decide_now(&self, conn: &mut PgConnection, p: &Prepared, payload: &Value, now: DateTime<Utc>) -> Result<Decided> {
+    async fn decide_now(
+        &self,
+        conn: &mut PgConnection,
+        p: &Prepared,
+        payload: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<Decided> {
         let matching = matching_events(conn, &p.bc, &p.tags, &p.query, -1, false).await?;
         let boundary = matching.last().map(|e| e.sequence);
         // decide() sees history decrypted wherever the key still exists.
@@ -264,10 +324,13 @@ impl Skilj {
             plain.push(e2);
         }
         let mut snapshots = BTreeMap::new();
-        let snapshot_items: Vec<&QueryItem> = p.query.iter().filter(|i| i.snapshot.is_some()).collect();
+        let snapshot_items: Vec<&QueryItem> =
+            p.query.iter().filter(|i| i.snapshot.is_some()).collect();
         let mut handed: Vec<StoredEvent> = vec![];
         for e in &plain {
-            let in_snapshot = snapshot_items.iter().any(|i| i.matches(&e.event_type, &e.tags));
+            let in_snapshot = snapshot_items
+                .iter()
+                .any(|i| i.matches(&e.event_type, &e.tags));
             let in_other = p
                 .query
                 .iter()
@@ -304,11 +367,19 @@ impl Skilj {
         })
     }
 
-    async fn process(&self, caller: &Caller<'_>, p: Prepared, req: CommandRequest) -> Result<CommandOutcome> {
+    async fn process(
+        &self,
+        caller: &Caller<'_>,
+        p: Prepared,
+        req: CommandRequest,
+    ) -> Result<CommandOutcome> {
         let client_id = caller.client_id().to_string();
         // Idempotency: an accepted key answers with its original outcome.
         if let Some(key) = &req.idempotency_key {
-            if let Some(o) = self.recorded_acceptance(&p.bc, &p.def.0.name, &client_id, key).await? {
+            if let Some(o) = self
+                .recorded_acceptance(&p.bc, &p.def.0.name, &client_id, key)
+                .await?
+            {
                 return Ok(o);
             }
         }
@@ -319,7 +390,9 @@ impl Skilj {
             self.decide_now(&mut conn, &p, &req.payload, now).await?
         };
         if let Decision::Reject { reason, kind } = &first.decision {
-            return self.rejection(caller, &p, reason, kind, &first.matching).await;
+            return self
+                .rejection(caller, &p, reason, kind, &first.matching)
+                .await;
         }
         // Provision keys outside the transaction.
         let command_protected = self.protect(&p.def.0, &req.payload).await?;
@@ -327,25 +400,42 @@ impl Skilj {
         let next = self.lock_counter(&mut tx, &p.bc).await?;
         // Re-check: anything new in the consistency query since the read?
         let mut decided = first;
-        let conflict = !matching_events(&mut tx, &p.bc, &p.tags, &p.query, decided.boundary.unwrap_or(-1), true)
-            .await?
-            .is_empty();
+        let conflict = !matching_events(
+            &mut tx,
+            &p.bc,
+            &p.tags,
+            &p.query,
+            decided.boundary.unwrap_or(-1),
+            true,
+        )
+        .await?
+        .is_empty();
         if conflict {
             let now2 = Self::now();
             decided = self.decide_now(&mut tx, &p, &req.payload, now2).await?;
             if let Decision::Reject { reason, kind } = &decided.decision {
                 drop(tx);
-                return self.rejection(caller, &p, reason, kind, &decided.matching).await;
+                return self
+                    .rejection(caller, &p, reason, kind, &decided.matching)
+                    .await;
             }
         }
-        let Decision::Accept(specs) = decided.decision else { unreachable!() };
+        let Decision::Accept(specs) = decided.decision else {
+            unreachable!()
+        };
         // Key race: whoever records first wins; the loser answers with
         // the winner's outcome.
         let command_id = crypto::generate_id();
-        let correlation_id = req.correlation_id.clone().unwrap_or_else(crypto::generate_id);
+        let correlation_id = req
+            .correlation_id
+            .clone()
+            .unwrap_or_else(crypto::generate_id);
         let mut new_events = Vec::with_capacity(specs.len());
         for spec in &specs {
-            new_events.push(self.prepare_triggered(&p, spec, &client_id, &command_id, &correlation_id).await?);
+            new_events.push(
+                self.prepare_triggered(&p, spec, &client_id, &command_id, &correlation_id)
+                    .await?,
+            );
         }
         let metadata = Metadata {
             type_name: p.def.0.name.clone(),
@@ -421,7 +511,10 @@ impl Skilj {
             recorded,
             triggered_sequences: written.iter().map(|e| e.sequence).collect(),
         };
-        Ok(CommandOutcome::Accepted { command, events: written })
+        Ok(CommandOutcome::Accepted {
+            command,
+            events: written,
+        })
     }
 
     async fn prepare_triggered(
@@ -438,12 +531,26 @@ impl Skilj {
             .read()
             .await
             .event_type(&p.bc, &spec.event_type)
-            .map_err(|_| Error::invalid(format!("decide() emitted unregistered event type {}", spec.event_type)))?;
+            .map_err(|_| {
+                Error::invalid(format!(
+                    "decide() emitted unregistered event type {}",
+                    spec.event_type
+                ))
+            })?;
         // The spec doesn't re-check decide()'s payloads; a bad one would be
         // stored forever, so we do.
-        ty.1.validate(&spec.payload)
-            .map_err(|e| Error::invalid(format!("decide() emitted an invalid {}: {e}", spec.event_type)))?;
-        let tags = derive_tags(&p.bc, &ty.0.tag_mappings, &spec.payload, self.inner.blind.as_ref())?;
+        ty.1.validate(&spec.payload).map_err(|e| {
+            Error::invalid(format!(
+                "decide() emitted an invalid {}: {e}",
+                spec.event_type
+            ))
+        })?;
+        let tags = derive_tags(
+            &p.bc,
+            &ty.0.tag_mappings,
+            &spec.payload,
+            self.inner.blind.as_ref(),
+        )?;
         let protected = self.protect(&ty.0, &spec.payload).await?;
         Ok(NewEvent {
             event_type: ty.0.name.clone(),
@@ -490,12 +597,20 @@ impl Skilj {
 
     /// Matching events as an admin may see them: in scope, rendered, the
     /// most recent max_events_per_read.
-    async fn shown_matching(&self, g: &Grant, bc: &str, matching: &[StoredEvent]) -> Result<(Vec<Rendered>, bool)> {
+    async fn shown_matching(
+        &self,
+        g: &Grant,
+        bc: &str,
+        matching: &[StoredEvent],
+    ) -> Result<(Vec<Rendered>, bool)> {
         let reg = self.inner.registry.read().await;
         let in_scope: Vec<&StoredEvent> = matching
             .iter()
             .filter(|e| {
-                let owner = reg.event_type(bc, &e.event_type).ok().and_then(|t| t.0.owner_tag_key.clone());
+                let owner = reg
+                    .event_type(bc, &e.event_type)
+                    .ok()
+                    .and_then(|t| t.0.owner_tag_key.clone());
                 owner_scope_satisfied(&e.tags, owner.as_deref(), g.mapping.scope.as_deref())
             })
             .collect();
@@ -511,7 +626,13 @@ impl Skilj {
         Ok((out, truncated))
     }
 
-    async fn recorded_acceptance(&self, bc: &str, ct: &str, client_id: &str, key: &str) -> Result<Option<CommandOutcome>> {
+    async fn recorded_acceptance(
+        &self,
+        bc: &str,
+        ct: &str,
+        client_id: &str,
+        key: &str,
+    ) -> Result<Option<CommandOutcome>> {
         let cutoff = Self::now() - self.inner.config.idempotency_key_retention;
         let outcome: Option<Value> = sqlx::query_scalar(
             "select outcome from idempotency_keys where bounded_context = $1 and command_type = $2 and client_id = $3 and key = $4 and recorded_at >= $5",
@@ -540,7 +661,12 @@ impl Skilj {
     }
 
     /// DryRunCommand.
-    pub async fn dry_run_command(&self, grant: &Grant, command_type: &str, payload: Value) -> Result<DryRunAnswer> {
+    pub async fn dry_run_command(
+        &self,
+        grant: &Grant,
+        command_type: &str,
+        payload: Value,
+    ) -> Result<DryRunAnswer> {
         if !grant.has_level(AccessLevel::Admin) {
             return Err(Error::forbidden("a dry run needs an admin grant"));
         }
@@ -548,7 +674,8 @@ impl Skilj {
         let p = self.authorise(&caller, command_type, &payload).await?;
         let d = {
             let mut conn = self.inner.pool.acquire().await?;
-            self.decide_now(&mut conn, &p, &payload, Self::now()).await?
+            self.decide_now(&mut conn, &p, &payload, Self::now())
+                .await?
         };
         let (matching_events, _) = self.shown_matching(grant, &p.bc, &d.matching).await?;
         let pa = self.private_access(grant).await?;
@@ -556,10 +683,21 @@ impl Skilj {
             Decision::Accept(specs) => {
                 let mut w = vec![];
                 for s in &specs {
-                    self.inner.registry.read().await.event_type(&p.bc, &s.event_type).map_err(|_| {
-                        Error::invalid(format!("decide() emitted unregistered event type {}", s.event_type))
-                    })?;
-                    w.push(self.render_would_be(&p.bc, s, &grant.role.id, grant, &pa).await?);
+                    self.inner
+                        .registry
+                        .read()
+                        .await
+                        .event_type(&p.bc, &s.event_type)
+                        .map_err(|_| {
+                            Error::invalid(format!(
+                                "decide() emitted unregistered event type {}",
+                                s.event_type
+                            ))
+                        })?;
+                    w.push(
+                        self.render_would_be(&p.bc, s, &grant.role.id, grant, &pa)
+                            .await?,
+                    );
                 }
                 (true, None, None, w)
             }
@@ -575,12 +713,18 @@ impl Skilj {
     }
 
     /// DryRunTriggerCommand: only the outcome.
-    pub async fn dry_run_trigger(&self, token: &AccessToken, command_type: &str, payload: Value) -> Result<DryRunAnswer> {
+    pub async fn dry_run_trigger(
+        &self,
+        token: &AccessToken,
+        command_type: &str,
+        payload: Value,
+    ) -> Result<DryRunAnswer> {
         let caller = Caller::Token(token);
         let p = self.authorise(&caller, command_type, &payload).await?;
         let d = {
             let mut conn = self.inner.pool.acquire().await?;
-            self.decide_now(&mut conn, &p, &payload, Self::now()).await?
+            self.decide_now(&mut conn, &p, &payload, Self::now())
+                .await?
         };
         let (accepted, reason, kind) = match d.decision {
             Decision::Accept(_) => (true, None, None),
@@ -618,12 +762,14 @@ impl Skilj {
         }
         let after_recorded: Option<i64> = match after_command {
             Some(id) => Some(
-                sqlx::query_scalar("select recorded from commands where id = $1 and bounded_context = $2")
-                    .bind(id)
-                    .bind(bc)
-                    .fetch_optional(&self.inner.pool)
-                    .await?
-                    .ok_or_else(|| Error::not_found(format!("command {id}")))?,
+                sqlx::query_scalar(
+                    "select recorded from commands where id = $1 and bounded_context = $2",
+                )
+                .bind(id)
+                .bind(bc)
+                .fetch_optional(&self.inner.pool)
+                .await?
+                .ok_or_else(|| Error::not_found(format!("command {id}")))?,
             ),
             None => None,
         };
@@ -665,7 +811,11 @@ impl Skilj {
                     .command_type(bc, &c.command_type)
                     .ok()
                     .and_then(|t| t.0.owner_tag_key.clone());
-                if owner_scope_satisfied(&c.consistency_tags, owner.as_deref(), grant.mapping.scope.as_deref()) {
+                if owner_scope_satisfied(
+                    &c.consistency_tags,
+                    owner.as_deref(),
+                    grant.mapping.scope.as_deref(),
+                ) {
                     out.push(self.render_command(&c, grant, &pa).await?);
                     if out.len() >= max {
                         break 'outer;
@@ -751,4 +901,3 @@ async fn matching_events(
     }
     Ok(by_seq.into_values().collect())
 }
-

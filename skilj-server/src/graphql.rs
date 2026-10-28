@@ -132,7 +132,11 @@ fn arg_json(ctx: &ResolverContext<'_>, name: &str) -> async_graphql::Result<Opti
 
 fn arg_strings(ctx: &ResolverContext<'_>, name: &str) -> async_graphql::Result<Vec<String>> {
     match ctx.args.get(name) {
-        Some(v) if !v.is_null() => v.list()?.iter().map(|x| Ok(x.string()?.to_string())).collect(),
+        Some(v) if !v.is_null() => v
+            .list()?
+            .iter()
+            .map(|x| Ok(x.string()?.to_string()))
+            .collect(),
         _ => Ok(vec![]),
     }
 }
@@ -146,7 +150,7 @@ where
     F: Fn(&Rendered) -> Value + Send + Sync + 'static,
 {
     Field::new(name, TypeRef::named("JSON"), move |ctx| {
-        let v = ctx.parent_value.try_downcast_ref::<Rendered>().map(|r| f(r));
+        let v = ctx.parent_value.try_downcast_ref::<Rendered>().map(&f);
         FieldFuture::new(async move { Ok(Some(FieldValue::value(to_gql(v?)))) })
     })
 }
@@ -162,18 +166,41 @@ fn rendered_object(name: &str) -> Object {
         .field(s("boundedContext", |r| Some(r.bounded_context.clone())))
         .field(s("type", |r| Some(r.type_name.clone())))
         .field(s("commandId", |r| r.command_id.clone()))
-        .field(s("correlationId", |r| r.metadata.as_ref().map(|m| m.correlation_id.clone())))
-        .field(s("causationId", |r| r.metadata.as_ref().and_then(|m| m.causation_id.clone())))
-        .field(s("clientId", |r| r.metadata.as_ref().map(|m| m.client_id.clone())))
-        .field(s("createdAt", |r| r.metadata.as_ref().map(|m| m.created_at.to_rfc3339())))
-        .field(Field::new("sequence", TypeRef::named(TypeRef::INT), |ctx| {
-            let v = ctx.parent_value.try_downcast_ref::<Rendered>().map(|r| r.sequence);
-            FieldFuture::new(async move { Ok(v?.map(|x| FieldValue::value(GqlValue::from(x)))) })
+        .field(s("correlationId", |r| {
+            r.metadata.as_ref().map(|m| m.correlation_id.clone())
         }))
+        .field(s("causationId", |r| {
+            r.metadata.as_ref().and_then(|m| m.causation_id.clone())
+        }))
+        .field(s("clientId", |r| {
+            r.metadata.as_ref().map(|m| m.client_id.clone())
+        }))
+        .field(s("createdAt", |r| {
+            r.metadata.as_ref().map(|m| m.created_at.to_rfc3339())
+        }))
+        .field(Field::new(
+            "sequence",
+            TypeRef::named(TypeRef::INT),
+            |ctx| {
+                let v = ctx
+                    .parent_value
+                    .try_downcast_ref::<Rendered>()
+                    .map(|r| r.sequence);
+                FieldFuture::new(
+                    async move { Ok(v?.map(|x| FieldValue::value(GqlValue::from(x)))) },
+                )
+            },
+        ))
         .field(json_field("payload", |r| r.payload.clone()))
-        .field(json_field("tags", |r| serde_json::to_value(&r.tags).unwrap_or_default()))
-        .field(json_field("origin", |r| serde_json::to_value(&r.origin).unwrap_or_default()))
-        .field(json_field("metadata", |r| serde_json::to_value(&r.metadata).unwrap_or_default()))
+        .field(json_field("tags", |r| {
+            serde_json::to_value(&r.tags).unwrap_or_default()
+        }))
+        .field(json_field("origin", |r| {
+            serde_json::to_value(&r.origin).unwrap_or_default()
+        }))
+        .field(json_field("metadata", |r| {
+            serde_json::to_value(&r.metadata).unwrap_or_default()
+        }))
 }
 
 /// A command outcome as the GraphQL caller sees it.
@@ -224,29 +251,67 @@ fn outcome_object() -> Object {
             CommandOutcome::Refused { message, .. } => Some(message.clone()),
             _ => None,
         }))
-        .field(Field::new("highestSequence", TypeRef::named(TypeRef::INT), |ctx| {
-            let v = get(&ctx).map(|o| o.0.events().iter().map(|e| e.sequence).max());
-            FieldFuture::new(async move { Ok(v?.map(|x| FieldValue::value(GqlValue::from(x)))) })
-        }))
-        .field(Field::new("events", TypeRef::named_nn_list_nn("Event"), |ctx| {
-            let v = get(&ctx).map(|o| o.1.clone());
-            FieldFuture::new(async move { Ok(Some(FieldValue::list(v?.into_iter().map(FieldValue::owned_any)))) })
-        }))
-        .field(Field::new("matchingEvents", TypeRef::named_nn_list("Event"), |ctx| {
-            let v = get(&ctx).map(|o| match &o.0 {
-                CommandOutcome::Rejected { matching_events, .. } => matching_events.clone(),
-                _ => None,
-            });
-            FieldFuture::new(async move { Ok(v?.map(|m| FieldValue::list(m.into_iter().map(FieldValue::owned_any)))) })
-        }))
-        .field(Field::new("matchingEventsTruncated", TypeRef::named(TypeRef::BOOLEAN), |ctx| {
-            let v = get(&ctx).map(|o| matches!(&o.0, CommandOutcome::Rejected { truncated: true, .. }));
-            FieldFuture::new(async move { Ok(Some(FieldValue::value(GqlValue::Boolean(v?)))) })
-        }))
+        .field(Field::new(
+            "highestSequence",
+            TypeRef::named(TypeRef::INT),
+            |ctx| {
+                let v = get(&ctx).map(|o| o.0.events().iter().map(|e| e.sequence).max());
+                FieldFuture::new(
+                    async move { Ok(v?.map(|x| FieldValue::value(GqlValue::from(x)))) },
+                )
+            },
+        ))
+        .field(Field::new(
+            "events",
+            TypeRef::named_nn_list_nn("Event"),
+            |ctx| {
+                let v = get(&ctx).map(|o| o.1.clone());
+                FieldFuture::new(async move {
+                    Ok(Some(FieldValue::list(
+                        v?.into_iter().map(FieldValue::owned_any),
+                    )))
+                })
+            },
+        ))
+        .field(Field::new(
+            "matchingEvents",
+            TypeRef::named_nn_list("Event"),
+            |ctx| {
+                let v = get(&ctx).map(|o| match &o.0 {
+                    CommandOutcome::Rejected {
+                        matching_events, ..
+                    } => matching_events.clone(),
+                    _ => None,
+                });
+                FieldFuture::new(async move {
+                    Ok(v?.map(|m| FieldValue::list(m.into_iter().map(FieldValue::owned_any))))
+                })
+            },
+        ))
+        .field(Field::new(
+            "matchingEventsTruncated",
+            TypeRef::named(TypeRef::BOOLEAN),
+            |ctx| {
+                let v = get(&ctx).map(|o| {
+                    matches!(
+                        &o.0,
+                        CommandOutcome::Rejected {
+                            truncated: true,
+                            ..
+                        }
+                    )
+                });
+                FieldFuture::new(async move { Ok(Some(FieldValue::value(GqlValue::Boolean(v?)))) })
+            },
+        ))
 }
 
 /// Render an outcome's events for the caller.
-async fn outcome_view(s: &Skilj, g: &Grant, o: CommandOutcome) -> async_graphql::Result<OutcomeView> {
+async fn outcome_view(
+    s: &Skilj,
+    g: &Grant,
+    o: CommandOutcome,
+) -> async_graphql::Result<OutcomeView> {
     let mut rendered = vec![];
     for e in o.events() {
         rendered.push(s.render_for(g, e).await.map_err(gql_err)?);
@@ -280,11 +345,18 @@ impl TypeGen {
             Shape::Scalar(s) => TypeRef::named(scalar_name(s.ty)),
             Shape::Array(inner) => {
                 let i = self.output(prefix, inner, true);
-                return if required { TypeRef::NonNull(Box::new(TypeRef::List(Box::new(i)))) } else { TypeRef::List(Box::new(i)) };
+                return if required {
+                    TypeRef::NonNull(Box::new(TypeRef::List(Box::new(i))))
+                } else {
+                    TypeRef::List(Box::new(i))
+                };
             }
             Shape::Object(o) if o.fields.is_empty() => TypeRef::named("JSON"),
             Shape::Object(o) => {
-                let name = self.unique(format!("{prefix}{}", o.name.as_deref().map(pascal).unwrap_or_default()));
+                let name = self.unique(format!(
+                    "{prefix}{}",
+                    o.name.as_deref().map(pascal).unwrap_or_default()
+                ));
                 let mut obj = Object::new(&name);
                 for (fname, f) in &o.fields {
                     let gname = graphql_field_name(fname);
@@ -317,14 +389,19 @@ impl TypeGen {
             Shape::Scalar(s) => TypeRef::named(scalar_name(s.ty)),
             Shape::Array(inner) => {
                 let i = self.input(prefix, inner, true);
-                return if required { TypeRef::NonNull(Box::new(TypeRef::List(Box::new(i)))) } else { TypeRef::List(Box::new(i)) };
+                return if required {
+                    TypeRef::NonNull(Box::new(TypeRef::List(Box::new(i))))
+                } else {
+                    TypeRef::List(Box::new(i))
+                };
             }
             Shape::Object(o) if o.fields.is_empty() => TypeRef::named("JSON"),
             Shape::Object(o) => {
                 let name = self.unique(format!("{prefix}Input"));
                 let mut obj = InputObject::new(&name);
                 for (fname, f) in &o.fields {
-                    let ty = self.input(&format!("{prefix}{}", pascal(fname)), &f.shape, f.required);
+                    let ty =
+                        self.input(&format!("{prefix}{}", pascal(fname)), &f.shape, f.required);
                     obj = obj.field(InputValue::new(graphql_field_name(fname), ty));
                 }
                 self.inputs.push(obj);
@@ -342,10 +419,19 @@ impl TypeGen {
 fn graphql_field_name(n: &str) -> String {
     // Payload field names are JSON keys; GraphQL needs identifiers. We keep
     // them as they are when they already are one.
-    if n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if n.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         n.to_string()
     } else {
-        format!("_{}", n.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>())
+        format!(
+            "_{}",
+            n.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>()
+        )
     }
 }
 
@@ -374,7 +460,9 @@ fn json_to_field(v: Value, shape: &Shape) -> Option<FieldValue<'static>> {
             }
         }
         Shape::Array(inner) => match v {
-            Value::Array(items) => Some(FieldValue::list(items.into_iter().filter_map(|i| json_to_field(i, inner)))),
+            Value::Array(items) => Some(FieldValue::list(
+                items.into_iter().filter_map(|i| json_to_field(i, inner)),
+            )),
             _ => None,
         },
         Shape::Object(o) if o.fields.is_empty() => Some(FieldValue::value(to_gql(v))),
@@ -406,10 +494,19 @@ pub fn build(reg: &Registry) -> Result<Schema, SchemaError> {
     let mut gen = TypeGen {
         objects: vec![],
         inputs: vec![],
-        names: ["Query", "Mutation", "Subscription", "Event", "CommandResult", "JSON", "FilterInput", "CommandInput"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        names: [
+            "Query",
+            "Mutation",
+            "Subscription",
+            "Event",
+            "CommandResult",
+            "JSON",
+            "FilterInput",
+            "CommandInput",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
     };
     let mut query = Object::new("Query");
     let mut mutation = Object::new("Mutation");
@@ -424,7 +521,9 @@ pub fn build(reg: &Registry) -> Result<Schema, SchemaError> {
         let mut q = Object::new(&qname);
         // Projections, typed.
         for p in reg.projections_of(name) {
-            let Ok(schema) = PSchema::parse(&p.schema) else { continue };
+            let Ok(schema) = PSchema::parse(&p.schema) else {
+                continue;
+            };
             let tname = format!("{ns}{}", pascal(&p.name));
             let ty = gen.output(&tname, &Shape::Object(schema.root.clone()), false);
             let pname = p.name.clone();
@@ -436,24 +535,34 @@ pub fn build(reg: &Registry) -> Result<Schema, SchemaError> {
                         let s = ctx_of(&ctx)?.skilj.clone();
                         let key = arg_str(&ctx, "key")?;
                         let wait = arg_i64(&ctx, "waitForSequence")?;
-                        let v = s.query_projection(&g, &pname, key.as_deref(), wait).await.map_err(gql_err)?;
+                        let v = s
+                            .query_projection(&g, &pname, key.as_deref(), wait)
+                            .await
+                            .map_err(gql_err)?;
                         Ok(v.map(FieldValue::owned_any))
                     })
                 })
                 .argument(InputValue::new("key", TypeRef::named(TypeRef::STRING)))
-                .argument(InputValue::new("waitForSequence", TypeRef::named(TypeRef::INT))),
+                .argument(InputValue::new(
+                    "waitForSequence",
+                    TypeRef::named(TypeRef::INT),
+                )),
             );
         }
         q = context_queries(q);
         gen.objects.push(q);
         let bc = name.clone();
-        query = query.field(Field::new(name.clone(), TypeRef::named_nn(&qname), move |ctx| {
-            let bc = bc.clone();
-            FieldFuture::new(async move {
-                let g = grant(&ctx, &bc).await?;
-                Ok(Some(FieldValue::owned_any(g)))
-            })
-        }));
+        query = query.field(Field::new(
+            name.clone(),
+            TypeRef::named_nn(&qname),
+            move |ctx| {
+                let bc = bc.clone();
+                FieldFuture::new(async move {
+                    let g = grant(&ctx, &bc).await?;
+                    Ok(Some(FieldValue::owned_any(g)))
+                })
+            },
+        ));
 
         // Typed command mutations.
         for t in reg.command_types_of(name) {
@@ -462,25 +571,33 @@ pub fn build(reg: &Registry) -> Result<Schema, SchemaError> {
             let bc = name.clone();
             let ct = t.0.name.clone();
             mutation = mutation.field(
-                command_args(Field::new(format!("{name}_{}", lower_camel(&t.0.name)), TypeRef::named_nn("CommandResult"), move |ctx| {
-                    let bc = bc.clone();
-                    let ct = ct.clone();
-                    FieldFuture::new(async move {
-                        let g = grant(&ctx, &bc).await?;
-                        let payload = arg_json(&ctx, "input")?.unwrap_or(Value::Null);
-                        let req = command_request(&ctx, ct, payload)?;
-                        let s = ctx_of(&ctx)?.skilj.clone();
-                        let o = s.submit_command(&g, req).await.map_err(gql_err)?;
-                        Ok(Some(FieldValue::owned_any(outcome_view(&s, &g, o).await?)))
-                    })
-                }))
+                command_args(Field::new(
+                    format!("{name}_{}", lower_camel(&t.0.name)),
+                    TypeRef::named_nn("CommandResult"),
+                    move |ctx| {
+                        let bc = bc.clone();
+                        let ct = ct.clone();
+                        FieldFuture::new(async move {
+                            let g = grant(&ctx, &bc).await?;
+                            let payload = arg_json(&ctx, "input")?.unwrap_or(Value::Null);
+                            let req = command_request(&ctx, ct, payload)?;
+                            let s = ctx_of(&ctx)?.skilj.clone();
+                            let o = s.submit_command(&g, req).await.map_err(gql_err)?;
+                            Ok(Some(FieldValue::owned_any(outcome_view(&s, &g, o).await?)))
+                        })
+                    },
+                ))
                 .argument(InputValue::new("input", input)),
             );
         }
         mutation = context_mutations(mutation, name);
 
         // Subscriptions.
-        subscription = subscription.field(subscription_field(format!("{name}_events"), name.clone(), None));
+        subscription = subscription.field(subscription_field(
+            format!("{name}_events"),
+            name.clone(),
+            None,
+        ));
         for t in reg.event_types_of(name) {
             subscription = subscription.field(subscription_field(
                 format!("{name}_{}", graphql_field_name(&t.0.name)),
@@ -497,16 +614,28 @@ pub fn build(reg: &Registry) -> Result<Schema, SchemaError> {
         .register(
             InputObject::new("FilterInput")
                 .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
-                .field(InputValue::new("operator", TypeRef::named_nn(TypeRef::STRING)))
+                .field(InputValue::new(
+                    "operator",
+                    TypeRef::named_nn(TypeRef::STRING),
+                ))
                 .field(InputValue::new("value", TypeRef::named_nn(TypeRef::STRING))),
         )
         .register(
             InputObject::new("CommandInput")
                 .field(InputValue::new("type", TypeRef::named_nn(TypeRef::STRING)))
                 .field(InputValue::new("payload", TypeRef::named_nn("JSON")))
-                .field(InputValue::new("idempotencyKey", TypeRef::named(TypeRef::STRING)))
-                .field(InputValue::new("correlationId", TypeRef::named(TypeRef::STRING)))
-                .field(InputValue::new("causationId", TypeRef::named(TypeRef::STRING))),
+                .field(InputValue::new(
+                    "idempotencyKey",
+                    TypeRef::named(TypeRef::STRING),
+                ))
+                .field(InputValue::new(
+                    "correlationId",
+                    TypeRef::named(TypeRef::STRING),
+                ))
+                .field(InputValue::new(
+                    "causationId",
+                    TypeRef::named(TypeRef::STRING),
+                )),
         )
         .register(query)
         .register(mutation)
@@ -523,12 +652,25 @@ pub fn build(reg: &Registry) -> Result<Schema, SchemaError> {
 }
 
 fn command_args(f: Field) -> Field {
-    f.argument(InputValue::new("idempotencyKey", TypeRef::named(TypeRef::STRING)))
-        .argument(InputValue::new("correlationId", TypeRef::named(TypeRef::STRING)))
-        .argument(InputValue::new("causationId", TypeRef::named(TypeRef::STRING)))
+    f.argument(InputValue::new(
+        "idempotencyKey",
+        TypeRef::named(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "correlationId",
+        TypeRef::named(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "causationId",
+        TypeRef::named(TypeRef::STRING),
+    ))
 }
 
-fn command_request(ctx: &ResolverContext<'_>, ct: String, payload: Value) -> async_graphql::Result<CommandRequest> {
+fn command_request(
+    ctx: &ResolverContext<'_>,
+    ct: String,
+    payload: Value,
+) -> async_graphql::Result<CommandRequest> {
     Ok(CommandRequest {
         command_type: ct,
         payload,
@@ -575,15 +717,24 @@ fn subscription_field(name: String, bc: String, event_type: Option<String>) -> S
                 .create_subscription(&g, et.as_deref(), &types, &filters, from, epoch.as_deref())
                 .await
                 .map_err(gql_err)?;
-            let live = c.skilj.subscription_stream(g, spec, resume).map(|item| match item {
-                Ok(r) => Ok(FieldValue::owned_any(r)),
-                Err(SubscriptionEnd::Revoked) => Err(async_graphql::Error::new("subscription revoked: the grant behind it no longer exists")
+            let live = c
+                .skilj
+                .subscription_stream(g, spec, resume)
+                .map(|item| match item {
+                    Ok(r) => Ok(FieldValue::owned_any(r)),
+                    Err(SubscriptionEnd::Revoked) => Err(async_graphql::Error::new(
+                        "subscription revoked: the grant behind it no longer exists",
+                    )
                     .extend_with(|_, e| e.set("code", "REVOKED"))),
-                Err(SubscriptionEnd::Lagged) => Err(async_graphql::Error::new("subscription ended: reconnect from the last sequence received")
+                    Err(SubscriptionEnd::Lagged) => Err(async_graphql::Error::new(
+                        "subscription ended: reconnect from the last sequence received",
+                    )
                     .extend_with(|_, e| e.set("code", "RECONNECT"))),
-            });
+                });
             // The connection lasts no longer than the JWT.
-            let until = std::time::Duration::from_secs((expires - chrono::Utc::now().timestamp()).max(0) as u64);
+            let until = std::time::Duration::from_secs(
+                (expires - chrono::Utc::now().timestamp()).max(0) as u64,
+            );
             let stream = futures::stream::unfold((live, false), |(mut live, done)| async move {
                 if done {
                     return None;
@@ -595,11 +746,20 @@ fn subscription_field(name: String, bc: String, event_type: Option<String>) -> S
             Ok(stream.take_until(tokio::time::sleep(until)))
         })
     })
-    .argument(InputValue::new("fromSequence", TypeRef::named(TypeRef::INT)))
+    .argument(InputValue::new(
+        "fromSequence",
+        TypeRef::named(TypeRef::INT),
+    ))
     .argument(InputValue::new("epoch", TypeRef::named(TypeRef::STRING)));
-    let f = f.argument(InputValue::new("eventTypes", TypeRef::named_nn_list(TypeRef::STRING)))
-        .argument(InputValue::new("filters", TypeRef::named_nn_list("FilterInput")));
-    f
+
+    f.argument(InputValue::new(
+        "eventTypes",
+        TypeRef::named_nn_list(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "filters",
+        TypeRef::named_nn_list("FilterInput"),
+    ))
 }
 
 /// Fields every context's query object has (parent value: the Grant).
@@ -750,7 +910,11 @@ fn context_queries(q: Object) -> Object {
 
 /// Per-context mutations, prefixed with the context name.
 fn context_mutations(mut m: Object, bc: &str) -> Object {
-    type Op = fn(Skilj, Grant, ResolverContext<'_>) -> futures::future::BoxFuture<'_, async_graphql::Result<GqlValue>>;
+    type Op = fn(
+        Skilj,
+        Grant,
+        ResolverContext<'_>,
+    ) -> futures::future::BoxFuture<'_, async_graphql::Result<GqlValue>>;
     let add = |m: Object, name: &str, args: Vec<InputValue>, op: Op| -> Object {
         let bcn = bc.to_string();
         let mut f = Field::new(format!("{bc}_{name}"), TypeRef::named("JSON"), move |ctx| {
@@ -774,77 +938,131 @@ fn context_mutations(mut m: Object, bc: &str) -> Object {
     // Generic submission and batch.
     let bcn = bc.to_string();
     m = m.field(
-        command_args(Field::new(format!("{bc}_submit"), TypeRef::named_nn("CommandResult"), move |ctx| {
-            let bcn = bcn.clone();
-            FieldFuture::new(async move {
-                let g = grant(&ctx, &bcn).await?;
-                let s = ctx_of(&ctx)?.skilj.clone();
-                let req = command_request(&ctx, req_str(&ctx, "type")?, arg_json(&ctx, "payload")?.unwrap_or(Value::Null))?;
-                let o = s.submit_command(&g, req).await.map_err(gql_err)?;
-                Ok(Some(FieldValue::owned_any(outcome_view(&s, &g, o).await?)))
-            })
-        }))
+        command_args(Field::new(
+            format!("{bc}_submit"),
+            TypeRef::named_nn("CommandResult"),
+            move |ctx| {
+                let bcn = bcn.clone();
+                FieldFuture::new(async move {
+                    let g = grant(&ctx, &bcn).await?;
+                    let s = ctx_of(&ctx)?.skilj.clone();
+                    let req = command_request(
+                        &ctx,
+                        req_str(&ctx, "type")?,
+                        arg_json(&ctx, "payload")?.unwrap_or(Value::Null),
+                    )?;
+                    let o = s.submit_command(&g, req).await.map_err(gql_err)?;
+                    Ok(Some(FieldValue::owned_any(outcome_view(&s, &g, o).await?)))
+                })
+            },
+        ))
         .argument(sn("type"))
         .argument(InputValue::new("payload", TypeRef::named_nn("JSON"))),
     );
     let bcn = bc.to_string();
     m = m.field(
-        Field::new(format!("{bc}_submitCommands"), TypeRef::named_nn_list_nn("CommandResult"), move |ctx| {
-            let bcn = bcn.clone();
-            FieldFuture::new(async move {
-                let g = grant(&ctx, &bcn).await?;
-                let s = ctx_of(&ctx)?.skilj.clone();
-                let items = arg_json(&ctx, "commands")?.unwrap_or(json!([]));
-                let reqs: Vec<CommandRequest> = items
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|c| CommandRequest {
-                        command_type: c["type"].as_str().unwrap_or_default().to_string(),
-                        payload: c["payload"].clone(),
-                        idempotency_key: c["idempotencyKey"].as_str().map(str::to_string),
-                        correlation_id: c["correlationId"].as_str().map(str::to_string),
-                        causation_id: c["causationId"].as_str().map(str::to_string),
-                    })
-                    .collect();
-                let out = s.submit_commands(&g, reqs).await.map_err(gql_err)?;
-                let mut views = vec![];
-                for o in out {
-                    views.push(FieldValue::owned_any(outcome_view(&s, &g, o).await?));
-                }
-                Ok(Some(FieldValue::list(views)))
-            })
-        })
-        .argument(InputValue::new("commands", TypeRef::named_nn_list_nn("CommandInput"))),
+        Field::new(
+            format!("{bc}_submitCommands"),
+            TypeRef::named_nn_list_nn("CommandResult"),
+            move |ctx| {
+                let bcn = bcn.clone();
+                FieldFuture::new(async move {
+                    let g = grant(&ctx, &bcn).await?;
+                    let s = ctx_of(&ctx)?.skilj.clone();
+                    let items = arg_json(&ctx, "commands")?.unwrap_or(json!([]));
+                    let reqs: Vec<CommandRequest> = items
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|c| CommandRequest {
+                            command_type: c["type"].as_str().unwrap_or_default().to_string(),
+                            payload: c["payload"].clone(),
+                            idempotency_key: c["idempotencyKey"].as_str().map(str::to_string),
+                            correlation_id: c["correlationId"].as_str().map(str::to_string),
+                            causation_id: c["causationId"].as_str().map(str::to_string),
+                        })
+                        .collect();
+                    let out = s.submit_commands(&g, reqs).await.map_err(gql_err)?;
+                    let mut views = vec![];
+                    for o in out {
+                        views.push(FieldValue::owned_any(outcome_view(&s, &g, o).await?));
+                    }
+                    Ok(Some(FieldValue::list(views)))
+                })
+            },
+        )
+        .argument(InputValue::new(
+            "commands",
+            TypeRef::named_nn_list_nn("CommandInput"),
+        )),
     );
 
-    m = add(m, "dryRun", vec![sn("type"), InputValue::new("payload", TypeRef::named_nn("JSON"))], |s, g, ctx| {
-        Box::pin(async move {
-            let d = s
-                .dry_run_command(&g, &req_str(&ctx, "type")?, arg_json(&ctx, "payload")?.unwrap_or(Value::Null))
-                .await
-                .map_err(gql_err)?;
-            Ok(to_gql(json!({"accepted": d.accepted, "rejectionReason": d.rejection_reason, "rejectionKind": d.rejection_kind,
-                "wouldBeEvents": d.would_be_events, "matchingEvents": d.matching_events})))
-        })
-    });
+    m = add(
+        m,
+        "dryRun",
+        vec![
+            sn("type"),
+            InputValue::new("payload", TypeRef::named_nn("JSON")),
+        ],
+        |s, g, ctx| {
+            Box::pin(async move {
+                let d = s
+                    .dry_run_command(
+                        &g,
+                        &req_str(&ctx, "type")?,
+                        arg_json(&ctx, "payload")?.unwrap_or(Value::Null),
+                    )
+                    .await
+                    .map_err(gql_err)?;
+                Ok(to_gql(
+                    json!({"accepted": d.accepted, "rejectionReason": d.rejection_reason, "rejectionKind": d.rejection_kind,
+                "wouldBeEvents": d.would_be_events, "matchingEvents": d.matching_events}),
+                ))
+            })
+        },
+    );
     m = add(
         m,
         "mintToken",
-        vec![sn("purpose"), sn("type"), s_("scope"), s_("startFrom"), i_("startAtSequence"), s_("startAtTime")],
+        vec![
+            sn("purpose"),
+            sn("type"),
+            s_("scope"),
+            s_("startFrom"),
+            i_("startAtSequence"),
+            s_("startAtTime"),
+        ],
         |s, g, ctx| {
             Box::pin(async move {
                 let purpose = TokenPurpose::parse(&req_str(&ctx, "purpose")?.to_lowercase())
-                    .ok_or_else(|| gql_err(Error::invalid("purpose is external_event, direct_creation, command or event_read")))?;
+                    .ok_or_else(|| {
+                        gql_err(Error::invalid(
+                            "purpose is external_event, direct_creation, command or event_read",
+                        ))
+                    })?;
                 let start = arg_str(&ctx, "startFrom")?
-                    .map(|x| EventReadStartPosition::parse(&x.to_lowercase()).ok_or_else(|| gql_err(Error::invalid("bad startFrom"))))
+                    .map(|x| {
+                        EventReadStartPosition::parse(&x.to_lowercase())
+                            .ok_or_else(|| gql_err(Error::invalid("bad startFrom")))
+                    })
                     .transpose()?;
                 let at_time = arg_str(&ctx, "startAtTime")?
-                    .map(|t| chrono::DateTime::parse_from_rfc3339(&t).map(|d| d.with_timezone(&chrono::Utc)))
+                    .map(|t| {
+                        chrono::DateTime::parse_from_rfc3339(&t)
+                            .map(|d| d.with_timezone(&chrono::Utc))
+                    })
                     .transpose()?;
                 let t = s
-                    .mint_token(&g, purpose, &req_str(&ctx, "type")?, arg_str(&ctx, "scope")?.as_deref(), start, arg_i64(&ctx, "startAtSequence")?, at_time)
+                    .mint_token(
+                        &g,
+                        purpose,
+                        &req_str(&ctx, "type")?,
+                        arg_str(&ctx, "scope")?.as_deref(),
+                        start,
+                        arg_i64(&ctx, "startAtSequence")?,
+                        at_time,
+                    )
                     .await
                     .map_err(gql_err)?;
                 Ok(ser(&t))
@@ -853,7 +1071,9 @@ fn context_mutations(mut m: Object, bc: &str) -> Object {
     );
     m = add(m, "revokeToken", vec![sn("id")], |s, g, ctx| {
         Box::pin(async move {
-            s.revoke_token(&g, &req_str(&ctx, "id")?).await.map_err(gql_err)?;
+            s.revoke_token(&g, &req_str(&ctx, "id")?)
+                .await
+                .map_err(gql_err)?;
             Ok(GqlValue::Boolean(true))
         })
     });
@@ -863,57 +1083,110 @@ fn context_mutations(mut m: Object, bc: &str) -> Object {
             Ok(GqlValue::Boolean(true))
         })
     });
-    m = add(m, "forgetSubject", vec![sn("subjectKey"), sn("subjectValue")], |s, g, ctx| {
-        Box::pin(async move {
-            s.forget_subject(&g, &req_str(&ctx, "subjectKey")?, &req_str(&ctx, "subjectValue")?)
+    m = add(
+        m,
+        "forgetSubject",
+        vec![sn("subjectKey"), sn("subjectValue")],
+        |s, g, ctx| {
+            Box::pin(async move {
+                s.forget_subject(
+                    &g,
+                    &req_str(&ctx, "subjectKey")?,
+                    &req_str(&ctx, "subjectValue")?,
+                )
                 .await
                 .map_err(gql_err)?;
-            Ok(GqlValue::Boolean(true))
-        })
-    });
+                Ok(GqlValue::Boolean(true))
+            })
+        },
+    );
     m = add(m, "rebuildProjection", vec![sn("name")], |s, g, ctx| {
         Box::pin(async move {
-            s.rebuild_projection(&g, &req_str(&ctx, "name")?).await.map_err(gql_err)?;
-            Ok(GqlValue::Boolean(true))
-        })
-    });
-    m = add(m, "discardProjectionRebuild", vec![sn("name")], |s, g, ctx| {
-        Box::pin(async move {
-            s.discard_projection_rebuild(&g, &req_str(&ctx, "name")?).await.map_err(gql_err)?;
-            Ok(GqlValue::Boolean(true))
-        })
-    });
-    m = add(m, "grantCapability", vec![sn("mappingId"), sn("capability")], |s, g, ctx| {
-        Box::pin(async move {
-            s.grant_capability_as_admin(&g, &req_str(&ctx, "mappingId")?, &req_str(&ctx, "capability")?)
+            s.rebuild_projection(&g, &req_str(&ctx, "name")?)
                 .await
                 .map_err(gql_err)?;
             Ok(GqlValue::Boolean(true))
         })
     });
-    m = add(m, "revokeCapability", vec![sn("mappingId"), sn("capability")], |s, g, ctx| {
-        Box::pin(async move {
-            s.revoke_capability_as_admin(&g, &req_str(&ctx, "mappingId")?, &req_str(&ctx, "capability")?)
+    m = add(
+        m,
+        "discardProjectionRebuild",
+        vec![sn("name")],
+        |s, g, ctx| {
+            Box::pin(async move {
+                s.discard_projection_rebuild(&g, &req_str(&ctx, "name")?)
+                    .await
+                    .map_err(gql_err)?;
+                Ok(GqlValue::Boolean(true))
+            })
+        },
+    );
+    m = add(
+        m,
+        "grantCapability",
+        vec![sn("mappingId"), sn("capability")],
+        |s, g, ctx| {
+            Box::pin(async move {
+                s.grant_capability_as_admin(
+                    &g,
+                    &req_str(&ctx, "mappingId")?,
+                    &req_str(&ctx, "capability")?,
+                )
                 .await
                 .map_err(gql_err)?;
-            Ok(GqlValue::Boolean(true))
-        })
-    });
-    m = add(m, "grantPrivateFieldAccess", vec![sn("granteeRoleId"), i_("eventSequence"), s_("commandId")], |s, g, ctx| {
-        Box::pin(async move {
-            let r = s
-                .grant_private_field_access(&g, &req_str(&ctx, "granteeRoleId")?, arg_i64(&ctx, "eventSequence")?, arg_str(&ctx, "commandId")?.as_deref())
+                Ok(GqlValue::Boolean(true))
+            })
+        },
+    );
+    m = add(
+        m,
+        "revokeCapability",
+        vec![sn("mappingId"), sn("capability")],
+        |s, g, ctx| {
+            Box::pin(async move {
+                s.revoke_capability_as_admin(
+                    &g,
+                    &req_str(&ctx, "mappingId")?,
+                    &req_str(&ctx, "capability")?,
+                )
                 .await
                 .map_err(gql_err)?;
-            Ok(ser(&r))
-        })
-    });
-    m = add(m, "revokePrivateFieldAccess", vec![sn("grantId")], |s, g, ctx| {
-        Box::pin(async move {
-            s.revoke_private_field_access(&g, &req_str(&ctx, "grantId")?).await.map_err(gql_err)?;
-            Ok(GqlValue::Boolean(true))
-        })
-    });
+                Ok(GqlValue::Boolean(true))
+            })
+        },
+    );
+    m = add(
+        m,
+        "grantPrivateFieldAccess",
+        vec![sn("granteeRoleId"), i_("eventSequence"), s_("commandId")],
+        |s, g, ctx| {
+            Box::pin(async move {
+                let r = s
+                    .grant_private_field_access(
+                        &g,
+                        &req_str(&ctx, "granteeRoleId")?,
+                        arg_i64(&ctx, "eventSequence")?,
+                        arg_str(&ctx, "commandId")?.as_deref(),
+                    )
+                    .await
+                    .map_err(gql_err)?;
+                Ok(ser(&r))
+            })
+        },
+    );
+    m = add(
+        m,
+        "revokePrivateFieldAccess",
+        vec![sn("grantId")],
+        |s, g, ctx| {
+            Box::pin(async move {
+                s.revoke_private_field_access(&g, &req_str(&ctx, "grantId")?)
+                    .await
+                    .map_err(gql_err)?;
+                Ok(GqlValue::Boolean(true))
+            })
+        },
+    );
     let _ = arg_bool;
     m
 }
@@ -996,7 +1269,11 @@ fn global_queries(q: Object) -> Object {
 }
 
 fn global_mutations(m: Object) -> Object {
-    type Op = fn(Skilj, Role, ResolverContext<'_>) -> futures::future::BoxFuture<'_, async_graphql::Result<GqlValue>>;
+    type Op = fn(
+        Skilj,
+        Role,
+        ResolverContext<'_>,
+    ) -> futures::future::BoxFuture<'_, async_graphql::Result<GqlValue>>;
     fn add(m: Object, name: &str, args: Vec<InputValue>, op: Op) -> Object {
         let mut f = Field::new(name, TypeRef::named("JSON"), move |ctx| {
             FieldFuture::new(async move {
@@ -1018,10 +1295,16 @@ fn global_mutations(m: Object) -> Object {
             FieldFuture::new(async move {
                 let s = ctx_of(&ctx)?.skilj.clone();
                 let r = s
-                    .create_superadmin(&req_str(&ctx, "bootstrapSecret")?, &req_str(&ctx, "name")?, &req_str(&ctx, "externalSubject")?)
+                    .create_superadmin(
+                        &req_str(&ctx, "bootstrapSecret")?,
+                        &req_str(&ctx, "name")?,
+                        &req_str(&ctx, "externalSubject")?,
+                    )
                     .await
                     .map_err(gql_err)?;
-                Ok(Some(FieldValue::value(to_gql(json!({"id": r.id, "name": r.name, "externalSubject": r.external_subject})))))
+                Ok(Some(FieldValue::value(to_gql(
+                    json!({"id": r.id, "name": r.name, "externalSubject": r.external_subject}),
+                ))))
             })
         })
         .argument(sn("bootstrapSecret"))
@@ -1030,41 +1313,70 @@ fn global_mutations(m: Object) -> Object {
     );
     let m = add(m, "addBoundedContext", vec![sn("name")], |s, r, ctx| {
         Box::pin(async move {
-            s.add_bounded_context(&r, &req_str(&ctx, "name")?).await.map_err(gql_err)?;
+            s.add_bounded_context(&r, &req_str(&ctx, "name")?)
+                .await
+                .map_err(gql_err)?;
             Ok(GqlValue::Boolean(true))
         })
     });
     let m = add(m, "deleteBoundedContext", vec![sn("name")], |s, r, ctx| {
         Box::pin(async move {
-            s.delete_bounded_context(&r, &req_str(&ctx, "name")?).await.map_err(gql_err)?;
+            s.delete_bounded_context(&r, &req_str(&ctx, "name")?)
+                .await
+                .map_err(gql_err)?;
             Ok(GqlValue::Boolean(true))
         })
     });
-    let m = add(m, "createRole", vec![sn("name"), sn("externalSubject"), bn("superadmin")], |s, r, ctx| {
-        Box::pin(async move {
-            let role = s
-                .create_role(&r, &req_str(&ctx, "name")?, arg_bool(&ctx, "superadmin")?, &req_str(&ctx, "externalSubject")?)
-                .await
-                .map_err(gql_err)?;
-            Ok(ser(&role))
-        })
-    });
+    let m = add(
+        m,
+        "createRole",
+        vec![sn("name"), sn("externalSubject"), bn("superadmin")],
+        |s, r, ctx| {
+            Box::pin(async move {
+                let role = s
+                    .create_role(
+                        &r,
+                        &req_str(&ctx, "name")?,
+                        arg_bool(&ctx, "superadmin")?,
+                        &req_str(&ctx, "externalSubject")?,
+                    )
+                    .await
+                    .map_err(gql_err)?;
+                Ok(ser(&role))
+            })
+        },
+    );
     let m = add(m, "revokeRole", vec![sn("roleId")], |s, r, ctx| {
         Box::pin(async move {
-            s.revoke_role(&r, &req_str(&ctx, "roleId")?).await.map_err(gql_err)?;
+            s.revoke_role(&r, &req_str(&ctx, "roleId")?)
+                .await
+                .map_err(gql_err)?;
             Ok(GqlValue::Boolean(true))
         })
     });
     let m = add(
         m,
         "grantAccess",
-        vec![sn("roleId"), sn("boundedContext"), sn("level"), bn("canReadSensitive"), s_("scope")],
+        vec![
+            sn("roleId"),
+            sn("boundedContext"),
+            sn("level"),
+            bn("canReadSensitive"),
+            s_("scope"),
+        ],
         |s, r, ctx| {
             Box::pin(async move {
                 let level = AccessLevel::parse(&req_str(&ctx, "level")?.to_lowercase())
                     .ok_or_else(|| gql_err(Error::invalid("level is read, write or admin")))?;
                 let m = s
-                    .grant_access(&r, &req_str(&ctx, "roleId")?, &req_str(&ctx, "boundedContext")?, level, arg_bool(&ctx, "canReadSensitive")?, arg_str(&ctx, "scope")?.as_deref())
+                    .grant_access(
+                        &r,
+                        &req_str(&ctx, "roleId")?,
+                        &req_str(&ctx, "boundedContext")?,
+                        level,
+                        arg_bool(&ctx, "canReadSensitive")?,
+                        arg_str(&ctx, "scope")?.as_deref(),
+                    )
                     .await
                     .map_err(gql_err)?;
                 Ok(ser(&m))
@@ -1073,21 +1385,7 @@ fn global_mutations(m: Object) -> Object {
     );
     let m = add(m, "revokeAccess", vec![sn("mappingId")], |s, r, ctx| {
         Box::pin(async move {
-            s.revoke_access(&r, &req_str(&ctx, "mappingId")?).await.map_err(gql_err)?;
-            Ok(GqlValue::Boolean(true))
-        })
-    });
-    let m = add(m, "grantCapability", vec![sn("mappingId"), sn("capability")], |s, r, ctx| {
-        Box::pin(async move {
-            s.grant_capability_as_superadmin(&r, &req_str(&ctx, "mappingId")?, &req_str(&ctx, "capability")?)
-                .await
-                .map_err(gql_err)?;
-            Ok(GqlValue::Boolean(true))
-        })
-    });
-    let m = add(m, "revokeCapability", vec![sn("mappingId"), sn("capability")], |s, r, ctx| {
-        Box::pin(async move {
-            s.revoke_capability_as_superadmin(&r, &req_str(&ctx, "mappingId")?, &req_str(&ctx, "capability")?)
+            s.revoke_access(&r, &req_str(&ctx, "mappingId")?)
                 .await
                 .map_err(gql_err)?;
             Ok(GqlValue::Boolean(true))
@@ -1095,12 +1393,51 @@ fn global_mutations(m: Object) -> Object {
     });
     let m = add(
         m,
+        "grantCapability",
+        vec![sn("mappingId"), sn("capability")],
+        |s, r, ctx| {
+            Box::pin(async move {
+                s.grant_capability_as_superadmin(
+                    &r,
+                    &req_str(&ctx, "mappingId")?,
+                    &req_str(&ctx, "capability")?,
+                )
+                .await
+                .map_err(gql_err)?;
+                Ok(GqlValue::Boolean(true))
+            })
+        },
+    );
+    let m = add(
+        m,
+        "revokeCapability",
+        vec![sn("mappingId"), sn("capability")],
+        |s, r, ctx| {
+            Box::pin(async move {
+                s.revoke_capability_as_superadmin(
+                    &r,
+                    &req_str(&ctx, "mappingId")?,
+                    &req_str(&ctx, "capability")?,
+                )
+                .await
+                .map_err(gql_err)?;
+                Ok(GqlValue::Boolean(true))
+            })
+        },
+    );
+    let m = add(
+        m,
         "setDelegableCapabilities",
-        vec![sn("mappingId"), InputValue::new("delegable", TypeRef::named_nn_list_nn(TypeRef::STRING))],
+        vec![
+            sn("mappingId"),
+            InputValue::new("delegable", TypeRef::named_nn_list_nn(TypeRef::STRING)),
+        ],
         |s, r, ctx| {
             Box::pin(async move {
                 let d = arg_strings(&ctx, "delegable")?.into_iter().collect();
-                s.set_delegable(&r, &req_str(&ctx, "mappingId")?, d).await.map_err(gql_err)?;
+                s.set_delegable(&r, &req_str(&ctx, "mappingId")?, d)
+                    .await
+                    .map_err(gql_err)?;
                 Ok(GqlValue::Boolean(true))
             })
         },
@@ -1108,7 +1445,14 @@ fn global_mutations(m: Object) -> Object {
     let m = add(
         m,
         "createBoundedContextFromTemplate",
-        vec![sn("template"), sn("name"), sn("roleId"), sn("level"), bn("canReadSensitive"), s_("scope")],
+        vec![
+            sn("template"),
+            sn("name"),
+            sn("roleId"),
+            sn("level"),
+            bn("canReadSensitive"),
+            s_("scope"),
+        ],
         |s, r, ctx| {
             Box::pin(async move {
                 let level = AccessLevel::parse(&req_str(&ctx, "level")?.to_lowercase())
@@ -1129,12 +1473,20 @@ fn global_mutations(m: Object) -> Object {
             })
         },
     );
-    add(m, "resyncBoundedContextFromTemplate", vec![sn("name")], |s, r, ctx| {
-        Box::pin(async move {
-            let errors = s.resync_from_template(&r, &req_str(&ctx, "name")?).await.map_err(gql_err)?;
-            Ok(to_gql(json!({"registrationErrors": errors})))
-        })
-    })
+    add(
+        m,
+        "resyncBoundedContextFromTemplate",
+        vec![sn("name")],
+        |s, r, ctx| {
+            Box::pin(async move {
+                let errors = s
+                    .resync_from_template(&r, &req_str(&ctx, "name")?)
+                    .await
+                    .map_err(gql_err)?;
+                Ok(to_gql(json!({"registrationErrors": errors})))
+            })
+        },
+    )
 }
 
 /// The schema cache: rebuilt when registered state changes, on any
@@ -1158,4 +1510,3 @@ impl SchemaCache {
         Ok(schema)
     }
 }
-

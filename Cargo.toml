@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["skilj-core", "skilj-server"]
+members = ["skilj-core", "skilj-server", "skilj-demo"]
 
 [workspace.package]
 version = "0.1.0"
