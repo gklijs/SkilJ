@@ -19,7 +19,8 @@
 --   history a caller is expected to have queried separately,
 --   an in-memory per-bounded-context cache of the most recent events,
 --   warmed at startup from Postgres up to a configurable count
---   (default 1000), so recent reads need no database round trip,
+--   (default 1000) and re-checked against Postgres on every read,
+--   so recent reads need not re-read rows they already hold,
 --   per-field sensitivity marking on events and commands alike - both
 --   resolving to the same per-subject EncryptionKey, so crypto-shredding
 --   erases both at once (SensitiveField, EncryptionKey,
@@ -38,7 +39,13 @@
 --   (see rule ProcessCommand), an optional caller-supplied partition key
 --   and sequence number on external event submission, so an at-least-once
 --   source redelivering a message it already delivered creates no second
---   event (see rule CreateExternalEvent), and two independent
+--   event (see rule CreateExternalEvent), per-entity one-shot and
+--   recurring deadlines, command approval where a type opts in,
+--   cross-context routes and operator-retryable parked deliveries,
+--   live projection-state subscriptions, master-key providers and
+--   rotation, segmented parallel projection processing, a per-caller
+--   GraphQL schema, and the optional required_role gate on a command
+--   type - and two independent
 --   authentication tracks:
 --   - GraphQL: identity is delegated to a trusted external identity
 --     provider. A caller presents a JWT the IdP issued; SkilJ verifies
@@ -144,7 +151,10 @@
 --     durable timers, retries, compensation, fan-out/fan-in - is left to
 --     that external system entirely; SkilJ's own event store stays the
 --     system of record for what happened to the domain, never for what
---     a process did to get there
+--     a process did to get there. The native per-entity deadline above
+--     does not cross this line: it schedules one command (or a chain of
+--     occurrences) for one entity and calls no external system, so it is
+--     a timer for a decision, not an orchestration of a process.
 -- Dependencies: none yet
 
 ------------------------------------------------------------
@@ -194,7 +204,17 @@ value Metadata {
                                  -- had, so that current schema still describes this payload in
                                  -- full. See the schema_is_backwards_compatible note above rule
                                  -- RegisterEventType.
-    client_id: String          -- identifies the client/caller that produced this message in some cases it might refer to the original call, for an event it might be the client that issues the command
+    client_id: String          -- identifies the caller that produced this message, per
+                                 -- origin: a stored Command and the events it triggers
+                                 -- carry the submitting caller (the Role id over GraphQL,
+                                 -- the CommandToken id over REST); an ExternalTriggered
+                                 -- event carries its ExternalEventToken id, a
+                                 -- DirectlyCreated one its DirectCreationToken id; a
+                                 -- SystemTriggered or SkiljRecorded event carries the
+                                 -- literal "system". Never caller-supplied, so it cannot
+                                 -- be used to impersonate another caller's idempotency
+                                 -- scope or private-field ownership (see rule
+                                 -- ProcessCommand and enum PrivateFieldKind).
     created_at: Timestamp
     correlation_id: String?     -- identifies the whole business transaction this message belongs
                                  -- to: every command and event in one causal chain carries the same
@@ -310,8 +330,14 @@ value QueryItemMapping {
                                  -- command's consistency_tags, which is what owner scoping
                                  -- reads. Empty means the item is unscoped by tag, and is
                                  -- then only valid with at least one event type - or
-                                 -- with none, as the nothing item: alone in its query,
-                                 -- no latest, a decision that needs no history
+-- with none, as the nothing item: alone in its query,
+    -- no latest, a decision that needs no history. This is an explicit
+    -- sentinel rather than an accident of two empty sets: the item exists
+    -- to say "decide from the payload alone", and QueryItem.matches is
+    -- defined to match nothing for it, while ConsistencyQueryIsWellFormed
+    -- allows it only as the sole item with no latest. Any other item with
+    -- both sets empty is refused. The same empty sets therefore mean
+    -- "matches nothing" here, never "matches everything".
     latest: Integer?             -- null: every event matching this item; n: only the n matching
                                  -- events with the highest sequences (fewer when fewer match).
                                  -- At least 1 when set (see invariant ConsistencyQueryIsWellFormed)
@@ -426,10 +452,43 @@ value CommandDecision {
     --
     -- An implementation is free to model this as a real two-case sum, with
     -- the rejection fields mandatory and non-optional in the rejection
-    -- case and absent entirely from the acceptance case; skilj's own does.
-    -- That is a faithful refinement of what is written here - it can
-    -- represent every well-formed decision and no malformed one - not a
-    -- divergence from it.
+    -- case and absent entirely from the acceptance case. That is a
+    -- faithful refinement of what is written here - it can represent
+    -- every well-formed decision and no malformed one - not a divergence
+    -- from it.
+}
+
+-- What one command submission answers with, whichever track it came in
+-- on. The five outcomes are the only answers a submission can get, and
+-- they are exhaustive: accepted (freshly decided), duplicate (an earlier
+-- accepted answer under the same idempotency key), rejected (decide()
+-- refused it), refused (it never reached decide() - authorisation,
+-- validation, registration or a transient failure), or pending_approval
+-- (an approval-required type became a CommandProposal). Accepted and
+-- duplicate carry the command and its triggered events; rejected carries
+-- the rejection pair and the evidence decide() saw; refused carries only a
+-- machine-readable refusal reason and a message; pending_approval carries
+-- the proposal. A batch repeats one outcome per command.
+--
+-- Making the outcome one value rather than one response shape per rule is
+-- what lets every surface, and a batch, answer consistently: a rejection
+-- is a domain answer with the same shape wherever it is asked, not a
+-- transport error. The wire spelling of the refusal reason is deferred
+-- with the rest of the wire contract (see the scope header's exclusions).
+value CommandOutcome {
+    kind: accepted | duplicate | rejected | refused | pending_approval
+    command: Command?              -- the stored Command for accepted/duplicate
+    events: List<Event>?           -- the triggered events, rendered as the accepting
+                                    -- surface renders them, for accepted/duplicate
+    rejection_reason: String?      -- set only for rejected
+    rejection_kind: String?        -- set only for rejected, always with the reason
+    matching_events: List<Event>?  -- the rendered evidence decide() saw, set only for
+                                    -- rejected and only when the caller is entitled to it
+    proposal: CommandProposal?     -- set only for pending_approval
+    refusal_reason: String?        -- machine-readable cause for refused, e.g.
+                                    -- no_decider_registered, command_type_not_registered,
+                                    -- payload_invalid, owner_scope_denied, malformed_request
+    refusal_message: String?       -- human-readable detail for refused
 }
 
 value SensitiveField {
@@ -453,7 +512,7 @@ value SensitiveField {
 
 value EncryptedPayload {
     payload: String                      -- payload with each declared sensitive field's
-                                          -- value replaced by ciphertext
+                                          -- string value replaced by string ciphertext
     encryption_keys: Set<EncryptionKey>  -- the EncryptionKeys used, one per distinct
                                           -- subject a sensitive field referenced
 }
@@ -652,18 +711,57 @@ entity BoundedContext {
                                             -- (see the note above that rule). The link ends with its
                                             -- target; it never changes target.
                                             --
-                                            -- Being a template is not a state a context enters:
-                                            -- nothing here marks a context as one, and a context is
-                                            -- a template only for as long as some other context's
-                                            -- field points at it. What is forbidden is the second
-                                            -- level - a context with a template of its own can never
-                                            -- be another's (see invariant
-                                            -- TemplateIsNeverItselfTemplated and the note above rule
-                                            -- CreateBoundedContextFromTemplate). In every other
-                                            -- respect a templated context is an ordinary bounded
-                                            -- context: it registers, evolves, archives and is
-                                            -- deleted exactly like any other, and what it inherited
-                                            -- becomes its own the instant it is registered
+-- Being a template is not a state a context enters:
+    -- nothing here marks a context as one, and a context is
+    -- a template only for as long as some other context's
+    -- field points at it. What is forbidden is the second
+    -- level - a context with a template of its own can never
+    -- be another's (see invariant
+    -- TemplateIsNeverItselfTemplated and the note above rule
+    -- CreateBoundedContextFromTemplate). In every other
+    -- respect a templated context is an ordinary bounded
+    -- context: it registers, evolves, archives and is
+    -- deleted exactly like any other, and what it inherited
+    -- becomes its own the instant it is registered
+
+    dispatch_template: String?
+                                            -- the name of the context whose compiled
+                                            -- declarations serve this one's decide() and
+                                            -- project(), set once at
+                                            -- creation by CreateBoundedContextFromTemplate and
+                                            -- by nothing else. Null for every untemplated
+                                            -- context.
+                                            --
+                                            -- Deliberately a second, permanent link beside
+                                            -- template above rather than the same field.
+                                            -- template is what a tenant came from and what a
+                                            -- later resync reads; it is cleared when the
+                                            -- template is deleted (see rule
+                                            -- DeleteBoundedContext), because there is then
+                                            -- nothing left to resync from. dispatch_template
+                                            -- is how a running process finds the compiled
+                                            -- code for a tenant whose name it never saw when
+                                            -- it was built: a tenant's name is chosen at
+                                            -- runtime, while a `.bounded_context(name)` declaration is compiled under
+                                            -- the template's name.
+                                            -- Deleting the template must not silently stop the
+                                            -- tenant from deciding or projecting, so this link
+                                            -- is never cleared - not by deletion, archival or
+                                            -- anything else. It names the template's
+                                            -- declaration, not the template's row, so a
+                                            -- process resolves it from its own compiled maps
+                                            -- rather than from current registered state.
+                                            --
+                                            -- A process that carries no declaration for this
+                                            -- name cannot serve the tenant: a command
+                                            -- submission is refused with the same
+                                            -- "no decider registered in this process"
+                                            -- refusal a command type this process does not
+                                            -- deploy gets, and a projection fold is left to
+                                            -- an instance that does carry it (see the
+                                            -- project() note above the rules). Advancing the
+                                            -- tenant past events without folding would lose
+                                            -- them for good, so refusing is the safe answer.
 
     event_types: EventType with bounded_context = this
     command_types: CommandType with bounded_context = this
@@ -674,6 +772,11 @@ entity BoundedContext {
     access_mappings: RoleAccessMapping with bounded_context = this
     encryption_keys: EncryptionKey with bounded_context = this
     blind_tags: BlindTag with bounded_context = this
+    master_key: MasterKey?         -- the context's own key provider key, null when it uses
+                                    -- the default key (see entity MasterKey and the note
+                                    -- above entity EncryptionKey). Assigning one isolates its
+                                    -- rotation and deletion from every other context.
+    summaries: Summary with bounded_context = this
 
     transitions status {
         active -> archived
@@ -755,9 +858,15 @@ variant SystemCreator : ContextCreator {
 -- ciphertext string for everyone else - which breaks the
 -- field-type-immutability rule the compatibility contract already fixes
 -- (see the fourth bullet of schema_is_backwards_compatible in the note
--- above RegisterEventType). A leaf has no such problem: a scalar keeps
--- the same declared type whether it holds plaintext or ciphertext,
--- exactly as today's flat sensitive fields already work.
+-- above RegisterEventType). A leaf avoids that object-versus-string flip,
+-- but not every scalar avoids it: ciphertext is always a string, so an
+-- integer or boolean leaf would change type once protected and no longer
+-- validate against its own declared schema. A sensitive field is
+-- therefore required to be string-typed at registration (see
+-- valid_sensitive_fields in the note above RegisterEventType); the
+-- plaintext it holds and the ciphertext that replaces it are both
+-- strings, so its declared type is unchanged either way. This is the
+-- same rule today's flat sensitive fields already follow.
 --
 -- The nesting cap itself is a stated expectation on what a bounded
 -- context's schema may declare, not something this spec enforces - the
@@ -927,7 +1036,154 @@ entity CommandType {
     -- always permitted, but letting an automated caller trigger it over
     -- REST with a CommandToken requires explicit opt-in per command type.
     rest_trigger_allowed: Boolean
+    required_role: String?           -- an optional Role.name a GraphQL caller must hold in
+                                      -- addition to its write-level grant (the
+                                      -- #[requires_role] attribute). Deployed declaration,
+                                      -- not registration state: it is not persisted and
+                                      -- cannot be changed by RegisterCommandType. It gates
+                                      -- submission only; approval has its own policy.
     command_tokens: CommandToken with command_type = this
+
+    registered_by_version: Integer?      -- the application_version of the process whose
+                                          -- startup reconciliation last wrote this
+                                          -- registration, or null for an explicit
+                                          -- registration or an unversioned process. Not
+                                          -- domain state: it is reconciliation metadata that
+                                          -- lets an older process recognise a newer
+                                          -- registration and leave it alone (see the
+                                          -- rolling-deploy note above RegisterEventType).
+}
+
+-- A command type that opts into approval (docs/architecture.md §214). The
+-- presence of a policy row is what makes approval required; the two
+-- optional refinements narrow it. It is separate from CommandType so an
+-- existing registration keeps its shape, and startup reconciliation never
+-- removes a stored policy when a later deploy stops declaring one - the
+-- same "never remove a protection" stance as §102.
+entity CommandApprovalPolicy {
+    command_type: CommandType
+    approver_role: String?         -- matched against Role.name; null means any active
+                                    -- admin-level Role may approve
+    deadline_seconds: Integer?      -- how long a proposal stays approvable; null means
+                                    -- until approved or rejected
+    allow_self_approval: Boolean   -- false unless the type opts in: the account that
+                                    -- proposed may not approve its own proposal
+}
+
+-- A submission of an approval-required command type. Its payload is stored
+-- encrypted with the type's sensitive fields exactly as a Command's would
+-- be; it becomes a Command only when approved, so decide() runs against
+-- current state at approval time rather than a snapshot taken here.
+entity CommandProposal {
+    id: String
+    bounded_context: BoundedContext
+    command_type: CommandType
+    payload: String                -- encrypted payload, in the same protected form as a
+                                    -- Command's
+    client_id: String              -- the proposing caller, preserved so approval decides
+                                    -- under that caller's identity
+    idempotency_key: String?
+    correlation_id: String
+    causation_id: String?
+    -- pending, approving, approved, rejected or expired. A String rather
+    -- than a closed union because the lifecycle is enforced by the rules
+    -- below, not by the field's shape, and the wire spelling stays
+    -- deferred. approving is the crash-safe claim: a conditional move out
+    -- of pending so two approvers cannot both take one proposal; a
+    -- transient failure releases it back to pending, a stale claim is
+    -- settled against the approval idempotency key before it is taken
+    -- over, and a crash strands nothing.
+    status: String
+    proposed_at: Timestamp
+    expires_at: Timestamp?
+    decided_at: Timestamp?
+    decided_by: Role?
+    command: Command?              -- set when approval produced a Command
+    rejection_reason: String?      -- set when decide() rejected at approval time
+    rejection_kind: String?
+}
+
+-- Per-entity deadlines (docs/architecture.md §46, §115, §212, §213): a
+-- reaction to one committed event schedules a one-shot or recurring
+-- command for one entity, cancellable by tag before it fires. It is a
+-- Rust-only plugin, not a wire surface: decide() stays pure and a
+-- background poller performs the write. One row per occurrence, not one
+-- mutating row, so a cancel matches pending rows by their tags and ends
+-- the chain naturally.
+value Recurrence {
+    cron: String                   -- the same Quartz-dialect expression the global
+                                    -- scheduler evaluates
+    missed_run_policy: skip | fire_once | fire_all
+    start_at: Timestamp?
+    end_at: Timestamp?
+    valid_until: Timestamp?        -- a kill-switch: a pending occurrence past it never
+                                    -- fires and begets nothing
+}
+
+entity Deadline {
+    id: String
+    schedule_name: String          -- the ScheduleDeadline's own NAME
+    bounded_context: BoundedContext -- the target bounded context
+    source_event: Event?
+    target_command_type: CommandType
+    payload: String                -- encrypted under the target type's sensitive fields
+    tags: Set<Tag>                 -- what CancelDeadline matches; never an opaque id
+    fire_at: Timestamp
+    expires_at: Timestamp?         -- handed to decide(); a row past it still fires so
+                                    -- the decision can see it is late
+    recurrence: Recurrence?
+    parent: Deadline?              -- the occurrence that begat this one, null for the
+                                    -- first; ids are deterministic so a crash re-inserts
+                                    -- the same next row idempotently
+    -- pending, fired, cancelled or parked. A String, like CommandProposal's
+    -- status: the transitions are the rules' contract and the wire
+    -- spelling stays deferred.
+    status: String
+    attempt_count: Integer
+    first_failed_at: Timestamp?
+    next_attempt_at: Timestamp?
+    last_error: String?
+    fired_at: Timestamp?
+    created_at: Timestamp
+}
+
+-- A cross-context route (docs/architecture.md §36): one bounded context's
+-- committed events turned into another's commands, with no external
+-- system in between. Like a deadline it is a Rust-only plugin: the route
+-- is compiled, its cursor is durable, and a background poller performs
+-- the write. The target command is submitted under the route's own client
+-- id and an idempotency key derived from the source event, so a crash
+-- between commit and cursor advance does not run it twice.
+entity CrossContextRoute {
+    name: String
+    source_context: BoundedContext
+    source_event_type: EventType
+    target_context: BoundedContext
+    target_command_type: CommandType
+    cursor: Integer?               -- the highest source sequence processed, null
+                                    -- before the first tick; start-from controls the seed
+    -- active or paused; a String for the same reason as CommandProposal.status.
+    status: String
+}
+
+-- A delivery that failed often enough to stop retrying automatically
+-- (docs/architecture.md §56, §64, §115). Operators list, redrive or
+-- discard these under the target bounded context.
+entity ParkedDelivery {
+    id: String
+    bounded_context: BoundedContext -- the target context whose command or event failed
+    kind: cross_context_route | external_event | command_trigger | deadline
+    source: String                 -- route name or bridge, e.g. "deadline:schedule"
+    identifier: String             -- the source's own id, used for dedupe
+    access_token_id: String?       -- null for CrossContextRoute/Deadline
+    target_command_type: CommandType?
+    request: String                -- stored payload/request, encrypted where the target
+                                    -- type declares sensitive fields
+    error: String
+    attempts: Integer
+    first_failed_at: Timestamp
+    last_failed_at: Timestamp
+    cursor: String                 -- deletion-safe page position, not the row id
 }
 
 entity EventType {
@@ -1049,6 +1305,13 @@ entity EventType {
     -- fetched over REST with an EventReadToken.
     event_read_allowed: Boolean
     event_read_tokens: EventReadToken with event_type = this
+
+    registered_by_version: Integer?      -- the application_version of the process whose
+                                          -- startup reconciliation last wrote this
+                                          -- registration, or null for an explicit
+                                          -- registration or an unversioned process. See
+                                          -- CommandType.registered_by_version and the
+                                          -- rolling-deploy note above RegisterEventType.
 }
 
 entity AccessToken {
@@ -1424,14 +1687,48 @@ entity RoleAccessMapping {
 -- One blind-index constraint of a bounded context (docs/architecture.md
 -- §205): the tag key whose values TagMapping.blind mappings hash, with the
 -- normalizer version every instance must agree on and what ForgetSubject
--- does with the hashes. The normalizer and the hashing key are compiled
--- and configured, not stored - a black box, like the encryption scheme -
--- so only the version and a fingerprint of the derived key (§208) are
--- compared: an instance declaring another version, or configured with
--- another key, or without a key of the stored generation, is refused at
--- startup, since its hashes would no longer match the stored ones. A key already mapped plainly by a registered type can't become
--- blind - its values are stored in the clear - and a key's blindness never
--- changes afterwards.
+-- does with the hashes.
+--
+-- The hashing contract, normative here rather than only in the
+-- architecture doc: a blind tag is
+--     HMAC-SHA256(constraint_key, normalize(value))
+-- rendered as lowercase hex, where constraint_key is derived from the
+-- process's blind-index root key and the pair (bounded_context name,
+-- tag_key) through HKDF-SHA256 with length-prefixed info, so two
+-- constraints or two bounded contexts never share a key. normalize() is a
+-- black box code the implementer supplies; it decides which spellings are
+-- one value. Its normalizer_version is stored here, and a process
+-- configured with another version is refused at startup
+-- (blind_normalizer_changed): values hashed the old way would stop
+-- matching, and a value already taken could be taken again.
+--
+-- A value is never stored, so TagMapping.blind may name a sensitive or
+-- private field. Every mapping of one key in a bounded context is blind
+-- or none is, and a key already mapped plainly by a registered type can't
+-- become blind - its values are stored in the clear. A key's blindness
+-- never changes afterwards.
+--
+-- The normalizer and the root key are compiled and configured, not
+-- stored, so only the version and a fingerprint of the derived key chain
+-- are compared. key_fingerprint is the hex HMAC-SHA256 of an empty
+-- message under a key derived from the root with a fixed label, chained
+-- through each later root key up to key_generation; it reveals nothing
+-- about a constraint key and can never equal a tag. An instance declaring
+-- another version, or configured with another key, or without a key of
+-- the stored generation, is refused at startup, since its hashes would no
+-- longer match the stored ones.
+--
+-- Rotation is by wrapping, never re-hashing: generation g's tag is
+-- HMAC(k_g, tag of generation g - 1), so a stored tag can be moved to the
+-- next generation without the value or its data key. The older root keys
+-- stay configured because new values are hashed under generation 0 first;
+-- their secrecy no longer matters once every stored tag has moved. A
+-- rotation rewrites Event.tags, Command.consistency_tags and query items,
+-- snapshot rows and the event cache under the sequence lock, so no write
+-- can interleave. An instance that does not carry the stored generation
+-- refuses with blind_index_key_not_configured; a running instance whose
+-- derived tags change under the lock rehashes and decides again
+-- (blind_tags_rotated). Both are retryable by another instance.
 entity BlindTag {
     bounded_context: BoundedContext
     tag_key: String
@@ -1455,10 +1752,67 @@ entity BlindTag {
                                             -- without decrypting anything
 }
 
+-- A subject's data key is sealed by a master key held in a key provider,
+-- never in the process: the provider wraps and unwraps it, and what this
+-- library stores is the provider's ciphertext plus the provider's key
+-- name and version. The provider is a black box here in the same register
+-- as protect_sensitive_fields - the spec owns that a stored data key can
+-- only be opened by the provider that wrapped it, not how Vault Transit
+-- or a key file does so. The default key serves every bounded context
+-- unless a superadmin assigns one of its own; a context's own key
+-- isolates its rotation, retirement and deletion. Rotating a master key
+-- re-wraps data keys in the background and never blocks writes: new data
+-- keys use the latest version at once, and every version stays usable
+-- until its retirement grace period ends. Retiring a version is what makes
+-- ciphertext under it unreadable at the provider, not merely unused; a
+-- context's own key, once no data key uses it, is deleted after the same
+-- grace period, which erases that context cryptographically including its
+-- backups (where the provider holds the only copy of the key).
+--
+-- The trail is recorded in the admin context as SkiljRecorded events:
+-- EncryptionMasterKeyRotated, EncryptionDataKeysRewrapped,
+-- EncryptionMasterKeyRetired, EncryptionKeyAssigned and
+-- EncryptionKeyDeleted. They are closed to every creation path and to
+-- event read tokens, like the access trail, and read through queryEvents
+-- on the admin context under an Admin grant. See SkiljRecorded and the
+-- master-key rules below.
+-- A master key in a key provider. Only its identity and lifecycle are
+-- stored here; the key material never leaves the provider. A context with
+-- no assigned key uses the default one. Rotating wraps data keys under a
+-- new version in the background; retiring a version is what makes old
+-- ciphertext unreadable there; deleting a context's own key erases that
+-- context cryptographically, backups included. The lifecycle transitions
+-- are active -> retired -> deleted, each only after the grace period in
+-- the provider's own policy.
+entity MasterKey {
+    provider: String               -- the configured key provider, by name
+    key_name: String               -- the provider's key, e.g. "skilj-default" or
+                                    -- "skilj-tenant-acme"
+    version: Integer               -- the latest version wrapping new data keys
+    previous_version: Integer?     -- still unwrapping, until retirement completes
+    retired_below: Integer?        -- versions below this may no longer unwrap
+    -- active, retired or deleted; a String for the same reason as
+    -- CommandProposal.status.
+    status: String
+    rotated_at: Timestamp?
+    rewrite_finished_at: Timestamp?
+    delete_after: Timestamp?
+    bounded_context: BoundedContext? -- the one context whose data this key is reserved
+                                    -- for; null for the default key
+}
+
 entity EncryptionKey {
     bounded_context: BoundedContext
     subject_key: String                    -- e.g. "user" - see SensitiveField.subject_key
     subject_value: String                  -- e.g. "123"
+    wrapped_data_key: String               -- the subject's data key, sealed by master_key;
+                                            -- unreadable outside the provider
+    master_key: MasterKey                  -- the provider key that wrapped this data key. A
+                                            -- context's own key once assigned; the default
+                                            -- before that
+    master_key_version: Integer            -- the provider version that wrapped it. New data keys
+                                            -- use the latest; old ones stay readable until their
+                                            -- version is retired
     status: active | destroyed
     created_at: Timestamp
     destroyed_at: Timestamp? when status = destroyed
@@ -1696,6 +2050,17 @@ entity Projection {
     -- past.
     caught_up_to: Integer?
 
+    -- Optional segmentation (docs/architecture.md §51): a projection may
+    -- be split into N independent segments, each folded by its own consumer
+    -- in parallel, with seg = hash(tag value) mod segments. segment_key
+    -- names the tag key whose values choose the segment; null means no
+    -- segmentation. A segmented projection's instances in different
+    -- segments are independent read models even though they share the
+    -- projection's name and schema. Adding or changing segmentation is a
+    -- rebuild, because the fold boundaries moved.
+    segments: Integer?
+    segment_key: String?
+
     -- A projection's own instance data may be a single value or many,
     -- each independently addressed by a caller-supplied key (see
     -- QueryProjection): one row per customer for a purchase history, one
@@ -1724,6 +2089,13 @@ entity Projection {
     -- up rather than something known only to whoever ran the deploy that
     -- staged it.
     rebuilds: ProjectionRebuild with projection = this
+
+    registered_by_version: Integer?      -- the application_version of the process whose
+                                          -- startup reconciliation last wrote this
+                                          -- registration, or null for an explicit
+                                          -- registration or an unversioned process. See
+                                          -- CommandType.registered_by_version and the
+                                          -- rolling-deploy note above RegisterEventType.
 }
 
 entity ProjectionRebuild {
@@ -1738,6 +2110,8 @@ entity ProjectionRebuild {
     schema_version: Integer
     consumed_event_types: Set<EventType>
     sync: Boolean
+    segments: Integer?
+    segment_key: String?
 
     -- Highest Event.sequence within the projection's bounded context this
     -- rebuild has processed under the new definition, tracked exactly as
@@ -1775,6 +2149,91 @@ entity ProjectionRebuild {
         pending -> building
         terminal: building
     }
+}
+
+-- A summary: the compiled, deployed definition of one fold that a command
+-- type can read through a snapshot item (see QueryItemMapping.snapshot
+-- and the ProcessCommand note on summaries). It is not registration state
+-- and no rule creates one: an instance's binary declares it beside the
+-- decide() that reads it, exactly as CommandType.consistency_query is
+-- deployed. What is state here is SummaryState below, one row per folded
+-- tag value, which may be persisted and caught up in the background or
+-- folded on demand - this specification allows either because both answer
+-- with the same state for the same events.
+--
+-- A summary is keyed by exactly one tag key and holds a state per value of
+-- it. Every event carrying a value of that key is folded into the state of
+-- each value it carries, in sequence order, told which value it is folding
+-- for: a transfer tagged with two accounts debits one state and credits the
+-- other. Which events fold into which summary is therefore decided by the
+-- tag alone, never by event type - a summary over "account" folds every
+-- event carrying an account tag, whatever its type. fold_summary(summary,
+-- state, event, tag_value) is the black box that performs one step, in the
+-- same register as project(); the current state is the fold of every event
+-- carrying that value up to the summary's as_of_sequence.
+--
+-- version is the summary definition's own version. State folded under
+-- another version is never trusted as current: it is treated as absent and
+-- refolded from the value's whole history, so a changed fold definition
+-- cannot leave a row that mixed two definitions.
+value Summary {
+    bounded_context: BoundedContext
+    name: String
+    tag_key: String
+    version: Integer
+    owner_tag_key: String?              -- optional owner dimension, in the same shape
+                                         -- EventType.owner_tag_key has: a tag key whose
+                                         -- value on any event touching this summary becomes
+                                         -- its owner value. Null means no owner dimension
+}
+
+-- One folded value of one summary. A row is identified by (summary,
+-- tag_value); tag_value is the value of summary.tag_key whose events were
+-- folded. as_of_sequence is the highest Event.sequence folded in, null when
+-- nothing has been folded yet. state is the fold's serialised result - a
+-- black box to this specification, exactly as a Projection's schema and
+-- state are. owner_value is the derived owner for this row and is null
+-- when the summary declares no owner dimension; it is updated from the
+-- tags of whichever event touched the row, never supplied by a reader.
+entity SummaryState {
+    summary: Summary
+    tag_value: String
+    state: String
+    as_of_sequence: Integer?
+    owner_value: String?
+}
+
+-- Fold one committed event into every summary whose tag key it carries.
+-- An implementation may instead fold the same events on demand under the
+-- same black box and produce the same row; this rule states the observable
+-- result either way. SummaryState is not rewritten in place where the
+-- implementation chooses on-demand folding - that is an optimisation
+-- behind the same contract, not a second semantics.
+rule FoldSummaries {
+    when: EventCommitted(event)
+    ensures:
+        for summary in Summaries
+                where summary.bounded_context = event.bounded_context
+                    and event.tags.any(t => t.key = summary.tag_key):
+            for tag in event.tags where tag.key = summary.tag_key:
+                let row = SummaryState{summary: summary, tag_value: tag.value}
+                if exists row:
+                    if row.as_of_sequence = null or row.as_of_sequence < event.sequence:
+                        row.state = fold_summary(summary, row.state, event, tag.value)
+                        row.as_of_sequence = event.sequence
+                        row.owner_value =
+                            if summary.owner_tag_key = null: null
+                            else: tag_owner_value(event, summary.owner_tag_key)
+                else:
+                    SummaryState.created(
+                        summary: summary,
+                        tag_value: tag.value,
+                        state: fold_summary(summary, null, event, tag.value),
+                        as_of_sequence: event.sequence,
+                        owner_value:
+                            if summary.owner_tag_key = null: null
+                            else: tag_owner_value(event, summary.owner_tag_key)
+                    )
 }
 
 entity Subscription {
@@ -1815,7 +2274,7 @@ entity Subscription {
                                             -- caller creates a fresh one whose from_sequence is
                                             -- the last sequence it actually received (see
                                             -- EventSubscription's DeliveryIsAtMostOnce).
-    kind: AllEventsSubscription | EventTypeSubscription
+    kind: AllEventsSubscription | EventTypeSubscription | ProjectionSubscription
 }
 
 variant AllEventsSubscription : Subscription {
@@ -1833,6 +2292,17 @@ variant AllEventsSubscription : Subscription {
 variant EventTypeSubscription : Subscription {
     event_type: EventType
     filters: List<Filter>
+}
+
+-- `projectionUpdates` (docs/architecture.md §49): the current state of one
+-- projection, pushed whenever it changes. It is not an event feed - a
+-- lagged connection refetches state rather than claiming a gap - so it
+-- carries no filters and no from_sequence: the first push is the current
+-- row for every key, and each later push is the row after an event touched
+-- it. Access is re-checked on every push exactly as EventSubscription's
+-- is, and private fields are redacted exactly as ProjectionQuery's are.
+variant ProjectionSubscription : Subscription {
+    projection: Projection
 }
 
 -- The server-side read position of one EventReadToken: the whole of what
@@ -1909,6 +2379,9 @@ entity ReadCursor {
 -- being shared, needs no admin anywhere, and is revocable only by that
 -- same caller (see rule RevokePrivateFieldAccess).
 entity PrivateFieldGrant {
+    id: String                             -- non-secret identifier, assigned when the grant is made
+                                            -- and carried into the access trail's grant_id; a grant is
+                                            -- named by this id when it is revoked or listed
     bounded_context: BoundedContext        -- the context the shared record lives in, and the
                                             -- one the grantor's own grant was scoped to when it
                                             -- made this. A grant never spans contexts, the same
@@ -1976,12 +2449,29 @@ entity PrivateFieldGrant {
 -- idempotency_key_retention is how long a recorded idempotency key keeps
 -- deduplicating at least (see rule ProcessCommand); after it the record
 -- is removed. A deployment may also keep keys forever.
+-- max_query_tags bounds how many tags one queryEvents/countEvents call may
+-- name (see rules QueryEvents and CountEvents), so a caller cannot build an
+-- unbounded tag-index lookup from one request. It is a page-shaping bound,
+-- not a visibility limit: a caller wanting more narrows in several calls.
+--
+-- max_items_per_batch bounds one batch call - external events, command
+-- submissions or command triggers (see CreateExternalEventBatch,
+-- SubmitCommandBatch and TriggerCommandBatch) - and is also the bound
+-- FetchCommands uses for a command page. A batch over the limit is
+-- refused whole rather than truncated.
+--
+-- max_capabilities_per_grant bounds both the capabilities a grant may hold
+-- and the delegable set it may pass on (see the capability rules and
+-- CapabilitiesAreWellFormed), so a grant stays a bounded named set rather
+-- than an arbitrary-length ACL.
 config {
     read_cursor_checkout_lease: Duration = 5.minutes
     max_events_per_read: Integer = 1000
     idempotency_key_retention: Duration = 48.hours
     max_query_tags: Integer = 32
     max_items_per_batch: Integer = 100
+    max_capabilities_per_grant: Integer = 16
+    max_deadline_attempts: Integer = 5
 }
 
 ------------------------------------------------------------
@@ -2062,6 +2552,16 @@ default SystemCreator skilj = { }
 -- final re-check and insert need the lock; reading matching events and
 -- running decide() beforehand does not.
 --
+-- The lock is held until commit, and that is what makes sequence order
+-- equal commit order within a bounded context: sequence n becomes visible
+-- only when its transaction commits, and no later sequence can commit
+-- before n, because the counter row that hands out both is held until
+-- then. Live delivery relies on this to fill a gap from Postgres in order
+-- (see EventSubscription's DeliveryIsAtMostOnce and
+-- SequenceIsGaplessPerBoundedContext), so an implementation that assigned
+-- sequences outside a commit-to-commit lock would violate more than
+-- gaplessness.
+--
 -- protect_sensitive_fields(type, payload), used in the same three rules
 -- and, for the command's own payload, in ProcessCommand, follows a
 -- similar pattern: it get-or-creates the EncryptionKey for each subject
@@ -2090,9 +2590,11 @@ default SystemCreator skilj = { }
 -- the enclosing nested object keeps its other fields, and the payload
 -- keeps its structure, with one scalar inside it now holding ciphertext
 -- instead of plaintext. That is why leaf-level is the only sound level -
--- a scalar's declared type is the same either way, whereas encrypting the
--- whole object would flip its type between object and string depending on
--- who reads it. subject_field resolves the same way, and is read, never
+-- a string leaf's declared type is the same either way, whereas
+-- encrypting the whole object would flip its type between object and
+-- string depending on who reads it. (A non-string leaf is refused at
+-- registration for exactly this reason - see valid_sensitive_fields
+-- above.) subject_field resolves the same way, and is read, never
 -- encrypted, exactly as when it names a top-level field. A sensitive
 -- field's own value may be stored only when its subject resolves: if the
 -- payload carries the sensitive leaf but omits the subject (or gives a
@@ -2357,9 +2859,14 @@ default SystemCreator skilj = { }
 -- starts, not a registered or admin-managed value: it is deliberately
 -- not a field on BoundedContext and nothing registers it, for the same
 -- reason the next_sequence row lock isn't modelled as an entity. Events
--- are appended to their bounded context's cache as they are committed,
--- so the latest events are always available without a database round
--- trip.
+-- are appended to their bounded context's cache as they are committed.
+-- The cache does not promise that a read never touches Postgres: a read
+-- freshens its window against the database first, so an event another
+-- instance committed is visible without waiting for a notice, and a
+-- promoted standby's lost tail is never served from the window. What the
+-- cache buys is that the freshening check is cheap and the cached rows
+-- are not re-read; it is not a no-round-trip guarantee. See
+-- docs/architecture.md §89.
 --
 -- Postgres remains the source of truth throughout; the cache is purely a
 -- read-path optimisation and never a limit on what is readable. Any read
@@ -2456,7 +2963,7 @@ default SystemCreator skilj = { }
 --   - correlation_id is used verbatim when the caller names one, and
 --     generated by generate_id() when it does not, so every stored Command
 --     and every stored Event carries one. generate_id() is a black box in
---     the same register as generate_token_id and generate_token_secret:
+--     the same register as generate_token_secret:
 --     the spec owns that it yields a fresh, unique value, not which
 --     primitive produces it.
 --   - causation_id is never generated. It is stored exactly as supplied
@@ -2517,6 +3024,13 @@ rule CreateExternalEventBatch {
                 correlation_id: item.correlation_id,
                 causation_id: item.causation_id
             )
+
+    @guidance
+        -- stop_at_first_failure is read here, exactly as TriggerCommandBatch
+        -- reads it: true ends the batch at the first item that fails
+        -- (refused or failing before creation), answering every later item
+        -- as not processed; false or omitted processes every item. A
+        -- redelivery answer is not a failure and never stops the batch.
 }
 
 rule CreateExternalEvent {
@@ -3118,6 +3632,11 @@ rule FetchEvents {
     requires: read_type.event_read_allowed = true
     requires: valid_filters(read_type, filters)
 
+    -- A client-tracked after past the latest committed sequence is refused
+    -- before any event is loaded. Otherwise a stale checkpoint would keep
+    -- returning nothing while skipping every event up to it.
+    requires: after_sequence = null or after_sequence <= highest_sequence(read_type.bounded_context)
+
     let candidates =
         Events where bounded_context = read_type.bounded_context
             and event_type = read_type
@@ -3268,12 +3787,20 @@ rule FetchEvents {
 --
 -- first_by_sequence(events, n) is another: the n events with the lowest
 -- Event.sequence among a set, or all of them when there are n or fewer.
--- It is how config.max_events_per_read bounds a read.
+-- It is how config.max_events_per_read bounds a read. last_by_sequence
+-- is its mirror: the n events with the highest Event.sequence, or all of
+-- them when there are n or fewer. It is deliberately used only where a
+-- caller asked for the newest evidence rather than the first page -
+-- DryRunCommand's matching events (see that rule's guidance) and
+-- CommandSubmission's rejection evidence - never by an ordinary paged
+-- read, which always starts at the oldest event a caller has not seen.
 --
 -- Commands have no sequence, but this library records them in an order:
 -- recorded_after(a, b) is whether a was recorded after b, and
 -- first_by_recording(commands, n) the n recorded earliest - how
 -- FetchCommands bounds its page by the same config.max_events_per_read.
+-- The same two apply to PrivateFieldGrants, which also have a creation
+-- stamp but no sequence (see rule ListPrivateFieldGrants).
 
 rule ConsumeEvents {
     when: ConsumeEvents(token, ack_mode?, filters)
@@ -3686,6 +4213,13 @@ rule CreateAllEventsSubscription {
     requires: epoch = null or epoch = current_epoch()
     requires: access_mapping.bounded_context.status = active
 
+    -- A from_sequence above the latest committed sequence is refused, not
+    -- accepted and ignored: a caller cannot have read an event that never
+    -- committed, and silently starting past the live tail would leave the
+    -- subscription mute with no explanation. The latest itself is accepted
+    -- and replays nothing.
+    requires: from_sequence = null or from_sequence <= highest_sequence(access_mapping.bounded_context)
+
     -- Every named event type must belong to the same bounded context as
     -- the grant - the same check and the same reasoning as
     -- RegisterProjection's consumed_event_types. An empty set is not a
@@ -3719,6 +4253,11 @@ rule CreateEventTypeSubscription {
     requires: epoch = null or epoch = current_epoch()
     requires: access_mapping.bounded_context = event_type.bounded_context
     requires: event_type.bounded_context.status = active
+
+    -- The same refusal as CreateAllEventsSubscription: past the latest
+    -- committed sequence is a mistake, the latest itself is the "read
+    -- everything" handoff.
+    requires: from_sequence = null or from_sequence <= highest_sequence(event_type.bounded_context)
     requires: valid_filters(event_type, filters)
 
     let starting_point =
@@ -3741,6 +4280,46 @@ rule CreateEventTypeSubscription {
             event_type: event_type,
             filters: filters
         )
+}
+
+rule CreateProjectionSubscription {
+    when: CreateProjectionSubscription(access_mapping, projection)
+    requires: access_mapping.status = active
+    requires: access_mapping.bounded_context = projection.bounded_context
+    requires: projection.bounded_context.status = active
+    requires: projection_visible_to(projection, access_mapping)
+
+    ensures:
+        ProjectionSubscription.created(
+            bounded_context: projection.bounded_context,
+            access_mapping: access_mapping,
+            created_at: now,
+            from_sequence: null,
+            projection: projection
+        )
+
+    @guidance
+        -- The initial push is the projection's current state for every key,
+        -- subject to the same owner scope and private-field redaction as
+        -- QueryProjection. A writer that changes a row pushes it; a lagged
+        -- connection refetches current state and carries on, because this
+        -- subscription promises current state rather than every event.
+}
+
+rule DeliverProjectionUpdates {
+    when: ProjectionRowChanged(projection, key)
+    ensures:
+        for subscription in Subscriptions
+                where subscription.kind = ProjectionSubscription
+                    and subscription.projection = projection
+                    and subscription.access_mapping.status = active
+                    and projection_key_visible_to(subscription.access_mapping, projection, key):
+            ProjectionUpdateDelivered(
+                subscription: subscription,
+                projection: projection,
+                key: key,
+                row: read_projection(projection, key, subscription.access_mapping)
+            )
 }
 
 -- render_event(event, access_mapping) is a black box in the same register
@@ -3924,6 +4503,14 @@ rule AuthoriseCommandSubmission {
     requires: command_type.bounded_context.status = active
     requires: valid_payload(command_type.schema, payload)
 
+    -- A type may name one Role that a GraphQL submitter must hold on top
+    -- of its grant (#[requires_role], docs/architecture.md §1.3.1). This
+    -- is a second gate, not a substitute for the grant; it is deployed
+    -- declaration, so it is checked live and never registered.
+    requires:
+        command_type.required_role = null
+        or access_mapping.role.name = command_type.required_role
+
     -- The very same derivation ProcessCommand performs downstream, over
     -- the very same payload - see the derive_tags note above the rules.
     let consistency_tags = derive_tags(command_type, payload)
@@ -4081,7 +4668,15 @@ rule ProcessCommand {
     when:
         CommandAuthorised(
             command_type, payload, client_id, idempotency_key?,
-            correlation_id?, causation_id?)
+            correlation_id?, causation_id?, approved?)
+
+    -- An approval-required type never reaches decide() on a direct
+    -- submission; it becomes a CommandProposal (see rule ProposeCommand).
+    -- An approved proposal re-enters here with approved = true, which is
+    -- the only way past the policy gate.
+    requires:
+        approved = true
+        or not exists CommandApprovalPolicy{command_type: command_type}
 
     -- Idempotency. idempotency_key is a value the caller chooses and
     -- supplies itself, carried here untouched from whichever surface
@@ -4094,6 +4689,11 @@ rule ProcessCommand {
     -- characters is a malformed-request rejection, on the same footing as
     -- an over-long correlation_id (see valid_correlation_id), since one is
     -- remembered with every accepted command that carries it.
+    -- valid_idempotency_key(idempotency_key) is that one gate: it holds
+    -- when the key is null or empty, and otherwise when it is at most 255
+    -- characters long. It is a black box in the same register as
+    -- valid_correlation_id, checked before the lookup below.
+    requires: valid_idempotency_key(idempotency_key)
     --
     -- recorded_acceptance(command_type, client_id, idempotency_key) is the
     -- outcome this library remembers against that key from that caller:
@@ -4281,6 +4881,18 @@ rule ProcessCommand {
     let decision = decide(command_type, payload, matching_events, now)
     requires: decision.accepted = true
 
+    -- Every event an accepted decision names is a registered type of this
+    -- command's own bounded context. decide() is compiled code and can
+    -- still name a type the deploy forgot to register, or one from another
+    -- context; committing it would make an event whose EventType the
+    -- context does not hold, breaking both EventTagsMatchDeclaredMappings
+    -- and every read that resolves the type. The refusal is the one
+    -- DryRunCommand's guidance already promises ("as ProcessCommand
+    -- refuses it").
+    requires:
+        decision.events.all(spec =>
+            command_type.bounded_context.event_types.any(et => et = spec.event_type))
+
     -- The command's own payload is protected on the way into storage,
     -- exactly as an event's is, and under the same per-subject keys - see
     -- the protect_sensitive_fields note above the rules. Deliberately
@@ -4302,7 +4914,7 @@ rule ProcessCommand {
     -- the correlation note above the rules.
     ensures:
         let command = Command.created(
-            id: generate_token_id(),
+            id: generate_id(),
             bounded_context: command_type.bounded_context,
             command_type: command_type,
             payload: protected.payload,
@@ -4320,10 +4932,11 @@ rule ProcessCommand {
             consistency_boundary: boundary
         )
         for spec in decision.events:
+            let protected_event = protect_sensitive_fields(spec.event_type, spec.payload)
             CommandTriggered.created(
                 bounded_context: command_type.bounded_context,
                 event_type: spec.event_type,
-                payload: protect_sensitive_fields(spec.event_type, spec.payload).payload,
+                payload: protected_event.payload,
                 metadata: {
                     type: spec.event_type.name,
                     version: spec.event_type.schema_version,
@@ -4334,7 +4947,7 @@ rule ProcessCommand {
                 },
                 sequence: next_sequence(command_type.bounded_context),
                 tags: derive_tags(spec.event_type, spec.payload),
-                encryption_keys: protect_sensitive_fields(spec.event_type, spec.payload).encryption_keys,
+                encryption_keys: protected_event.encryption_keys,
                 command: command
             )
 
@@ -4362,39 +4975,539 @@ rule ProcessCommand {
         -- reaching past the cached window is completed from Postgres.
 }
 
--- The command-side read, and the only one there is: CommandSubmission
--- and CommandTrigger only submit, and a Projection is built from
--- EventTypes alone, so before this nothing anywhere read a stored
--- Command.payload back. Admin-level rather than read-level deliberately.
--- A command payload is one caller's own input as it was submitted, not a
--- curated view of it the way a projection is, so reading other callers'
--- commands is an operator and audit capability rather than part of
--- ordinary reading - which is why this faces AdminAccess, the same actor
--- SubjectErasure and TypeRegistration face.
---
--- It answers two shapes of question with one rule: "which commands of
--- this type were submitted in this window" (command_types, plus the
--- optional after/before bounds on metadata.created_at - both inclusive,
--- and each omittable independently of the other), and "which command
--- produced this event" (triggered_event, the reverse of
--- CommandTriggered.command). triggered_event is a CommandTriggered
--- specifically rather than any Event: a command-triggered event is the
--- only kind that has a command behind it at all, and belonging to some
--- command's triggered_events is exactly what makes it one.
---
--- Every filter narrows and none overrides another. Supplying
--- triggered_event alongside a command_types or time filter its command
--- does not satisfy yields nothing, rather than the command anyway: a
--- caller stating two conditions gets what meets both, and is never
--- handed a result contradicting a filter it supplied itself. That
--- uniform conjunction is also what keeps an empty command_types set
--- meaning "no restriction" rather than "no results" - not a vacuous case
--- but the unrestricted state itself, exactly as
--- AllEventsSubscription.event_types is.
---
--- Like FetchEvents and QueryProjection, this deliberately does not
--- require the bounded context to be active: archiving stops new commands,
--- and reading the ones submitted before that is the point.
+-- One answer for every submission. A submission either finds a recorded
+-- acceptance under its key (duplicate), reaches ProcessCommand and is
+-- accepted, reaches decide() and is rejected, or is refused before
+-- decide() - and each of those is one CommandOutcome. This rule states
+-- the middle three; the refusals are the preconditions of the
+-- authorisation rules and carry refusal_reason instead of a rejection
+-- pair. A surface or batch never invents a fourth shape.
+rule AnswerCommand {
+    when:
+        AnswerCommand(
+            command_type, payload, client_id, idempotency_key?,
+            correlation_id?, causation_id?)
+
+    requires: not exists CommandApprovalPolicy{command_type: command_type}
+    requires: valid_idempotency_key(idempotency_key)
+
+    let prior_outcome = recorded_acceptance(command_type, client_id, idempotency_key)
+    let is_duplicate = prior_outcome != null
+
+    let consistency_tags = derive_tags(command_type, payload)
+    let consistency_query = derive_query(command_type, payload)
+    let matching_events =
+        query_matching_events(command_type.bounded_context, consistency_tags, consistency_query)
+    let decision = decide(command_type, payload, matching_events, now)
+
+    let outcome = CommandOutcome{
+        kind:
+            if is_duplicate: duplicate
+            else if decision.accepted: accepted
+            else: rejected,
+        command: null,
+        events: null,
+        rejection_reason: null,
+        rejection_kind: null,
+        matching_events: null,
+        proposal: null,
+        refusal_reason: null,
+        refusal_message: null
+    }
+
+    ensures:
+        CommandOutcomeReturned(
+            outcome: outcome,
+            kind:
+                if is_duplicate: duplicate
+                else if decision.accepted: accepted
+                else: rejected,
+            command: null,
+            events: if is_duplicate: prior_outcome else: decision.events,
+            rejection_reason: if is_duplicate or decision.accepted: null else: decision.rejection_reason,
+            rejection_kind: if is_duplicate or decision.accepted: null else: decision.rejection_kind,
+            matching_events: if is_duplicate or decision.accepted: null else: matching_events,
+            refusal_reason: null,
+            refusal_message: null
+        )
+
+    @guidance
+        -- A duplicate is answered before decide() would run, exactly as
+        -- ProcessCommand does; this rule still reads the decision for the
+        -- shape, but nothing it computes is committed. An accepted answer
+        -- is ProcessCommand's, not a second acceptance - the two rules
+        -- share one decision procedure, and ProcessCommand is the only
+        -- writer. A refusal (validate, authorise, resolve a registration,
+        -- or a transient lock failure) answers with kind = refused and
+        -- never calls decide() at all.
+}
+
+-- Command approval (docs/architecture.md §214). A type opts in with a
+-- policy. Its submissions become proposals and decide() does not run;
+-- approval re-runs the ordinary submission pipeline under the proposing
+-- caller's own id, against current state, so a proposal is not a stale
+-- decision. The proposal row is the queue: pending -> approving ->
+-- approved/rejected, with expiry as a fifth, final state.
+rule SetCommandApprovalPolicy {
+    when: SetCommandApprovalPolicy(access_mapping, command_type, approver_role?,
+        deadline_seconds?, allow_self_approval)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = command_type.bounded_context
+
+    let policy = CommandApprovalPolicy{command_type: command_type}
+
+    ensures:
+        if exists policy:
+            policy.approver_role = approver_role
+            policy.deadline_seconds = deadline_seconds
+            policy.allow_self_approval = allow_self_approval
+        else:
+            CommandApprovalPolicy.created(
+                command_type: command_type,
+                approver_role: approver_role,
+                deadline_seconds: deadline_seconds,
+                allow_self_approval: allow_self_approval
+            )
+}
+
+rule ProposeCommand {
+    when:
+        CommandAuthorised(
+            command_type, payload, client_id, idempotency_key?,
+            correlation_id?, causation_id?, approved?)
+    requires: approved != true
+    requires: exists CommandApprovalPolicy{command_type: command_type}
+
+    let policy = CommandApprovalPolicy{command_type: command_type}
+    let protected = protect_sensitive_fields(command_type, payload)
+    let prior =
+        CommandProposal{
+            bounded_context: command_type.bounded_context,
+            command_type: command_type,
+            client_id: client_id,
+            idempotency_key: idempotency_key,
+            status: "pending"
+        }
+
+    ensures:
+        if exists prior:
+            ProposalPending(proposal: prior)
+        else:
+            CommandProposal.created(
+                id: generate_id(),
+                bounded_context: command_type.bounded_context,
+                command_type: command_type,
+                payload: protected.payload,
+                client_id: client_id,
+                idempotency_key: idempotency_key,
+                correlation_id: correlation_id ?? generate_id(),
+                causation_id: causation_id,
+                status: "pending",
+                proposed_at: now,
+                expires_at:
+                    if policy.deadline_seconds = null: null
+                    else: deadline_after(now, policy.deadline_seconds),
+                decided_at: null,
+                decided_by: null,
+                command: null,
+                rejection_reason: null,
+                rejection_kind: null
+            )
+}
+
+rule ApproveCommand {
+    when: ApproveCommand(access_mapping, proposal)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = proposal.bounded_context
+    requires: proposal.status = "pending"
+
+    let policy = CommandApprovalPolicy{command_type: proposal.command_type}
+    let proposer = Role{id: proposal.client_id}
+
+    -- A named approver is one Role name; no policy means any admin.
+    requires: policy.approver_role = null or access_mapping.role.name = policy.approver_role
+
+    -- No self-approval unless the type opted in. Self is the proposing
+    -- human, resolved by external_subject, so approving under another Role
+    -- with the same subject is still refused. A REST token or an internal
+    -- path resolves to no Role, so it never matches and any admin may
+    -- approve it.
+    requires:
+        policy.allow_self_approval
+        or not exists proposer
+        or access_mapping.role.external_subject != proposer.external_subject
+
+    -- An owner-scoped admin sees only proposals whose derived owner is in
+    -- scope, and an out-of-scope proposal answers as missing.
+    requires:
+        access_mapping.scope = null
+        or proposal_owner_scope_satisfied(proposal, access_mapping.scope)
+
+    requires: proposal.expires_at = null or now <= proposal.expires_at
+
+    ensures:
+        proposal.status = "approved"
+        proposal.decided_at = now
+        proposal.decided_by = access_mapping.role
+        CommandAuthorised(
+            command_type: proposal.command_type,
+            payload: decrypt_proposal(proposal),
+            client_id: proposal.client_id,
+            idempotency_key: "skilj-approval:" + proposal.id,
+            correlation_id: proposal.correlation_id,
+            causation_id: proposal.causation_id,
+            approved: true
+        )
+        CommandProposalApproved(proposal: proposal, approver: access_mapping.role)
+
+    @guidance
+        -- Approval re-runs ProcessCommand with the proposal's decrypted
+        -- payload, the proposing client_id and skilj-approval:<proposal id>
+        -- as the idempotency key (or the caller's own when supplied), all
+        -- under the target bounded context's sequence lock. That is the
+        -- command write; this rule states the proposal transition and
+        -- leaves the command and its events to ProcessCommand, exactly as
+        -- a direct submission does. The secret key so approval cannot be
+        -- run twice for one proposal. A decide() rejection at approval
+        -- time is recorded on the proposal as rejection_reason/kind.
+}
+
+rule RejectCommand {
+    when: RejectCommand(access_mapping, proposal, reason)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = proposal.bounded_context
+    requires: proposal.status = "pending"
+    requires: proposal.expires_at = null or now <= proposal.expires_at
+
+    let policy = CommandApprovalPolicy{command_type: proposal.command_type}
+    requires: policy.approver_role = null or access_mapping.role.name = policy.approver_role
+    requires:
+        access_mapping.scope = null
+        or proposal_owner_scope_satisfied(proposal, access_mapping.scope)
+
+    ensures:
+        proposal.status = "rejected"
+        proposal.decided_at = now
+        proposal.decided_by = access_mapping.role
+        proposal.rejection_reason = reason
+        proposal.rejection_kind = "rejected_by_approver"
+        CommandProposalRejected(proposal: proposal, approver: access_mapping.role, reason: reason)
+
+    @guidance
+        -- Rejecting one's own proposal - withdrawing it - is always
+        -- allowed, even where self-approval is not.
+}
+
+rule ExpireCommandProposals {
+    when: ApprovalDeadlinesPassed()
+    ensures:
+        for proposal in CommandProposals
+                where status = "pending"
+                    and expires_at != null
+                    and expires_at < now:
+            proposal.status = "expired"
+            CommandProposalExpired(proposal: proposal)
+}
+
+-- Deadlines. A schedule reacts to one committed source event, producing
+-- at most one occurrence (or the first of a chain). Cancellation is by
+-- tag, because the cancelling event never learns an id the schedule
+-- generated. Firing is an ordinary command submission under the reserved
+-- client id "deadline" and idempotency key "skilj-deadline:<id>", so a
+-- crash that fires twice is deduplicated.
+rule ScheduleDeadline {
+    when: DeadlineScheduled(source_event, schedule_name, target_command_type,
+        fire_at, tags, payload, recurrence?, expires_at?)
+    requires: target_command_type.bounded_context.status = active
+    requires: valid_payload(target_command_type.schema, payload)
+    requires: tags.all(t => target_command_type.tag_mappings.any(m => m.key = t.key))
+
+    let protected = protect_sensitive_fields(target_command_type, payload)
+
+    -- A first occurrence outside its own recurrence window is a caller
+    -- bug and is skipped; a bad cron degrades to a stored one-shot rather
+    -- than refusing the row.
+    let in_window =
+        recurrence = null
+        or (recurrence.start_at = null or fire_at >= recurrence.start_at)
+            and (recurrence.end_at = null or fire_at <= recurrence.end_at)
+            and (recurrence.valid_until = null or fire_at <= recurrence.valid_until)
+
+    ensures:
+        if in_window:
+            Deadline.created(
+                id: generate_id(),
+                schedule_name: schedule_name,
+                bounded_context: target_command_type.bounded_context,
+                source_event: source_event,
+                target_command_type: target_command_type,
+                payload: protected.payload,
+                tags: tags,
+                fire_at: fire_at,
+                expires_at: expires_at,
+                recurrence: recurrence,
+                parent: null,
+                status: "pending",
+                attempt_count: 0,
+                first_failed_at: null,
+                next_attempt_at: null,
+                last_error: null,
+                fired_at: null,
+                created_at: now
+            )
+}
+
+rule CancelDeadline {
+    when: DeadlineCancelled(source_event, schedule_name, cancel_tags)
+    requires: cancel_tags.count > 0
+    ensures:
+        for deadline in Deadlines
+                where schedule_name = schedule_name
+                    and status = "pending"
+                    and cancel_tags.all(t => deadline.tags.any(d => d.key = t.key and d.value = t.value)):
+            deadline.status = "cancelled"
+
+    @guidance
+        -- Only pending rows are cancelled. A firing row has already been
+        -- claimed and may have committed its command; cancelling it would
+        -- claim an outcome that may exist. A row in backoff is pending and
+        -- is cancelled, so a cancel that lands during retry still wins.
+}
+
+rule FireDueDeadline {
+    when: DeadlineDue(deadline)
+    requires: deadline.status = "pending"
+    requires: deadline.fire_at <= now
+    requires: deadline.next_attempt_at = null or deadline.next_attempt_at <= now
+    requires: not_past_recurrence_window(deadline, now)
+
+    let payload = decrypt_deadline_payload(deadline)
+    let decision_context =
+        DeadlineContext{
+            scheduled_at: deadline.fire_at,
+            deadline_at: deadline.expires_at,
+            expired: deadline.expires_at != null and now > deadline.expires_at
+        }
+
+    ensures:
+        deadline.status = "fired"
+        deadline.fired_at = now
+        CommandAuthorised(
+            command_type: deadline.target_command_type,
+            payload: payload,
+            client_id: "deadline",
+            idempotency_key: "skilj-deadline:" + deadline.id,
+            correlation_id: deadline.source_event?.metadata.correlation_id,
+            causation_id: deadline.source_event?.id
+        )
+        if deadline.recurrence != null:
+            Deadline.created(
+                id: deadline.id + "#r" + next_recurrence_sequence(deadline),
+                schedule_name: deadline.schedule_name,
+                bounded_context: deadline.bounded_context,
+                source_event: deadline.source_event,
+                target_command_type: deadline.target_command_type,
+                payload: deadline.payload,
+                tags: deadline.tags,
+                fire_at: next_recurrence_fire_at(deadline, now),
+                expires_at: deadline.expires_at,
+                recurrence: deadline.recurrence,
+                parent: deadline,
+                status: "pending",
+                attempt_count: 0,
+                first_failed_at: null,
+                next_attempt_at: null,
+                last_error: null,
+                fired_at: null,
+                created_at: now
+            )
+
+    @guidance
+        -- The next occurrence is inserted before the fired mark and under
+        -- a deterministic id, so a crash between the two re-fires
+        -- idempotently. FireAll needs no extra cap because only the
+        -- immediate next occurrence is inserted per firing. A decision
+        -- that rejects the command is a business outcome and still marks
+        -- the occurrence fired; an expiry window (expires_at) is a probe
+        -- handed to decide(), not a reason to skip. A recurrence's
+        -- valid_until and window checks end the chain.
+        --
+        -- An approval-required target proposes rather than decides (see
+        -- rule ProposeCommand): the occurrence still counts as fired, and
+        -- the proposal carries the deadline's client id and key so a crash
+        -- re-finds it instead of proposing twice.
+}
+
+rule RetryDeadline {
+    when: DeadlineAttemptFailed(deadline, error)
+    requires: deadline.status = "pending"
+    let attempts = deadline.attempt_count + 1
+
+    ensures:
+        if attempts >= config.max_deadline_attempts:
+            deadline.status = "parked"
+            deadline.last_error = error
+            ParkedDelivery.created(
+                bounded_context: deadline.bounded_context,
+                kind: deadline,
+                source: "deadline:" + deadline.schedule_name,
+                identifier: deadline.id,
+                access_token_id: null,
+                target_command_type: deadline.target_command_type,
+                request: deadline.payload,
+                error: error,
+                attempts: attempts,
+                first_failed_at: deadline.first_failed_at ?? now,
+                last_failed_at: now
+            )
+        else:
+            deadline.status = "pending"
+            deadline.attempt_count = attempts
+            deadline.first_failed_at = deadline.first_failed_at ?? now
+            deadline.last_error = error
+            deadline.next_attempt_at = retry_after(now, attempts)
+
+    @guidance
+        -- Retry with the same backoff policy routes use, then park in the
+        -- target bounded context. Going back to pending (not holding the
+        -- firing claim) lets a cancel during backoff win. Only this
+        -- instance's own claim is updated. A parked deadline is final;
+        -- retryParkedDelivery redrives it under the same
+        -- "skilj-deadline:<id>" key.
+}
+
+rule RegisterCrossContextRoute {
+    when: RegisterCrossContextRoute(name, source_context, source_event_type,
+        target_context, target_command_type, start_from)
+    requires: source_context.status = active
+    requires: target_context.status = active
+    requires: source_event_type.bounded_context = source_context
+    requires: target_command_type.bounded_context = target_context
+
+    ensures:
+        CrossContextRoute.created(
+            name: name,
+            source_context: source_context,
+            source_event_type: source_event_type,
+            target_context: target_context,
+            target_command_type: target_command_type,
+            cursor: start_sequence_for(start_from, source_context),
+            status: "active"
+        )
+}
+
+rule PauseCrossContextRoute {
+    when: PauseCrossContextRoute(access_mapping, route)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = route.source_context
+    ensures:
+        route.status = "paused"
+}
+
+rule ResumeCrossContextRoute {
+    when: ResumeCrossContextRoute(access_mapping, route)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = route.source_context
+    ensures:
+        route.status = "active"
+}
+
+-- A route advances one source event per decision, in sequence order, so a
+-- crash re-delivers at worst the last event; the target command's key
+-- makes that a duplicate rather than a second command. A failure retries
+-- per the same policy as deadlines and then parks. An approval-required
+-- target proposes under the route's own client id and key, so nothing
+-- source-side can bypass an approver.
+rule RouteCrossContext {
+    when: CrossContextRouteDue(route, source_event)
+    requires: route.status = "active"
+    requires: source_event.bounded_context = route.source_context
+    requires: source_event.event_type = route.source_event_type
+    requires: route.cursor = null or source_event.sequence > route.cursor
+
+    ensures:
+        CommandAuthorised(
+            command_type: route.target_command_type,
+            payload: route_payload(route, source_event),
+            client_id: "cross-context-route",
+            idempotency_key: "skilj-route:" + route.name + ":" + source_event.id,
+            correlation_id: source_event.metadata.correlation_id,
+            causation_id: source_event.id
+        )
+        route.cursor = source_event.sequence
+}
+
+rule ParkDelivery {
+    when: DeliveryAttemptFailed(delivery_kind, bounded_context, source, identifier,
+        access_token_id?, target_command_type?, request, error)
+    requires: delivery_kind = cross_context_route
+        or delivery_kind = external_event
+        or delivery_kind = command_trigger
+
+    let prior =
+        ParkedDelivery{
+            bounded_context: bounded_context,
+            kind: delivery_kind,
+            source: source,
+            identifier: identifier,
+            access_token_id: access_token_id
+        }
+
+    ensures:
+        if exists prior:
+            prior.error = error
+            prior.attempts = prior.attempts + 1
+            prior.last_failed_at = now
+        else:
+            ParkedDelivery.created(
+                id: generate_id(),
+                bounded_context: bounded_context,
+                kind: delivery_kind,
+                source: source,
+                identifier: identifier,
+                access_token_id: access_token_id,
+                target_command_type: target_command_type,
+                request: request,
+                error: error,
+                attempts: 1,
+                first_failed_at: now,
+                last_failed_at: now,
+                cursor: parked_cursor(now, identifier)
+            )
+}
+
+rule RetryParkedDelivery {
+    when: RetryParkedDelivery(access_mapping, delivery)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = delivery.bounded_context
+
+    ensures:
+        RedriveRequested(delivery: delivery)
+        ParkedDelivery.removed(delivery: delivery)
+
+    @guidance
+        -- The redrive runs under the row's own identity: the original
+        -- token for a bridge, and the original idempotency key where one
+        -- was recorded. A row whose request no longer decodes is refused
+        -- as an invalid parked delivery rather than panicking. A
+        -- concurrent retry is refused as already in progress rather than
+        -- running twice.
+}
+
+rule DiscardParkedDelivery {
+    when: DiscardParkedDelivery(access_mapping, delivery)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = delivery.bounded_context
+    ensures:
+        ParkedDelivery.removed(delivery: delivery)
+}
 
 rule DryRunCommand {
     when: DryRunCommand(access_mapping, command_type, payload)
@@ -4427,8 +5540,8 @@ rule DryRunCommand {
             access_mapping: access_mapping,
             command_type: command_type,
             accepted: decision.accepted,
-            rejection_reason: decision.reason,
-            rejection_kind: decision.kind,
+            rejection_reason: decision.rejection_reason,
+            rejection_kind: decision.rejection_kind,
             would_be_events: map(decision.events, spec =>
                 render_would_be_event(spec, access_mapping)),
             matching_events: map(shown, e => render_event(e, access_mapping))
@@ -4489,8 +5602,8 @@ rule DryRunTriggerCommand {
         TriggerDryRun(
             token: token,
             accepted: decision.accepted,
-            rejection_reason: decision.reason,
-            rejection_kind: decision.kind
+            rejection_reason: decision.rejection_reason,
+            rejection_kind: decision.rejection_kind
         )
 
     @guidance
@@ -4571,7 +5684,50 @@ rule TriggerCommandBatch {
                 correlation_id: item.correlation_id,
                 causation_id: item.causation_id
             )
+
+    @guidance
+        -- stop_at_first_failure is read by this rule, not left to the
+        -- surface: when it is true, the first item that is refused (or
+        -- fails before it is decided) ends the batch, every later item is
+        -- answered as not processed and no rule is applied to it. When it
+        -- is false or omitted, every item is processed regardless. A
+        -- rejection is an answer, not a failure, and never stops the
+        -- batch.
 }
+
+-- The command-side read, and the only one there is: CommandSubmission
+-- and CommandTrigger only submit, and a Projection is built from
+-- EventTypes alone, so before this nothing anywhere read a stored
+-- Command.payload back. Admin-level rather than read-level deliberately.
+-- A command payload is one caller's own input as it was submitted, not a
+-- curated view of it the way a projection is, so reading other callers'
+-- commands is an operator and audit capability rather than part of
+-- ordinary reading - which is why this faces AdminAccess, the same actor
+-- SubjectErasure and TypeRegistration face.
+--
+-- It answers two shapes of question with one rule: "which commands of
+-- this type were submitted in this window" (command_types, plus the
+-- optional after/before bounds on metadata.created_at - both inclusive,
+-- and each omittable independently of the other), and "which command
+-- produced this event" (triggered_event, the reverse of
+-- CommandTriggered.command). triggered_event is a CommandTriggered
+-- specifically rather than any Event: a command-triggered event is the
+-- only kind that has a command behind it at all, and belonging to some
+-- command's triggered_events is exactly what makes it one.
+--
+-- Every filter narrows and none overrides another. Supplying
+-- triggered_event alongside a command_types or time filter its command
+-- does not satisfy yields nothing, rather than the command anyway: a
+-- caller stating two conditions gets what meets both, and is never
+-- handed a result contradicting a filter it supplied itself. That
+-- uniform conjunction is also what keeps an empty command_types set
+-- meaning "no restriction" rather than "no results" - not a vacuous case
+-- but the unrestricted state itself, exactly as
+-- AllEventsSubscription.event_types is.
+--
+-- Like FetchEvents and QueryProjection, this deliberately does not
+-- require the bounded context to be active: archiving stops new commands,
+-- and reading the ones submitted before that is the point.
 
 rule FetchCommands {
     when: FetchCommands(access_mapping, command_types, after?, before?, triggered_event?, after_command?)
@@ -4944,7 +6100,7 @@ rule InspectEvent {
         -- QueryEvents applies; see its guidance.
 }
 
--- The ten rules below are the admin bounded context's operations. In
+-- The admin bounded context rules below are its operations. In
 -- principle each should itself be a Command producing a CommandTriggered
 -- Event (BoundedContextAdded, BoundedContextArchived, BoundedContextDeleted,
 -- EventTypeRegistered, CommandTypeRegistered, TokenCreated, TokenRevoked)
@@ -4953,6 +6109,15 @@ rule InspectEvent {
 -- command-processing mechanism, so for now these are modelled as direct
 -- effects, consistent with CreateExternalEvent and CreateDirectEvent
 -- above.
+--
+-- The access trail below is not an exception to that, and the two
+-- descriptions do not contradict each other. SkiljRecorded events are
+-- recorded by rule RecordAccessEvent as an effect of the operation
+-- changing access, not as the admin operation's own domain event: an
+-- AccessGranted says that a grant changed, while the still-missing
+-- command/event pair above would say that an admin asked for the change.
+-- The trail is complete for what it is, and the dogfooding gap above
+-- remains about the next layer up.
 
 -- Creating a bounded context grants nobody access to it. AddBoundedContext
 -- writes the BoundedContext and nothing else: no RoleAccessMapping comes
@@ -5028,7 +6193,9 @@ rule AddBoundedContext {
             name: name,
             status: active,
             created_at: now,
-            created_by: creator
+            created_by: creator,
+            template: null,
+            dispatch_template: null
         )
 }
 
@@ -5039,7 +6206,7 @@ rule AddBoundedContext {
 -- contexts exist, when each appeared and who created it - without relying
 -- on GraphQL introspection to discover them.
 --
--- It is not one of the ten the note above counts: those are the admin
+-- It is not one of the admin-operation rules the note above counts: those are the admin
 -- bounded context's mutations, each of which should one day be a Command
 -- producing an Event. This one writes nothing, so there is nothing for it
 -- to dogfood into - it follows FetchCommands' and QueryProjection's shape
@@ -5132,6 +6299,16 @@ rule ArchiveBoundedContext {
 -- tenant makes its template undeletable. Deletion stays what it already
 -- was, an unconditional act depending on nothing outside the context
 -- being ended.
+--
+-- The tenant keeps its dispatch_template name as well. Clearing the
+-- resync link must not also leave the tenant with no decider once its
+-- template row is gone: the template's compiled declarations are still in
+-- the running binary, and the tenant resolves them by that name (see
+-- BoundedContext.dispatch_template). So the ensures below clears template
+-- and only template; dispatch_template is never written after creation.
+-- A process that does not carry the named declaration answers as it does
+-- for any type it does not deploy - refusing the command, or leaving the
+-- projection fold to an instance that does.
 --
 -- The name comes free again. AddBoundedContext's `not exists
 -- BoundedContext{name: name}` guard is true once more, so a later call
@@ -5348,7 +6525,8 @@ rule CreateBoundedContextFromTemplate {
             status: active,
             created_at: now,
             created_by: creator,
-            template: template
+            template: template,
+            dispatch_template: template.name
         )
         RoleAccessMapping.created(
             role: role,
@@ -5537,10 +6715,21 @@ rule ApplyTemplateRegistrations {
 -- entity CommandType) "exists" means the whole path resolves: the outer
 -- field is declared, its declared type is the named nested shape, and
 -- that shape declares the named leaf. Same check, one level deeper.
--- There is no FilterOperator-style type-matching concern here: a tag
--- mapping or a sensitive field reads a value, it never compares one, so
--- the field's declared type has no bearing on whether the mapping makes
--- sense.
+--
+-- valid_sensitive_fields checks one more thing beyond existence, and only
+-- for SensitiveField.field: that field must be declared string-typed.
+-- subject_field is only read, never encrypted, so any scalar is fine
+-- there. The sensitive field itself must be a string because
+-- protect_sensitive_fields replaces its value with ciphertext, and
+-- ciphertext is a string - an integer or boolean would no longer validate
+-- against its own declared type, and a typed GraphQL field generated from
+-- that schema could not serve it. This is not the FilterOperator-style
+-- comparison matrix below: it is one type requirement, stated once, and a
+-- registration whose sensitive field is not a string is rejected outright.
+--
+-- There is no other type-matching concern here: a tag mapping reads a
+-- value, never compares one, so a tag's field type has no bearing on
+-- whether the mapping makes sense.
 --
 -- Both validate against the schema submitted in the same call, not the
 -- registered type's current one, so a registration that changes schema
@@ -5824,6 +7013,14 @@ rule ApplyTemplateRegistrations {
 -- here: a grant on the admin context must not become a way to register
 -- types into arbitrary other contexts.
 --
+-- valid_type_name(name) is the one gate every EventType, CommandType and
+-- Projection name passes, and it is there because the name becomes a
+-- GraphQL type name: it starts with a letter or underscore, contains only
+-- letters, digits and underscores, and is at most 100 characters. It is a
+-- black box in the same register as valid_bounded_context_name. Unlike a
+-- bounded context name, case is preserved - existing Rust declarations are
+-- PascalCase - so the check constrains shape, not case.
+--
 -- Registration is also where the two REST opt-ins are set:
 -- EventType.event_read_allowed and CommandType.rest_trigger_allowed. Both
 -- are reconciled the same way as the origin permissions - a type is
@@ -5868,6 +7065,49 @@ rule ApplyTemplateRegistrations {
 -- replaced: the new expression's occurrences after that instant are exactly
 -- the ones still owed.
 
+-- Rolling deploys and startup reconciliation. The loop above is also what
+-- makes an older binary meet a newer registration - a rollback, or an
+-- instance still on the old version restarting mid-rollout. Applying it
+-- as an ordinary registration would narrow the stored registration back
+-- to what the older binary declares: an older schema, a dropped tag
+-- mapping, and, worst, a dropped sensitive field, private field or owner
+-- tag key - turning off encryption, redaction or owner scoping for every
+-- instance, the newer ones included. Startup registration is therefore
+-- not the same act as the explicit Register* rules, and has its own
+-- guarantees, modelled by ReconcileEventTypeAtStartup,
+-- ReconcileCommandTypeAtStartup and ReconcileProjectionAtStartup below:
+--
+--   - Application version. A process may carry an application_version -
+--     any number that only increases from release to release. Before
+--     writing a registration it reads the stored registered_by_version.
+--     If both exist and the process's is lower, the stored row is kept
+--     exactly as it is - schema, flags, tags, protections, consumed event
+--     types, a staged rebuild and all - and the type or projection is
+--     reported as kept-newer. Otherwise the ordinary registration
+--     proceeds and the row is stamped with this process's version. An
+--     unversioned process neither stamps nor can be told it is older.
+--   - Schema direction. Even without versions, a registration refused by
+--     schema_is_backwards_compatible is checked the other way with the
+--     same black box: when the stored schema is a compatible evolution of
+--     the process's, the process is the older one and the stored
+--     registration is kept untouched. If neither direction is compatible,
+--     the ordinary refusal stands.
+--   - Protections are never removed at startup, whatever the version.
+--     A stored sensitive field, private field or owner tag key the
+--     process does not declare is merged back into what is registered: a
+--     field path the process declares differently is a change and is
+--     registered as declared, but an omitted path is not a removal.
+--     Deliberately removing one is an explicit Register* call, which does
+--     not reconcile. This holds for a newer version too.
+--   - An explicit Register* call never reconciles: an admin asking to
+--     register an older shape is making a mistake worth refusing, not
+--     performing a deploy.
+--
+-- Registration attributes the compatibility rules do not cover follow the
+-- newest version that actually writes. The application version is what
+-- makes "newest" knowable for flags and consumed event types, whose
+-- contents cannot say it.
+
 rule RegisterEventType {
     when: RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
         sensitive_fields, private_fields, external_creation_allowed, direct_creation_allowed,
@@ -5877,6 +7117,7 @@ rule RegisterEventType {
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
+    requires: valid_type_name(name)
     requires: valid_schema(schema)
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
@@ -6019,6 +7260,7 @@ rule RegisterCommandType {
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
+    requires: valid_type_name(name)
     requires: valid_schema(schema)
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
@@ -6186,6 +7428,23 @@ rule RegisterCommandType {
 -- schema. A rebuild is a second, private fold that nothing reads until it
 -- is complete, not a projection taken offline in view of its callers.
 --
+-- Serialisation with writers and the async consumer. RegisterProjection
+-- decides whether a consumed-type change is trivial by asking whether the
+-- stream already holds events of that type, and a first-time sync
+-- projection folds existing history before its registration completes.
+-- Both read the stream while other instances may be committing and while
+-- an async consumer may be folding, so both must run under the bounded
+-- context's sequence lock - the same lock every write takes, held to
+-- commit (see next_sequence above). Without it an event can commit
+-- between the history check and the registration, making a staged change
+-- look trivial and losing that event for the new projection, or commit
+-- between the inline history fold and caught_up_to being set, leaving a
+-- projection declared sync while an event ahead of it was never folded -
+-- exactly what SyncProjectionNeverLags forbids. The lock is what makes
+-- "the stream at registration time" a single instant rather than a race.
+-- This is a requirement on the act, not a second visible state: a caller
+-- still sees the registration either complete or refused.
+--
 -- A first-time registration stages nothing and rebuilds nothing, but it is
 -- not unconditionally blank either. Registering a sync projection into a
 -- bounded context that already holds events of a type it consumes folds
@@ -6205,13 +7464,18 @@ rule RegisterCommandType {
 
 rule RegisterProjection {
     when: RegisterProjection(access_mapping, bounded_context, name, schema,
-        consumed_event_types, sync, requires_capability?)
+        consumed_event_types, sync, requires_capability?, segments?, segment_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
+    requires: valid_type_name(name)
     requires: valid_schema(schema)
     requires: requires_capability = null or valid_capability_name(requires_capability)
+    requires: (segments = null and segment_key = null)
+        or (segments != null and segments > 0 and segment_key != null
+            and bounded_context.event_types.any(et =>
+                et.tag_mappings.any(m => m.key = segment_key)))
 
     -- Every EventType a projection consumes must belong to the same
     -- bounded context: a projection is built from its own context's
@@ -6255,6 +7519,13 @@ rule RegisterProjection {
 
     let becoming_sync = exists existing and existing.sync = false and sync = true
 
+    -- Segmentation is part of the fold boundary, so changing it is a
+    -- non-trivial change like a schema change: the existing rows were
+    -- folded under different segments.
+    let segmentation_changed =
+        exists existing
+        and (existing.segments != segments or existing.segment_key != segment_key)
+
     -- Every event this bounded context has ever committed, named once
     -- because the first-time case below needs both whether it holds
     -- anything relevant and where it currently ends. Expressed as a
@@ -6281,7 +7552,8 @@ rule RegisterProjection {
 
     let rebuild_needed =
         exists existing
-        and (schema_changed or consumed_change_has_history or becoming_sync)
+        and (schema_changed or consumed_change_has_history or becoming_sync
+            or segmentation_changed)
 
     -- At most one pending rebuild exists per projection
     -- (UniqueRebuildPerProjectionAndStatus), so this is the row to
@@ -6299,6 +7571,8 @@ rule RegisterProjection {
                 consumed_event_types: consumed_event_types,
                 sync: sync,
                 requires_capability: requires_capability,
+                segments: segments,
+                segment_key: segment_key,
                 -- The bounded context's latest committed sequence, not
                 -- merely the latest one of a consumed type: the history is
                 -- folded through the same black-box project() an async
@@ -6329,6 +7603,8 @@ rule RegisterProjection {
                     if schema_changed: existing.schema_version + 1 else: existing.schema_version
                 staged.consumed_event_types = consumed_event_types
                 staged.sync = sync
+                staged.segments = segments
+                staged.segment_key = segment_key
                 staged.caught_up_to = null
             else:
                 ProjectionRebuild.created(
@@ -6338,6 +7614,8 @@ rule RegisterProjection {
                         if schema_changed: existing.schema_version + 1 else: existing.schema_version,
                     consumed_event_types: consumed_event_types,
                     sync: sync,
+                    segments: segments,
+                    segment_key: segment_key,
                     caught_up_to: null,
                     status: pending
                 )
@@ -6348,6 +7626,8 @@ rule RegisterProjection {
             -- registration non-trivial.
             existing.consumed_event_types = consumed_event_types
             existing.sync = sync
+            existing.segments = segments
+            existing.segment_key = segment_key
             existing.requires_capability = requires_capability
 }
 
@@ -6446,6 +7726,227 @@ rule DiscardProjectionRebuild {
 
     ensures:
         not exists staged
+}
+
+-- The three startup-reconciliation rules the note above RegisterEventType
+-- describes. Each takes the same declaration an explicit Register* call
+-- takes plus the process's optional application_version, and either keeps
+-- the stored registration untouched or performs an ordinary registration
+-- with the stored protections merged back in. They are separate rules
+-- rather than a branch in Register* so an explicit admin call can never
+-- accidentally reconcile.
+--
+-- kept_newer is reported rather than silent: the operator needs to know a
+-- process is older than the stored state and that its own declaration was
+-- not applied.
+
+rule ReconcileEventTypeAtStartup {
+    when: ReconcileEventTypeAtStartup(application_version?, access_mapping, bounded_context, name,
+        schema, tag_mappings, sensitive_fields, private_fields, external_creation_allowed,
+        direct_creation_allowed, system_triggered_allowed, event_read_allowed,
+        system_triggered_schedule?, missed_occurrence_policy?, owner_tag_key?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = bounded_context
+    requires: bounded_context.status = active
+
+    let existing = EventType{bounded_context: bounded_context, name: name}
+
+    -- A stored row written by a higher application version wins outright.
+    let stored_version_newer =
+        exists existing
+        and application_version != null
+        and existing.registered_by_version != null
+        and existing.registered_by_version > application_version
+
+    -- Without a usable version, a registration the stored schema is a
+    -- compatible evolution of says this process is the older one. If
+    -- neither direction is compatible the ordinary registration below
+    -- refuses it.
+    let stored_schema_newer =
+        exists existing
+        and not schema_is_backwards_compatible(existing.schema, schema)
+        and schema_is_backwards_compatible(schema, existing.schema)
+
+    let keep_newer = stored_version_newer or stored_schema_newer
+
+    -- Startup never removes a protection. A stored field the process does
+    -- not declare for the same path is kept; a path the process declares
+    -- differently is a change and is registered as declared.
+    let stored_sensitive_fields = if exists existing: existing.sensitive_fields else: {}
+    let stored_private_fields = if exists existing: existing.private_fields else: {}
+    let merged_sensitive_fields =
+        sensitive_fields
+            + filter(stored_sensitive_fields,
+                s => not sensitive_fields.any(d => d.field = s.field))
+    let merged_private_fields =
+        private_fields
+            + filter(stored_private_fields,
+                p => not private_fields.any(d => d.field = p.field))
+    let merged_owner_tag_key =
+        if owner_tag_key != null: owner_tag_key
+        else if exists existing: existing.owner_tag_key
+        else: null
+
+    ensures:
+        if keep_newer:
+            RegistrationKeptNewer(
+                bounded_context: bounded_context,
+                kind: "EventType",
+                name: name,
+                stored_version: existing.registered_by_version
+            )
+        else:
+            RegisterEventType(
+                access_mapping: access_mapping,
+                bounded_context: bounded_context,
+                name: name,
+                schema: schema,
+                tag_mappings: tag_mappings,
+                sensitive_fields: merged_sensitive_fields,
+                private_fields: merged_private_fields,
+                external_creation_allowed: external_creation_allowed,
+                direct_creation_allowed: direct_creation_allowed,
+                system_triggered_allowed: system_triggered_allowed,
+                event_read_allowed: event_read_allowed,
+                system_triggered_schedule: system_triggered_schedule,
+                missed_occurrence_policy: missed_occurrence_policy,
+                owner_tag_key: merged_owner_tag_key
+            )
+            RegistrationStamped(
+                bounded_context: bounded_context,
+                kind: "EventType",
+                name: name,
+                application_version: application_version
+            )
+}
+
+rule ReconcileCommandTypeAtStartup {
+    when: ReconcileCommandTypeAtStartup(application_version?, access_mapping, bounded_context, name,
+        schema, tag_mappings, sensitive_fields, private_fields, rest_trigger_allowed, owner_tag_key?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = bounded_context
+    requires: bounded_context.status = active
+
+    let existing = CommandType{bounded_context: bounded_context, name: name}
+    let stored_version_newer =
+        exists existing
+        and application_version != null
+        and existing.registered_by_version != null
+        and existing.registered_by_version > application_version
+    let stored_schema_newer =
+        exists existing
+        and not schema_is_backwards_compatible(existing.schema, schema)
+        and schema_is_backwards_compatible(schema, existing.schema)
+    let keep_newer = stored_version_newer or stored_schema_newer
+
+    let stored_sensitive_fields = if exists existing: existing.sensitive_fields else: {}
+    let stored_private_fields = if exists existing: existing.private_fields else: {}
+    let merged_sensitive_fields =
+        sensitive_fields
+            + filter(stored_sensitive_fields,
+                s => not sensitive_fields.any(d => d.field = s.field))
+    let merged_private_fields =
+        private_fields
+            + filter(stored_private_fields,
+                p => not private_fields.any(d => d.field = p.field))
+    let merged_owner_tag_key =
+        if owner_tag_key != null: owner_tag_key
+        else if exists existing: existing.owner_tag_key
+        else: null
+
+    ensures:
+        if keep_newer:
+            RegistrationKeptNewer(
+                bounded_context: bounded_context,
+                kind: "CommandType",
+                name: name,
+                stored_version: existing.registered_by_version
+            )
+        else:
+            RegisterCommandType(
+                access_mapping: access_mapping,
+                bounded_context: bounded_context,
+                name: name,
+                schema: schema,
+                tag_mappings: tag_mappings,
+                sensitive_fields: merged_sensitive_fields,
+                private_fields: merged_private_fields,
+                rest_trigger_allowed: rest_trigger_allowed,
+                owner_tag_key: merged_owner_tag_key
+            )
+            RegistrationStamped(
+                bounded_context: bounded_context,
+                kind: "CommandType",
+                name: name,
+                application_version: application_version
+            )
+}
+
+rule ReconcileProjectionAtStartup {
+    when: ReconcileProjectionAtStartup(application_version?, access_mapping, bounded_context, name,
+        schema, consumed_event_types, sync, requires_capability?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = bounded_context
+    requires: bounded_context.status = active
+
+    let existing = Projection{bounded_context: bounded_context, name: name}
+    let stored_version_newer =
+        exists existing
+        and application_version != null
+        and existing.registered_by_version != null
+        and existing.registered_by_version > application_version
+    let stored_schema_newer =
+        exists existing
+        and not schema_is_backwards_compatible(existing.schema, schema)
+        and schema_is_backwards_compatible(schema, existing.schema)
+    let keep_newer = stored_version_newer or stored_schema_newer
+
+    ensures:
+        if keep_newer:
+            RegistrationKeptNewer(
+                bounded_context: bounded_context,
+                kind: "Projection",
+                name: name,
+                stored_version: existing.registered_by_version
+            )
+        else:
+            RegisterProjection(
+                access_mapping: access_mapping,
+                bounded_context: bounded_context,
+                name: name,
+                schema: schema,
+                consumed_event_types: consumed_event_types,
+                sync: sync,
+                requires_capability: requires_capability
+            )
+            RegistrationStamped(
+                bounded_context: bounded_context,
+                kind: "Projection",
+                name: name,
+                application_version: application_version
+            )
+}
+
+-- The write behind RegistrationStamped: the reconciled row remembers which
+-- application version wrote it, so the next process can recognise that it
+-- is older. Kept separate from the three reconciliation rules because the
+-- stamp is about the registration that was just written, whichever kind it
+-- was.
+rule StampRegistration {
+    when: RegistrationStamped(bounded_context, kind, name, application_version)
+    ensures:
+        if kind = "EventType":
+            let event_type = EventType{bounded_context: bounded_context, name: name}
+            event_type.registered_by_version = application_version
+        else if kind = "CommandType":
+            let command_type = CommandType{bounded_context: bounded_context, name: name}
+            command_type.registered_by_version = application_version
+        else if kind = "Projection":
+            let projection = Projection{bounded_context: bounded_context, name: name}
+            projection.registered_by_version = application_version
 }
 
 -- The four token-minting rules below are deliberately uniform: one rule
@@ -6764,7 +8265,7 @@ rule CreateSuperadmin {
 
     ensures:
         Role.created(
-            id: generate_token_id(),
+            id: generate_id(),
             external_subject: external_subject,
             name: name,
             superadmin: true,
@@ -6788,7 +8289,7 @@ rule CreateRole {
 
     ensures:
         Role.created(
-            id: generate_token_id(),
+            id: generate_id(),
             external_subject: external_subject,
             name: name,
             superadmin: superadmin,
@@ -6887,7 +8388,7 @@ rule GrantCapabilityAsSuperadmin {
     requires: target.status = active
     requires: valid_capability_name(capability)
     requires: capability not in target.capabilities
-    requires: target.capabilities.count < 16
+    requires: target.capabilities.count < config.max_capabilities_per_grant
     ensures:
         target.capabilities = target.capabilities + {capability}
         AccessChanged(
@@ -6923,7 +8424,7 @@ rule GrantCapabilityAsAdmin {
     requires: target.role != access_mapping.role
     requires: capability in access_mapping.delegable
     requires: capability not in target.capabilities
-    requires: target.capabilities.count < 16
+    requires: target.capabilities.count < config.max_capabilities_per_grant
     ensures:
         target.capabilities = target.capabilities + {capability}
         AccessChanged(
@@ -6965,7 +8466,7 @@ rule SetDelegableCapabilities {
     requires: target.status = active
     requires: target.level = admin
     requires: delegable.all(c => valid_capability_name(c))
-    requires: delegable.count <= 16
+    requires: delegable.count <= config.max_capabilities_per_grant
     ensures:
         target.delegable = delegable
         AccessChanged(
@@ -7076,7 +8577,8 @@ rule RecordAccessEvent {
         )
 }
 
--- Registers the six types above in the admin context. Idempotent in the
+-- Registers the access event types listed by access_event_type_names in
+-- the admin context. Idempotent in the
 -- way stamp_admin_bounded_context is: it acts only for a type that is not
 -- registered yet, so a restart changes nothing. Not RegisterEventType: no
 -- grant is behind it, the types are part of the library, and they may be
@@ -7107,6 +8609,26 @@ rule RegisterAccessEventTypes {
                     schedule_position: null,
                     last_fired_at: null,
                     event_read_allowed: false
+                )
+}
+
+-- The startup report ProjectionQuery's PrivateFieldsAreTheProjectionsToKeep
+-- guarantee describes, stated where it happens rather than only in surface
+-- prose. A projection may fold a private field into state that any admin of
+-- the context can read, so startup reports every such projection once per
+-- process. It changes nothing: the projection is already serving, and this
+-- is the library telling the operator which of them keep plaintext that
+-- read-time redaction no longer reaches.
+rule ReportPrivateFieldProjections {
+    when: SkiljStarted()
+    ensures:
+        for projection in Projections:
+            if projection.consumed_event_types.any(et => et.private_fields.count > 0):
+                PrivateFieldProjectionReported(
+                    projection: projection,
+                    consumed_event_types:
+                        filter(projection.consumed_event_types,
+                            et => et.private_fields.count > 0)
                 )
 }
 
@@ -7188,11 +8710,148 @@ rule ForgetSubject {
         -- leaves the subject's events and commands, so the value is free
         -- and no hash of it is left. without_key is a black box: the set
         -- less every tag with that key.
+        --
+        -- This is the one and only rewrite of stored records anywhere in
+        -- this specification, and it rewrites derived index data only:
+        -- Event.tags / Command.consistency_tags lose one blind hash each,
+        -- while payload, metadata and sequence stay exactly as stored.
+        -- "A stored event is never rewritten" everywhere else means the
+        -- event's content - the payload and its provenance - and is not
+        -- contradicted here. The blind hash is an index beside the event,
+        -- whose whole purpose is to be erasable without decrypting the
+        -- payload it indexes (see entity BlindTag's erasure fields).
         for blind in key.bounded_context.blind_tags where erasure_subject_key = key.subject_key:
             for event in key.bounded_context.events where Tag(key: blind.erasure_subject_tag, value: key.subject_value) in tags:
                 event.tags = without_key(event.tags, blind.tag_key)
             for command in key.bounded_context.commands where Tag(key: blind.erasure_subject_tag, value: key.subject_value) in consistency_tags:
                 command.consistency_tags = without_key(command.consistency_tags, blind.tag_key)
+}
+
+-- Master-key lifecycle (docs/architecture.md §129, §130). Only a
+-- superadmin manages keys. Rotation is online: data keys are re-wrapped in
+-- the background under the new version, and the old version stays usable
+-- until retirement. A context's own key can be deleted after no data key
+-- uses it; that erases the context's sensitive data cryptographically,
+-- including in backups, because the provider holds the only copy.
+rule RegisterMasterKey {
+    when: RegisterMasterKey(caller, provider, key_name, bounded_context?)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    ensures:
+        MasterKey.created(
+            provider: provider,
+            key_name: key_name,
+            version: 1,
+            previous_version: null,
+            retired_below: null,
+            status: "active",
+            rotated_at: null,
+            rewrite_finished_at: null,
+            delete_after: null,
+            bounded_context: bounded_context
+        )
+}
+
+rule AssignMasterKey {
+    when: AssignMasterKey(caller, bounded_context, master_key)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: bounded_context.status = active
+    requires: master_key.status = "active"
+    requires: master_key.bounded_context = null or master_key.bounded_context = bounded_context
+
+    ensures:
+        bounded_context.master_key = master_key
+        EncryptionKeyAssigned(
+            bounded_context: bounded_context,
+            master_key: master_key,
+            actor_role_id: caller.id
+        )
+
+    @guidance
+        -- Assignment changes which key wraps data keys created from then
+        -- on; existing data keys keep their own master_key/version and stay
+        -- readable until that version is retired. A key reserved for one
+        -- context cannot be assigned to another.
+}
+
+rule RotateMasterKey {
+    when: RotateMasterKey(caller, master_key)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: master_key.status = "active"
+    requires: master_key.version >= 1
+
+    ensures:
+        master_key.previous_version = master_key.version
+        master_key.version = master_key.version + 1
+        master_key.rotated_at = now
+        EncryptionMasterKeyRotated(
+            master_key: master_key,
+            new_version: master_key.version + 1,
+            actor_role_id: caller.id
+        )
+        for key in EncryptionKeys where key.master_key = master_key
+                and key.status = active
+                and key.master_key_version < master_key.version:
+            key.master_key_version = master_key.version
+        EncryptionDataKeysRewrapped(master_key: master_key, actor_role_id: caller.id)
+
+    @guidance
+        -- The rewrite is idempotent and resumable: each data key is
+        -- re-wrapped at most once per version, and the loop records when
+        -- it finishes. Writes never wait for it, and a crash resumes from
+        -- rewrite_finished_at.
+        --
+        -- A key skilj did not create - a customer's own provider key - is
+        -- followed, not driven: an external rotation is recorded and its
+        -- data keys rewrapped, but this rule refuses to rotate or retire
+        -- it. Those versions may serve other systems, so skilj only uses
+        -- them.
+}
+
+rule RetireMasterKeyVersion {
+    when: RetireMasterKeyVersion(caller, master_key, retire_below)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: retire_below <= master_key.version
+
+    ensures:
+        master_key.retired_below = retire_below
+        master_key.status = if retire_below > (master_key.previous_version ?? 0): "retired" else: master_key.status
+        EncryptionMasterKeyRetired(
+            master_key: master_key,
+            retired_below: retire_below,
+            actor_role_id: caller.id
+        )
+
+    @guidance
+        -- A version may be retired only once every data key has moved past
+        -- it. Retirement is what turns old ciphertext unreadable at the
+        -- provider; it is deliberately irreversible.
+}
+
+rule DeleteMasterKey {
+    when: DeleteMasterKey(caller, master_key)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: master_key.bounded_context != null
+    requires: master_key.status = "retired"
+    requires: master_key.bounded_context.status = archived
+
+    ensures:
+        master_key.status = "deleted"
+        master_key.delete_after = now
+        EncryptionKeyDeleted(
+            master_key: master_key,
+            actor_role_id: caller.id
+        )
+
+    @guidance
+        -- Only an archived context's own retired key, and only when no data
+        -- key remains under it. Deleting the provider key is the
+        -- cryptographic erasure of that context; it does not delete the
+        -- context's rows.
 }
 
 -- The four rules below are the whole of the private-field mechanism's own
@@ -7252,7 +8911,9 @@ rule GrantPrivateFieldAccessForEvent {
         or is_default_private_reader(event, access_mapping)
 
     ensures:
+        let grant_id = generate_id()
         PrivateFieldGrant.created(
+            id: grant_id,
             bounded_context: access_mapping.bounded_context,
             grantor: access_mapping.role,
             grantee: grantee,
@@ -7267,7 +8928,7 @@ rule GrantPrivateFieldAccessForEvent {
             bounded_context: access_mapping.bounded_context,
             payload: {
                 actor_role_id: access_mapping.role.id,
-                -- grant_id names the grant created just above
+                grant_id: grant_id,
                 event_sequence: event?.sequence,
                 command_id: null
             }
@@ -7352,7 +9013,9 @@ rule GrantPrivateFieldAccessForCommand {
         or is_default_private_reader(command, access_mapping)
 
     ensures:
+        let grant_id = generate_id()
         PrivateFieldGrant.created(
+            id: grant_id,
             bounded_context: access_mapping.bounded_context,
             grantor: access_mapping.role,
             grantee: grantee,
@@ -7367,7 +9030,7 @@ rule GrantPrivateFieldAccessForCommand {
             bounded_context: access_mapping.bounded_context,
             payload: {
                 actor_role_id: access_mapping.role.id,
-                -- grant_id names the grant created just above
+                grant_id: grant_id,
                 event_sequence: null,
                 command_id: command?.id
             }
@@ -7417,7 +9080,7 @@ rule RevokePrivateFieldAccess {
 -- PrivateFieldKind).
 
 rule ListPrivateFieldGrants {
-    when: ListPrivateFieldGrants(access_mapping, grantor?)
+    when: ListPrivateFieldGrants(access_mapping, grantor?, after_grant_id?)
     requires: access_mapping.status = active
 
     -- Own grants to anyone; anyone else's to an admin only.
@@ -7430,15 +9093,25 @@ rule ListPrivateFieldGrants {
     -- nameable inside it, where grantor is each grant's own field - the
     -- same shape QueryEvents uses for its tags argument.
     let subject = grantor ?? access_mapping.role
+    let after_grant = PrivateFieldGrant{id: after_grant_id}
 
     let listed =
         PrivateFieldGrants where bounded_context = access_mapping.bounded_context
             and grantor = subject
+            and (after_grant_id = null
+                or (exists after_grant and recorded_after(grant, after_grant)))
+
+    -- The same page bound every other read has. A caller with many grants
+    -- over many records would otherwise be handed an unbounded result.
+    -- after_grant_id is the public paging cursor: grants have no sequence,
+    -- but they are recorded in an order (see the first_by_recording note
+    -- above rule ConsumeEvents).
+    let page = first_by_recording(listed, config.max_events_per_read)
 
     ensures:
         PrivateFieldGrantsListed(
             access_mapping: access_mapping,
-            grants: listed
+            grants: page
         )
 
     @guidance
@@ -7475,6 +9148,24 @@ invariant UniqueProjectionNamePerContext {
     for a in Projections:
         for b in Projections:
             a != b and a.bounded_context = b.bounded_context implies a.name != b.name
+}
+
+invariant UniqueSummaryNamePerContext {
+    -- Summary names are what a snapshot item and InspectSnapshot name, so
+    -- two summaries of one bounded context sharing a name would make both
+    -- ambiguous. Like projection names, uniqueness is per context.
+    for a in Summaries:
+        for b in Summaries:
+            a != b and a.bounded_context = b.bounded_context implies a.name != b.name
+}
+
+invariant OneSummaryStatePerValue {
+    -- A row is identified by its summary and the tag value it folds, the
+    -- same way a projection refresh row is identified by projection and
+    -- key. The fold updates that one row rather than adding another.
+    for a in SummaryStates:
+        for b in SummaryStates:
+            a != b and a.summary = b.summary implies a.tag_value != b.tag_value
 }
 
 invariant UniqueRebuildPerProjectionAndStatus {
@@ -7548,10 +9239,17 @@ invariant DynamicConsistencyBoundaryHonoured {
     -- of its items does not conflict: a narrower query is a narrower
     -- conflict, deliberately (see the consistency query note above the
     -- rules).
+    --
+    -- A null consistency_boundary means the query matched nothing when
+    -- the command decided - there was no sequence to record. It is read
+    -- as "before the first event", so any matching event committed later
+    -- is a conflict; comparing with null directly would leave the
+    -- invariant vacuously true for exactly the commands with the least
+    -- evidence behind them.
     for c in Commands:
         for e in Events:
             (e.bounded_context = c.bounded_context and c.in_consistency_query(e)
-                and e.sequence > c.consistency_boundary)
+                and (c.consistency_boundary = null or e.sequence > c.consistency_boundary))
                 implies e in c.triggered_events
 }
 
@@ -7783,8 +9481,8 @@ invariant CapabilitiesAreWellFormed {
     for m in RoleAccessMappings:
         m.capabilities.all(c => valid_capability_name(c))
         and m.delegable.all(c => valid_capability_name(c))
-        and m.capabilities.count <= 16
-        and m.delegable.count <= 16
+        and m.capabilities.count <= config.max_capabilities_per_grant
+        and m.delegable.count <= config.max_capabilities_per_grant
 }
 
 invariant AccessTrailIsComplete {
@@ -7882,16 +9580,15 @@ actor AdminAccess {
     identified_by: RoleAccessMapping where status = active and level = admin
 }
 
-actor SensitiveDataAccess {
-    -- Authorises reading the decrypted value of sensitive fields, on top
-    -- of whatever level the underlying RoleAccessMapping already grants.
-    -- Orthogonal to level rather than a level of its own, so it is not
-    -- what a surface faces: ProjectionQuery faces ReadAccess and reads
-    -- can_read_sensitive off that same mapping (see its
-    -- SensitiveFieldsStayProtected guarantee). A caller who is this actor
-    -- is by construction also a ReadAccess one.
-    identified_by: RoleAccessMapping where status = active and can_read_sensitive = true
-}
+-- can_read_sensitive is not an actor of its own. It authorises reading
+-- the decrypted value of sensitive fields, on top of whatever level the
+-- underlying RoleAccessMapping already grants, and is orthogonal to level
+-- rather than a level: ProjectionQuery and the other reading surfaces
+-- face ReadAccess or AdminAccess and read can_read_sensitive off that
+-- same mapping (see their SensitiveFieldsStayProtected guarantees). A
+-- caller with can_read_sensitive is by construction also a ReadAccess
+-- one, so giving it a separate actor would add a second identity for the
+-- same mapping and no surface to face it.
 
 actor Superadmin {
     identified_by: Role where status = active and superadmin = true
@@ -8279,6 +9976,15 @@ surface ProjectionQuery {
 
     provides:
         QueryProjection(access_mapping, projection, key?, wait_for_sequence?)
+        SubscribeProjectionUpdates(access_mapping, projection)
+
+    @guarantee ProjectionUpdatesFollowTheQuery
+        -- SubscribeProjectionUpdates pushes the same current state
+        -- QueryProjection would answer with, under the same grant, owner
+        -- scope and private-field redaction (see rule
+        -- CreateProjectionSubscription). It is current state on each
+        -- change, not an event feed: a lagged connection refetches and
+        -- carries on rather than reporting a gap.
 
     @guarantee GrantScopedToBoundedContext
         -- A grant only authorises querying projections belonging to its
@@ -8744,6 +10450,46 @@ surface EventQuery {
         -- scope header's exclusions).
 }
 
+-- The read behind SnapshotInspection. It names one summary, not a range:
+-- an unknown name is refused (UnknownNameIsAnError), while a known summary
+-- with no row for tag_value answers with nothing recorded rather than an
+-- error - except for a scoped caller, for whom an unestablished owner
+-- fails closed (see the surface's GrantScopedToOwnerWhenDeclared).
+rule InspectSnapshot {
+    when: InspectSnapshot(access_mapping, snapshot_name, tag_value)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+
+    let summary = Summary{
+        bounded_context: access_mapping.bounded_context,
+        name: snapshot_name
+    }
+    requires: exists summary
+
+    let state = SummaryState{summary: summary, tag_value: tag_value}
+
+    -- The three-holds/fails-closed contract QueryProjection states for an
+    -- owner scope, applied to one row: no scope holds; a summary with no
+    -- owner dimension holds; otherwise the row must exist and its derived
+    -- owner must be the scope. A cold row for a scoped caller is the
+    -- fail-closed case, not the cold answer.
+    requires:
+        access_mapping.scope = null
+        or summary.owner_tag_key = null
+        or (exists state and summary_owner_scope_satisfied(state, access_mapping.scope))
+
+    ensures:
+        SnapshotInspected(
+            access_mapping: access_mapping,
+            summary: summary,
+            tag_value: tag_value,
+            state: state?.state,
+            as_of_sequence: state?.as_of_sequence,
+            version: summary.version,
+            owner_value: state?.owner_value
+        )
+}
+
 surface SnapshotInspection {
     facing access_mapping: AdminAccess
 
@@ -8762,9 +10508,9 @@ surface SnapshotInspection {
         -- Within its own bounded context, a grant that names a scope (see
         -- RoleAccessMapping.scope) only authorises inspecting summaries
         -- that belong to it. A summary may declare which tag key names its
-        -- "owner" dimension - in deployed configuration only, with no field
-        -- on any entity here and no registration surface to read it back
-        -- from, the same register the tag key the summary is itself keyed
+        -- "owner" dimension in deployed configuration (value Summary's
+        -- owner_tag_key), with no registration surface to read it back
+        -- from - the same register the tag key the summary is itself keyed
         -- on is already drawn from (see the guidance below for why this
         -- surface has nothing registered behind it at all). That key need
         -- not be the one the summary is keyed on: a summary keyed per
@@ -8834,11 +10580,14 @@ surface SnapshotInspection {
         -- GraphQL only, admin-facing, read-only - the one place the
         -- optional summary named in the guidance above ProcessCommand's
         -- own decide() call is itself observable. No context clause:
-        -- unlike Event or Projection, a summary is never created by any
-        -- rule in this specification - it exists only as compiled,
-        -- deployed configuration, the same register CommandType.tag_mappings
-        -- itself is drawn from, with no registration surface of its own
-        -- and so nothing here for a context clause to range over.
+        -- unlike Event or Projection, the Summary definition is never
+        -- created by any rule in this specification - it exists only as
+        -- compiled, deployed configuration (see value Summary), the same
+        -- register CommandType.consistency_query itself is drawn from,
+        -- with no registration surface of its own and so nothing here for
+        -- a context clause to range over. The SummaryState rows it reads
+        -- are folded from events (see rule FoldSummaries), but they are
+        -- keyed by the summary and a tag value, not created as summaries.
         -- access_mapping alone is enough to scope every answer to one
         -- bounded context, the same way QueryEvents/CountEvents scope
         -- through it without a context clause either.
@@ -8913,6 +10662,12 @@ surface CommandSubmission {
         -- submission for a command type that declares no owner dimension,
         -- whatever the grant's scope holds.
 
+    @guarantee RequiredRoleIsAnExtraGate
+        -- A command type may declare one Role name (#[requires_role]);
+        -- submitting it then requires both the write-level grant and that
+        -- exact Role.name. The check is deployed declaration, not
+        -- registration state, and never replaces the grant.
+
     @guarantee EveryCommandGetsACorrelationId
         -- correlation_id and causation_id are both optional, and a caller
         -- supplying neither is not thereby left out of the chain: the stored
@@ -8983,6 +10738,23 @@ surface CommandSubmission {
         -- indication when events within scope were left out. decide()
         -- itself still saw every matching event; this narrows only what
         -- is shown.
+        --
+        -- It serves the most recent matches rather than the oldest page
+        -- every other read starts from, deliberately: the caller is
+        -- debugging a decision that just happened, and the nearest
+        -- preceding events are the ones that explain it. A conflicting
+        -- event committed long ago is less likely to be the surprise than
+        -- the one immediately before the lock. last_by_sequence is that
+        -- mirror of first_by_sequence (see the note above rule
+        -- ConsumeEvents).
+
+    @guarantee EverySubmissionHasOneOutcome
+        -- Every accepted, duplicate, rejected, refused or pending-approval
+        -- submission is one CommandOutcome (see value CommandOutcome and
+        -- rule AnswerCommand) - the same answers on both tracks, never a
+        -- rejection shaped differently from a refusal or a field present
+        -- only on one path. This is the surface-level statement of what
+        -- AnswerCommand computes; a batch repeats it once per command.
 
     @guidance
         -- GraphQL only: a mutation, qualified by bounded context per the
@@ -9003,6 +10775,89 @@ surface CommandSubmission {
         -- narrowly scoped to an automated caller acting on an outcome,
         -- not debugging one. See MatchingEventsRequiresAdminLevel above
         -- for the access-level restriction on top of that scoping.
+}
+
+surface CommandApproval {
+    facing access_mapping: AdminAccess
+    context proposal: CommandProposal
+        where bounded_context = access_mapping.bounded_context
+
+    provides:
+        ListCommandProposals(access_mapping, command_type?, status?, after?)
+        ApproveCommand(access_mapping, proposal)
+        RejectCommand(access_mapping, proposal, reason)
+        SetCommandApprovalPolicy(access_mapping, command_type, approver_role?,
+            deadline_seconds?, allow_self_approval)
+
+    @guarantee GrantScopedToBoundedContext
+        -- A grant approves and lists proposals only in its own bounded
+        -- context. A proposal from another context is invisible here.
+
+    @guarantee ProposalIsPendingOnce
+        -- A submission of an approval-required type creates at most one
+        -- pending proposal per (command type, proposing caller,
+        -- idempotency key), and resubmitting with that key answers the
+        -- original proposal rather than a second one. A proposal may be
+        -- approved or rejected exactly once: the claim moves it out of
+        -- pending before the command runs, so two approvers cannot both
+        -- accept it. A crash after the claim is recoverable under the same
+        -- approval idempotency key rather than by running it twice.
+
+    @guarantee ApprovalRunsAgainstCurrentState
+        -- Approval is an ordinary submission at approval time: decide()
+        -- runs under the bounded context's lock against the state current
+        -- then, not against a snapshot taken when the proposal was made.
+        -- A decision can therefore differ from what would have happened
+        -- at proposal time, and that is the point of approving.
+
+    @guarantee NoSelfApprovalUnlessDeclared
+        -- The account that proposed may not approve its own proposal
+        -- unless the type's policy sets allow_self_approval. Self is the
+        -- proposing human, resolved by external_subject, not merely the
+        -- proposing Role row; rejecting one's own proposal is always
+        -- allowed as a withdrawal.
+
+    @guarantee StartupKeepsApprovalPolicies
+        -- A deploy that stops declaring an approval policy does not
+        -- remove the stored one; only an explicit
+        -- SetCommandApprovalPolicy false/clear does. The same
+        -- never-remove-a-protection stance startup registration takes.
+
+    @guidance
+        -- GraphQL only. REST submission of an approval-required type still
+        -- answers pendingApproval and a proposal id; approval and
+        -- rejection have no REST counterpart and are admin actions.
+}
+
+surface ParkedDeliveryAdmin {
+    facing access_mapping: AdminAccess
+    context delivery: ParkedDelivery
+        where bounded_context = access_mapping.bounded_context
+
+    provides:
+        ListParkedDeliveries(access_mapping, kind?, after?)
+        RetryParkedDelivery(access_mapping, delivery)
+        DiscardParkedDelivery(access_mapping, delivery)
+
+    @guarantee GrantScopedToBoundedContext
+        -- A grant sees and redrives only its own context's parked rows.
+
+    @guarantee RetryKeepsTheOriginalIdentity
+        -- A redrive runs under the token, route or deadline the row
+        -- recorded, with its original idempotency key where it had one, so
+        -- redriving a command that did commit is a duplicate, not a second
+        -- command. If the request can no longer be decoded the row is
+        -- refused as invalid rather than partially applied.
+
+    @guarantee OneAdminActionAtATime
+        -- A row is claimed before its redrive runs; a second retry while
+        -- the first is in flight is refused as already in progress. Delete
+        -- removes only the parked row, never any command or event.
+
+    @guidance
+        -- GraphQL only. Listing is paged with the same bound every other
+        -- list uses; the cursor spelling stays deferred with the wire
+        -- contract.
 }
 
 surface CommandTrigger {
@@ -9110,13 +10965,13 @@ surface CommandBatchSubmission {
         -- command sent on its own.
 
     @guarantee AnsweredInTheOrderGiven
-        -- A batch is answered with exactly one outcome per command, in the
-        -- order the commands were given, and each outcome is the one a
+        -- A batch is answered with exactly one CommandOutcome per command,
+        -- in the order the commands were given, and each is the outcome a
         -- single submission of that command answers: accepted with its
-        -- Command and events, rejected with its reason and kind,
-        -- deduplicated with the original outcome, or refused with the error
-        -- a single submission would get. The same holds for
-        -- TriggerCommands, whose outcomes are those of a single trigger.
+        -- Command and events, duplicate with the original outcome, rejected
+        -- with its reason and kind, refused with its refusal reason and
+        -- message, or pending_approval with its proposal. The same holds
+        -- for TriggerCommands, whose outcomes are those of a single trigger.
 
     @guarantee NotATransaction
         -- A batch is not accepted or rejected as a whole. An accepted
@@ -9141,9 +10996,10 @@ surface CommandBatchSubmission {
         -- batch. It is for a caller whose order the batch must not break
         -- across a failure: a broker bridge, whose partition is decided in
         -- order and whose dedupe watermark would otherwise move past a
-        -- message that failed. A command that fails after the batch's
-        -- commands were decided together - its write refused under the
-        -- lock - doesn't stop the commands decided with it. Unset, which
+        -- message that failed. A command that was decided but then failed
+        -- as its write committed does not retroactively stop the commands
+        -- answered before it; only the commands after it are left
+        -- unprocessed. Unset, which
         -- is how submitCommands always runs, NotATransaction holds as it
         -- stands.
 
@@ -9267,6 +11123,32 @@ surface CommandQuery {
         -- ProjectionQuery (see the scope header's exclusions).
 }
 
+surface EncryptionKeyAdmin {
+    facing caller: Superadmin
+
+    provides:
+        ListMasterKeys(caller)
+        AssignMasterKey(caller, bounded_context, master_key)
+        RotateMasterKey(caller, master_key)
+        RetireMasterKeyVersion(caller, master_key, retire_below)
+        DeleteMasterKey(caller, master_key)
+
+    @guarantee ProviderOwnsTheKeyMaterial
+        -- No action here accepts or returns key material. The provider
+        -- wraps and unwraps; this surface names a provider key, its
+        -- version and lifecycle.
+
+    @guarantee RotationNeverBlocksWrites
+        -- Rotation rewrites data keys in the background. A write during
+        -- it uses the latest version for a new data key and can still
+        -- unwrap an old one until its version is retired.
+
+    @guidance
+        -- GraphQL only, superadmin-only. The trail is recorded in the
+        -- admin context as the Encryption* SkiljRecorded events named in
+        -- the note above entity EncryptionKey.
+}
+
 surface TypeRegistration {
     facing access_mapping: AdminAccess
     context bounded_context: BoundedContext
@@ -9275,6 +11157,8 @@ surface TypeRegistration {
     exposes:
         for projection in bounded_context.projections:
             projection.name
+            projection.segments
+            projection.segment_key
             for rebuild in projection.rebuilds:
                 rebuild.status
                 rebuild.schema_version
@@ -9304,6 +11188,7 @@ surface TypeRegistration {
             command_type.name
             command_type.schema
             command_type.schema_version
+            command_type.required_role
             command_type.tag_mappings
             -- The consistency query as the answering instance has it
             -- deployed, not as registered - nothing registers it (see
@@ -9327,7 +11212,7 @@ surface TypeRegistration {
             sensitive_fields, private_fields, rest_trigger_allowed, owner_tag_key?)
             when bounded_context.status = active
         RegisterProjection(access_mapping, bounded_context, name, schema,
-            consumed_event_types, sync)
+            consumed_event_types, sync, requires_capability?, segments?, segment_key?)
             when bounded_context.status = active
         RebuildProjection(access_mapping, projection)
         DiscardProjectionRebuild(access_mapping, projection)
@@ -9644,6 +11529,35 @@ surface BoundedContextCreation {
         -- The next step is always GrantRoleAccessMapping on surface
         -- AccessManagement; see the note above rule AddBoundedContext for
         -- why the two are separate acts.
+}
+
+-- The GraphQL schema is per caller (docs/architecture.md §138), not one
+-- shared schema: a Role's schema contains only the projection types of
+-- bounded contexts its active mappings reach, a superadmin gets all of
+-- them, and a caller with no credential gets none and introspection
+-- disabled. Resolvers already refuse, but a type's presence is itself an
+-- oracle, so validation must not see another tenant's types either.
+rule BuildSchemaForCaller {
+    when: SchemaRequested(caller?)
+    let visible_contexts =
+        if caller = null: {}
+        else if caller.superadmin: BoundedContexts
+        else: BoundedContexts where exists RoleAccessMapping{
+            role: caller, bounded_context: this, status: active
+        }
+    ensures:
+        SchemaServed(
+            caller: caller,
+            bounded_contexts: visible_contexts,
+            introspection: caller != null
+        )
+
+    @guidance
+        -- Scoped schemas are cached per set of bounded contexts and the
+        -- registry generation; a schema built while a rebuild ran is
+        -- served but not cached. A context the caller cannot see fails
+        -- validation exactly as one that does not exist, which is the
+        -- point: an existence oracle is a grant too.
 }
 
 surface BoundedContextDirectory {
@@ -9978,7 +11892,7 @@ surface PrivateFieldGrantManagement {
         GrantPrivateFieldAccessForEvent(access_mapping, grantee, event?)
         GrantPrivateFieldAccessForCommand(access_mapping, grantee, command?)
         RevokePrivateFieldAccess(access_mapping, grant)
-        ListPrivateFieldGrants(access_mapping, grantor?)
+        ListPrivateFieldGrants(access_mapping, grantor?, after_grant_id?)
 
     @guarantee SharingIsSelfServiceAndRevocationIsTheGrantorsAlone
         -- The only surface in this file where a grant is made with no
