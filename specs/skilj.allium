@@ -2093,7 +2093,13 @@ default SystemCreator skilj = { }
 -- a scalar's declared type is the same either way, whereas encrypting the
 -- whole object would flip its type between object and string depending on
 -- who reads it. subject_field resolves the same way, and is read, never
--- encrypted, exactly as when it names a top-level field. Unlike
+-- encrypted, exactly as when it names a top-level field. A sensitive
+-- field's own value may be stored only when its subject resolves: if the
+-- payload carries the sensitive leaf but omits the subject (or gives a
+-- non-scalar one), no key can be chosen, so the write is refused with
+-- sensitive_field_without_subject rather than leaving the plaintext in
+-- storage where ForgetSubject could never reach it. A field whose leaf is
+-- absent has nothing to protect and is skipped, as before. Unlike
 -- next_sequence's target, EncryptionKey is a real, rule-governed entity
 -- (see its transitions and ForgetSubject below); this call only ever
 -- provisions - destruction is always a separate, explicitly authorised
@@ -3775,12 +3781,19 @@ rule CreateEventTypeSubscription {
 -- PrivateField). It decides one thing per field: whether this caller is
 -- entitled to see the leaf.
 --
+-- For an own-kind field, the default reader is the record's own creator;
+-- for an addressed-kind field, it is the party that field's own
+-- PrivateField.addressee_field names in the payload. The answer is
+-- therefore per field, not per record: an addressee of one addressed
+-- field does not thereby read the creator's own-kind fields, and the
+-- creator does not thereby read a field addressed to someone else.
+-- is_default_private_reader remains the record-level predicate for who
+-- may grant on a record, not for which field a reader sees.
+--
 -- For an own-kind or addressed-kind field, the caller is entitled when
 -- any of three things is true:
---   - is_default_private_reader(record, access_mapping) holds - the
---     caller is the record's own creator, or the party its payload
---     addressed (see the guidance on rule
---     GrantPrivateFieldAccessForEvent for that predicate in full), or
+--   - the caller is that field's own default reader, as described above,
+--     or
 --   - an active PrivateFieldGrant names this exact record and this
 --     caller's Role as grantee, or
 --   - an active blanket PrivateFieldGrant - one naming neither an event
@@ -3791,6 +3804,11 @@ rule CreateEventTypeSubscription {
 --     was made. That is what keeps a blanket grant a convenience instead
 --     of a wider trust boundary: it can never let a grantee see something
 --     its grantor could not have handed over one record at a time.
+--
+-- A grant whose own grantor is no longer active has no effect: a revoked
+-- Role's outgoing shares stop reaching their grantees at the next read,
+-- whether they named one record or no record at all.
+--
 -- For a capability-kind field, the caller is entitled when
 -- access_mapping.capabilities contains that field's own declared
 -- capability, and there is no PrivateFieldGrant to look for - holding
@@ -8927,7 +8945,7 @@ surface CommandSubmission {
     @guarantee DuplicateAcceptanceReturnsTheOriginalOutcome
         -- A submission whose idempotency_key already produced an accepted
         -- outcome for this command type in this bounded context, submitted
-        -- by the same Role, is answered
+        -- by the same caller, is answered
         -- with that original outcome - the same triggered events - and
         -- decide() is not called again, no second Command is created and no
         -- second event is appended. It is the original answer even when
@@ -8939,8 +8957,9 @@ surface CommandSubmission {
         -- Bounded to acceptances on purpose: a key that produced a
         -- rejection has nothing remembered against it, and a resubmission
         -- bearing it is decided fresh, every time (see rule
-        -- ProcessCommand). Scoped to the bounded context and command type
-        -- alone, and not to the submitting Role.
+        -- ProcessCommand). Scoped to the bounded context, command type and
+        -- submitting caller (client_id) - never shared across callers, so
+        -- one caller's key can never swallow another caller's submission.
 
     @guarantee MatchingEventsRequiresAdminLevel
         -- The matching_events set surfaced on a rejection (see the

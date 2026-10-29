@@ -158,6 +158,7 @@ fn status_for(err: &CoreError) -> StatusCode {
             EventStoreError::InvalidTagMapping => StatusCode::BAD_REQUEST,
             EventStoreError::InvalidSensitiveField => StatusCode::BAD_REQUEST,
             EventStoreError::PayloadDoesNotMatchSchema => StatusCode::BAD_REQUEST,
+            EventStoreError::SensitiveFieldWithoutSubject => StatusCode::BAD_REQUEST,
             EventStoreError::ReservedIdempotencyKeyPrefix => StatusCode::BAD_REQUEST,
             EventStoreError::IdempotencyKeyTooLong => StatusCode::BAD_REQUEST,
             EventStoreError::DedupeAndIdempotencyKey => StatusCode::BAD_REQUEST,

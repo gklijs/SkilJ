@@ -10,6 +10,32 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Security
+
+- A sensitive field whose value is present but whose `subject_field` is
+  absent (or not a scalar) is no longer stored in plaintext. The write is
+  refused with `sensitive_field_without_subject`; the infallible
+  `protect_sensitive_fields` wrapper fails closed by nulling every
+  sensitive leaf instead. A declared field whose leaf is absent is still
+  skipped.
+- A revoked Role's outgoing private-field grants stop granting at the
+  next read, per-record and blanket alike: a grant now counts only while
+  its grantor is active. The rows stay `active`; ending them with the
+  Role is a separate change.
+- Private-field entitlement is decided per field rather than per record:
+  an `own` field is visible to the record's creator, and an `addressed`
+  field to the party *that field's* `addressee_field` names. A type
+  declaring both no longer lets the addressee read the creator's own
+  fields or the creator read what was addressed to someone else.
+  Record-level `is_default_private_reader` still decides who may grant.
+
+### Fixed
+
+- Spec: an idempotency key is scoped to the submitting caller
+  (`client_id`) as well as the bounded context and command type, matching
+  `ProcessCommand`; the contradictory "not to the submitting Role"
+  sentence is gone (issue #137).
+
 ## [0.2.0] - 2026-10-27
 
 ### Changed (breaking)

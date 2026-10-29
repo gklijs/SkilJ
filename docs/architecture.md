@@ -5335,14 +5335,19 @@ colleague" into an administrative ticket. `grant_private_field_access_for_event`
 the grantor is genuinely the named record's own default reader via a new
 shared predicate, `is_default_private_reader(record, role)` - generic
 over `Event`/`Command` via a small `PrivateFieldRecord` trait
-(`skilj-core/src/event_store/mod.rs`), one predicate reused at grant
-time and render time alike, never two implementations of the same
-question. A blanket grant cannot be checked against records that do not
-exist yet, so it is trusted when made and *re-derived per record at
-every read* instead - what stops it being a wider trust boundary than
-the per-record form: a reader coming through a blanket grant sees a
-field only where the grantor would itself have been that exact record's
-default reader. `revoke_private_field_access` - only the grantor may end
+(`skilj-core/src/event_store/mod.rs`), used at grant time and to
+re-derive a blanket grantor's reach at read time. It stays record-level
+on purpose: it answers who may *grant* on a record. Which field a reader
+sees is decided per field instead (`own` by the creator, `addressed` by
+that field's own `addressee_field`), so a type declaring both kinds does
+not let an addressee read the creator's own fields or the reverse. A
+blanket grant cannot be checked against records that do not exist yet,
+so it is trusted when made and *re-derived per record at every read*
+instead - what stops it being a wider trust boundary than the per-record
+form: a reader coming through a blanket grant sees a field only where
+the grantor would itself have been that exact record's default reader.
+A grant whose grantor is no longer active reaches nothing, per-record
+or blanket, even while its row says `active`. `revoke_private_field_access` - only the grantor may end
 it, not the grantee, not an admin. `list_private_field_grants` - a
 caller's own outgoing grants need no particular level; naming a
 *different* grantor needs `access_mapping.level = admin`, the
@@ -5364,9 +5369,11 @@ needs no extra load to reconstruct one at read time.
 **Render-time integration**: `render_event`/`render_command` each gained
 a `grants: &[PrivateFieldGrant]` parameter and a third redaction pass
 after the existing sensitive-field one - per `PrivateField` entry,
-`Team`-kind checks `access_mapping.role.name` directly; `Own`/`Addressed`
-check `is_default_private_reader` first, then any active grant naming
-this exact record or (re-derived) a matching blanket one. Every call
+`Capability`-kind checks `access_mapping.capabilities` directly;
+`Own`/`Addressed` check that field's own default reader first (the
+creator for `Own`, the party that field's `addressee_field` names for
+`Addressed`), then any active grant naming this exact record or
+(re-derived) a matching blanket one whose grantor is still active. Every call
 site that already threaded `access_mapping ` through now also loads and
 threads a `Vec<PrivateFieldGrant>` snapshot - `query_events`/
 `inspect_event`/`fetch_commands`/`deliver_to_subscriptions`'s own
@@ -13117,7 +13124,7 @@ Tests: `skilj/tests/projection_query.rs` (`capability_mutations_and_reads_end_to
 
 **Concurrency.** Every writer takes the mapping row first and the admin context's `sequence` row second, and everything that locks both follows that order. The baseline re-reads the mapping `FOR UPDATE` inside its transaction before taking the sequence lock, and baselines from that fresh row, so a grant revoked, deleted or changed since the list was read is skipped or recorded as it is now, never resurrected after its `AccessRevoked`. The deletion locks the `bounded_contexts` row (which holds off a new mapping through its foreign key), then the active mapping rows, then the private-field grants table (`SHARE ROW EXCLUSIVE`), reads what is active, drops the schema, and only then records the revokes, so the sequence lock is held for the inserts and the commit, not across the drop, and a grant committed after the read cannot exist. Tests: `a_baseline_does_not_resurrect_a_grant_revoked_after_it_listed`, `a_deletion_waits_for_a_private_field_grant_in_flight_and_records_it`, `a_stale_registered_schema_is_refreshed_at_startup`.
 
-**Role revocation and private-field grants.** `revokeRole` ends the Role's mappings and records each (`role_revoked`). It does not end the private-field grants the Role made or holds, and records nothing for them: a revoked Role cannot authenticate, so a share to it reads nothing and a share by it is a decision about records the grantor can no longer reach, and a Role is never reactivated. The grants remain `active` rows with no revoke event. Ending them with the Role would be a separate change.
+**Role revocation and private-field grants.** `revokeRole` ends the Role's mappings and records each (`role_revoked`). It does not rewrite the private-field grants the Role made or holds, and records nothing for them, but neither kind has any effect afterwards: a revoked Role cannot authenticate, so a share *to* it reads nothing, and `entitled_to_read_private_field` now requires the grant's own `grantor.status` to be active, so a share *by* it stops reaching its grantees at the next read too - per-record and blanket alike. The grants remain `active` rows with no revoke event. Ending them with the Role (and recording `PrivateFieldAccessRevoked` with reason `role_revoked`) would be a separate change.
 
 **Not done:** denied attempts, reads of gated projections, and the other admin operations (tokens, type registration, and the adding and archiving of bounded contexts), which the spec still lists as direct effects.
 

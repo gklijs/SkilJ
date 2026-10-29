@@ -101,10 +101,19 @@ fn addressed_field() -> PrivateField {
     }
 }
 
-/// A schema real enough for `valid_private_fields` to resolve `note` and
-/// `addressee_id` as real leaves.
+/// A second addressed field, on the same type as an own field, so a test
+/// can prove entitlement is per field rather than per record.
+fn addressed_message_field() -> PrivateField {
+    PrivateField {
+        field: "message".into(),
+        ..addressed_field()
+    }
+}
+
+/// A schema real enough for `valid_private_fields` to resolve `note`,
+/// `message` and `addressee_id` as real leaves.
 fn schema() -> String {
-    r#"{"properties":{"note":{"type":"string"},"addressee_id":{"type":"string"}}}"#.into()
+    r#"{"properties":{"note":{"type":"string"},"message":{"type":"string"},"addressee_id":{"type":"string"}}}"#.into()
 }
 
 fn event_type(private_fields: Vec<PrivateField>) -> EventType {
@@ -576,6 +585,35 @@ fn render_event_redacts_an_addressed_field_from_anyone_else() {
     assert_eq!(rendered, r#"{"addressee_id":"customer@x","note":null}"#);
 }
 
+/// #136: a type may declare both kinds on one record. Each field has its
+/// own default reader, so the creator does not thereby read what was
+/// addressed to the customer, and the customer does not thereby read the
+/// creator's own note.
+#[test]
+fn render_event_decides_each_fields_default_reader_separately() {
+    let et = event_type(vec![own_field(), addressed_message_field()]);
+    let e = event(
+        &et,
+        0,
+        "role-1",
+        r#"{"note":"creator only","message":"for the customer","addressee_id":"customer@x"}"#,
+    );
+    let creator = access_mapping(role("role-1", "Agent", "agent@x"), AccessLevel::Admin);
+    let customer = access_mapping(
+        role("cust-role", "Customer", "customer@x"),
+        AccessLevel::Admin,
+    );
+
+    assert_eq!(
+        event_store::render_event(&e, &creator, &no_key, &[]),
+        r#"{"addressee_id":"customer@x","message":null,"note":"creator only"}"#
+    );
+    assert_eq!(
+        event_store::render_event(&e, &customer, &no_key, &[]),
+        r#"{"addressee_id":"customer@x","message":"for the customer","note":null}"#
+    );
+}
+
 #[test]
 fn render_event_a_per_record_grant_opens_an_own_field_to_its_grantee() {
     let et = event_type(vec![own_field()]);
@@ -669,6 +707,47 @@ fn render_event_a_revoked_grant_no_longer_opens_the_field() {
         status: TokenStatus::Revoked,
         revoked_at: Some(timestamp(1)),
         ..blanket_grant(role("role-1", "Agent", "agent@x"), grantee)
+    };
+
+    let rendered = event_store::render_event(&e, &mapping, &no_key, &[grant]);
+
+    assert_eq!(rendered, r#"{"note":null}"#);
+}
+
+/// #135: a grant whose own grantor has been revoked stops reaching its
+/// grantee, even though the grant row is still `active`.
+#[test]
+fn render_event_a_blanket_grant_from_a_revoked_grantor_no_longer_opens_the_field() {
+    let et = event_type(vec![own_field()]);
+    let e = event(&et, 0, "role-1", r#"{"note":"private"}"#);
+    let grantee = role("role-2", "Colleague", "colleague@x");
+    let mapping = access_mapping(grantee.clone(), AccessLevel::Admin);
+    let revoked_grantor = Role {
+        status: RoleStatus::Revoked,
+        revoked_at: Some(timestamp(1)),
+        ..role("role-1", "Agent", "agent@x")
+    };
+    let grant = blanket_grant(revoked_grantor, grantee);
+
+    let rendered = event_store::render_event(&e, &mapping, &no_key, &[grant]);
+
+    assert_eq!(rendered, r#"{"note":null}"#);
+}
+
+#[test]
+fn render_event_a_per_record_grant_from_a_revoked_grantor_no_longer_opens_the_field() {
+    let et = event_type(vec![own_field()]);
+    let e = event(&et, 0, "role-1", r#"{"note":"private"}"#);
+    let grantee = role("role-2", "Colleague", "colleague@x");
+    let mapping = access_mapping(grantee.clone(), AccessLevel::Admin);
+    let revoked_grantor = Role {
+        status: RoleStatus::Revoked,
+        revoked_at: Some(timestamp(1)),
+        ..role("role-1", "Agent", "agent@x")
+    };
+    let grant = PrivateFieldGrant {
+        event_sequence: Some(0),
+        ..blanket_grant(revoked_grantor, grantee)
     };
 
     let rendered = event_store::render_event(&e, &mapping, &no_key, &[grant]);

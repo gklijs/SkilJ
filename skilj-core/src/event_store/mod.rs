@@ -802,6 +802,17 @@ pub enum Error {
     #[error("this payload does not validate against its type's registered schema")]
     PayloadDoesNotMatchSchema,
 
+    /// A declared sensitive field has a value in the payload but its own
+    /// `subject_field` is absent (or not a scalar), so there is no subject
+    /// to key the ciphertext by. Storing it anyway would leave the value in
+    /// plaintext and make it unerasable by `ForgetSubject`, so the write is
+    /// refused instead.
+    #[error(
+        "a sensitive field is present but its subject_field is absent: every sensitive value \
+         needs a subject to be encrypted under"
+    )]
+    SensitiveFieldWithoutSubject,
+
     /// Not spec-modeled: a security-review finding on `CrossContextRoute`
     /// ([docs/architecture.md §36](../../../docs/architecture.md#cross-context-route)) - the `idempotency_keys` table's own
     /// primary key is `(command_type_name, idempotency_key)` with no
@@ -948,6 +959,7 @@ impl SkiljRejection for Error {
             Error::DirectCreationNotAllowed => "direct_creation_not_allowed",
             Error::RestTriggerNotAllowed => "rest_trigger_not_allowed",
             Error::PayloadDoesNotMatchSchema => "payload_does_not_match_schema",
+            Error::SensitiveFieldWithoutSubject => "sensitive_field_without_subject",
             Error::ReservedIdempotencyKeyPrefix => "reserved_idempotency_key_prefix",
             Error::IdempotencyKeyTooLong => "idempotency_key_too_long",
             Error::DedupeAndIdempotencyKey => "dedupe_and_idempotency_key",
@@ -2196,40 +2208,64 @@ fn highest_sequence(events: &[Event]) -> Option<i64> {
 /// Takes `sensitive_fields` alone, not a whole `EventType`/`CommandType`,
 /// since "it takes an EventType and a CommandType interchangeably" per
 /// the spec's own note - `sensitive_fields` is the identical
-/// `Set<SensitiveField>` on both. A field or its own `subject_field`
+/// `Set<SensitiveField>` on both. A declared field whose own leaf is
 /// missing from `payload` (an optional field the caller omitted) is
-/// skipped rather than encrypted with nothing to key it by - the same
-/// "absence reads as empty/no-op" register `schema_properties`/
-/// `schema_required` already use elsewhere in this module.
+/// skipped - the same "absence reads as empty/no-op" register
+/// `schema_properties`/`schema_required` already use elsewhere in this
+/// module.
+///
+/// A sensitive field that *has* a value but whose subject field is absent
+/// must not be stored in plaintext: [`try_protect_sensitive_fields`]
+/// refuses that write. This infallible wrapper exists for callers whose
+/// payload is generated rather than supplied (a scheduled event's
+/// `scheduled_payload`), and fails closed there instead - every declared
+/// sensitive leaf is nulled and no key is returned - so no path can ever
+/// write an unkeyed plaintext value through it.
 pub fn protect_sensitive_fields(
     sensitive_fields: &[SensitiveField],
     payload: &str,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
 ) -> ProtectedPayload {
+    match try_protect_sensitive_fields(sensitive_fields, payload, resolve_key) {
+        Ok(protected) => protected,
+        Err(_) => redact_every_sensitive_field(sensitive_fields, payload),
+    }
+}
+
+/// The write paths' version of [`protect_sensitive_fields`]: identical,
+/// except that a declared sensitive field with a value but no subject is
+/// an error (`Error::SensitiveFieldWithoutSubject`) instead of being left
+/// in the clear. Every caller that stores a caller-supplied payload uses
+/// this one.
+pub fn try_protect_sensitive_fields(
+    sensitive_fields: &[SensitiveField],
+    payload: &str,
+    resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
+) -> crate::error::Result<ProtectedPayload> {
     if sensitive_fields.is_empty() {
-        return ProtectedPayload {
+        return Ok(ProtectedPayload {
             payload: payload.to_string(),
             encryption_keys: Vec::new(),
-        };
+        });
     }
 
     let mut parsed: serde_json::Value = serde_json::from_str(payload).expect(
-        "protect_sensitive_fields: payload is always valid JSON by the time this is called",
+        "try_protect_sensitive_fields: payload is always valid JSON by the time this is called",
     );
     let mut used_keys: Vec<EncryptionKey> = Vec::new();
 
     for sf in sensitive_fields {
-        let Some(subject_value) =
-            payload_field_value(&parsed, &sf.subject_field).and_then(json_scalar_to_string)
-        else {
-            continue;
-        };
+        let subject_value =
+            payload_field_value(&parsed, &sf.subject_field).and_then(json_scalar_to_string);
         let Some(plaintext) = payload_field_value(&parsed, &sf.field).map(|v| {
             v.as_str()
                 .map(str::to_string)
                 .unwrap_or_else(|| v.to_string())
         }) else {
             continue;
+        };
+        let Some(subject_value) = subject_value else {
+            return Err(Error::SensitiveFieldWithoutSubject.into());
         };
 
         let (key, data_key) = resolve_key(&sf.subject_key, &subject_value);
@@ -2243,10 +2279,38 @@ pub fn protect_sensitive_fields(
         }
     }
 
-    ProtectedPayload {
+    Ok(ProtectedPayload {
         payload: serde_json::to_string(&parsed)
             .expect("re-serialising a parsed JSON Value is infallible"),
         encryption_keys: used_keys,
+    })
+}
+
+/// The fail-closed fallback [`protect_sensitive_fields`] returns when
+/// [`try_protect_sensitive_fields`] refuses a payload: every declared
+/// sensitive leaf is set to null, so no value is left readable.
+fn redact_every_sensitive_field(
+    sensitive_fields: &[SensitiveField],
+    payload: &str,
+) -> ProtectedPayload {
+    if sensitive_fields.is_empty() {
+        return ProtectedPayload {
+            payload: payload.to_string(),
+            encryption_keys: Vec::new(),
+        };
+    }
+    let mut parsed: serde_json::Value = serde_json::from_str(payload).expect(
+        "redact_every_sensitive_field: payload is always valid JSON by the time this is called",
+    );
+    for sf in sensitive_fields {
+        if let Some(slot) = payload_field_value_mut(&mut parsed, &sf.field) {
+            *slot = serde_json::Value::Null;
+        }
+    }
+    ProtectedPayload {
+        payload: serde_json::to_string(&parsed)
+            .expect("re-serialising a parsed JSON Value is infallible"),
+        encryption_keys: Vec::new(),
     }
 }
 
@@ -2260,8 +2324,10 @@ pub fn protect_sensitive_fields(
 /// `resolve_key` returning `None` (a destroyed key - `ForgetSubject`) is
 /// `Error::EncryptionKeyNotActive`: the proposal can no longer be
 /// approved, which is the intended crypto-shredding outcome rather than a
-/// decryption panic. A field absent from the payload is skipped, matching
-/// `protect_sensitive_fields`'s own skip.
+/// decryption panic. A field whose own leaf is absent from the payload is
+/// skipped, the same absent-leaf case `try_protect_sensitive_fields`
+/// skips. A proposal stored before that check existed may also lack the
+/// subject; it is left as stored rather than decrypted.
 pub fn reveal_sensitive_fields(
     sensitive_fields: &[SensitiveField],
     payload: &str,
@@ -2539,30 +2605,40 @@ pub fn is_default_private_reader<R: PrivateFieldRecord>(record: &R, role: &Role)
 /// Whether `access_mapping.role` may read one `PrivateField` entry on
 /// `record` - the one decision the redaction pass below makes per field.
 /// `Capability`-kind needs no `record`/grant lookup at all: holding the
-/// capability is the entitlement. `Own`/`Addressed` hold when `is_default_private_reader` holds
-/// directly, or an active `PrivateFieldGrant` reaches this caller -
-/// either a per-record one `matches_this_record` identifies, or a
-/// blanket one (naming neither an event nor a command) whose own
-/// `grantor` independently satisfies `is_default_private_reader` for
-/// `record` - re-derived here, against the record actually being read,
-/// which is what keeps a blanket grant a convenience rather than a wider
-/// trust boundary (see `entity PrivateFieldGrant`'s own doc comment).
+/// capability is the entitlement. `Own`/`Addressed` hold when this exact
+/// field's own default reader is the caller, or an active
+/// `PrivateFieldGrant` reaches this caller - either a per-record one
+/// `matches_this_record` identifies, or a blanket one (naming neither an
+/// event nor a command) whose own `grantor` independently satisfies
+/// `is_default_private_reader` for `record` - re-derived here, against the
+/// record actually being read, which is what keeps a blanket grant a
+/// convenience rather than a wider trust boundary (see `entity
+/// PrivateFieldGrant`'s own doc comment).
+///
+/// The default-reader half is deliberately per field, not per record:
+/// an `Own` field is visible only to the record's creator, and an
+/// `Addressed` field only to the party *that field's own*
+/// `addressee_field` names. `is_default_private_reader`'s record-level
+/// answer stays in use for who may *grant* on a record; it must not decide
+/// which field a reader sees, or an addressee of one field would also read
+/// the creator's `Own` fields and the reverse.
 fn entitled_to_read_private_field<R: PrivateFieldRecord>(
     record: &R,
-    kind: PrivateFieldKind,
-    capability: Option<&str>,
+    field: &PrivateField,
     access_mapping: &RoleAccessMapping,
     grants: &[PrivateFieldGrant],
     matches_this_record: impl Fn(&PrivateFieldGrant) -> bool,
 ) -> bool {
-    match kind {
-        PrivateFieldKind::Capability => {
-            crate::access_control::mapping_holds_capability(access_mapping, capability)
-        }
+    match field.kind {
+        PrivateFieldKind::Capability => crate::access_control::mapping_holds_capability(
+            access_mapping,
+            field.capability.as_deref(),
+        ),
         PrivateFieldKind::Own | PrivateFieldKind::Addressed => {
-            is_default_private_reader(record, &access_mapping.role)
+            private_field_default_reader(record, field, &access_mapping.role)
                 || grants.iter().any(|g| {
                     g.status == TokenStatus::Active
+                        && g.grantor.status == RoleStatus::Active
                         && g.grantee == access_mapping.role
                         && (matches_this_record(g)
                             || (g.event_sequence.is_none()
@@ -2570,6 +2646,32 @@ fn entitled_to_read_private_field<R: PrivateFieldRecord>(
                                 && is_default_private_reader(record, &g.grantor)))
                 })
         }
+    }
+}
+
+/// The per-field half of the default-reader rule: `Own` holds for the
+/// record's creator, `Addressed` for whoever the field's own
+/// `addressee_field` names in `record`'s payload. `Capability` has no
+/// default reader (see `entitled_to_read_private_field` above).
+fn private_field_default_reader<R: PrivateFieldRecord>(
+    record: &R,
+    field: &PrivateField,
+    role: &Role,
+) -> bool {
+    match field.kind {
+        PrivateFieldKind::Own => record.client_id() == role.id,
+        PrivateFieldKind::Addressed => {
+            let Some(addressee_field) = field.addressee_field.as_deref() else {
+                return false;
+            };
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(record.payload()) else {
+                return false;
+            };
+            payload_field_value(&parsed, addressee_field)
+                .and_then(json_scalar_to_string)
+                .is_some_and(|addressee| addressee == role.external_subject)
+        }
+        PrivateFieldKind::Capability => false,
     }
 }
 
@@ -2605,8 +2707,8 @@ fn entitled_to_read_private_field<R: PrivateFieldRecord>(
 /// before the call" split every other rule in this module already
 /// follows for `resolve_data_key`. Empty for a caller with no such
 /// grants, which is every caller before this mechanism existed - the
-/// third pass below is then just `is_default_private_reader`/capability
-/// holding, unchanged from a `private_fields`-free type's own
+/// third pass below is then just the field's own default reader (or its
+/// capability) holding, unchanged from a `private_fields`-free type's own
 /// behaviour.
 pub fn render_event(
     event: &Event,
@@ -2746,14 +2848,7 @@ fn redact_unentitled_private_fields<R: PrivateFieldRecord>(
         "redact_unentitled_private_fields: payload is always valid JSON by the time this is called",
     );
     for p in private_fields {
-        if entitled_to_read_private_field(
-            record,
-            p.kind,
-            p.capability.as_deref(),
-            access_mapping,
-            grants,
-            &matches_this_record,
-        ) {
+        if entitled_to_read_private_field(record, p, access_mapping, grants, &matches_this_record) {
             continue;
         }
         if let Some(slot) = payload_field_value_mut(&mut parsed, &p.field) {
@@ -4394,7 +4489,8 @@ pub fn create_external_event(
     )?;
     let event_type = &adapter.event_type;
 
-    let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
+    let protected =
+        try_protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key)?;
     Ok(Event {
         bounded_context: event_type.bounded_context.clone(),
         event_type: event_type.clone(),
@@ -4446,7 +4542,8 @@ pub fn create_direct_event(
     )?;
     let event_type = &adapter.event_type;
 
-    let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
+    let protected =
+        try_protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key)?;
     Ok(Event {
         bounded_context: event_type.bounded_context.clone(),
         event_type: event_type.clone(),
@@ -5241,7 +5338,8 @@ pub(crate) fn process_command_at_boundary(
     let consistency_tags =
         derive_tags(&command_type.tag_mappings, payload, blind, bounded_context)?;
 
-    let protected = protect_sensitive_fields(&command_type.sensitive_fields, payload, &resolve_key);
+    let protected =
+        try_protect_sensitive_fields(&command_type.sensitive_fields, payload, &resolve_key)?;
     let command = Command {
         id,
         bounded_context: command_type.bounded_context.clone(),
@@ -5266,8 +5364,11 @@ pub(crate) fn process_command_at_boundary(
         let event_type = resolve_event_type(&spec.event_type)
             .ok_or_else(|| Error::UnregisteredEventType(spec.event_type.clone()))?;
         let spec_payload = spec.payload.to_string();
-        let event_protected =
-            protect_sensitive_fields(&event_type.sensitive_fields, &spec_payload, &resolve_key);
+        let event_protected = try_protect_sensitive_fields(
+            &event_type.sensitive_fields,
+            &spec_payload,
+            &resolve_key,
+        )?;
         events.push(Event {
             bounded_context: command_type.bounded_context.clone(),
             event_type: event_type.clone(),
