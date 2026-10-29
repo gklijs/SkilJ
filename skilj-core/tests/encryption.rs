@@ -10,6 +10,7 @@ use chrono::Utc;
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::encryption::{self, EncryptionMasterKey};
+use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{
     self, BoundedContext, BoundedContextStatus, Command, CommandType, EncryptionKey,
     EncryptionKeyStatus, Event, EventOrigin, EventType,
@@ -170,6 +171,66 @@ fn protect_sensitive_fields_is_a_no_op_when_sensitive_fields_is_empty() {
         panic!("resolve_key must never be called when sensitive_fields is empty")
     });
     assert_eq!(protected.payload, r#"{"a":1}"#);
+    assert!(protected.encryption_keys.is_empty());
+}
+
+#[test]
+fn try_protect_sensitive_fields_refuses_a_sensitive_value_without_its_subject() {
+    let sensitive_fields = vec![SensitiveField {
+        field: "email".into(),
+        subject_key: "user".into(),
+        subject_field: "user_id".into(),
+    }];
+    // The sensitive leaf is present; the subject field it would be keyed
+    // by is not.
+    let payload = r#"{"email":"person@example.com","other":"unchanged"}"#;
+
+    let err = event_store::try_protect_sensitive_fields(&sensitive_fields, payload, |_, _| {
+        panic!("resolve_key must never be called without a subject")
+    })
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        event_store::Error::SensitiveFieldWithoutSubject.code()
+    );
+}
+
+#[test]
+fn protect_sensitive_fields_fails_closed_when_a_sensitive_value_has_no_subject() {
+    let sensitive_fields = vec![SensitiveField {
+        field: "email".into(),
+        subject_key: "user".into(),
+        subject_field: "user_id".into(),
+    }];
+    let payload = r#"{"email":"person@example.com","other":"unchanged"}"#;
+
+    let protected = event_store::protect_sensitive_fields(&sensitive_fields, payload, |_, _| {
+        panic!("resolve_key must never be called without a subject")
+    });
+
+    let parsed: serde_json::Value = serde_json::from_str(&protected.payload).unwrap();
+    assert_eq!(parsed["email"], serde_json::Value::Null);
+    assert_eq!(parsed["other"], "unchanged");
+    assert!(protected.encryption_keys.is_empty());
+}
+
+#[test]
+fn try_protect_sensitive_fields_skips_a_declared_field_that_is_absent() {
+    let sensitive_fields = vec![SensitiveField {
+        field: "email".into(),
+        subject_key: "user".into(),
+        subject_field: "user_id".into(),
+    }];
+    let payload = r#"{"other":"unchanged"}"#;
+
+    let protected =
+        event_store::try_protect_sensitive_fields(&sensitive_fields, payload, |_, _| {
+            panic!("resolve_key must never be called for an absent field")
+        })
+        .unwrap();
+
+    assert_eq!(protected.payload, payload);
     assert!(protected.encryption_keys.is_empty());
 }
 

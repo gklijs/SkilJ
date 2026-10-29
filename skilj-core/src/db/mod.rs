@@ -4842,7 +4842,7 @@ pub async fn propose_command(
         &mut resolved,
     )
     .await?;
-    let protected = crate::event_store::protect_sensitive_fields(
+    let protected = crate::event_store::try_protect_sensitive_fields(
         &command_type.sensitive_fields,
         &authorised.payload,
         |subject_key, subject_value| {
@@ -4858,7 +4858,7 @@ pub async fn propose_command(
                 data_key.clone(),
             )
         },
-    );
+    )?;
 
     let id = crate::shared::generate_token_id();
     let expires_at = policy
