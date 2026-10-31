@@ -311,6 +311,7 @@ impl Projection for CustomerProfile {
     type State = CustomerProfileState;
     type Event = BankingEvent;
     const NAME: &'static str = "CustomerProfile";
+    const SUBJECT_KEY: Option<&'static str> = Some("customer");
     fn consumed_event_types() -> Vec<&'static str> {
         vec!["AccountOpened"]
     }
@@ -1770,6 +1771,7 @@ fn colliding_projection_type_names_serve_one_and_refuse_the_other() {
                     consumed_event_types: Vec::new(),
                     sync: false,
                     caught_up_to: None,
+                    owner_tag_key: None,
                     requires_capability: None,
                 },
             )

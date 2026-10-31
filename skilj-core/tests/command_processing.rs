@@ -1033,3 +1033,44 @@ fn a_full_dcb_scenario_uses_real_derive_tags_output_not_hand_built_fixtures() {
 // is "held within one reconciliation pass by registering EventTypes
 // before CommandTypes... not by any check in ProcessCommand itself" -
 // RegisterEventType/RegisterCommandType's obligation, not this one's.
+
+#[test]
+fn null_tags_do_not_create_a_default_boundary_but_remain_explicitly_queryable() {
+    let null = Tag {
+        key: "account".into(),
+        value: None,
+    };
+    let events = vec![
+        event_with_tags(0, vec![null.clone()]),
+        event_with_tags(1, vec![tag("account", "A")]),
+    ];
+    let tags = vec![null.clone(), tag("account", "A")];
+    let query = event_store::effective_query(&[], &tags);
+    assert_eq!(
+        event_store::select_matching_events(&query, &events)
+            .iter()
+            .map(|e| e.sequence)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(event_store::consistency_boundary(&events, &tags), Some(1));
+    let only_null = vec![null.clone()];
+    assert!(event_store::effective_query(&[], &only_null).is_empty());
+    assert_eq!(
+        event_store::consistency_boundary_and_matching_events(&events, &only_null),
+        (None, Vec::new())
+    );
+    let explicit = vec![skilj_core::shared::QueryItem {
+        event_types: vec![],
+        tags: only_null,
+        latest: None,
+        snapshot: None,
+    }];
+    assert_eq!(
+        event_store::select_matching_events(&event_store::effective_query(&explicit, &[]), &events)
+            .iter()
+            .map(|e| e.sequence)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+}

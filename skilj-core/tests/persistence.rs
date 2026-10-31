@@ -1171,6 +1171,7 @@ fn a_projections_required_capability_round_trips_and_can_be_set_alone() {
             consumed_event_types: vec![et],
             sync: false,
             caught_up_to: None,
+            owner_tag_key: Some("company".into()),
             requires_capability: Some("staff".to_string()),
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1179,6 +1180,7 @@ fn a_projections_required_capability_round_trips_and_can_be_set_alone() {
             .unwrap()
             .unwrap();
         assert_eq!(read.requires_capability.as_deref(), Some("staff"));
+        assert_eq!(read.owner_tag_key.as_deref(), Some("company"));
         let listed = db::list_projections_for_bounded_context(&pool, &bc.name)
             .await
             .unwrap();
@@ -1194,6 +1196,25 @@ fn a_projections_required_capability_round_trips_and_can_be_set_alone() {
             .unwrap();
         assert_eq!(read.requires_capability.as_deref(), Some("audit"));
         assert_eq!(read.schema_version, 1);
+
+        db::set_projection_owner_tag_key(&pool, &bc.name, &projection.name, Some("tenant"))
+            .await
+            .unwrap();
+        let updated = db::get_projection(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.owner_tag_key.as_deref(), Some("tenant"));
+        assert_eq!(updated.schema_version, 1);
+        assert!(db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            &projection.name,
+            ProjectionRebuildStatus::Pending
+        )
+        .await
+        .unwrap()
+        .is_none());
 
         projection.requires_capability = None;
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1522,6 +1543,7 @@ fn round_trips_a_projection_with_no_consumed_event_types() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1550,6 +1572,7 @@ fn round_trips_a_projection_with_consumed_event_types() {
             consumed_event_types: vec![et_a.clone(), et_b.clone()],
             sync: true,
             caught_up_to: Some(41),
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1586,6 +1609,7 @@ fn upsert_projection_replaces_consumed_event_types() {
             consumed_event_types: vec![et_a.clone()],
             sync: false,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1634,6 +1658,7 @@ fn round_trips_a_projection_rebuild() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: Some(10),
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1678,6 +1703,7 @@ fn get_projection_rebuild_is_none_when_none_staged() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1709,6 +1735,7 @@ fn upsert_projection_rebuild_restages_in_place_when_status_is_unchanged() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1761,6 +1788,7 @@ fn a_pending_and_a_building_rebuild_coexist_for_the_same_projection() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1868,6 +1896,7 @@ fn transition_projection_rebuild_to_building_replaces_the_pending_row() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1935,6 +1964,7 @@ fn delete_projection_rebuild_removes_it() {
             consumed_event_types: Vec::new(),
             sync: false,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -3253,6 +3283,58 @@ fn an_origin_kind_from_a_newer_version_reads_back_as_unknown() {
                 }
             ),
             "{refused:?}"
+        );
+    });
+}
+
+#[test]
+fn projection_subject_key_does_not_decrypt_other_namespaces_with_the_same_value() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = KeyService::new(InMemoryKeyProvider::from_bytes([6u8; 32]));
+        db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
+            .await
+            .unwrap();
+        db::get_or_create_encryption_key(&pool, &bc.name, "account", "42", &master)
+            .await
+            .unwrap();
+        let user_key = db::get_active_data_key(&pool, &bc.name, "user", "42", &master)
+            .await
+            .unwrap()
+            .unwrap();
+        let account_key =
+            db::projection_subject_data_key(&pool, &bc.name, "account", "42", Some(&master))
+                .await
+                .unwrap()
+                .unwrap();
+        let user_ciphertext = skilj_core::encryption::encrypt_leaf(&user_key, "private user");
+        let account_ciphertext =
+            skilj_core::encryption::encrypt_leaf(&account_key, "private account");
+        let state = serde_json::json!({ "user": user_ciphertext, "account": account_ciphertext })
+            .to_string();
+        let rendered: serde_json::Value = serde_json::from_str(
+            &skilj_core::projections::read_projection(&state, &[account_key]),
+        )
+        .unwrap();
+        assert_eq!(rendered["user"], user_ciphertext);
+        assert_eq!(rendered["account"], "private account");
+        assert!(
+            db::projection_subject_data_key(&pool, &bc.name, "unknown", "42", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db::destroy_encryption_key(&pool, &bc.name, "account", "42", test_now())
+            .await
+            .unwrap();
+        assert!(
+            db::projection_subject_data_key(&pool, &bc.name, "account", "42", None)
+                .await
+                .unwrap()
+                .is_none()
         );
     });
 }

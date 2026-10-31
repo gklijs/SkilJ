@@ -1817,13 +1817,23 @@ fn resuming_from_a_sequence_replays_the_missed_span_then_goes_live() {
         }
         assert_eq!(received, vec![sequences[3], live]);
 
-        // Five committed events from the start is over the cap of 3.
+        // Five events exceed a single page of three: read-level clients
+        // recover the entire span without an admin-only history query.
         ws_send_json(&mut ws, subscribe("2", -1)).await;
-        let refused = ws_recv_json(&mut ws).await;
-        assert_eq!(refused["id"], "2", "{refused}");
+        let mut replayed = Vec::new();
+        for _ in 0..5 {
+            let message = ws_recv_json(&mut ws).await;
+            assert_eq!(message["id"], "2", "{message}");
+            assert!(message["payload"].get("errors").is_none(), "{message}");
+            replayed.push(
+                message["payload"]["data"]["allEvents"]["sequence"]
+                    .as_i64()
+                    .unwrap(),
+            );
+        }
         assert_eq!(
-            refused["payload"]["errors"][0]["extensions"]["code"], "resume_span_too_large",
-            "{refused}"
+            replayed,
+            sequences.iter().copied().chain([live]).collect::<Vec<_>>()
         );
 
         // docs/architecture.md §148: past the latest committed sequence is

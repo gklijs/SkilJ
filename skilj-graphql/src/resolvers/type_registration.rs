@@ -357,6 +357,12 @@ pub fn register_projection_field(n: &Naming) -> Field {
                 let name = ctx.args.try_get("name")?.string()?.to_string();
                 let schema = ctx.args.try_get("schema")?.string()?.to_string();
                 let sync = ctx.args.try_get("sync")?.boolean()?;
+                let owner_tag_key = ctx
+                    .args
+                    .get("ownerTagKey")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
                 let requires_capability = ctx
                     .args
                     .get("requiresCapability")
@@ -427,7 +433,8 @@ pub fn register_projection_field(n: &Naming) -> Field {
                     staged.as_ref(),
                     &bounded_context_events,
                 )
-                .map_err(to_graphql_error)?;
+                .map_err(to_graphql_error)?
+                .with_owner_tag_key(owner_tag_key.clone());
 
                 let result = match registration {
                     ProjectionRegistration::Created {
@@ -494,6 +501,14 @@ pub fn register_projection_field(n: &Naming) -> Field {
                     }
                 };
 
+                skilj_core::db::set_projection_owner_tag_key(
+                    &state.pool,
+                    &bounded_context_name,
+                    &name,
+                    owner_tag_key.as_deref(),
+                )
+                .await
+                .map_err(to_graphql_error)?;
                 Ok(Some(FieldValue::owned_any(result)))
             })
         },
@@ -512,6 +527,10 @@ pub fn register_projection_field(n: &Naming) -> Field {
         TypeRef::named_nn_list_nn(TypeRef::STRING),
     ))
     .argument(InputValue::new("sync", TypeRef::named_nn(TypeRef::BOOLEAN)))
+    .argument(InputValue::new(
+        "ownerTagKey",
+        TypeRef::named(TypeRef::STRING),
+    ))
     .argument(InputValue::new(
         "requiresCapability",
         TypeRef::named(TypeRef::STRING),

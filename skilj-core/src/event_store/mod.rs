@@ -446,7 +446,8 @@ pub struct Event {
     pub bounded_context: BoundedContext,
     /// Its event type.
     pub event_type: EventType,
-    /// The payload JSON, sensitive fields encrypted.
+    /// The stored payload JSON has sensitive fields encrypted. Internal
+    /// temporary copies passed to a decider have those fields decrypted.
     pub payload: String,
     /// Who created it, when, and in which causal chain.
     pub metadata: Metadata,
@@ -740,6 +741,15 @@ pub enum Error {
     #[error("tag key `{0}` is already mapped in the clear by a registered type")]
     BlindTagKeyInUse(String),
 
+    /// A selected historical sensitive field cannot be recovered for a decider.
+    #[error("cannot decide this command: sensitive history at event {sequence} ({event_type}) is unavailable; the subject may have been forgotten or its encryption key is unavailable")]
+    SensitiveHistoryUnavailable {
+        /// The selected event's sequence, without disclosing subject values.
+        sequence: i64,
+        /// The selected event type.
+        event_type: String,
+    },
+
     /// This EncryptionKey is not active.
     #[error("this EncryptionKey is not active")]
     EncryptionKeyNotActive,
@@ -949,6 +959,7 @@ impl SkiljRejection for Error {
             Error::CommandTypeNotInBoundedContext => "command_type_not_in_bounded_context",
             Error::TriggeredEventNotInBoundedContext => "triggered_event_not_in_bounded_context",
             Error::AfterCommandNotInBoundedContext => "after_command_not_in_bounded_context",
+            Error::SensitiveHistoryUnavailable { .. } => "sensitive_history_unavailable",
             Error::EncryptionKeyNotActive => "encryption_key_not_active",
             Error::CursorAckModeMismatch => "cursor_ack_mode_mismatch",
             Error::NotManualAckCursor => "not_manual_ack_cursor",
@@ -4946,7 +4957,11 @@ pub fn consistency_boundary_and_matching_events(
 ) -> (Option<i64>, Vec<Event>) {
     let matching: Vec<Event> = bounded_context_events
         .iter()
-        .filter(|e| consistency_tags.iter().any(|t| e.tags.contains(t)))
+        .filter(|e| {
+            consistency_tags
+                .iter()
+                .any(|t| t.value.is_some() && e.tags.contains(t))
+        })
         .cloned()
         .collect();
     let boundary = highest_sequence(&matching);
@@ -4965,7 +4980,11 @@ pub fn consistency_boundary(
 ) -> Option<i64> {
     bounded_context_events
         .iter()
-        .filter(|e| consistency_tags.iter().any(|t| e.tags.contains(t)))
+        .filter(|e| {
+            consistency_tags
+                .iter()
+                .any(|t| t.value.is_some() && e.tags.contains(t))
+        })
         .map(|e| e.sequence)
         .max()
 }
@@ -5078,7 +5097,9 @@ pub fn query_has_snapshots(query: &[QueryItem]) -> bool {
 /// The query a command is decided with: its own `consistency_query`, or,
 /// when it declares none, the default - one item per consistency tag, any
 /// event type, every match. The default selects exactly the events
-/// carrying any of `consistency_tags`, as before queries existed.
+/// carrying any non-null consistency tag. Missing values do not create a
+/// shared boundary; an empty or all-null set reads and conflicts on nothing.
+/// An explicit query may still select null-valued tags.
 pub fn effective_query(
     consistency_query: &[QueryItem],
     consistency_tags: &[Tag],
@@ -5088,6 +5109,7 @@ pub fn effective_query(
     }
     consistency_tags
         .iter()
+        .filter(|tag| tag.value.is_some())
         .map(|tag| QueryItem {
             event_types: Vec::new(),
             tags: vec![tag.clone()],

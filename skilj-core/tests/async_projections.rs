@@ -32,6 +32,10 @@ struct TestDispatcher;
 const POISON_AMOUNT: i64 = -999;
 
 impl ProjectionDispatcher for TestDispatcher {
+    fn live_fold_compatible(&self, _bounded_context: &str, _projection_name: &str) -> bool {
+        true
+    }
+
     fn keys(
         &self,
         _bounded_context: &str,
@@ -253,6 +257,7 @@ async fn seed_async_projection(
         consumed_event_types: consumed,
         sync: false,
         caught_up_to: None,
+        owner_tag_key: None,
         requires_capability: None,
     };
     db::upsert_projection(pool, &projection).await.unwrap();
@@ -967,6 +972,7 @@ fn two_concurrent_first_time_registrations_never_double_fold_history() {
             consumed_event_types: vec![et.clone()],
             sync: true,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
 
@@ -1463,6 +1469,7 @@ fn registering_a_sync_projection_during_live_writes_folds_every_event_once() {
             consumed_event_types: vec![et.clone()],
             sync: true,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
 
@@ -1517,6 +1524,7 @@ fn registering_a_sync_projection_with_no_history_misses_no_concurrent_event() {
             consumed_event_types: vec![et.clone()],
             sync: true,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         // As the caller found it: no matching event yet, so no fold.
@@ -1572,6 +1580,7 @@ fn registering_a_sync_projection_needs_no_second_connection_under_the_lock() {
             consumed_event_types: vec![et.clone()],
             sync: true,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
 
@@ -1829,5 +1838,178 @@ fn catch_up_leaves_a_projection_it_does_not_know_alone() {
             .unwrap()
             .unwrap();
         assert_eq!(unknown.caught_up_to, None, "advanced without folding");
+    });
+}
+
+struct PausedDispatcher;
+impl ProjectionDispatcher for PausedDispatcher {
+    fn keys(&self, bc: &str, name: &str, event: &Event) -> Option<Vec<String>> {
+        TestDispatcher.keys(bc, name, event)
+    }
+    fn project(
+        &self,
+        bc: &str,
+        name: &str,
+        state: &str,
+        event: &Event,
+        key: &str,
+    ) -> Option<skilj_core::error::Result<String>> {
+        TestDispatcher.project(bc, name, state, event, key)
+    }
+    fn default_state(&self, bc: &str, name: &str) -> Option<String> {
+        TestDispatcher.default_state(bc, name)
+    }
+    fn owner_tag_key(&self, bc: &str, name: &str) -> Option<Option<&'static str>> {
+        TestDispatcher.owner_tag_key(bc, name)
+    }
+}
+
+#[test]
+fn staged_rebuild_pauses_live_unless_the_fold_is_explicitly_compatible() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        insert_plain_event(&pool, &bc, &et, 20).await;
+        db::catch_up_bounded_context(&pool, &bc.name, &PausedDispatcher)
+            .await
+            .unwrap();
+        let live = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        db::upsert_projection_rebuild(
+            &pool,
+            &ProjectionRebuild {
+                projection: live.clone(),
+                schema: live.schema.clone(),
+                schema_version: live.schema_version + 1,
+                consumed_event_types: live.consumed_event_types.clone(),
+                sync: false,
+                caught_up_to: None,
+                status: ProjectionRebuildStatus::Pending,
+            },
+        )
+        .await
+        .unwrap();
+        insert_plain_event(&pool, &bc, &et, 5).await;
+        db::catch_up_bounded_context(&pool, &bc.name, &PausedDispatcher)
+            .await
+            .unwrap();
+        assert_eq!(
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+                .await
+                .unwrap()
+                .unwrap(),
+            "20"
+        );
+        assert_eq!(
+            db::get_projection(&pool, &bc.name, "AccountBalance")
+                .await
+                .unwrap()
+                .unwrap()
+                .caught_up_to,
+            live.caught_up_to
+        );
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+        assert_eq!(
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+                .await
+                .unwrap()
+                .unwrap(),
+            "25"
+        );
+    });
+}
+
+struct ChangedSchemaDispatcher;
+impl ProjectionDispatcher for ChangedSchemaDispatcher {
+    fn state_schema(&self, _: &str, _: &str) -> Option<&str> {
+        Some(r#"{"type":"object"}"#)
+    }
+    fn keys(&self, bc: &str, name: &str, event: &Event) -> Option<Vec<String>> {
+        PausedDispatcher.keys(bc, name, event)
+    }
+    fn project(
+        &self,
+        bc: &str,
+        name: &str,
+        state: &str,
+        event: &Event,
+        key: &str,
+    ) -> Option<skilj_core::error::Result<String>> {
+        PausedDispatcher.project(bc, name, state, event, key)
+    }
+    fn default_state(&self, bc: &str, name: &str) -> Option<String> {
+        PausedDispatcher.default_state(bc, name)
+    }
+    fn owner_tag_key(&self, bc: &str, name: &str) -> Option<Option<&'static str>> {
+        PausedDispatcher.owner_tag_key(bc, name)
+    }
+}
+
+#[test]
+fn a_schema_mismatch_stays_paused_after_discarding_the_rebuild() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        insert_plain_event(&pool, &bc, &et, 20).await;
+        db::catch_up_bounded_context(&pool, &bc.name, &PausedDispatcher)
+            .await
+            .unwrap();
+        let live = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        db::upsert_projection_rebuild(
+            &pool,
+            &ProjectionRebuild {
+                projection: live.clone(),
+                schema: r#"{"type":"object"}"#.into(),
+                schema_version: 2,
+                consumed_event_types: vec![et.clone()],
+                sync: false,
+                caught_up_to: None,
+                status: ProjectionRebuildStatus::Pending,
+            },
+        )
+        .await
+        .unwrap();
+        db::delete_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalance",
+            ProjectionRebuildStatus::Pending,
+        )
+        .await
+        .unwrap();
+        insert_plain_event(&pool, &bc, &et, 5).await;
+        db::catch_up_bounded_context(&pool, &bc.name, &ChangedSchemaDispatcher)
+            .await
+            .unwrap();
+        assert_eq!(
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+                .await
+                .unwrap()
+                .unwrap(),
+            "20"
+        );
+        assert_eq!(
+            db::get_projection(&pool, &bc.name, "AccountBalance")
+                .await
+                .unwrap()
+                .unwrap()
+                .caught_up_to,
+            live.caught_up_to
+        );
     });
 }

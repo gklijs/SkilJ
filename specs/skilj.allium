@@ -946,9 +946,9 @@ entity CommandType {
     -- a list of items OR'd together - an event matches the query when it
     -- matches any one item (see QueryItem.matches). Empty is the default,
     -- what every command type declaring none holds; it means exactly the
-    -- tag match this library always made, consistency_tags.any(t => t in
-    -- e.tags) over every event type with latest null - equivalently,
-    -- one item per derived tag. (Per derived tag rather than per mapping:
+    -- match consistency_tags.any(t => t.value != null and t in e.tags)
+    -- over every event type with latest null - equivalently, one item per
+    -- non-null derived tag. Empty or all-null sets read and conflict on nothing. (Per derived tag rather than per mapping:
     -- a list-valued mapping derives several tags, and the default matches
     -- an event carrying any one of them, where a single item over that
     -- mapping would require all of them.)
@@ -1899,7 +1899,7 @@ entity Command {
     -- is the tag match over consistency_tags; see
     -- CommandType.consistency_query.
     in_consistency_query(e):
-        (consistency_query.count = 0 and consistency_tags.any(t => t in e.tags))
+        (consistency_query.count = 0 and consistency_tags.any(t => t.value != null and t in e.tags))
             or consistency_query.any(i => i.matches(e))
 
     -- Events produced by this command, stored in the same transaction.
@@ -2032,6 +2032,10 @@ entity Projection {
     -- changes who may read, not what is folded.
     requires_capability: String?
 
+    -- Owner tag dimension, visible to admins and reconciled immediately like
+    -- requires_capability; it does not trigger a rebuild or version bump.
+    owner_tag_key: String?
+
     -- Opt-in, and deliberate friction: use with care. A sync projection
     -- is updated inline, in the same transaction as the event that feeds
     -- it, so it is never stale - but its update cost is paid on the write
@@ -2098,6 +2102,14 @@ entity Projection {
                                           -- rolling-deploy note above RegisterEventType.
 }
 
+-- While any rebuild is pending or building, the deployed fold may update
+-- the live generation only with explicit LIVE_FOLD_COMPATIBLE permission:
+-- the developer asserts preservation of the live schema and its meaning.
+-- Otherwise live folding and caught_up_to pause, for ordinary and segmented
+-- consumers. Sync writes fail with live_fold_paused rather than commit stale
+-- state. Fold updates are transactional; failures preserve prior live state.
+-- Queries continue serving that state; caught_up_to and the rebuild status
+-- expose its staleness. Promotion resumes normal folding.
 entity ProjectionRebuild {
     projection: Projection      -- the live Projection this rebuild replaces when it is promoted
 
@@ -2715,7 +2727,7 @@ default SystemCreator skilj = { }
 --   - ANY-match comes for free under the default query. The default
 --     consistency-boundary match (a command type declaring no
 --     consistency_query - see the consistency query note below) is
---     consistency_tags.any(t => t in tags), i.e. "does any tag in one set
+--     consistency_tags.any(t => t.value != null and t in tags), i.e. "does any tag in one set
 --     appear in the other". A list-valued field contributing one tag per
 --     element therefore matches when any element matches, with no
 --     rule-level change at all - the semantics people usually want from a
@@ -2806,7 +2818,7 @@ default SystemCreator skilj = { }
 -- per-item "latest" does not fit a single Events-where expression; its
 -- contract is exact. Over the Events of that bounded context:
 --   - query empty (the default): every event e with
---     consistency_tags.any(t => t in e.tags) - exactly the match this
+--     consistency_tags.any(t => t.value != null and t in e.tags) - exactly the match this
 --     library always made.
 --   - otherwise, the union of: for each item with latest null, every
 --     event e with item.matches(e); for each item with latest = n, only
@@ -4102,9 +4114,10 @@ rule QueryProjection {
         -- front, to the queried instance's own key: a projection's key
         -- is itself a real subject value in practice (a customer id, a
         -- user id), so the key is the subject checked. If the grant
-        -- holds, every active EncryptionKey for that one subject is
-        -- resolved and the instance's stored state is decrypted with
-        -- them, at any depth; if it does not hold, nothing is looked up
+        -- holds and the projection declares a subject namespace, the active
+        -- EncryptionKey for (declared namespace, instance key) is resolved
+        -- and used to decrypt state at any depth. No other namespace is
+        -- tried. Without a declaration or grant, nothing is looked up
         -- at all. There is deliberately no per-field distinction at read
         -- time here, and no per-projection declaration of which fields
         -- are sensitive: the instance is either checked against its own
@@ -4197,8 +4210,8 @@ rule QueryProjection {
 -- subscription - resumes from there with no gap and no replay of
 -- anything earlier: the events committed after from_sequence but before
 -- the subscription existed are delivered first, then the live feed.
--- That span is bounded like any read (config.max_events_per_read); a
--- caller further behind reads the rest back first. Neither rule requires the bounded context to be
+-- That span is delivered in bounded pages (config.max_events_per_read),
+-- without requiring an admin-only history read for long disconnections. Neither rule requires the bounded context to be
 -- active: unlike EventFetch and QueryProjection, this is deliberate the
 -- other way - an archived context accepts no new events, so a
 -- subscription against one would be created only to sit forever unfed.
@@ -4230,11 +4243,10 @@ rule CreateAllEventsSubscription {
         from_sequence
         ?? (Events where bounded_context = access_mapping.bounded_context).count - 1
 
-    -- The resume span, delivered before any live event (see the note
-    -- above): bounded like any read.
-    requires: (Events where bounded_context = access_mapping.bounded_context
-                  and sequence > starting_point).count
-              <= config.max_events_per_read
+    -- Deliver the committed resume span before live events in ordered pages
+    -- of at most config.max_events_per_read; the span itself has no size cap.
+    -- Recheck the read grant and field grants for each page. Backpressure
+    -- bounds memory; clients may reconnect from the last processed sequence.
 
     ensures:
         AllEventsSubscription.created(
@@ -4264,12 +4276,8 @@ rule CreateEventTypeSubscription {
         from_sequence
         ?? (Events where bounded_context = event_type.bounded_context).count - 1
 
-    -- The resume span, over this event type only - see
-    -- CreateAllEventsSubscription.
-    requires: (Events where bounded_context = event_type.bounded_context
-                  and event_type = event_type
-                  and sequence > starting_point).count
-              <= config.max_events_per_read
+    -- Resume in bounded pages as CreateAllEventsSubscription does, selecting
+    -- this type and its filters without limiting the total recoverable span.
 
     ensures:
         EventTypeSubscription.created(
@@ -4664,6 +4672,20 @@ rule AuthoriseCommandTrigger {
         )
 }
 
+-- The current command payload reaches decide() before storage encryption.
+-- Selected historical events are decrypted into temporary copies for decide()
+-- using each declared field's exact (subject_key, subject_value). Stored events,
+-- event caches, projection folds and summary folds retain ciphertext. Caller
+-- read grants do not constrain this internal domain computation. Rejection
+-- history must use the stored copies and ordinary read-time authorization.
+-- If any selected sensitive value cannot be decrypted because its subject key
+-- is absent or destroyed, reject with sensitive_history_unavailable and a clear
+-- reason identifying the event, without disclosing subject values. Never pass
+-- ciphertext to a decider that expects plaintext. Recheck under the command
+-- transaction even without a new matching event, so forgetting between the
+-- optimistic decision and commit invalidates that decision. Missing optional
+-- sensitive leaves require no key. Summary states remain opaque ciphertext;
+-- this decryption contract applies to the selected event history itself.
 rule ProcessCommand {
     when:
         CommandAuthorised(
@@ -7464,7 +7486,7 @@ rule RegisterCommandType {
 
 rule RegisterProjection {
     when: RegisterProjection(access_mapping, bounded_context, name, schema,
-        consumed_event_types, sync, requires_capability?, segments?, segment_key?)
+        consumed_event_types, sync, requires_capability?, owner_tag_key?, segments?, segment_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
@@ -7571,6 +7593,7 @@ rule RegisterProjection {
                 consumed_event_types: consumed_event_types,
                 sync: sync,
                 requires_capability: requires_capability,
+                owner_tag_key: owner_tag_key,
                 segments: segments,
                 segment_key: segment_key,
                 -- The bounded context's latest committed sequence, not
@@ -7597,6 +7620,7 @@ rule RegisterProjection {
             -- live definition takes the new requirement at once rather
             -- than waiting for the staged one to be promoted.
             existing.requires_capability = requires_capability
+            existing.owner_tag_key = owner_tag_key
             if exists staged:
                 staged.schema = schema
                 staged.schema_version =
@@ -7629,6 +7653,7 @@ rule RegisterProjection {
             existing.segments = segments
             existing.segment_key = segment_key
             existing.requires_capability = requires_capability
+            existing.owner_tag_key = owner_tag_key
 }
 
 -- The admin action the staging above waits for, and the only thing in this
@@ -7886,7 +7911,7 @@ rule ReconcileCommandTypeAtStartup {
 
 rule ReconcileProjectionAtStartup {
     when: ReconcileProjectionAtStartup(application_version?, access_mapping, bounded_context, name,
-        schema, consumed_event_types, sync, requires_capability?)
+        schema, consumed_event_types, sync, requires_capability?, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
@@ -7920,7 +7945,8 @@ rule ReconcileProjectionAtStartup {
                 schema: schema,
                 consumed_event_types: consumed_event_types,
                 sync: sync,
-                requires_capability: requires_capability
+                requires_capability: requires_capability,
+                owner_tag_key: owner_tag_key
             )
             RegistrationStamped(
                 bounded_context: bounded_context,
@@ -9998,9 +10024,8 @@ surface ProjectionQuery {
         -- Within its own bounded context, a grant that names a scope (see
         -- RoleAccessMapping.scope) only authorises querying projection
         -- instances that belong to it. A projection may declare which tag
-        -- key names its "owner" dimension - in deployed configuration
-        -- only, with no registration surface and nothing an admin can
-        -- read it back from - and each instance's own owner value is
+        -- key names its "owner" dimension, registered as owner_tag_key and
+        -- visible through TypeRegistration and CapabilityOverview. Its value is
         -- derived from the tags of the events that built it, never
         -- supplied by the caller querying it. An instance owned by
         -- someone else, or one whose owner is not established at all -
@@ -10043,27 +10068,14 @@ surface ProjectionQuery {
         -- QueryProjection's guidance on the capability check).
 
     @guarantee SensitiveFieldsStayProtected
-        -- A projection built from a field its source EventType marked
-        -- sensitive stays protected exactly as the source event is:
-        -- sensitivity is declared once, on the EventType, and inherited
-        -- rather than re-declared per projection - there is no
-        -- per-projection sensitive-field declaration to keep in step
-        -- with it, or to forget. Decryption is decided once per query
-        -- against the very same RoleAccessMapping this surface faces,
-        -- taking the queried instance's own key as the subject, under
-        -- either of two grants: the bounded-context-wide
-        -- can_read_sensitive, or the caller's own verified IdP identity
-        -- matching that key - a Role reading data about itself needs no
-        -- separate grant. A caller with neither is never handed a
-        -- decrypted value, not even one it is expected to discard (see
-        -- QueryProjection's guidance on read_projection). The deliberate
-        -- limitation this carries: an instance whose own key is not
-        -- itself a real subject value - an unkeyed projection, or one
-        -- keyed on something else entirely - offers no subject for
-        -- either grant to be checked against, so none of its content
-        -- ever decrypts here, not even for a can_read_sensitive caller.
-        -- EventSubscription's push is the contrasting case: it decides
-        -- per field, each against that field's own subject.
+        -- Folds and summaries receive stored ciphertext. Decrypt only on
+        -- read, for can_read_sensitive or an external_subject matching the
+        -- instance key, and only within the projection's explicitly declared
+        -- subject namespace (Rust Projection::SUBJECT_KEY). The instance key
+        -- is the subject value; other namespaces with that value are never
+        -- tried. An absent declaration leaves all state encrypted, including
+        -- for can_read_sensitive. Destroyed keys leave ciphertext. No
+        -- field-level sensitivity declaration is needed on the projection.
 
     @guarantee PrivateFieldsAreTheProjectionsToKeep
         -- Unlike a sensitive field, a private field reaches project() as
@@ -10196,9 +10208,9 @@ surface EventSubscription {
         -- DeliverToSubscriptions). The only past it delivers is what the
         -- caller has not seen yet: when from_sequence is earlier than the
         -- latest committed event, the events in between come first, in
-        -- order, then the live feed, with none of them twice - at most
-        -- config.max_events_per_read of them, a longer span being
-        -- refused rather than loaded. A caller wanting current state
+        -- order, then the live feed, with none of them twice. Each page
+        -- contains at most config.max_events_per_read events; there is no
+        -- cap on the entire span. A caller wanting current state
         -- first queries it separately - FetchEvents or QueryProjection -
         -- and, for a gap-free handoff into the live feed, supplies the
         -- sequence it read up to as from_sequence here. Anything
@@ -11212,7 +11224,7 @@ surface TypeRegistration {
             sensitive_fields, private_fields, rest_trigger_allowed, owner_tag_key?)
             when bounded_context.status = active
         RegisterProjection(access_mapping, bounded_context, name, schema,
-            consumed_event_types, sync, requires_capability?, segments?, segment_key?)
+            consumed_event_types, sync, requires_capability?, owner_tag_key?, segments?, segment_key?)
             when bounded_context.status = active
         RebuildProjection(access_mapping, projection)
         DiscardProjectionRebuild(access_mapping, projection)
@@ -11843,6 +11855,10 @@ surface CapabilityOverview {
             -- type: the two lists to read for a typo.
             required_capabilities(bc) - held_capabilities(bc)
             held_capabilities(bc) - required_capabilities(bc)
+            for projection in bc.projections:
+                projection.name
+                projection.owner_tag_key
+                projection.requires_capability
 }
 
 -- The history of who held what, for a superadmin. The events behind it

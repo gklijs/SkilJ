@@ -1423,6 +1423,7 @@ fn submit_command_rolls_back_the_command_and_every_event_together_when_a_later_e
             consumed_event_types: vec![order_shipped, poison],
             sync: true,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1704,6 +1705,7 @@ fn submit_command_batch_isolates_a_failing_commands_savepoint_from_its_batch_mat
             consumed_event_types: Vec::new(),
             sync: true,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -1823,6 +1825,7 @@ fn submit_command_batch_recycles_a_failed_commands_sequence_numbers_for_a_later_
             consumed_event_types: Vec::new(),
             sync: true,
             caught_up_to: None,
+            owner_tag_key: None,
             requires_capability: None,
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
@@ -2324,6 +2327,7 @@ fn a_batch_folds_its_events_into_a_sync_projection_at_once() {
                 consumed_event_types: vec![et.clone()],
                 sync: true,
                 caught_up_to: None,
+                owner_tag_key: None,
                 requires_capability: None,
             },
         )

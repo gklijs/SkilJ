@@ -535,6 +535,7 @@ pub struct Skilj {
 /// `Arc<dyn CommandDispatcher>` cheaply (cloning the `Arc<HashMap<...>>`
 /// alone) without requiring an `Arc<Skilj>`.
 struct Dispatcher {
+    key_service: Option<KeyService>,
     command_types: Arc<HashMap<(String, String), RegisteredCommandType>>,
     template_cache: skilj_core::template_cache::TemplateCache,
     /// What a command type's snapshot items fold with
@@ -545,6 +546,10 @@ struct Dispatcher {
 }
 
 impl CommandDispatcher for Dispatcher {
+    fn key_service(&self) -> Option<&KeyService> {
+        self.key_service.as_ref()
+    }
+
     fn blind_index(&self) -> skilj_core::blind::BlindIndex {
         self.blind_index.clone()
     }
@@ -732,6 +737,20 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
             self.registered(bounded_context, projection_name)?
                 .owner_tag_key,
         )
+    }
+
+    fn state_schema(&self, bounded_context: &str, projection_name: &str) -> Option<&str> {
+        Some(&self.registered(bounded_context, projection_name)?.schema)
+    }
+
+    fn live_fold_compatible(&self, bounded_context: &str, projection_name: &str) -> bool {
+        self.registered(bounded_context, projection_name)
+            .is_some_and(|p| p.live_fold_compatible)
+    }
+
+    fn subject_key(&self, bounded_context: &str, projection_name: &str) -> Option<&'static str> {
+        self.registered(bounded_context, projection_name)?
+            .subject_key
     }
 
     fn requires_capability(
@@ -1064,6 +1083,7 @@ impl Skilj {
     /// `Dispatcher`'s own doc comment gives.
     pub fn command_dispatcher(&self) -> Arc<dyn CommandDispatcher> {
         Arc::new(Dispatcher {
+            key_service: self.key_service.clone(),
             command_types: self.command_types.clone(),
             template_cache: self.template_cache.clone(),
             snapshots: SnapshotDispatcherImpl {
@@ -2540,6 +2560,8 @@ struct RegisteredProjection {
     sync: bool,
     default_state_json: String,
     owner_tag_key: Option<&'static str>,
+    subject_key: Option<&'static str>,
+    live_fold_compatible: bool,
     requires_capability: Option<&'static str>,
     partition_count: u32,
     keys: KeysFn,
@@ -2559,6 +2581,8 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
         sync: T::sync(),
         default_state_json,
         owner_tag_key: T::OWNER_TAG_KEY,
+        subject_key: T::SUBJECT_KEY,
+        live_fold_compatible: T::LIVE_FOLD_COMPATIBLE,
         requires_capability: T::REQUIRES_CAPABILITY,
         partition_count: T::PARTITION_COUNT,
         keys: Box::new(move |event| {
@@ -3774,6 +3798,8 @@ impl SkiljBuilder {
                         // `ensure_private_field_grants_table`'s own doc
                         // comments.
                         skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
+                        skilj_core::db::ensure_projection_owner_tag_key_column(pool, &bc.name)
+                            .await?;
                         skilj_core::db::ensure_projection_requires_capability_column(
                             pool, &bc.name,
                         )
@@ -4016,6 +4042,7 @@ impl SkiljBuilder {
                         cache: Arc::clone(&ip.cache),
                     }),
                 dispatcher: Arc::new(Dispatcher {
+                    key_service: key_service.clone(),
                     command_types: command_types.clone(),
                     template_cache: template_cache.clone(),
                     snapshots: SnapshotDispatcherImpl {
@@ -5828,6 +5855,8 @@ async fn reconcile_projections(
             }
             Err(e) => return Err(e),
         };
+        let registration =
+            registration.with_owner_tag_key(registered.owner_tag_key.map(str::to_owned));
         match registration {
             ProjectionRegistration::Created {
                 projection,
@@ -5867,6 +5896,13 @@ async fn reconcile_projections(
                 })
             }
         }
+        skilj_core::db::set_projection_owner_tag_key(
+            pool,
+            bounded_context_name,
+            name,
+            registered.owner_tag_key,
+        )
+        .await?;
         // Stamped on the live row even when a rebuild was staged, so an
         // older version doesn't stage one back before it's promoted.
         version

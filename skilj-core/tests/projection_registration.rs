@@ -131,6 +131,7 @@ fn existing_projection(consumed_event_types: Vec<EventType>, sync: bool) -> Proj
         consumed_event_types,
         sync,
         caught_up_to: Some(5),
+        owner_tag_key: None,
         requires_capability: None,
     }
 }

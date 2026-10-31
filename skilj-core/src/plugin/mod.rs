@@ -283,7 +283,10 @@ pub trait CommandType {
         None
     }
 
-    /// Decides from the events the command's query selects. Implement
+    /// Decides from the events the command's query selects. Sensitive event
+    /// values are decrypted into temporary copies; unavailable subject keys
+    /// reject before this method runs. Projection and summary folds remain
+    /// ciphertext-based. Implement
     /// this, or [`decide_with`](CommandType::decide_with) when the
     /// decision also needs a snapshot's state; the framework only calls
     /// `decide_with`, whose default calls this. The default here refuses
@@ -586,6 +589,11 @@ pub trait Projection {
         false
     }
 
+    /// Whether this fold may update the live generation while a rebuild is
+    /// staged or building. Opt in only when it preserves the old state schema
+    /// and meaning. Otherwise live folding pauses until promotion.
+    const LIVE_FOLD_COMPATIBLE: bool = false;
+
     /// Which instance(s) of this projection `event` updates - see the
     /// instance-data note on `entity Projection` in the spec. Defaults to
     /// one constant, unnamed key (`""`) - the "single shared value" case
@@ -606,11 +614,8 @@ pub trait Projection {
     /// different tenants sharing one bounded context, `None` (the
     /// default) for a projection with no such notion, e.g. `keys()`
     /// already being a person's own id or the projection being unkeyed.
-    /// Deliberately a Rust-only implementation detail with no spec entity
-    /// field and no registration/admin-visible surface of its own - the
-    /// identical treatment `Snapshot::TAG_KEY` already gets, and for the
-    /// same reason: `RoleAccessMapping.scope` is what an admin actually
-    /// grants and sees, not this.
+    /// Registered as `projections::Projection::owner_tag_key`, visible in
+    /// TypeRegistration and CapabilityOverview. Reconciled without a rebuild.
     ///
     /// When set, each instance's own "owner" value is derived
     /// automatically at fold time from whichever event touched it: the
@@ -622,6 +627,11 @@ pub trait Projection {
     /// function's own doc comment and specs/skilj.allium's
     /// `owner_scope_satisfied`.
     const OWNER_TAG_KEY: Option<&'static str> = None;
+
+    /// Subject namespace whose value is this projection's instance key.
+    /// Only keys in this namespace may decrypt state on read. Without a
+    /// declaration the state stays encrypted, including for sensitive readers.
+    const SUBJECT_KEY: Option<&'static str> = None;
 
     /// The capability a grant must hold to query this projection at all
     /// (`RoleAccessMapping::capabilities`), if any - `None` (the default,
@@ -1079,6 +1089,13 @@ impl<'a, E> Decision<'a, E> {
 /// `skilj` facade's builder, implements this by hand instead - nothing
 /// about it is facade-specific.
 pub trait CommandDispatcher: Send + Sync {
+    /// Key service used by the command engine to decrypt selected event
+    /// history before calling the pure decider. Missing or destroyed subject
+    /// keys reject the command; folds and cached events remain encrypted.
+    fn key_service(&self) -> Option<&crate::encryption::KeyService> {
+        None
+    }
+
     /// `None` when no `(bounded_context, command_type)` pair matches
     /// anything registered - the caller decides what that means for its
     /// own wire contract (an unrecognised-command rejection, a 404,
@@ -1258,6 +1275,24 @@ pub trait ProjectionDispatcher: Send + Sync {
         bounded_context: &str,
         projection_name: &str,
     ) -> Option<Option<&'static str>>;
+
+    /// Subject namespace declared by the compiled projection. No declaration
+    /// means no projection decryption; other namespaces are never tried.
+    fn subject_key(&self, _bounded_context: &str, _projection_name: &str) -> Option<&'static str> {
+        None
+    }
+
+    /// Schema produced by this process's compiled fold, when known. A
+    /// mismatch with the live schema pauses folding unless explicitly allowed,
+    /// including after a staged rebuild is discarded.
+    fn state_schema(&self, _bounded_context: &str, _projection_name: &str) -> Option<&str> {
+        None
+    }
+
+    /// Explicit permission to fold the live generation during a rebuild.
+    fn live_fold_compatible(&self, _bounded_context: &str, _projection_name: &str) -> bool {
+        false
+    }
 
     /// The registered projection's own `Projection::REQUIRES_CAPABILITY` - the
     /// identical `Option<Option<_>>` shape `owner_tag_key` just above

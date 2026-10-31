@@ -56,6 +56,7 @@ type LedgerCapabilityOverviewEntry @inaccessible {
 	held: [String!]!
 	requiredButNotHeld: [String!]!
 	heldButNotRequired: [String!]!
+	projections: [LedgerProjection!]!
 }
 
 type LedgerCommandApprovalPolicy @inaccessible {
@@ -346,6 +347,7 @@ type LedgerProjection {
 	schemaVersion: Int!
 	consumedEventTypes: [LedgerEventType!]!
 	sync: Boolean!
+	ownerTagKey: String
 	requiresCapability: String
 	caughtUpTo: Int
 	pendingRebuild: LedgerProjectionRebuild
@@ -501,7 +503,7 @@ type Mutation {
 	ledgerDeleteBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: LedgerMissedOccurrencePolicy): LedgerEventType! @inaccessible
 	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): LedgerCommandType! @inaccessible
-	ledgerRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, requiresCapability: String): LedgerProjectionRegistrationResult! @inaccessible
+	ledgerRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, ownerTagKey: String, requiresCapability: String): LedgerProjectionRegistrationResult! @inaccessible
 	ledgerRebuildProjection(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
 	ledgerDiscardProjectionRebuild(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
 	ledgerRetryParkedDelivery(boundedContext: String!, id: String!): LedgerParkedDelivery! @inaccessible

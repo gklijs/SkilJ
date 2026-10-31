@@ -230,7 +230,18 @@ pub fn all_events_field(n: &Naming) -> SubscriptionField {
                 // time, delivered first, in order; live events at or
                 // below `delivered_up_to` are then skipped as duplicates.
                 let mut processed_up_to = delivered_up_to;
-                match deliver_batch(&state, &role_id, &bounded_context_name, &mut current, &resume_span).await {
+                let mut resume_after = from_sequence;
+                while resume_after < resume_span {
+                    let page = match resume_page(&state, &bounded_context_name, resume_after, resume_span).await {
+                        Ok(page) if page.is_empty() => break,
+                        Ok(page) => page,
+                        Err(err) => {
+                            yielder.yield_error(err).await;
+                            return Ok(());
+                        }
+                    };
+                    resume_after = page.last().expect("nonempty resume page").sequence;
+                match deliver_batch(&state, &role_id, &bounded_context_name, &mut current, &page).await {
                     Ok(delivered) => {
                         for (sequence, rendered) in delivered {
                             yielder
@@ -242,6 +253,7 @@ pub fn all_events_field(n: &Naming) -> SubscriptionField {
                         yielder.yield_error(err).await;
                         return Ok(());
                     }
+                }
                 }
                 loop {
                   let event = tokio::select! {
@@ -404,7 +416,18 @@ pub fn events_by_type_field(n: &Naming) -> SubscriptionField {
                 // time, delivered first, in order; live events at or
                 // below `delivered_up_to` are then skipped as duplicates.
                 let mut processed_up_to = delivered_up_to;
-                match deliver_batch(&state, &role_id, &bounded_context_name, &mut current, &resume_span).await {
+                let mut resume_after = from_sequence;
+                while resume_after < resume_span {
+                    let page = match resume_page(&state, &bounded_context_name, resume_after, resume_span).await {
+                        Ok(page) if page.is_empty() => break,
+                        Ok(page) => page,
+                        Err(err) => {
+                            yielder.yield_error(err).await;
+                            return Ok(());
+                        }
+                    };
+                    resume_after = page.last().expect("nonempty resume page").sequence;
+                match deliver_batch(&state, &role_id, &bounded_context_name, &mut current, &page).await {
                     Ok(delivered) => {
                         for (sequence, rendered) in delivered {
                             yielder
@@ -416,6 +439,7 @@ pub fn events_by_type_field(n: &Naming) -> SubscriptionField {
                         yielder.yield_error(err).await;
                         return Ok(());
                     }
+                }
                 }
                 loop {
                   let event = tokio::select! {
@@ -509,10 +533,9 @@ pub fn events_by_type_field(n: &Naming) -> SubscriptionField {
 /// between (all of the bounded context's, or `event_type`'s only) are
 /// the resume span - delivered before any live event, so a caller that
 /// read up to `fromSequence` (or last received it before a disconnect)
-/// misses nothing committed before this subscription existed. At most
-/// `max_events_per_read` of them; a larger span is refused with
-/// `resume_span_too_large` rather than loaded, and the caller reads it
-/// back with `queryEvents` first. One above the latest is refused with
+/// misses nothing committed before this subscription existed. The span
+/// is loaded lazily in pages of at most `max_events_per_read` events.
+/// One above the latest is refused with
 /// `from_sequence_not_committed` (§148), and an `epoch` other than the
 /// database's current one with `epoch_changed` (§176): after a failover
 /// the log may end before `fromSequence`, or reuse it for other events,
@@ -522,10 +545,10 @@ pub fn events_by_type_field(n: &Naming) -> SubscriptionField {
 async fn resolve_start(
     state: &GraphqlState,
     bounded_context: &str,
-    event_type: Option<&str>,
+    _event_type: Option<&str>,
     from_sequence: Option<i64>,
     epoch: Option<&str>,
-) -> async_graphql::Result<(i64, Vec<skilj_core::event_store::Event>, i64)> {
+) -> async_graphql::Result<(i64, i64, i64)> {
     let (latest, current_epoch) =
         skilj_core::db::latest_sequence_and_epoch(&state.pool, bounded_context)
             .await
@@ -545,39 +568,29 @@ async fn resolve_start(
         ))
         .extend_with(|_, ext| ext.set("code", "from_sequence_not_committed")));
     }
-    let Some(from_sequence) = from_sequence.filter(|from| *from < latest) else {
-        let start = from_sequence.unwrap_or(latest);
-        return Ok((start, Vec::new(), start));
-    };
-    let cap = state.max_events_per_read.max(1);
-    let limit = i64::try_from(cap).unwrap_or(i64::MAX - 1) + 1;
-    let mut span = match event_type {
-        None => {
-            skilj_core::db::list_events_for_bounded_context_from_limited(
-                &state.pool,
-                bounded_context,
-                from_sequence,
-                limit,
-            )
-            .await
-        }
-        Some(event_type) => {
-            skilj_core::db::list_events_from_limited(
-                &state.pool,
-                bounded_context,
-                event_type,
-                from_sequence,
-                limit,
-            )
-            .await
-        }
-    }
+    let start = from_sequence.unwrap_or(latest);
+    Ok((start, latest, latest))
+}
+
+/// Load one bounded page up to the subscribe-time watermark. Delivery filters
+/// event types and rechecks access for each page. No entire resume span is kept.
+async fn resume_page(
+    state: &GraphqlState,
+    bounded_context: &str,
+    after: i64,
+    through: i64,
+) -> async_graphql::Result<Vec<skilj_core::event_store::Event>> {
+    let limit = i64::try_from(state.max_events_per_read.max(1)).unwrap_or(i64::MAX);
+    let mut page = skilj_core::db::list_events_for_bounded_context_from_limited(
+        &state.pool,
+        bounded_context,
+        after,
+        limit,
+    )
+    .await
     .map_err(to_graphql_error)?;
-    span.retain(|event| event.sequence <= latest);
-    if span.len() > cap {
-        return Err(resume_span_too_large_error(cap));
-    }
-    Ok((from_sequence, span, latest))
+    page.retain(|event| event.sequence <= through);
+    Ok(page)
 }
 
 /// The live feed's ordering (docs/architecture.md §90). Events reach the
@@ -622,14 +635,6 @@ async fn in_sequence_order(
     *processed_up_to = event.sequence;
     ordered.push(event);
     Ok(ordered)
-}
-
-fn resume_span_too_large_error(cap: usize) -> async_graphql::Error {
-    async_graphql::Error::new(format!(
-        "more than {cap} events were committed after fromSequence - read them back with \
-         queryEvents first, then subscribe from the last sequence read"
-    ))
-    .extend_with(|_, ext| ext.set("code", "resume_span_too_large"))
 }
 
 /// Committed events, in order, delivered to one subscription: the grant
