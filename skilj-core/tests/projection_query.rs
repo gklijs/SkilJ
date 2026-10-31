@@ -72,6 +72,7 @@ fn projection() -> Projection {
         consumed_event_types: Vec::new(),
         sync: false,
         caught_up_to: Some(5),
+        owner_tag_key: None,
         requires_capability: None,
     }
 }

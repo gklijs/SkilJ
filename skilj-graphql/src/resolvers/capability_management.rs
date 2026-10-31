@@ -271,6 +271,8 @@ pub struct CapabilityOverviewEntry {
     pub required: BTreeSet<String>,
     /// Held by an active grant.
     pub held: BTreeSet<String>,
+    /// Projection registration metadata, including the owner tag dimension.
+    pub projections: Vec<crate::gql_types::ProjectionWithRebuild>,
 }
 
 /// `capabilityOverview: [CapabilityOverviewEntry!]!` - superadmin only,
@@ -289,12 +291,12 @@ pub fn capability_overview_field(n: &Naming) -> Field {
                     .map_err(to_graphql_error)?
                 {
                     let mut required = BTreeSet::new();
-                    for p in
+                    let projections =
                         skilj_core::db::list_projections_for_bounded_context(&state.pool, &bc.name)
                             .await
-                            .map_err(to_graphql_error)?
-                    {
-                        required.extend(p.requires_capability);
+                            .map_err(to_graphql_error)?;
+                    for p in &projections {
+                        required.extend(p.requires_capability.clone());
                     }
                     for et in
                         skilj_core::db::list_event_types_for_bounded_context(&state.pool, &bc.name)
@@ -322,10 +324,35 @@ pub fn capability_overview_field(n: &Naming) -> Field {
                         .into_iter()
                         .flat_map(|m| m.capabilities)
                         .collect();
+                    let mut projection_entries = Vec::new();
+                    for projection in projections {
+                        let pending_rebuild = skilj_core::db::get_projection_rebuild(
+                            &state.pool,
+                            &bc.name,
+                            &projection.name,
+                            skilj_core::projections::ProjectionRebuildStatus::Pending,
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
+                        let building_rebuild = skilj_core::db::get_projection_rebuild(
+                            &state.pool,
+                            &bc.name,
+                            &projection.name,
+                            skilj_core::projections::ProjectionRebuildStatus::Building,
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
+                        projection_entries.push(crate::gql_types::ProjectionWithRebuild {
+                            projection,
+                            pending_rebuild,
+                            building_rebuild,
+                        });
+                    }
                     entries.push(FieldValue::owned_any(CapabilityOverviewEntry {
                         bounded_context: bc.name,
                         required,
                         held,
+                        projections: projection_entries,
                     }));
                 }
                 Ok(Some(FieldValue::list(entries)))

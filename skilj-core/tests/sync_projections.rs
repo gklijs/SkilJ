@@ -244,6 +244,7 @@ async fn seed_sync_projection(
         consumed_event_types: consumed,
         sync: true,
         caught_up_to: None,
+        owner_tag_key: None,
         requires_capability: None,
     };
     db::upsert_projection(pool, &projection).await.unwrap();

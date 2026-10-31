@@ -286,6 +286,7 @@ pub fn capability_overview_entry_object(n: &Naming) -> Object {
         scalar "held": TypeRef::named_nn_list_nn(TypeRef::STRING) => |e| string_list(e.held.iter().cloned()),
         scalar "requiredButNotHeld": TypeRef::named_nn_list_nn(TypeRef::STRING) => |e| string_list(e.required.difference(&e.held).cloned()),
         scalar "heldButNotRequired": TypeRef::named_nn_list_nn(TypeRef::STRING) => |e| string_list(e.held.difference(&e.required).cloned()),
+        list "projections": TypeRef::named_nn_list_nn(n.ty("Projection")) => |e| e.projections.clone(),
     })
 }
 
@@ -740,6 +741,7 @@ pub fn projection_object(n: &Naming) -> Object {
         scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |p| Value::from(p.projection.schema_version),
         list "consumedEventTypes": TypeRef::named_nn_list_nn(n.ty("EventType")) => |p| p.projection.consumed_event_types.clone(),
         scalar "sync": TypeRef::named_nn(TypeRef::BOOLEAN) => |p| Value::from(p.projection.sync),
+        scalar "ownerTagKey": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.projection.owner_tag_key.clone()),
         scalar "requiresCapability": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.projection.requires_capability.clone()),
         scalar "caughtUpTo": TypeRef::named(TypeRef::INT) => |p| match p.projection.caught_up_to {
             Some(seq) => Value::from(seq),

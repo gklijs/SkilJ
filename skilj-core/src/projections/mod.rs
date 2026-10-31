@@ -45,6 +45,10 @@ use crate::event_store::{BoundedContext, BoundedContextStatus, Event, EventType}
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A synchronous projection cannot safely fold its live generation during a rebuild.
+    #[error("synchronous projection {0:?} is paused for an incompatible rebuild")]
+    LiveFoldPaused(String),
+
     /// A projection may only consume EventTypes from its own bounded context.
     #[error("a projection may only consume EventTypes from its own bounded context")]
     ConsumedEventTypeNotInBoundedContext,
@@ -71,6 +75,7 @@ pub enum Error {
 impl SkiljRejection for Error {
     fn code(&self) -> &str {
         match self {
+            Error::LiveFoldPaused(_) => "live_fold_paused",
             Error::ConsumedEventTypeNotInBoundedContext => {
                 "consumed_event_type_not_in_bounded_context"
             }
@@ -112,6 +117,8 @@ pub struct Projection {
     /// rebuilds the projection nor bumps `schema_version`, since it
     /// changes who may read, not what is folded.
     pub requires_capability: Option<String>,
+    /// Tag dimension that owns each instance; reconciled without a rebuild.
+    pub owner_tag_key: Option<String>,
 }
 
 /// See `entity ProjectionRebuild`'s `status` field/transition graph.
@@ -210,6 +217,20 @@ pub fn check_consumed_event_type_names<'a>(
         }
     }
     Ok(())
+}
+
+impl ProjectionRegistration {
+    /// Attach the declared owner dimension to the registration result. It is
+    /// access metadata and does not itself require a state rebuild.
+    pub fn with_owner_tag_key(mut self, owner_tag_key: Option<String>) -> Self {
+        match &mut self {
+            Self::Created { projection, .. } | Self::ReconciledTrivially(projection) => {
+                projection.owner_tag_key = owner_tag_key
+            }
+            Self::RebuildStaged(rebuild) => rebuild.projection.owner_tag_key = owner_tag_key,
+        }
+        self
+    }
 }
 
 /// Every `(event type, private field)` among `consumed_event_types` - what
@@ -314,6 +335,7 @@ pub fn register_projection(
                 sync,
                 caught_up_to: None,
                 requires_capability,
+                owner_tag_key: None,
             },
             needs_history_fold,
         });
@@ -446,7 +468,7 @@ pub fn discard_projection_rebuild(
 /// `read_projection`'s own real branch - see `crate::encryption::decrypt_ciphertext_leaves`'s
 /// own doc comment for the full design and why it's automatic rather than
 /// a declared `Projection.sensitive_fields`. `data_keys` is the caller's
-/// own pre-resolution (`db::list_active_data_keys_for_subject_value`,
+/// own pre-resolution (`db::projection_subject_data_key`,
 /// gated on `event_store::sensitive_field_is_granted` first) - empty
 /// means either the caller isn't granted for this instance's own subject,
 /// or nothing sensitive was ever found for it; either way `state_json` is

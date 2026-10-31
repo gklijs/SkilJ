@@ -13180,3 +13180,68 @@ Every instance runs it, so no restart, deploy or reconciliation role is involved
 **What it doesn't do.** Data keys never change, so ciphertext sealed under them is not re-encrypted; a copy of the database taken before a rotation, with the old master key version, still opens - until that version is retired, which is why the leak response retires immediately. Moving the default key from one provider to another (key file to Vault) isn't supported yet; startup refuses the mix. Only Vault/OpenBao among key services; AWS, GCP and Azure KMS fit the same trait, though they charge per key, which matters with a key per tenant.
 
 **Tests.** `skilj/tests/master_key_rotation.rs`, against an in-process imitation of Transit (versioned ciphertexts, batch rewrap, `min_decryption_version`, key creation, deletion only once allowed, token checks): the Vault provider on its own; a requested rotation end to end with the key file and with Vault - adopted on first start, rewrapped in every context, the old version kept through the grace period, a destroyed key left destroyed, old ciphertext still opening, then a leak rotation retiring at once; a scheduled rotation; a rotation made at the provider directly; legacy data keys refused without their key, or with the wrong one naming the context despite a corrupt newest row, then moved; another provider's data keys refusing startup; a context given its own key - moved, rotated without touching the default key, read by an instance that never used the key, and the key deleted at the provider after the context is; a key a superadmin brought, refused when missing, let go of but not deleted; 250 data keys with one corrupt one - one event across both batches, the corrupt one marked once, and the rotation retiring regardless; a data key wrapped under an old version after the rewrap, holding up the retirement until it is rewrapped; the GraphQL surface, including a misspelt and an empty context refused; a key not retired while a context moving off it still has data keys under it; one bad ciphertext in a Vault batch marked while the rest are rewrapped; a slow provider not holding pool connections (fails before the change); a brought key followed but never rotated or retired by skilj; asking to create a key that exists claiming nothing; a key file recreated at its path refusing startup, a marked data key cleared by a read and another tried again by the next rotation; a due deletion refused, and started over, while a data key is wrapped by the key; a deletion waiting for a provisioning that holds the key's row and then finding its data key; another Vault with a key at the same path refusing startup, the key checked once across three contexts, and an unreachable Vault not stopping the start; zero intervals refused. The tests cap each instance's pool at four connections, as the other suites do: sixteen tests starting instances together otherwise exhaust a default Postgres's hundred. `skilj/tests/vault_transit_container.rs` runs the provider and the lifecycle against real Vault 1.17 and OpenBao 2.1.0 in containers - each refusal's status, a batch with failed items, `min_decryption_version`, creating, deleting, a token without the right, and a leak rotation and a tenant key's deletion end to end - and skips without Docker, which fails CI. `encryption::provider` unit tests cover the keyrings and the key file, `encryption::trail`'s the events' schemas and tags.
+
+
+## 231. Decisions from the spec rebuild review (issue #148)
+
+Default command consistency matching excludes tags with no value. Such tags
+remain stored, and explicit queries can still select them; commands with no
+non-null default tags read no history and have no tag consistency boundary.
+Both the optimistic read and the locked conflict check use that same selection.
+
+Event subscriptions recover arbitrarily long committed spans in pages bounded
+by `max_events_per_read`, with a subscribe-time watermark separating replay
+from live delivery. Delivery rechecks grants and field permissions for each
+page. A client can reconnect with its last processed sequence after a lag or
+transport failure; a read-level grant needs no admin-only history query.
+
+Projection decryption requires `Projection::SUBJECT_KEY`: the instance key is
+the subject value, and only its declared namespace is used. Equal values in
+other namespaces never supply decryption keys. Undeclared projections and
+forgotten subjects stay encrypted, including for a sensitive-reader grant.
+Projection and summary folds continue to receive stored ciphertext.
+
+A pending or building rebuild pauses live folding unless the application
+explicitly declares `Projection::LIVE_FOLD_COMPATIBLE`. This declaration asserts
+compatibility with the live state's schema and meaning. Failed folds roll back;
+paused projections retain their state and progress. A synchronous projection
+refuses writes with `live_fold_paused` rather than commit stale state. The
+existing progress and rebuild fields make the pause inspectable. Promotion
+resumes normal folding.
+
+Projection `owner_tag_key` is registered and exposed through TypeRegistration
+and CapabilityOverview. It reconciles without rebuilding or incrementing the
+state schema version, including while a rebuild is staged. The public Rust
+Projection struct gains this field, so the workspace advances to 0.3.0.
+
+Database persistence is split under `skilj-core/src/db/` by responsibility:
+registration and schemas, roles and access, event and command records, command
+processing, projection records and consumers, routes, deadlines, secrets,
+encryption keys, tokens and cursors. `db/mod.rs` retains the pool, notifications,
+metrics and reexports, preserving existing public `db::` paths. Helpers shared
+between rule groups are visible only within the database module.
+
+
+`decide()` receives decrypted copies of selected historical event payloads,
+independently of the submitting caller's read grants. Its incoming command is
+already plaintext. Projection and summary folds continue to see ciphertext.
+Copies used for decisions never enter the event cache, stored history, or a
+rejection's matching-event response. Each sensitive leaf uses its declared
+subject namespace. If a selected sensitive value cannot be recovered after
+forgetting, the command fails with `sensitive_history_unavailable` and a reason
+identifying the event without disclosing the subject. The command transaction
+rechecks selected history even with no new matching event, retaining key locks
+until commit, so a subject forgotten after the optimistic decision cannot make
+that earlier answer commit. Missing optional sensitive leaves need no key.
+Custom CommandDispatcher implementations expose their KeyService through
+`key_service()`; the facade wires this automatically. Snapshot and summary
+states remain opaque and are not decrypted by this event-history contract.
+
+This strict unavailable-history rule also applies to blind-index uniqueness
+queries: a retained hash can still match a forgotten record, but the command
+fails with `sensitive_history_unavailable` before its domain decider can return
+its usual already-taken rejection. It never accepts reuse on that account.
+
+A compiled fold whose schema differs from the live registration also pauses
+without a compatibility declaration. Discarding a staged rebuild therefore
+cannot accidentally resume an incompatible fold against the old state.

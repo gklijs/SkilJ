@@ -1012,3 +1012,163 @@ fn a_query_of_nothing_reads_no_history_and_never_conflicts() {
         assert!(calls[..4].iter().filter(|c| c.is_empty()).count() == 3);
     });
 }
+
+struct SensitiveHistoryDispatcher {
+    service: skilj_core::encryption::KeyService,
+    seen: Mutex<Vec<Vec<String>>>,
+}
+impl CommandDispatcher for SensitiveHistoryDispatcher {
+    fn key_service(&self) -> Option<&skilj_core::encryption::KeyService> {
+        Some(&self.service)
+    }
+    fn dispatch(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        history: &[Event],
+    ) -> Option<skilj_core::error::Result<CommandDecision>> {
+        let emails: Vec<String> = history
+            .iter()
+            .map(|event| {
+                serde_json::from_str::<serde_json::Value>(&event.payload).unwrap()["email"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        self.seen.lock().unwrap().push(emails.clone());
+        Some(Ok(CommandDecision::Accepted {
+            events: emails
+                .last()
+                .map(|email| EventSpec {
+                    event_type: "CompanySignedUp".into(),
+                    payload: serde_json::json!({"company_id":"acme", "email":email}),
+                })
+                .into_iter()
+                .collect(),
+        }))
+    }
+    fn required_role(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        Some(None)
+    }
+    fn snapshot_name(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        Some(None)
+    }
+    fn dispatch_from_snapshot(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[Event],
+        _: &skilj_core::plugin::DecisionContext,
+    ) -> Option<skilj_core::error::Result<CommandDecision>> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn deciders_get_decrypted_copies_and_refuse_forgotten_history_even_after_the_optimistic_read() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else { return; };
+        let h = seed(&pool).await;
+        let service = skilj_core::encryption::KeyService::new(skilj_core::encryption::InMemoryKeyProvider::from_bytes([8u8;32]));
+        let mut et = h.signed_up.clone();
+        et.schema = r#"{"type":"object","properties":{"company_id":{"type":"string"},"email":{"type":"string"}}}"#.into();
+        et.sensitive_fields = vec![skilj_core::shared::SensitiveField { field:"email".into(), subject_key:"company".into(), subject_field:"company_id".into() }];
+        db::upsert_event_type(&pool, &et).await.unwrap();
+        let mut ct = h.create_ticket.clone();
+        ct.name = "CheckEmail".into();
+        db::upsert_command_type(&pool, &ct).await.unwrap();
+        let dispatcher = SensitiveHistoryDispatcher { service, seen: Mutex::new(vec![]) };
+        let insert = |email: &'static str| {
+            let pool = pool.clone(); let et = et.clone(); let service = dispatcher.service.clone();
+            async move {
+                let (key, _, data_key) = db::get_or_create_encryption_key(&pool, &et.bounded_context.name, "company", "acme", &service).await.unwrap();
+                let payload = serde_json::json!({"company_id":"acme", "email":email}).to_string();
+                let protected = skilj_core::event_store::try_protect_sensitive_fields(&et.sensitive_fields, &payload, |_,_| (key.clone(),data_key.clone())).unwrap();
+                let sequence = db::next_sequence(&pool, &et.bounded_context.name).await.unwrap();
+                let event = Event {
+                    bounded_context: et.bounded_context.clone(), event_type: et.clone(), payload: protected.payload,
+                    metadata: Metadata { r#type:et.name.clone(), version:1, client_id:"test".into(), created_at:test_now(), correlation_id:None, causation_id:None },
+                    sequence, tags:skilj_core::event_store::derive_plain_tags(&et.tag_mappings, &payload), encryption_keys:protected.encryption_keys, origin:EventOrigin::DirectlyCreated,
+                };
+                db::insert_event(&pool, &event, None).await.unwrap();
+            }
+        };
+        insert("old@example.com").await;
+        let cache = EventCache::new(1000);
+        let context = skilj_core::plugin::DecisionContext::at(test_now());
+        let body = payload("t1");
+        let resolved = db::resolve_command_submission(&pool,&dispatcher,&NoSnapshots,&cache,&ct,&body,&context).await.unwrap();
+        assert_eq!(*dispatcher.seen.lock().unwrap(), vec![vec!["old@example.com".to_string()]]);
+        assert!(!resolved.matching_events[0].payload.contains("old@example.com"));
+        insert("new@example.com").await;
+        let outcome = db::submit_command(&pool,&dispatcher,&NoProjections,&EventBroadcaster::new(16),&cache,&ct,&body,"client",None,None,
+            &resolved.bounded_context_events,&resolved.consistency_tags,&resolved.matching_events,resolved.decision,Some(&dispatcher.service),test_now(),None,&[],None,Some(resolved.covered_through),&context).await.unwrap();
+        assert_eq!(dispatcher.seen.lock().unwrap().last().unwrap(), &vec!["old@example.com".to_string(),"new@example.com".to_string()]);
+        match outcome { SubmitCommandOutcome::Accepted { events, .. } => assert!(!events[0].payload.contains("new@example.com")), _ => panic!("expected acceptance") }
+        let resolved = db::resolve_command_submission(&pool,&dispatcher,&NoSnapshots,&cache,&ct,&body,&context).await.unwrap();
+        db::destroy_encryption_key(&pool,&h.bc.name,"company","acme",test_now()).await.unwrap();
+        let result = db::submit_command(&pool,&dispatcher,&NoProjections,&EventBroadcaster::new(16),&cache,&ct,&body,"client",None,None,
+            &resolved.bounded_context_events,&resolved.consistency_tags,&resolved.matching_events,resolved.decision,Some(&dispatcher.service),test_now(),None,&[],None,Some(resolved.covered_through),&context).await;
+        assert!(matches!(result, Err(skilj_core::error::Error::EventStore(skilj_core::event_store::Error::SensitiveHistoryUnavailable { .. }))));
+        let result = db::resolve_command_submission(&pool,&dispatcher,&NoSnapshots,&cache,&ct,&body,&context).await;
+        assert!(matches!(result, Err(skilj_core::error::Error::EventStore(skilj_core::event_store::Error::SensitiveHistoryUnavailable { .. }))));
+    });
+}
+
+#[test]
+fn all_null_default_tags_read_nothing_with_or_without_cache_and_in_a_batch() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let h = seed(&pool).await;
+        let mut ct = h.log_contact.clone();
+        ct.tag_mappings = vec![ticket()];
+        db::upsert_command_type(&pool, &ct).await.unwrap();
+        record(&pool, &h.bc, &h.created, "acme", None).await;
+        let dispatcher = SensitiveHistoryDispatcher {
+            service: skilj_core::encryption::KeyService::new(
+                skilj_core::encryption::InMemoryKeyProvider::from_bytes([9u8; 32]),
+            ),
+            seen: Mutex::new(vec![]),
+        };
+        let context = skilj_core::plugin::DecisionContext::at(test_now());
+        for size in [0, 1000] {
+            let resolved = db::resolve_command_submission(
+                &pool,
+                &dispatcher,
+                &NoSnapshots,
+                &EventCache::new(size),
+                &ct,
+                "{}",
+                &context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved.consistency_tags.len(), 1);
+            assert!(resolved.consistency_tags[0].value.is_none());
+            assert!(resolved.bounded_context_events.is_empty());
+            assert!(resolved.matching_events.is_empty());
+            record(&pool, &h.bc, &h.created, "acme", None).await;
+            let results = db::submit_command_batch(
+                &pool,
+                &dispatcher,
+                &NoProjections,
+                None,
+                &h.bc.name,
+                vec![batched(&ct, "{}".into(), resolved)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(kind(results[0].as_ref().unwrap()), "accepted");
+        }
+        assert_eq!(
+            *dispatcher.seen.lock().unwrap(),
+            vec![Vec::<String>::new(), Vec::<String>::new()]
+        );
+    });
+}

@@ -65,8 +65,8 @@ pub(crate) async fn wait_until_caught_up(
 /// identical two-grant test `render_event` already has, reused unchanged)
 /// decides, once per query, whether this caller is entitled to see
 /// anything decrypted for this instance's own `key` at all - if so,
-/// `db::list_active_data_keys_for_subject_value` resolves every active
-/// `EncryptionKey` for it, and `skilj_core::projections::read_projection`
+/// `db::projection_subject_data_key` resolves the active key in the
+/// projection's declared `SUBJECT_KEY` namespace, and `skilj_core::projections::read_projection`
 /// tries them against every string leaf in the stored state, at any
 /// depth. No `Projection.sensitive_fields` declaration anywhere - see
 /// `skilj_core::encryption::decrypt_ciphertext_leaves`'s own doc comment
@@ -227,21 +227,29 @@ async fn projection_instance(
         .owner_tag_key(bounded_context_name, name)
         .flatten();
 
-    // Real decrypt-on-read - automatic, no `Projection.sensitive_fields`
-    // declaration anywhere (see `field()`'s own doc comment). Grant
-    // checked once, up front: an ungranted caller's query never needs a
-    // master key, or even a DB round trip for one, at all.
-    let data_keys = if skilj_core::event_store::sensitive_field_is_granted(access_mapping, key) {
-        skilj_core::db::list_active_data_keys_for_subject_value(
-            &state.pool,
-            bounded_context_name,
-            key,
-            state.key_service.as_ref(),
-        )
-        .await
-        .map_err(to_graphql_error)?
-    } else {
-        Vec::new()
+    // Namespace and instance value identify one subject, never every subject
+    // sharing this value. Undeclared projections stay encrypted.
+    let subject_key = state
+        .projection_dispatcher
+        .subject_key(bounded_context_name, name);
+    let data_keys = match subject_key {
+        Some(subject_key)
+            if skilj_core::event_store::sensitive_field_is_granted(access_mapping, key)
+                && !skilj_core::secrets::is_reserved_subject_key(subject_key) =>
+        {
+            skilj_core::db::projection_subject_data_key(
+                &state.pool,
+                bounded_context_name,
+                subject_key,
+                key,
+                state.key_service.as_ref(),
+            )
+            .await
+            .map_err(to_graphql_error)?
+            .into_iter()
+            .collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
     };
     let state_json = skilj_core::projections::read_projection(&state_json, &data_keys);
 

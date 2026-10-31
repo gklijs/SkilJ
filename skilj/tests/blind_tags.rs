@@ -397,6 +397,19 @@ impl Crm {
         )
     }
 
+    async fn assert_forgotten_history_rejected(&self, email: &str) {
+        let error = self
+            .submit_through(
+                &self.skilj,
+                "RegisterCustomer",
+                serde_json::json!({"customer_id":id("c"),"email":email}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "sensitive_history_unavailable");
+        assert!(error.to_string().contains("forgotten"), "{error}");
+    }
+
     async fn change(&self, customer_id: &str, old_email: &str, email: &str) -> String {
         let payload = serde_json::json!({
             "customer_id": customer_id, "old_email": old_email, "email": email,
@@ -594,10 +607,10 @@ fn a_kept_address_stays_taken_after_its_customer_is_forgotten() {
         assert_eq!(crm.register(&c1, "alice@example.com").await, "accepted");
         crm.forget(&c1).await;
         assert_eq!(crm.stored_hashes().await.len(), 1);
-        assert_eq!(
-            crm.register(&id("c"), "alice@example.com").await,
-            "email_taken"
-        );
+        // The hash still matches, but selected history cannot be decrypted.
+        // Refuse explicitly before calling the domain decider.
+        crm.assert_forgotten_history_rejected("alice@example.com")
+            .await;
         crm.skilj.shutdown(std::time::Duration::from_secs(10)).await;
     });
 }
@@ -880,10 +893,9 @@ fn rotating_the_key_rewraps_every_stored_tag_and_keeps_every_value_taken() {
 
         // Every address keeps its state: the forgotten one stays taken, the
         // changed-from one is free, and new ones hash under the new key.
-        assert_eq!(
-            rotated.register(&id("c"), "Alice@Example.com").await,
-            "email_taken"
-        );
+        rotated
+            .assert_forgotten_history_rejected("Alice@Example.com")
+            .await;
         assert_eq!(
             rotated.register(&id("c"), "robert@example.com").await,
             "email_taken"

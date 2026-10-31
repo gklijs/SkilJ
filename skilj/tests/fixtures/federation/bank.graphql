@@ -56,6 +56,7 @@ type BankCapabilityOverviewEntry @inaccessible {
 	held: [String!]!
 	requiredButNotHeld: [String!]!
 	heldButNotRequired: [String!]!
+	projections: [BankProjection!]!
 }
 
 type BankCommandApprovalPolicy @inaccessible {
@@ -346,6 +347,7 @@ type BankProjection {
 	schemaVersion: Int!
 	consumedEventTypes: [BankEventType!]!
 	sync: Boolean!
+	ownerTagKey: String
 	requiresCapability: String
 	caughtUpTo: Int
 	pendingRebuild: BankProjectionRebuild
@@ -501,7 +503,7 @@ type Mutation {
 	bankDeleteBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: BankMissedOccurrencePolicy): BankEventType! @inaccessible
 	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): BankCommandType! @inaccessible
-	bankRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, requiresCapability: String): BankProjectionRegistrationResult! @inaccessible
+	bankRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, ownerTagKey: String, requiresCapability: String): BankProjectionRegistrationResult! @inaccessible
 	bankRebuildProjection(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
 	bankDiscardProjectionRebuild(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
 	bankRetryParkedDelivery(boundedContext: String!, id: String!): BankParkedDelivery! @inaccessible

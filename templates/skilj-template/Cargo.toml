@@ -11,8 +11,8 @@ default = ["local"]
 local = ["skilj/local"]
 
 [dependencies]
-skilj = "0.2.0"
-skilj-core = "0.2.0"
+skilj = "0.3.0"
+skilj-core = "0.3.0"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }

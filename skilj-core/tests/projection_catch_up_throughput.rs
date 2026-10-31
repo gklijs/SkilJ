@@ -173,6 +173,7 @@ async fn scenario(pool: &Pool, label: &str, projections: &[&str]) {
                 consumed_event_types: vec![et.clone()],
                 sync: false,
                 caught_up_to: None,
+                owner_tag_key: None,
                 requires_capability: None,
             },
         )
