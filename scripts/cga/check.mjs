@@ -15,6 +15,10 @@ const TARGET = 'x86_64-unknown-linux-gnu';
 const PACKAGE = 'skilj-core';
 export const digest = path => createHash('sha256').update(readFileSync(path)).digest('hex');
 
+// The installed compiler driver is cached independently of workspace targets.
+export const toolCacheKey = (here = HERE) =>
+  `cga-tool-v1-${REVISION}-${NIGHTLY}-${TARGET}-${digest(join(here, 'compat.patch'))}`;
+
 function runCommand(command, args, options = {}) {
   const result = spawnSync(command, args, { cwd: ROOT, stdio: 'inherit', ...options });
   if (result.error) throw result.error;
@@ -22,12 +26,12 @@ function runCommand(command, args, options = {}) {
   return result;
 }
 
-export function install({ root = ROOT, here = HERE, run = runCommand } = {}) {
-  const stamp = `${REVISION}\n${digest(join(here, 'compat.patch'))}\n`;
+export function install({ root = ROOT, here = HERE, run = runCommand,
+  prefix = join(root, 'target/cga-tool') } = {}) {
+  const stamp = `${toolCacheKey(here)}\n`;
   // Restored binaries still need their compiler/LLVM runtime libraries.
   run('rustup', ['toolchain', 'install', NIGHTLY, '--profile', 'minimal', '--no-self-update',
     '--component', 'rustc-dev', '--component', 'rust-src', '--component', 'llvm-tools'], { cwd: root });
-  const prefix = join(root, 'target/cga-tool');
   const marker = join(prefix, 'skilj-build');
   const binary = join(prefix, 'bin/cargo-cga');
   if (existsSync(binary) && existsSync(marker) && readFileSync(marker, 'utf8') === stamp) return binary;
@@ -176,10 +180,15 @@ export function compare(actual, baseline, log = console.error) {
 
 export function main(args = process.argv.slice(2)) {
   const { values } = parseArgs({ args, options: {
-    record: { type: 'boolean' }, 'install-only': { type: 'boolean' }, help: { type: 'boolean' },
+    record: { type: 'boolean' }, 'install-only': { type: 'boolean' },
+    'tool-cache-key': { type: 'boolean' }, help: { type: 'boolean' },
   } });
   if (values.help) {
-    console.log('Usage: node scripts/cga/check.mjs [--record | --install-only]\nPinned partial CGA analysis and per-finding regression check.');
+    console.log('Usage: node scripts/cga/check.mjs [--record | --install-only | --tool-cache-key]\nPinned partial CGA analysis and per-finding regression check.');
+    return;
+  }
+  if (values['tool-cache-key']) {
+    console.log(toolCacheKey());
     return;
   }
   const lock = join(ROOT, 'Cargo.lock');
@@ -190,7 +199,8 @@ export function main(args = process.argv.slice(2)) {
   else if (!readFileSync(lock).equals(readFileSync(snapshot))) {
     throw new Error('Cargo.lock differs from scripts/cga/workspace.lock; review dependencies and use --record');
   }
-  const binary = install();
+  const binary = install({ prefix: process.env.CGA_TOOL_ROOT
+    ? resolve(process.env.CGA_TOOL_ROOT) : join(ROOT, 'target/cga-tool') });
   if (values['install-only']) return;
   const output = join(ROOT, 'target/cga-report');
   mkdirSync(output, { recursive: true });

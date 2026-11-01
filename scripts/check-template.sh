@@ -15,17 +15,31 @@
 # run, for a machine that can't start the embedded Postgres.
 #
 # Usage: scripts/check-template.sh [--published] [--no-run]
+#        [--cache-dir DIR [--prepare-only | --prepared]]
 set -euo pipefail
 
 published=false
 run=true
-for arg in "$@"; do
-    case "$arg" in
+prepare_only=false
+prepared=false
+cache_dir=
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --published) published=true ;;
         --no-run) run=false ;;
-        *) echo "check-template: unknown argument $arg" >&2; exit 2 ;;
+        --prepare-only) prepare_only=true ;;
+        --prepared) prepared=true ;;
+        --cache-dir)
+            [[ $# -ge 2 && -n "$2" ]] || { echo 'check-template: --cache-dir needs a directory' >&2; exit 2; }
+            cache_dir="$2"; shift ;;
+        *) echo "check-template: unknown argument $1" >&2; exit 2 ;;
     esac
+    shift
 done
+if { $prepare_only || $prepared; } && [[ -z "$cache_dir" ]]; then
+    echo 'check-template: --prepare-only/--prepared requires --cache-dir' >&2
+    exit 2
+fi
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
@@ -40,26 +54,48 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp -r "$root/templates/skilj-template" "$work/app"
-cd "$work/app"
-grep -rl '{{' . | xargs sed -i 's/{{project-name}}/template-check/g; s/{{crate_name}}/template_check/g'
-if grep -rn '{{' . ; then
-    echo "check-template: unfilled placeholders left (see above)" >&2
-    exit 1
+# CI uses a stable generated-project path and target directory so Cargo's
+# fingerprints survive between runs. Logs and Postgres data stay temporary.
+if [[ -n "$cache_dir" ]]; then
+    mkdir -p "$cache_dir"
+    cache_dir="$(cd "$cache_dir" && pwd)"
+    app="$cache_dir/app"
+    export CARGO_TARGET_DIR="$cache_dir/build"
+else
+    app="$work/app"
+    export CARGO_TARGET_DIR="$work/target"
 fi
 
-if ! $published; then
-    cat >> Cargo.toml <<EOF
+if ! $prepared; then
+    # Only the generated app is replaced; cached build artifacts are its sibling.
+    rm -rf "$app"
+    cp -r "$root/templates/skilj-template" "$app"
+    cd "$app"
+    grep -rl '{{' . | xargs sed -i 's/{{project-name}}/template-check/g; s/{{crate_name}}/template_check/g'
+    if grep -rn '{{' . ; then
+        echo "check-template: unfilled placeholders left (see above)" >&2
+        exit 1
+    fi
+    # The persistent generated app may live below the main workspace's target/.
+    # Declare a standalone workspace so Cargo does not adopt its ancestor.
+    printf '\n[workspace]\n' >> Cargo.toml
+    if ! $published; then
+        cat >> Cargo.toml <<EOF
 
 [patch.crates-io]
 skilj = { path = "$root/skilj" }
 skilj-core = { path = "$root/skilj-core" }
 EOF
+    fi
+else
+    [[ -f "$app/Cargo.toml" ]] || { echo 'check-template: prepare the cached app first' >&2; exit 2; }
+    cd "$app"
+fi
+if $prepare_only; then
+    echo "check-template: prepared $app"
+    exit 0
 fi
 
-# The template isn't a workspace member; keep its build out of the
-# workspace's own target directory.
-export CARGO_TARGET_DIR="$work/target"
 cargo check --all-targets
 # What the Dockerfile builds: without the embedded-Postgres `local` feature.
 cargo check --all-targets --no-default-features
@@ -85,10 +121,12 @@ fail() {
 
 # Long enough for the first run's Postgres download and initdb.
 for _ in $(seq 1 300); do
+    # shellcheck disable=SC2016 # Match the literal variable in printed commands.
     grep -q '^  curl .*\$WITHDRAW' "$log" && break
     kill -0 "$server_pid" 2>/dev/null || fail "the server exited before it was ready"
     sleep 1
 done
+# shellcheck disable=SC2016 # Match the literal variable in printed commands.
 grep -q '^  curl .*\$WITHDRAW' "$log" || fail "the server didn't print its try-it commands within 300s"
 
 # The commands exactly as the server prints them, as a reader pastes them.

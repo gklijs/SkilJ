@@ -5,11 +5,10 @@
 ## so the scripts they call (scripts/ci-test.sh and the Postgres scripts
 ## behind it) see the same Debian container, running as root, that they
 ## were written against. The independent checks are separate jobs and run
-## in parallel; only `test` needs a database.
+## in parallel. Each test shard and the coverage job has its own database.
 ##
-## rust-cache saves only on main: a PR reads main's cache, and PR-scoped
-## caches nothing else can read would only evict it from the 10 GB
-## repository limit.
+## Most Rust caches are saved on main and read by PRs. Semver is PR-only
+## and saves a PR-scoped cache so subsequent updates can reuse it.
 
 name: CI
 
@@ -38,6 +37,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: node --test scripts/ci.test.mjs
       # Validates every "§N" citation of docs/architecture.md's own section
       # headings (a past renumbering silently broke ~600 of them).
       - run: scripts/check-section-refs.sh
@@ -45,6 +48,8 @@ jobs:
   check-cga:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      CGA_TOOL_ROOT: ${{ github.workspace }}/.ci-cga-tool
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -57,10 +62,23 @@ jobs:
         with:
           key: cga-nightly-2026-10-18
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: CGA tool cache key
+        id: cga-tool-key
+        run: echo "key=$(node scripts/cga/check.mjs --tool-cache-key)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v5
+        id: cga-tool-cache
+        with:
+          path: .ci-cga-tool
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cga-tool-key.outputs.key }}
       - name: Test CGA regression guard
         run: node --test scripts/cga/check.test.mjs
       - name: Check potential panic baseline
         run: node scripts/cga/check.mjs
+      - uses: actions/cache/save@v5
+        if: github.ref == 'refs/heads/main' && steps.cga-tool-cache.outputs.cache-hit != 'true'
+        with:
+          path: .ci-cga-tool
+          key: ${{ steps.cga-tool-cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -87,14 +105,23 @@ jobs:
     # reader. In a root container it would use Debian's packaged server
     # instead, and test something else.
     runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare template at a stable path
+        run: scripts/check-template.sh --prepare-only --cache-dir target/template-check
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: target/template-check/app -> ../build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Generates templates/skilj-template, builds it against this
       # workspace's crates - the template isn't a workspace member, so
       # nothing else notices when a change breaks it (docs/architecture.md §105) -
       # and runs the quickstart: deposit accepted, overdraft rejected.
-      - run: scripts/check-template.sh
+      - run: scripts/check-template.sh --prepared --cache-dir target/template-check
 
   check-template-docker:
     # The template's Dockerfile, built the way a user builds it (amd64;
@@ -103,7 +130,35 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - run: scripts/check-template-docker.sh
+      - uses: docker/setup-buildx-action@v4
+      - uses: actions/cache/restore@v5
+        id: docker-cache
+        with:
+          path: ${{ runner.temp }}/template-docker-cache
+          key: ${{ runner.os }}-template-docker-v1-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-template-docker-v1-
+      - name: Build and smoke-test the template image
+        env:
+          DOCKER_CACHE_HIT: ${{ steps.docker-cache.outputs.cache-hit }}
+        run: |
+          cache_args=()
+          if [[ -f "$RUNNER_TEMP/template-docker-cache/index.json" ]]; then
+            cache_args+=(--cache-from "type=local,src=$RUNNER_TEMP/template-docker-cache")
+          fi
+          if [[ "$GITHUB_REF" == refs/heads/main && "$DOCKER_CACHE_HIT" != true ]]; then
+            cache_args+=(--cache-to "type=local,dest=$RUNNER_TEMP/template-docker-cache-new,mode=max")
+          fi
+          scripts/check-template-docker.sh "${cache_args[@]}"
+      - name: Replace the exported layer cache
+        if: github.ref == 'refs/heads/main' && steps.docker-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf "$RUNNER_TEMP/template-docker-cache"
+          mv "$RUNNER_TEMP/template-docker-cache-new" "$RUNNER_TEMP/template-docker-cache"
+      - uses: actions/cache/save@v5
+        if: github.ref == 'refs/heads/main' && steps.docker-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/template-docker-cache
+          key: ${{ steps.docker-cache.outputs.cache-primary-key }}
 
   check-federation-composition:
     runs-on: ubuntu-24.04
@@ -158,7 +213,8 @@ jobs:
           tool: cargo-semver-checks@0.51.0
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # This job is PR-only: cache within the PR for its next update.
+          save-if: true
       # Every published crate with a library target, compared with its
       # latest release on crates.io: the ones the README's stability
       # promise names, and the internal ones a patch release must not
@@ -223,7 +279,11 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-  test:
+  test-suites:
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [business, app, libraries]
     runs-on: ubuntu-24.04
     container:
       image: rust:1-bookworm
@@ -259,6 +319,8 @@ jobs:
     env:
       # ci-test.sh reads this to find the service; its credentials default
       # to postgres/postgres/postgres, which is also what the service gets.
+      CI_TEST_GROUP: ${{ matrix.group }}
+      CI_TEST_LOG: /tmp/test-output.log
       CI_POSTGRES_HOST: skilj-postgres
       # Disk, not speed: no run reuses the incremental cache, and line
       # tables keep file:line in panic backtraces while dropping the
@@ -282,22 +344,46 @@ jobs:
       - run: bash scripts/ci-test.sh --setup-only
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Compiles exactly what the run below needs, as its own step so a
       # compile error is told apart from a failing test. Not `cargo build
       # --all-targets`: `cargo test` recompiled the workspace crates after
       # it (1m43s on the first GitHub run).
-      - run: cargo test --workspace --no-run
+      - run: bash scripts/ci-test.sh --build-only
       # Every Postgres-backed test runs against a real server, and the
       # broker suites against containers on the runner's Docker, which
       # this container job reaches through its mounted socket. ci-test.sh
       # fails the build if any test skipped anyway (§223).
       - run: bash scripts/ci-test.sh
 
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: test-${{ matrix.group }}-timings-and-log
+          path: |
+            /tmp/test-output.log
+            target/cargo-timings/
+          if-no-files-found: ignore
+
+  # Keep the existing required check name and fail if any shard failed or skipped.
+  test:
+    if: always()
+    needs: test-suites
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every test shard
+        env:
+          RESULT: ${{ needs.test-suites.result }}
+        run: test "$RESULT" = success
+
   # Line coverage of the same run as `test`, reported in the job summary
   # and attached as lcov. Informational: it never fails the build, and
   # there is no threshold until there is a baseline to hold.
   coverage:
+    # Instrumented builds run separately on main and on explicit dispatch.
+    # Every PR still runs the full uninstrumented suite through test-suites.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     continue-on-error: true
     container:

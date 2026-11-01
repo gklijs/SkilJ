@@ -70,6 +70,25 @@ were written against that; a job that runs on the bare runner instead
 would need `sudo` for the in-job Postgres fallback and the failover
 test. The `actionlint` job checks `.github/workflows/ci.yml` itself.
 
+The required `test` check aggregates three whole-binary shards: `business`
+(`graphql_business_surfaces`), `app` (the other `skilj` targets and its
+doctests), and `libraries` (every other workspace crate). Each shard has
+its own Postgres server and the same no-skip guard. Both app shards enable
+`skilj/local`, as the full workspace does through `skilj-demo`. To reproduce
+a shard, set `CI_TEST_GROUP=business`, `app`, or `libraries` before running
+`bash scripts/ci-test.sh`; omit it for the full workspace. `--build-only`
+compiles the selected group without a database and writes Cargo timings.
+The shard jobs upload their timing reports and test logs, including on failure.
+
+Coverage is informational and runs on pushes to `main` and manual workflow
+dispatch, rather than repeating the instrumented full run on every PR.
+Clippy and rustdoc stay together; MSRV and CGA keep their own toolchains.
+Most dependency caches are saved on `main`; the PR-only semver job saves a
+PR-scoped cache for subsequent updates. The native template uses a stable
+generated project and cached target directory. Its Docker check imports
+and exports BuildKit layers; the template's pinned `cargo-chef` dependency
+stage survives source-only changes, while the final image is still smoke-tested.
+
 The blocking `check-cga` job compares potential panic paths in `skilj-core`
 with a checked-in per-finding baseline. Run `node scripts/cga/check.mjs`;
 after a deliberate reduction, use `--record` and review the baseline diff.

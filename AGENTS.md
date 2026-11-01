@@ -70,7 +70,7 @@ Coverage is partial: unresolved generic vtable calls are skipped with their name
 
 ## CI checks
 
-The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each (12-15 and 17-18 are their own jobs; 16 is a weekly workflow):
+The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs. Steps 8-9 run per whole-binary test shard (`business`, `app`, `libraries`), aggregated by the required `test` check; 10-11 stay together. Coverage (15) runs on `main` and manual dispatch; 16 is a weekly workflow:
 1. actionlint — checks the workflow file itself, including shellcheck on its `run:` blocks
 2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`
 3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace, then runs its quickstart (embedded Postgres, a deposit accepted, an overdraft rejected); `--no-run` skips the run
@@ -79,13 +79,20 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 6. `cargo deny check` — RustSec advisories, licenses, banned crates and sources, per `deny.toml`
 7. `cargo +1.95 check --workspace --lib --bins` — the declared minimum supported Rust version (`rust-version` in `Cargo.toml`) still builds
 8. `scripts/ci-test.sh --setup-only` — settles the CI job's Postgres before the long build, preferring the `services:` container and falling back to one inside the job's own container
-9. `cargo test --workspace --no-run`, then `scripts/ci-test.sh` — `cargo test --workspace -- --nocapture` against that database, plus the guard that fails the build if any test skipped (Postgres, brokers or Temporal)
+9. `CI_TEST_GROUP=<group> bash scripts/ci-test.sh --build-only`, then `scripts/ci-test.sh` with the same group — `cargo test --workspace -- --nocapture` against that database, plus the guard that fails the build if any test skipped (Postgres, brokers or Temporal)
 10. `cargo clippy --workspace --all-targets -- -D warnings`
 11. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 12. `scripts/check-spec.sh` — `allium check` on `specs/skilj.allium`: fails on an error, or on more warnings than the script's `MAX_WARNINGS` (a ratchet; lower it when a warning is fixed)
 13. `cargo machete` — no unused dependency; one kept on purpose goes in the crate's `[package.metadata.cargo-machete] ignored` with its reason
 14. `cargo semver-checks` on the library crates against their latest release, pull requests only. Blocking: a breaking change fails it until the minor version is bumped in the same diff
-15. `cargo llvm-cov` — line coverage of the full test run, in the job summary and as an lcov artifact. Informational (`continue-on-error`), no threshold
+15. `cargo llvm-cov` — on pushes to `main` and manual workflow dispatch, line coverage of the full test run, in the job summary and as an lcov artifact. Informational (`continue-on-error`), no threshold
 16. `cargo mutants` — weekly (`.github/workflows/mutants.yml`), on the access trail and the `*_with_trail` writers against the `access_trail` tests. Surviving mutants are listed in the job summary. Informational
 17. `scripts/check-template-docker.sh` — builds `templates/skilj-template`'s Dockerfile against this workspace and starts the image (its own job, needs Docker)
 18. `node scripts/cga/check.mjs` — pinned partial `skilj-core` panic analysis; fails on new findings, new analysis gaps, or analyzer failures. Its Node.js regression tests run in the same job.
+
+Run `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs` after changing CI scripts.
+The CI regression suite checks that sharding covers every integration target exactly once,
+preserves doctests and `skilj/local`, and still fails when a service-dependent test skips.
+`CI_TEST_GROUP` defaults to `all` locally. `--build-only` needs no database and records timings.
+Most Rust dependency caches save on `main`; semver saves within the PR because it is PR-only.
+Template builds and the CGA tool binary have separate caches; see docs/architecture.md §222.

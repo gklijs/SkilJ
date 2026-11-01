@@ -9,7 +9,7 @@ node --test scripts/cga/check.test.mjs
 
 The first command installs the exact CGA revision in `check.mjs`, using its
 pinned nightly (including `rustc-dev`, `rust-src`, and `llvm-tools`), into
-`target/cga-tool`. The LLVM component supplies the library needed to link
+`target/cga-tool` (or `CGA_TOOL_ROOT` when set). The LLVM component supplies the library needed to link
 CGA's compiler driver; it must also be installed on cache hits. The command
 applies `compat.patch`, then analyzes `skilj-core` on x86_64 Linux with `cga.toml`. Because the library
 workspace does not track `Cargo.lock`, `workspace.lock` is a dedicated
@@ -19,6 +19,14 @@ Successful `--record` runs update both the snapshot and finding baseline.
 It needs Git, Node.js 22 or newer, Rustup, network access for toolchain setup, and the usual
 native build dependencies (including OpenSSL headers). It does not need
 Postgres or Docker. The blocking `check-cga` CI job runs both commands.
+
+CI sets `CGA_TOOL_ROOT` to `.ci-cga-tool`, outside Rust-cache's target
+cleanup, and restores that directory with a dedicated Actions cache.
+`node scripts/cga/check.mjs --tool-cache-key` prints the key without setting
+up Rust or touching the workspace lockfile. It includes the CGA revision,
+pinned nightly, target, and compatibility-patch hash. A tool cache hit skips
+building the driver, but never skips installing its nightly components or
+running the core analysis. Workspace dependencies use their existing Rust cache.
 
 ## What the check covers
 
