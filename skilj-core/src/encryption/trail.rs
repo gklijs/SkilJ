@@ -283,7 +283,22 @@ impl MasterKeyChange {
 
     /// The event for this change at `sequence`: `SkiljRecorded`,
     /// `client_id` the literal `"system"`, tagged as the type maps it.
+    ///
+    /// # Panics
+    /// Panics if secure randomness is unavailable. Use [`Self::try_into_event`]
+    /// to return the failure instead.
     pub fn into_event(self, admin: &BoundedContext, sequence: i64, now: DateTime<Utc>) -> Event {
+        self.try_into_event(admin, sequence, now)
+            .expect("secure randomness is unavailable")
+    }
+
+    /// Builds the trail event, returning OS randomness failures.
+    pub fn try_into_event(
+        self,
+        admin: &BoundedContext,
+        sequence: i64,
+        now: DateTime<Utc>,
+    ) -> crate::error::Result<Event> {
         debug_assert_eq!(admin.name, ADMIN_BOUNDED_CONTEXT_NAME);
         let event_type = master_key_event_type(admin, self.kind);
         let tags = self
@@ -299,14 +314,14 @@ impl MasterKeyChange {
                     .map(str::to_string),
             })
             .collect();
-        Event {
+        Ok(Event {
             bounded_context: admin.clone(),
             metadata: Metadata {
                 r#type: event_type.name.clone(),
                 version: event_type.schema_version,
                 client_id: "system".to_string(),
                 created_at: now,
-                correlation_id: Some(crate::shared::generate_token_id()),
+                correlation_id: Some(crate::shared::try_generate_token_id()?),
                 causation_id: None,
             },
             payload: Value::Object(self.payload).to_string(),
@@ -315,7 +330,7 @@ impl MasterKeyChange {
             tags,
             encryption_keys: Vec::new(),
             origin: EventOrigin::SkiljRecorded,
-        }
+        })
     }
 }
 

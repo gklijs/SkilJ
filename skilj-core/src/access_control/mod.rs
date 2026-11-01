@@ -1456,12 +1456,21 @@ pub struct RevocationBroadcaster {
 
 impl RevocationBroadcaster {
     /// A broadcaster no one listens to yet.
+    ///
+    /// # Panics
+    /// Panics if secure randomness is unavailable. Use [`Self::try_new`]
+    /// to return the failure instead.
     pub fn new() -> Self {
+        Self::try_new().expect("secure randomness is unavailable")
+    }
+
+    /// Creates a broadcaster, returning OS randomness failures.
+    pub fn try_new() -> crate::error::Result<Self> {
         let (sender, _receiver) = tokio::sync::broadcast::channel(256);
-        Self {
+        Ok(Self {
             sender,
-            instance_id: crate::shared::generate_token_id(),
-        }
+            instance_id: crate::shared::try_generate_token_id()?,
+        })
     }
 
     /// See `EventBroadcaster::instance_id`'s own doc comment - identical

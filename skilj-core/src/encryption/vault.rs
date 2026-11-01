@@ -40,7 +40,7 @@ enum Token {
 /// module doc).
 #[derive(Clone)]
 pub struct VaultTransitProvider {
-    client: reqwest::Client,
+    client: Result<reqwest::Client, String>,
     address: String,
     mount: String,
     key: String,
@@ -60,13 +60,26 @@ impl std::fmt::Debug for VaultTransitProvider {
 
 impl VaultTransitProvider {
     /// The Transit key `key` at `address` (`https://vault.example:8200`),
-    /// on the `transit` mount, authenticating with `token`.
+    /// on the `transit` mount, authenticating with `token`. Client setup
+    /// failures are returned by operations; [`Self::try_new`] reports them
+    /// immediately. A supplied [`Self::client`] replaces the default client.
     pub fn new(
         address: impl Into<String>,
         key: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
         Self::with_token(address.into(), key.into(), Token::Static(token.into()))
+    }
+
+    /// Like [`Self::new`], returning HTTP client initialization failures.
+    pub fn try_new(
+        address: impl Into<String>,
+        key: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let provider = Self::new(address, key, token);
+        provider.http_client()?;
+        Ok(provider)
     }
 
     /// [`new`](Self::new), with the address, token and namespace from
@@ -87,6 +100,7 @@ impl VaultTransitProvider {
             ),
         };
         let mut provider = Self::with_token(address, key.into(), token);
+        provider.http_client()?;
         provider.namespace = std::env::var("VAULT_NAMESPACE").ok();
         Ok(provider)
     }
@@ -96,7 +110,7 @@ impl VaultTransitProvider {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
-                .expect("a reqwest client with a timeout always builds"),
+                .map_err(|error| error.to_string()),
             address: address.trim_end_matches('/').to_string(),
             mount: "transit".to_string(),
             key,
@@ -134,8 +148,14 @@ impl VaultTransitProvider {
 
     /// The HTTP client, for TLS settings of your own (a private CA, say).
     pub fn client(mut self, client: reqwest::Client) -> Self {
-        self.client = client;
+        self.client = Ok(client);
         self
+    }
+
+    fn http_client(&self) -> Result<&reqwest::Client, Error> {
+        self.client
+            .as_ref()
+            .map_err(|message| self.unavailable(format!("initializing HTTP client: {message}")))
     }
 
     fn unavailable(&self, message: impl std::fmt::Display) -> Error {
@@ -194,7 +214,7 @@ impl VaultTransitProvider {
         body: Option<Value>,
     ) -> Result<(u16, Value), Error> {
         let url = format!("{}/v1/{}/{}", self.address, self.mount, path);
-        let mut request = self.client.request(method, &url);
+        let mut request = self.http_client()?.request(method, &url);
         if let Some(body) = &body {
             request = request.json(body);
         }
@@ -234,7 +254,10 @@ impl VaultTransitProvider {
     ) -> Result<Value, (Option<u16>, Error)> {
         let fail = |status: Option<u16>| move |err: Error| (status, err);
         let url = format!("{}/v1/{}/{}", self.address, self.mount, path);
-        let mut request = self.client.request(method, &url);
+        let mut request = self
+            .http_client()
+            .map_err(fail(None))?
+            .request(method, &url);
         if let Some(body) = &body {
             request = request.json(body);
         }
@@ -516,6 +539,30 @@ impl KeyProvider for VaultTransitProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_initialization_errors_reach_both_request_paths() {
+        let mut provider =
+            VaultTransitProvider::try_new("http://vault:8200", "skilj", "t").unwrap();
+        // A deterministic real builder failure, without changing process-wide TLS state.
+        provider.client = reqwest::Client::builder()
+            .user_agent("invalid\nheader")
+            .build()
+            .map_err(|error| error.to_string());
+        assert!(provider.client.is_err());
+        let error = provider
+            .request_with_body(reqwest::Method::GET, "keys/skilj", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ProviderUnavailable { .. }));
+        let (_, error) = provider
+            .request_with_status(reqwest::Method::GET, "keys/skilj", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ProviderUnavailable { .. }));
+        let repaired = provider.client(reqwest::Client::new());
+        assert!(repaired.http_client().is_ok());
+    }
 
     #[test]
     fn the_version_is_read_from_the_ciphertext() {

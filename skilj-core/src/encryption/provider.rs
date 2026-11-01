@@ -19,9 +19,9 @@
 //! [`rotate`]: KeyProvider::rotate
 //! [`retire_below`]: KeyProvider::retire_below
 
+use super::random_bytes;
 use super::Error;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -130,14 +130,6 @@ pub fn validate_key_name(key: &str) -> Result<(), Error> {
     }
 }
 
-fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut bytes = [0u8; N];
-    SystemRandom::new().fill(&mut bytes).expect(
-        "SystemRandom::fill only fails on catastrophic OS RNG failure - see ring's own docs",
-    );
-    bytes
-}
-
 /// A keyring held in the process, shared by [`InMemoryKeyProvider`] and
 /// [`KeyFileProvider`]: version `n` is `keys[n - 1]`, `None` once retired.
 /// A wrapped key is the AES-256-GCM nonce followed by the sealed key.
@@ -207,7 +199,7 @@ impl Keyring {
     fn wrap(&self, data_key: &[u8; 32]) -> Result<WrappedDataKey, Error> {
         let version = self.latest();
         let key = self.key(version)?;
-        let nonce = random_bytes::<NONCE_LEN>();
+        let nonce = random_bytes::<NONCE_LEN>()?;
         let sealing = LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, &key).expect("a 32-byte key is valid for AES-256-GCM"),
         );
@@ -248,13 +240,13 @@ impl Keyring {
         opened.try_into().map_err(|_| Error::DecryptFailed)
     }
 
-    fn rotate(&mut self) -> u32 {
+    fn rotate(&mut self) -> Result<u32, Error> {
         let version = self.latest() + 1;
         self.versions.push(StoredVersion {
             version,
-            key: Some(to_hex(&random_bytes::<32>())),
+            key: Some(to_hex(&random_bytes::<32>()?)),
         });
-        version
+        Ok(version)
     }
 
     fn retire_below(&mut self, version: u32) {
@@ -288,8 +280,17 @@ pub struct InMemoryKeyProvider {
 
 impl InMemoryKeyProvider {
     /// A keyring whose version 1 is a fresh random key.
+    ///
+    /// # Panics
+    /// Panics if secure randomness is unavailable. Use [`Self::try_new`]
+    /// to return the failure instead.
     pub fn new() -> Self {
-        Self::from_bytes(random_bytes::<32>())
+        Self::try_new().expect("secure randomness is unavailable")
+    }
+
+    /// A fresh in-memory keyring, returning OS randomness failures.
+    pub fn try_new() -> Result<Self, Error> {
+        Ok(Self::from_bytes(random_bytes::<32>()?))
     }
 
     /// A keyring whose version 1 is `bytes`: two providers made from the
@@ -340,7 +341,7 @@ impl KeyProvider for InMemoryKeyProvider {
     }
 
     fn rotate(&self) -> BoxFuture<'_, Result<u32, Error>> {
-        Box::pin(async move { self.with(Keyring::rotate) })
+        Box::pin(async move { self.with(Keyring::rotate)? })
     }
 
     fn retire_below(&self, version: u32) -> BoxFuture<'_, Result<(), Error>> {
@@ -362,7 +363,7 @@ impl KeyProvider for InMemoryKeyProvider {
             if keyrings.contains_key(&self.key) {
                 return Ok(false);
             }
-            keyrings.insert(self.key.clone(), Keyring::new(random_bytes::<32>()));
+            keyrings.insert(self.key.clone(), Keyring::new(random_bytes::<32>()?));
             Ok(true)
         })
     }
@@ -416,7 +417,7 @@ impl KeyFileProvider {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| self.io_error(e))?;
         }
-        self.write(&Keyring::new(random_bytes::<32>()))?;
+        self.write(&Keyring::new(random_bytes::<32>()?))?;
         Ok(true)
     }
 
@@ -458,10 +459,10 @@ impl KeyFileProvider {
         std::fs::rename(&temporary, &self.path).map_err(|e| self.io_error(e))
     }
 
-    fn change<T>(&self, f: impl FnOnce(&mut Keyring) -> T) -> Result<T, Error> {
+    fn change<T>(&self, f: impl FnOnce(&mut Keyring) -> Result<T, Error>) -> Result<T, Error> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut keyring = self.read()?;
-        let out = f(&mut keyring);
+        let out = f(&mut keyring)?;
         self.write(&keyring)?;
         Ok(out)
     }
@@ -489,7 +490,12 @@ impl KeyProvider for KeyFileProvider {
     }
 
     fn retire_below(&self, version: u32) -> BoxFuture<'_, Result<(), Error>> {
-        Box::pin(async move { self.change(|k| k.retire_below(version)) })
+        Box::pin(async move {
+            self.change(|k| {
+                k.retire_below(version);
+                Ok(())
+            })
+        })
     }
 
     /// The file next to this one, `<stem>-<key>.json`.
@@ -530,6 +536,57 @@ mod tests {
             .build()
             .unwrap()
             .block_on(future)
+    }
+
+    #[test]
+    fn rng_failure_does_not_create_rotate_or_wrap_keys() {
+        let provider = InMemoryKeyProvider::from_bytes([1; 32]);
+        let path = std::env::temp_dir().join(format!(
+            "skilj-rng-{}.json",
+            crate::shared::generate_token_id()
+        ));
+        let file = KeyFileProvider::open(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let missing = path.with_extension("missing");
+        let service = super::super::KeyService::new(provider.clone());
+        super::super::with_rng_failure(|| {
+            block_on(async {
+                assert!(matches!(
+                    provider.wrap(&[2; 32]).await,
+                    Err(Error::RandomnessUnavailable)
+                ));
+                assert!(matches!(
+                    provider.rotate().await,
+                    Err(Error::RandomnessUnavailable)
+                ));
+                assert!(matches!(
+                    provider.key("new").unwrap().create().await,
+                    Err(Error::RandomnessUnavailable)
+                ));
+                assert!(matches!(
+                    service.generate().await,
+                    Err(Error::RandomnessUnavailable)
+                ));
+                assert!(matches!(
+                    file.wrap(&[2; 32]).await,
+                    Err(Error::RandomnessUnavailable)
+                ));
+                assert!(matches!(
+                    file.rotate().await,
+                    Err(Error::RandomnessUnavailable)
+                ));
+                assert!(matches!(
+                    KeyFileProvider::open(&missing),
+                    Err(Error::RandomnessUnavailable)
+                ));
+            })
+        });
+        assert_eq!(block_on(provider.versions()).unwrap().latest, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!missing.exists());
+        assert!(block_on(provider.key("new").unwrap().versions()).is_err());
+        assert_eq!(block_on(provider.rotate()).unwrap(), 2);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

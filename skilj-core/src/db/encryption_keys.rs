@@ -339,7 +339,7 @@ pub async fn resolve_encryption_keys(
     key_service: Option<&KeyService>,
     resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
 ) -> crate::error::Result<()> {
-    let subjects = crate::event_store::sensitive_field_subjects(sensitive_fields, payload);
+    let subjects = crate::event_store::try_sensitive_field_subjects(sensitive_fields, payload)?;
     if subjects.is_empty() {
         return Ok(());
     }
@@ -399,7 +399,7 @@ pub async fn resolve_data_keys_for_reading(
     resolved: &mut std::collections::HashMap<(String, String), Option<DataKey>>,
 ) -> crate::error::Result<()> {
     let granted_subjects: Vec<(String, String)> =
-        crate::event_store::sensitive_field_subjects(sensitive_fields, payload)
+        crate::event_store::try_sensitive_field_subjects(sensitive_fields, payload)?
             .into_iter()
             .filter(|(_, subject_value)| {
                 crate::event_store::sensitive_field_is_granted(access_mapping, subject_value)

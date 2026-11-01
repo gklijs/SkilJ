@@ -127,7 +127,7 @@ pub async fn propose_command(
         },
     )?;
 
-    let id = crate::shared::generate_token_id();
+    let id = crate::shared::try_generate_token_id()?;
     let expires_at = policy
         .deadline_seconds
         .map(|seconds| now + chrono::Duration::seconds(seconds));
@@ -629,10 +629,10 @@ pub async fn reveal_command_proposal_payload(
     proposal: &CommandProposal,
     key_service: Option<&KeyService>,
 ) -> crate::error::Result<String> {
-    let subjects = crate::event_store::sensitive_field_subjects(
+    let subjects = crate::event_store::try_sensitive_field_subjects(
         &command_type.sensitive_fields,
         &proposal.payload,
-    );
+    )?;
     if subjects.is_empty() {
         return Ok(proposal.payload.clone());
     }
@@ -718,10 +718,10 @@ pub(super) async fn proposal_subject_forgotten(
     proposal: &CommandProposal,
 ) -> crate::error::Result<bool> {
     let schema = schema_ident(&proposal.bounded_context.name);
-    for (subject_key, subject_value) in crate::event_store::sensitive_field_subjects(
+    for (subject_key, subject_value) in crate::event_store::try_sensitive_field_subjects(
         &command_type.sensitive_fields,
         &proposal.payload,
-    ) {
+    )? {
         let destroyed: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT EXISTS (SELECT 1 FROM {schema}.encryption_keys \
              WHERE subject_key = $1 AND subject_value = $2 \
@@ -790,7 +790,7 @@ pub async fn forget_subject_in_command_proposals(
             let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
             let names_subject = match (&sensitive_fields[command_type], &parsed) {
                 (Some(fields), Some(_)) => {
-                    crate::event_store::sensitive_field_subjects(fields, payload)
+                    crate::event_store::try_sensitive_field_subjects(fields, payload)?
                         .iter()
                         .any(|(key, value)| key == subject_key && value == subject_value)
                 }

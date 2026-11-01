@@ -898,6 +898,8 @@ pub enum Error {
     /// real, unaddressed decode failure mode for a plugin-authored
     /// payload specifically. See docs/architecture.md §1.6/§1.7 for where
     /// this is raised (the `skilj` facade's decide()-dispatch bridge).
+    /// Also returned by the sensitive-field payload APIs when their
+    /// input cannot be parsed as JSON.
     #[error("stored payload did not decode into its expected type: {0}")]
     PayloadDecodeFailed(String),
 
@@ -1513,6 +1515,12 @@ pub fn valid_payload(schema: &str, payload: &str) -> bool {
 /// normally in play, so this is only reached by schema churn.
 const MAX_COMPILED_SCHEMAS: usize = 256;
 
+// Entries are fully constructed before insertion, so a poisoned lock still
+// contains usable validators and may safely be recovered.
+static COMPILED_SCHEMA_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<jsonschema::Validator>>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// `schema` compiled, from a process-wide cache keyed by the schema text
 /// itself (docs/architecture.md §127): compiling cost about 60 µs for an
 /// ordinary schema, against 0.2 µs to validate with the result, and ran
@@ -1521,22 +1529,18 @@ const MAX_COMPILED_SCHEMAS: usize = 256;
 /// served. `None` for a schema that doesn't parse or compile - not cached,
 /// since registration refuses such schemas and they don't recur.
 fn compiled_schema(schema: &str) -> Option<std::sync::Arc<jsonschema::Validator>> {
-    static CACHE: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<jsonschema::Validator>>>,
-    > = std::sync::LazyLock::new(Default::default);
-
-    if let Some(validator) = CACHE
+    if let Some(validator) = COMPILED_SCHEMA_CACHE
         .lock()
-        .expect("the compiled-schema cache is never poisoned")
+        .unwrap_or_else(|error| error.into_inner())
         .get(schema)
     {
         return Some(validator.clone());
     }
     let schema_value = serde_json::from_str::<serde_json::Value>(schema).ok()?;
     let validator = std::sync::Arc::new(jsonschema::validator_for(&schema_value).ok()?);
-    let mut cache = CACHE
+    let mut cache = COMPILED_SCHEMA_CACHE
         .lock()
-        .expect("the compiled-schema cache is never poisoned");
+        .unwrap_or_else(|error| error.into_inner());
     if cache.len() >= MAX_COMPILED_SCHEMAS {
         cache.clear();
     }
@@ -2247,7 +2251,8 @@ pub fn protect_sensitive_fields(
 /// except that a declared sensitive field with a value but no subject is
 /// an error (`Error::SensitiveFieldWithoutSubject`) instead of being left
 /// in the clear. Every caller that stores a caller-supplied payload uses
-/// this one.
+/// this one. Malformed JSON returns [`Error::PayloadDecodeFailed`] when
+/// sensitive fields are declared; an empty declaration is a no-op.
 pub fn try_protect_sensitive_fields(
     sensitive_fields: &[SensitiveField],
     payload: &str,
@@ -2260,9 +2265,8 @@ pub fn try_protect_sensitive_fields(
         });
     }
 
-    let mut parsed: serde_json::Value = serde_json::from_str(payload).expect(
-        "try_protect_sensitive_fields: payload is always valid JSON by the time this is called",
-    );
+    let mut parsed: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error: serde_json::Error| Error::PayloadDecodeFailed(error.to_string()))?;
     let mut used_keys: Vec<EncryptionKey> = Vec::new();
 
     for sf in sensitive_fields {
@@ -2280,7 +2284,7 @@ pub fn try_protect_sensitive_fields(
         };
 
         let (key, data_key) = resolve_key(&sf.subject_key, &subject_value);
-        let ciphertext = crate::encryption::encrypt_leaf(&data_key, &plaintext);
+        let ciphertext = crate::encryption::try_encrypt_leaf(&data_key, &plaintext)?;
 
         if let Some(slot) = payload_field_value_mut(&mut parsed, &sf.field) {
             *slot = serde_json::Value::String(ciphertext);
@@ -2291,15 +2295,15 @@ pub fn try_protect_sensitive_fields(
     }
 
     Ok(ProtectedPayload {
-        payload: serde_json::to_string(&parsed)
-            .expect("re-serialising a parsed JSON Value is infallible"),
+        payload: parsed.to_string(),
         encryption_keys: used_keys,
     })
 }
 
 /// The fail-closed fallback [`protect_sensitive_fields`] returns when
 /// [`try_protect_sensitive_fields`] refuses a payload: every declared
-/// sensitive leaf is set to null, so no value is left readable.
+/// sensitive leaf is set to null, so no value is left readable. A malformed
+/// payload is replaced with JSON null because its leaves cannot be located.
 fn redact_every_sensitive_field(
     sensitive_fields: &[SensitiveField],
     payload: &str,
@@ -2310,9 +2314,8 @@ fn redact_every_sensitive_field(
             encryption_keys: Vec::new(),
         };
     }
-    let mut parsed: serde_json::Value = serde_json::from_str(payload).expect(
-        "redact_every_sensitive_field: payload is always valid JSON by the time this is called",
-    );
+    let mut parsed: serde_json::Value =
+        serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
     for sf in sensitive_fields {
         if let Some(slot) = payload_field_value_mut(&mut parsed, &sf.field) {
             *slot = serde_json::Value::Null;
@@ -2338,7 +2341,9 @@ fn redact_every_sensitive_field(
 /// decryption panic. A field whose own leaf is absent from the payload is
 /// skipped, the same absent-leaf case `try_protect_sensitive_fields`
 /// skips. A proposal stored before that check existed may also lack the
-/// subject; it is left as stored rather than decrypted.
+/// subject; it is left as stored rather than decrypted. Malformed JSON
+/// returns [`Error::PayloadDecodeFailed`] when sensitive fields are declared;
+/// an empty declaration is a no-op.
 pub fn reveal_sensitive_fields(
     sensitive_fields: &[SensitiveField],
     payload: &str,
@@ -2348,7 +2353,7 @@ pub fn reveal_sensitive_fields(
         return Ok(payload.to_string());
     }
     let mut parsed: serde_json::Value = serde_json::from_str(payload)
-        .expect("reveal_sensitive_fields: payload is always valid JSON by the time this is called");
+        .map_err(|error: serde_json::Error| Error::PayloadDecodeFailed(error.to_string()))?;
     for sf in sensitive_fields {
         let Some(subject_value) =
             payload_field_value(&parsed, &sf.subject_field).and_then(json_scalar_to_string)
@@ -2368,7 +2373,7 @@ pub fn reveal_sensitive_fields(
             *slot = serde_json::Value::String(plaintext);
         }
     }
-    Ok(serde_json::to_string(&parsed).expect("re-serialising a parsed JSON Value is infallible"))
+    Ok(parsed.to_string())
 }
 
 /// Every distinct `(subject_key, subject_value)` pair `payload` will need
@@ -2376,6 +2381,8 @@ pub fn reveal_sensitive_fields(
 /// own caller uses this to know what to pre-provision (via
 /// `db::get_or_create_encryption_key`) before ever calling it, the same
 /// pre-resolution step `resolve_event_type`/`next_sequence` already need.
+/// Malformed JSON yields no subjects; use [`try_sensitive_field_subjects`]
+/// to distinguish it from a payload with no subjects.
 /// Pure, no DB, no encryption - just a payload walk. A field whose
 /// `subject_field` is absent or non-scalar contributes nothing, matching
 /// `protect_sensitive_fields`'s own skip for that case.
@@ -2383,12 +2390,21 @@ pub fn sensitive_field_subjects(
     sensitive_fields: &[SensitiveField],
     payload: &str,
 ) -> Vec<(String, String)> {
+    try_sensitive_field_subjects(sensitive_fields, payload).unwrap_or_default()
+}
+
+/// The fallible version of [`sensitive_field_subjects`]. Malformed JSON
+/// returns [`Error::PayloadDecodeFailed`] when fields are declared.
+/// An empty declaration returns an empty list without parsing.
+pub fn try_sensitive_field_subjects(
+    sensitive_fields: &[SensitiveField],
+    payload: &str,
+) -> crate::error::Result<Vec<(String, String)>> {
     if sensitive_fields.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let parsed: serde_json::Value = serde_json::from_str(payload).expect(
-        "sensitive_field_subjects: payload is always valid JSON by the time this is called",
-    );
+    let parsed: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error: serde_json::Error| Error::PayloadDecodeFailed(error.to_string()))?;
 
     let mut subjects = Vec::new();
     for sf in sensitive_fields {
@@ -2401,7 +2417,7 @@ pub fn sensitive_field_subjects(
             }
         }
     }
-    subjects
+    Ok(subjects)
 }
 
 /// Pushes `Tag { key, value }` onto `tags` unless an identical tag is
@@ -2720,7 +2736,8 @@ fn private_field_default_reader<R: PrivateFieldRecord>(
 /// grants, which is every caller before this mechanism existed - the
 /// third pass below is then just the field's own default reader (or its
 /// capability) holding, unchanged from a `private_fields`-free type's own
-/// behaviour.
+/// behaviour. Malformed JSON is rendered as JSON null when a sensitive
+/// or private field declaration requires parsing.
 pub fn render_event(
     event: &Event,
     access_mapping: &RoleAccessMapping,
@@ -2809,8 +2826,8 @@ pub fn render_would_be_event(
     let payload = if sensitive_fields.is_empty() {
         event.payload.clone()
     } else {
-        let mut parsed: serde_json::Value = serde_json::from_str(&event.payload)
-            .expect("render_would_be_event: a decided event's payload is serialized JSON");
+        let mut parsed: serde_json::Value =
+            serde_json::from_str(&event.payload).unwrap_or(serde_json::Value::Null);
         for sf in sensitive_fields {
             let granted = payload_field_value(&parsed, &sf.subject_field)
                 .and_then(json_scalar_to_string)
@@ -2855,9 +2872,8 @@ fn redact_unentitled_private_fields<R: PrivateFieldRecord>(
         return payload.to_string();
     }
 
-    let mut parsed: serde_json::Value = serde_json::from_str(payload).expect(
-        "redact_unentitled_private_fields: payload is always valid JSON by the time this is called",
-    );
+    let mut parsed: serde_json::Value =
+        serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
     for p in private_fields {
         if entitled_to_read_private_field(record, p, access_mapping, grants, &matches_this_record) {
             continue;
@@ -2889,8 +2905,8 @@ pub fn redact_private_fields(event: &Event) -> Event {
     if private_fields.is_empty() {
         return event.clone();
     }
-    let mut parsed: serde_json::Value = serde_json::from_str(&event.payload)
-        .expect("redact_private_fields: payload is always valid JSON by the time this is called");
+    let mut parsed: serde_json::Value =
+        serde_json::from_str(&event.payload).unwrap_or(serde_json::Value::Null);
     for p in private_fields {
         if let Some(slot) = payload_field_value_mut(&mut parsed, &p.field) {
             *slot = serde_json::Value::Null;
@@ -2920,9 +2936,8 @@ fn decrypt_sensitive_fields(
         return payload.to_string();
     }
 
-    let mut parsed: serde_json::Value = serde_json::from_str(payload).expect(
-        "decrypt_sensitive_fields: payload is always valid JSON by the time this is called",
-    );
+    let mut parsed: serde_json::Value =
+        serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
 
     for sf in sensitive_fields {
         let Some(subject_value) =
@@ -3913,16 +3928,25 @@ impl EventBroadcaster {
     /// subscriber may lag behind by before its next `subscribe()`d
     /// receiver starts reporting `Lagged` - see
     /// `SkiljBuilder::event_broadcast_capacity`'s own doc comment.
+    ///
+    /// # Panics
+    /// Panics if secure randomness is unavailable. Use [`Self::try_new`]
+    /// to return the failure instead.
     pub fn new(capacity: usize) -> Self {
+        Self::try_new(capacity).expect("secure randomness is unavailable")
+    }
+
+    /// Creates a broadcaster, returning OS randomness failures.
+    pub fn try_new(capacity: usize) -> crate::error::Result<Self> {
         // `broadcast::channel` panics on a zero capacity; one is the
         // smallest real buffer (a slow subscriber then lags sooner).
         let (sender, _receiver) = tokio::sync::broadcast::channel(capacity.max(1));
         let (gaps, _gaps_receiver) = tokio::sync::watch::channel(0);
-        Self {
+        Ok(Self {
             sender,
             gaps: std::sync::Arc::new(gaps),
-            instance_id: crate::shared::generate_token_id(),
-        }
+            instance_id: crate::shared::try_generate_token_id()?,
+        })
     }
 
     /// A random id generated once per broadcaster - in practice once per
@@ -4123,10 +4147,11 @@ pub fn consume_events(
     now: chrono::DateTime<chrono::Utc>,
     checkout_lease: chrono::Duration,
 ) -> crate::error::Result<ConsumeEventsResult> {
-    let position = existing_cursor.map_or_else(
-        || initial_consume_position(token, events),
-        |cursor| cursor.sequence,
-    );
+    check_consume_events(token, existing_cursor, ack_mode, filters)?;
+    let position = match existing_cursor {
+        Some(cursor) => cursor.sequence,
+        None => try_initial_consume_position(token, events)?,
+    };
     // `events` is the whole history, so every event of the token's type
     // after `position` was examined.
     let scanned_through = events
@@ -4159,35 +4184,68 @@ pub fn consume_events(
 /// token's own scope was never visible to it, so it can't count as
 /// "already seen" either), but blind to any call's `filters`, which vary
 /// call to call and must never move where a one-time seed lands.
-/// `AtSequence` is the caller-chosen value, unvalidated.
+/// `AtSequence` is the caller-chosen value, unvalidated. Inconsistent
+/// token start fields return `i64::MAX` (no later events); use
+/// [`try_initial_consume_position`] to
+/// report the error instead.
 pub fn initial_consume_position<'a>(
     token: &EventReadToken,
     history: impl IntoIterator<Item = &'a Event>,
 ) -> i64 {
+    try_initial_consume_position(token, history).unwrap_or(i64::MAX)
+}
+
+/// Resolves a new cursor's initial position, rejecting inconsistent token
+/// start fields with the same errors as token creation.
+pub fn try_initial_consume_position<'a>(
+    token: &EventReadToken,
+    history: impl IntoIterator<Item = &'a Event>,
+) -> crate::error::Result<i64> {
+    check_read_token_start(token)?;
     let read_type = &token.event_type;
     let qualifying = history
         .into_iter()
         .filter(|e| e.bounded_context.same_as(&read_type.bounded_context))
         .filter(|e| e.event_type.same_as(read_type))
         .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()));
-    match token.start_from {
+    Ok(match token.start_from {
         EventReadStartPosition::Beginning => -1,
         EventReadStartPosition::Latest => qualifying.map(|e| e.sequence).max().unwrap_or(-1),
-        EventReadStartPosition::AtSequence => token.start_at_sequence.expect(
-            "create_event_read_token guarantees start_at_sequence is Some when \
-             start_from = AtSequence",
-        ),
+        EventReadStartPosition::AtSequence => token
+            .start_at_sequence
+            .ok_or(crate::access_control::Error::StartAtSequenceMismatch)?,
         EventReadStartPosition::AtTime => {
-            let threshold = token.start_at_time.expect(
-                "create_event_read_token guarantees start_at_time is Some when \
-                 start_from = AtTime",
-            );
+            let threshold = token
+                .start_at_time
+                .ok_or(crate::access_control::Error::StartAtTimeMismatch)?;
             qualifying
                 .filter(|e| e.metadata.created_at <= threshold)
                 .map(|e| e.sequence)
                 .max()
                 .unwrap_or(-1)
         }
+    })
+}
+
+fn check_read_token_start(token: &EventReadToken) -> crate::error::Result<()> {
+    use crate::access_control::Error as AccessError;
+    match token.start_from {
+        EventReadStartPosition::AtSequence
+            if token.start_at_sequence.is_none() || token.start_at_time.is_some() =>
+        {
+            Err(AccessError::StartAtSequenceMismatch.into())
+        }
+        EventReadStartPosition::AtTime
+            if token.start_at_time.is_none() || token.start_at_sequence.is_some() =>
+        {
+            Err(AccessError::StartAtTimeMismatch.into())
+        }
+        EventReadStartPosition::Beginning | EventReadStartPosition::Latest
+            if token.start_at_sequence.is_some() || token.start_at_time.is_some() =>
+        {
+            Err(AccessError::StartAtValueNotAllowed.into())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -4205,6 +4263,9 @@ pub fn check_consume_events(
     filters: &[Filter],
 ) -> crate::error::Result<()> {
     check_fetch_events(token, filters)?;
+    if existing_cursor.is_none() {
+        check_read_token_start(token)?;
+    }
     match (existing_cursor, ack_mode) {
         (None, None) => Err(Error::CursorAckModeMismatch.into()),
         (Some(cursor), Some(requested)) if requested != cursor.ack_mode => {
@@ -4258,11 +4319,23 @@ pub fn consume_events_page(
     // than `checkout_lease` is treated as abandoned rather than live, the
     // same "self-healing, not a hard failure" register
     // `fire_due_deadlines`'s own missed-occurrence handling already uses.
-    let is_leased = mode == AckMode::ManualAck
-        && !is_new
-        && existing_cursor
-            .and_then(|c| c.checked_out_at)
-            .is_some_and(|checked_out_at| checked_out_at + checkout_lease > now);
+    let is_leased = if mode == AckMode::ManualAck && !is_new {
+        match existing_cursor.and_then(|c| c.checked_out_at) {
+            Some(checked_out_at) => {
+                checked_out_at
+                    .checked_add_signed(checkout_lease)
+                    .ok_or_else(|| {
+                        crate::error::Error::configuration(
+                            "read cursor checkout lease exceeds the timestamp range",
+                        )
+                    })?
+                    > now
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
 
     // `is_leased` overrides everything else to the empty set - a second
     // caller racing a live claim sees no candidates at all, not a
@@ -4514,7 +4587,8 @@ pub fn create_external_event(
             correlation_id: Some(
                 correlation_id
                     .filter(|id| !id.is_empty())
-                    .unwrap_or_else(crate::shared::generate_token_id),
+                    .map(Ok)
+                    .unwrap_or_else(crate::shared::try_generate_token_id)?,
             ),
             causation_id: causation_id.filter(|id| !id.is_empty()),
         },
@@ -4567,7 +4641,8 @@ pub fn create_direct_event(
             correlation_id: Some(
                 correlation_id
                     .filter(|id| !id.is_empty())
-                    .unwrap_or_else(crate::shared::generate_token_id),
+                    .map(Ok)
+                    .unwrap_or_else(crate::shared::try_generate_token_id)?,
             ),
             causation_id: causation_id.filter(|id| !id.is_empty()),
         },
@@ -4653,6 +4728,10 @@ pub fn latest_occurrence_at_or_before(
 /// `EventType.last_fired_at` advance to - the caller's own job to persist,
 /// atomically with the event itself (see `db::fire_system_event`).
 #[allow(clippy::too_many_arguments)]
+///
+/// # Panics
+/// Panics if secure randomness is unavailable. Use [`try_create_system_event`]
+/// to return the failure instead.
 pub fn create_system_event(
     event_type: &EventType,
     occurrence_at: chrono::DateTime<chrono::Utc>,
@@ -4661,15 +4740,41 @@ pub fn create_system_event(
     resolve_payload: impl FnOnce() -> String,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
 ) -> Option<(Event, chrono::DateTime<chrono::Utc>)> {
+    try_create_system_event(
+        event_type,
+        occurrence_at,
+        now,
+        next_sequence,
+        resolve_payload,
+        resolve_key,
+    )
+    .expect("secure randomness is unavailable")
+}
+
+/// Like [`create_system_event`], propagating encryption and randomness
+/// failures so the scheduler can retry without advancing its position.
+#[allow(clippy::too_many_arguments)]
+pub fn try_create_system_event(
+    event_type: &EventType,
+    occurrence_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    next_sequence: i64,
+    resolve_payload: impl FnOnce() -> String,
+    resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
+) -> crate::error::Result<Option<(Event, chrono::DateTime<chrono::Utc>)>> {
     if !event_type.system_triggered_allowed {
-        return None;
+        return Ok(None);
     }
     if event_type.bounded_context.status != BoundedContextStatus::Active {
-        return None;
+        return Ok(None);
     }
-    let schedule = event_type.system_triggered_schedule.as_deref()?;
-    let policy = event_type.missed_occurrence_policy?;
-    let position = event_type.schedule_position?;
+    let (Some(schedule), Some(policy), Some(position)) = (
+        event_type.system_triggered_schedule.as_deref(),
+        event_type.missed_occurrence_policy,
+        event_type.schedule_position,
+    ) else {
+        return Ok(None);
+    };
 
     // An occurrence is never fired before its own instant, and never
     // twice: `position` is the durable, shared record of how far this
@@ -4679,7 +4784,7 @@ pub fn create_system_event(
     // This is what makes two instances raising the same occurrence
     // harmless rather than a duplicate event.
     if occurrence_at > now || occurrence_at <= position {
-        return None;
+        return Ok(None);
     }
 
     // no_gap: this occurrence is the very next one the position hasn't
@@ -4696,11 +4801,16 @@ pub fn create_system_event(
         MissedOccurrencePolicy::Skip => no_gap && nothing_later_is_due,
     };
     if !eligible {
-        return None;
+        return Ok(None);
     }
 
     let payload = resolve_payload();
-    let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
+    let protected =
+        match try_protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key) {
+            Ok(protected) => protected,
+            Err(crate::error::Error::Encryption(error)) => return Err(error.into()),
+            Err(_) => redact_every_sensitive_field(&event_type.sensitive_fields, &payload),
+        };
     let event = Event {
         bounded_context: event_type.bounded_context.clone(),
         event_type: event_type.clone(),
@@ -4712,7 +4822,7 @@ pub fn create_system_event(
             created_at: now,
             // Always a root - a scheduler tick has no caller and no
             // upstream cause to inherit (issue #18).
-            correlation_id: Some(crate::shared::generate_token_id()),
+            correlation_id: Some(crate::shared::try_generate_token_id()?),
             causation_id: None,
         },
         sequence: next_sequence,
@@ -4721,7 +4831,7 @@ pub fn create_system_event(
         encryption_keys: protected.encryption_keys,
         origin: EventOrigin::SystemTriggered,
     };
-    Some((event, occurrence_at))
+    Ok(Some((event, occurrence_at)))
 }
 
 /// See `rule SkipMissedOccurrences`. `None` when the resume is a no-op
@@ -5353,7 +5463,8 @@ pub(crate) fn process_command_at_boundary(
     let correlation_id = correlation_id
         .filter(|id| !id.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(crate::shared::generate_token_id);
+        .map(Ok)
+        .unwrap_or_else(crate::shared::try_generate_token_id)?;
     let causation_id = causation_id.filter(|id| !id.is_empty()).map(str::to_string);
 
     let bounded_context = &command_type.bounded_context.name;
@@ -5421,4 +5532,25 @@ pub(crate) fn process_command_at_boundary(
     }
 
     Ok(ProcessCommandResult { command, events })
+}
+
+#[cfg(test)]
+mod panic_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn a_poisoned_schema_cache_still_validates_payloads() {
+        let schema = r#"{"type":"string"}"#;
+        assert!(valid_payload(schema, r#""valid""#));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = COMPILED_SCHEMA_CACHE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            panic!("poison the compiled-schema cache");
+        });
+        assert!(valid_payload(schema, r#""valid""#));
+        assert!(!valid_payload(schema, "123"));
+        // A new schema also exercises the cache's recovered write lock.
+        assert!(valid_payload(r#"{"type":"integer","minimum":17}"#, "18"));
+    }
 }

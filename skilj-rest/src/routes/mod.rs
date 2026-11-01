@@ -1311,15 +1311,15 @@ async fn get_events_consume(
                         -1,
                         state.max_events_per_read,
                         |chunk| {
-                            position =
-                                position.max(event_store::initial_consume_position(&token, chunk));
+                            position = position
+                                .max(event_store::try_initial_consume_position(&token, chunk)?);
                             Ok(true)
                         },
                     )
                     .await?;
                     position
                 }
-                _ => event_store::initial_consume_position(&token, std::iter::empty()),
+                _ => event_store::try_initial_consume_position(&token, std::iter::empty())?,
             },
         };
         // The page after `position`: `fetch_events_page` applies exactly

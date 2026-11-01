@@ -306,7 +306,7 @@ pub async fn put_secret_value(
         key_service,
     )
     .await?;
-    let ciphertext = encryption::encrypt_leaf(&data_key, plaintext.expose());
+    let ciphertext = encryption::try_encrypt_leaf(&data_key, plaintext.expose())?;
 
     let row: SecretVersionRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.secret_versions \

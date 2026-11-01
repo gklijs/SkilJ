@@ -191,16 +191,27 @@ impl BootstrapGate {
 
 /// A fresh bootstrap secret, or `None` when `existing_roles` holds an active
 /// superadmin and no secret may be claimed.
+///
+/// # Panics
+/// Panics if secure randomness is unavailable. Use [`try_generate_bootstrap_secret`]
+/// to return the failure instead.
 pub fn generate_bootstrap_secret(existing_roles: &[Role]) -> Option<BootstrapSecret> {
+    try_generate_bootstrap_secret(existing_roles).expect("secure randomness is unavailable")
+}
+
+/// Like [`generate_bootstrap_secret`], returning OS randomness failures.
+pub fn try_generate_bootstrap_secret(
+    existing_roles: &[Role],
+) -> crate::error::Result<Option<BootstrapSecret>> {
     if existing_roles
         .iter()
         .any(|r| r.superadmin && r.status == RoleStatus::Active)
     {
-        return None;
+        return Ok(None);
     }
-    Some(BootstrapSecret {
-        secret: crate::shared::generate_token_secret(),
-    })
+    Ok(Some(BootstrapSecret {
+        secret: crate::shared::try_generate_token_secret()?,
+    }))
 }
 
 /// See `rule CreateSuperadmin`. `presented_secret` is `bootstrap_secret`

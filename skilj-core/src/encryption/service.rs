@@ -220,7 +220,7 @@ impl KeyService {
         &self,
         provider: &dyn KeyProvider,
     ) -> Result<(DataKey, WrappedDataKey), Error> {
-        let data_key = DataKey(super::random_bytes::<32>());
+        let data_key = DataKey(super::random_bytes::<32>()?);
         let wrapped = provider.wrap(&data_key.0).await?;
         self.remember(provider.name(), &wrapped, &data_key);
         Ok((data_key, wrapped))

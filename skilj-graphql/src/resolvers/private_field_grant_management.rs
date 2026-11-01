@@ -63,7 +63,8 @@ pub fn grant_private_field_access_for_event_field(n: &Naming) -> Field {
                     &access_mapping,
                     &grantee,
                     event.as_ref(),
-                    skilj_core::shared::generate_token_id(),
+                    skilj_core::shared::try_generate_token_id()
+                        .map_err(crate::error::to_graphql_error)?,
                     chrono::Utc::now(),
                 )
                 .map_err(to_graphql_error)?;
@@ -133,7 +134,8 @@ pub fn grant_private_field_access_for_command_field(n: &Naming) -> Field {
                     &access_mapping,
                     &grantee,
                     command.as_ref(),
-                    skilj_core::shared::generate_token_id(),
+                    skilj_core::shared::try_generate_token_id()
+                        .map_err(crate::error::to_graphql_error)?,
                     chrono::Utc::now(),
                 )
                 .map_err(to_graphql_error)?;

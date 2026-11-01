@@ -8,7 +8,7 @@ use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::ErrorExtensions;
-use skilj_core::shared::generate_token_id;
+use skilj_core::shared::try_generate_token_id;
 
 /// `createSuperadmin(bootstrapSecret: String!, name: String!, externalSubject: String!): CreatedSuperadmin!`,
 /// see `gql_types::created_superadmin_object`'s own doc comment for why
@@ -45,7 +45,7 @@ pub fn field(n: &Naming) -> Field {
                     name,
                     external_subject,
                     &existing_roles,
-                    generate_token_id(),
+                    try_generate_token_id().map_err(crate::error::to_graphql_error)?,
                     chrono::Utc::now(),
                 ) {
                     Ok(role) => role,

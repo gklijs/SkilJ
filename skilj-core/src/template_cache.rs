@@ -62,7 +62,10 @@ impl TemplateCache {
     pub async fn refresh(&self, pool: &Pool) -> crate::error::Result<()> {
         let mappings = crate::db::list_dispatch_template_mappings(pool).await?;
         let replacement: HashMap<String, Option<String>> = mappings.into_iter().collect();
-        *self.current.write().unwrap() = replacement;
+        *self
+            .current
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = replacement;
         Ok(())
     }
 
@@ -72,9 +75,31 @@ impl TemplateCache {
     /// exactly like an untemplated context, never a dispatch failure of
     /// its own).
     pub fn effective_bounded_context(&self, bounded_context: &str) -> String {
-        match self.current.read().unwrap().get(bounded_context) {
+        match self
+            .current
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(bounded_context)
+        {
             Some(Some(template)) => template.clone(),
             _ => bounded_context.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_poisoned_cache_preserves_dispatch_mappings() {
+        let cache = TemplateCache::new();
+        let _ = std::panic::catch_unwind(|| {
+            let mut current = cache.current.write().unwrap();
+            current.insert("tenant".into(), Some("template".into()));
+            panic!("poison the lock after publishing a complete mapping");
+        });
+        assert_eq!(cache.effective_bounded_context("tenant"), "template");
+        assert_eq!(cache.effective_bounded_context("other"), "other");
     }
 }

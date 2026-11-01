@@ -925,7 +925,7 @@ pub(super) async fn provision_missing_encryption_keys(
         event_specs,
         event_types_by_name,
         resolved,
-    );
+    )?;
     provision_encryption_subjects(conn, command_type, needed_subjects, resolved, key_service).await
 }
 
@@ -938,21 +938,21 @@ pub(super) fn missing_encryption_subjects(
     event_specs: &[crate::shared::EventSpec],
     event_types_by_name: &std::collections::HashMap<String, EventType>,
     resolved: &std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
-) -> Vec<(String, String)> {
+) -> crate::error::Result<Vec<(String, String)>> {
     let mut needed_subjects: Vec<(String, String)> =
-        crate::event_store::sensitive_field_subjects(&command_type.sensitive_fields, payload);
+        crate::event_store::try_sensitive_field_subjects(&command_type.sensitive_fields, payload)?;
     for spec in event_specs {
         if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
-            needed_subjects.extend(crate::event_store::sensitive_field_subjects(
+            needed_subjects.extend(crate::event_store::try_sensitive_field_subjects(
                 &event_type.sensitive_fields,
                 &spec.payload.to_string(),
-            ));
+            )?);
         }
     }
     needed_subjects.retain(|pair| !resolved.contains_key(pair));
     needed_subjects.sort();
     needed_subjects.dedup();
-    needed_subjects
+    Ok(needed_subjects)
 }
 
 /// Provisions a key for each of `needed_subjects` on `conn` into `resolved`.
@@ -1027,7 +1027,7 @@ pub(super) async fn finish_accepted_command_in_tx(
     .await?;
 
     let result = crate::event_store::process_command_at_boundary(
-        crate::shared::generate_token_id(),
+        crate::shared::try_generate_token_id()?,
         command_type,
         payload,
         client_id,
@@ -1772,13 +1772,19 @@ pub(super) async fn write_command_batch_as_set(
         };
 
         let mut resolved = item.resolved.clone();
-        let needed_subjects = missing_encryption_subjects(
+        let needed_subjects = match missing_encryption_subjects(
             &item.command_type,
             &item.payload,
             &event_specs,
             &event_types_by_name,
             &resolved,
-        );
+        ) {
+            Ok(subjects) => subjects,
+            Err(error) => {
+                results.push(Some(Err(error)));
+                continue;
+            }
+        };
         if !needed_subjects.is_empty() {
             savepoint.write(tx, None).await?;
             provision_encryption_subjects(
@@ -1791,9 +1797,16 @@ pub(super) async fn write_command_batch_as_set(
             .await?;
         }
 
+        let command_id = match crate::shared::try_generate_token_id() {
+            Ok(id) => id,
+            Err(error) => {
+                results.push(Some(Err(error.into())));
+                continue;
+            }
+        };
         let mut assigned = highest_assigned;
         let processed = crate::event_store::process_command_at_boundary(
-            crate::shared::generate_token_id(),
+            command_id,
             &item.command_type,
             &item.payload,
             &item.client_id,
@@ -2915,18 +2928,18 @@ pub async fn dry_run_command(
                     client_id: client_id.to_string(),
                 });
             }
-            let needs_a_key = !crate::event_store::sensitive_field_subjects(
+            let mut needs_a_key = !crate::event_store::try_sensitive_field_subjects(
                 &command_type.sensitive_fields,
                 payload,
-            )
-            .is_empty()
-                || events.iter().any(|e| {
-                    !crate::event_store::sensitive_field_subjects(
-                        &e.event_type.sensitive_fields,
-                        &e.payload,
-                    )
-                    .is_empty()
-                });
+            )?
+            .is_empty();
+            for event in &events {
+                needs_a_key |= !crate::event_store::try_sensitive_field_subjects(
+                    &event.event_type.sensitive_fields,
+                    &event.payload,
+                )?
+                .is_empty();
+            }
             if needs_a_key && key_service.is_none() {
                 return Err(encryption::Error::MasterKeyNotConfigured.into());
             }

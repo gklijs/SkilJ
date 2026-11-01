@@ -163,6 +163,17 @@ fn protect_sensitive_fields_encrypts_the_declared_leaf_and_leaves_the_rest_untou
         encryption::decrypt_leaf(&data_key, ciphertext).unwrap(),
         "person@example.com"
     );
+    let revealed =
+        event_store::reveal_sensitive_fields(&sensitive_fields, &protected.payload, |sk, sv| {
+            assert_eq!(sk, "user");
+            assert_eq!(sv, "42");
+            Some(data_key.clone())
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&revealed).unwrap(),
+        serde_json::from_str::<serde_json::Value>(payload).unwrap()
+    );
 }
 
 #[test]
@@ -172,6 +183,55 @@ fn protect_sensitive_fields_is_a_no_op_when_sensitive_fields_is_empty() {
     });
     assert_eq!(protected.payload, r#"{"a":1}"#);
     assert!(protected.encryption_keys.is_empty());
+}
+
+#[test]
+fn sensitive_field_result_apis_reject_malformed_json_before_resolving_keys() {
+    let fields = [SensitiveField {
+        field: "email".into(),
+        subject_key: "user".into(),
+        subject_field: "user_id".into(),
+    }];
+    for payload in ["", "not json", r#"{"email":"secret","user_id":"42""#] {
+        let protect_error = event_store::try_protect_sensitive_fields(&fields, payload, |_, _| {
+            panic!("invalid JSON must be rejected before resolving keys")
+        })
+        .unwrap_err();
+        let reveal_error = event_store::reveal_sensitive_fields(&fields, payload, |_, _| {
+            panic!("invalid JSON must be rejected before resolving keys")
+        })
+        .unwrap_err();
+        for error in [protect_error, reveal_error] {
+            assert!(matches!(
+                error,
+                skilj_core::error::Error::EventStore(event_store::Error::PayloadDecodeFailed(_))
+            ));
+            assert_eq!(error.code(), "payload_decode_failed");
+        }
+        let protected = event_store::protect_sensitive_fields(&fields, payload, |_, _| {
+            panic!("invalid JSON must be rejected before resolving keys")
+        });
+        assert_eq!(protected.payload, "null");
+        assert!(protected.encryption_keys.is_empty());
+    }
+}
+
+#[test]
+fn sensitive_field_result_apis_preserve_the_empty_declaration_no_op() {
+    let payload = "not json";
+    let protected = event_store::try_protect_sensitive_fields(&[], payload, |_, _| {
+        panic!("empty declarations must not resolve keys")
+    })
+    .unwrap();
+    assert_eq!(protected.payload, payload);
+    assert!(protected.encryption_keys.is_empty());
+    assert_eq!(
+        event_store::reveal_sensitive_fields(&[], payload, |_, _| {
+            panic!("empty declarations must not resolve keys")
+        })
+        .unwrap(),
+        payload
+    );
 }
 
 #[test]
@@ -600,4 +660,101 @@ fn read_projection_decrypts_via_the_resolved_data_keys() {
     let parsed: serde_json::Value = serde_json::from_str(&decrypted).unwrap();
     assert_eq!(parsed["email"], "person@example.com");
     assert_eq!(parsed["total"], 3);
+}
+
+#[test]
+fn malformed_payloads_fail_closed_in_rendering_and_subject_extraction() {
+    use skilj_core::shared::{PrivateField, PrivateFieldKind};
+    for payload in ["", "not json", r#"{"email":"secret","user_id":"42""#] {
+        let mut event = event_with_payload(payload);
+        let fields = event.event_type.sensitive_fields.clone();
+        assert_eq!(
+            event_store::try_sensitive_field_subjects(&fields, payload)
+                .unwrap_err()
+                .code(),
+            "payload_decode_failed"
+        );
+        assert!(event_store::sensitive_field_subjects(&fields, payload).is_empty());
+        for sensitive in [true, false] {
+            if !sensitive {
+                event.event_type.sensitive_fields.clear();
+                event.event_type.private_fields = vec![PrivateField {
+                    field: "email".into(),
+                    kind: PrivateFieldKind::Own,
+                    capability: None,
+                    addressee_field: None,
+                }];
+            }
+            for granted in [true, false] {
+                let mapping = access_mapping(granted, "42");
+                let no_key = |_: &str, _: &str| -> Option<encryption::DataKey> {
+                    panic!("malformed JSON must not resolve a key")
+                };
+                assert_eq!(
+                    event_store::render_event(&event, &mapping, &no_key, &[]),
+                    "null"
+                );
+                let would_be = event_store::WouldBeEvent {
+                    event_type: event.event_type.clone(),
+                    payload: payload.into(),
+                    tags: Vec::new(),
+                    client_id: "someone".into(),
+                };
+                assert_eq!(
+                    event_store::render_would_be_event(&would_be, &mapping, &[]),
+                    "null"
+                );
+                let mut command = command_with_real_ciphertext(
+                    &encryption::generate_and_wrap_data_key(&master_key(1)).0,
+                );
+                command.payload = payload.into();
+                command.command_type.sensitive_fields = event.event_type.sensitive_fields.clone();
+                command.command_type.private_fields = event.event_type.private_fields.clone();
+                assert_eq!(
+                    event_store::render_command(&command, &mapping, &no_key, &[]),
+                    "null"
+                );
+            }
+            if !sensitive {
+                assert_eq!(event_store::redact_private_fields(&event).payload, "null");
+            }
+        }
+    }
+    assert!(event_store::try_sensitive_field_subjects(&[], "not json")
+        .unwrap()
+        .is_empty());
+    let fields = event_type_with_sensitive_field().sensitive_fields;
+    assert_eq!(
+        event_store::try_sensitive_field_subjects(&fields, r#"{"user_id":"42"}"#).unwrap(),
+        vec![("user".into(), "42".into())]
+    );
+}
+
+#[tokio::test]
+async fn key_resolution_rejects_malformed_json_before_database_or_provider_access() {
+    let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+    let fields = event_type_with_sensitive_field().sensitive_fields;
+    let error = skilj_core::db::resolve_encryption_keys(
+        &pool,
+        "banking",
+        &fields,
+        "not json",
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "payload_decode_failed");
+    let error = skilj_core::db::resolve_data_keys_for_reading(
+        &pool,
+        "banking",
+        &fields,
+        "not json",
+        &access_mapping(true, "42"),
+        None,
+        &mut Default::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "payload_decode_failed");
 }

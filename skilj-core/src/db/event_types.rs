@@ -373,7 +373,7 @@ pub async fn fire_system_event(
     // no sequence number is ever burned on an occurrence that didn't
     // actually fire.
     let next_seq = next_sequence(&mut *tx, bounded_context).await?;
-    let Some((event, new_position)) = crate::event_store::create_system_event(
+    let Some((event, new_position)) = crate::event_store::try_create_system_event(
         &event_type,
         occurrence_at,
         now,
@@ -388,7 +388,8 @@ pub async fn fire_system_event(
                 );
             (key.clone(), data_key.clone())
         },
-    ) else {
+    )?
+    else {
         return Ok(None);
     };
 

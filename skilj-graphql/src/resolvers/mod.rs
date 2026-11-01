@@ -477,8 +477,10 @@ macro_rules! create_type_token_field {
                     let token = $create_fn(
                         &access_mapping,
                         &target_type,
-                        ::skilj_core::shared::generate_token_id(),
-                        ::skilj_core::shared::generate_token_secret(),
+                        ::skilj_core::shared::try_generate_token_id()
+                            .map_err($crate::error::to_graphql_error)?,
+                        ::skilj_core::shared::try_generate_token_secret()
+                            .map_err($crate::error::to_graphql_error)?,
                         scope,
                         chrono::Utc::now(),
                     )
