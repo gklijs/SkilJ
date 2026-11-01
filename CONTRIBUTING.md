@@ -70,6 +70,13 @@ were written against that; a job that runs on the bare runner instead
 would need `sudo` for the in-job Postgres fallback and the failover
 test. The `actionlint` job checks `.github/workflows/ci.yml` itself.
 
+The blocking `check-cga` job compares potential panic paths in `skilj-core`
+with a checked-in per-finding baseline. Run `node scripts/cga/check.mjs`;
+after a deliberate reduction, use `--record` and review the baseline diff.
+The tool is pinned and patched around an upstream generic-dispatch crash.
+Skipped targets are tracked too. Coverage is partial and excludes the
+GraphQL/REST server; see [the CGA guide](scripts/cga/README.md).
+
 Building `skilj-temporal` ([docs/architecture.md §34](docs/architecture.md#skilj-temporal-plan)) no longer needs a
 system `protoc` binary: `temporalio-client`/`temporalio-common` 1.0.0
 (bumped from 0.8.0 as part of 0.0.5) added a `vendored-protox` feature,

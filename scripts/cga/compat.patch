@@ -1,0 +1,57 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 951c001..b495445 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -48,4 +48,6 @@ check-cfg = ['cfg(bootstrap)']
+ suspicious = "deny"
+ correctness = "deny"
+ perf = "deny"
+-style = "deny"
+\ No newline at end of file
++style = "deny"
++# Keep this standalone tool checkout outside the host project workspace.
++[workspace]
+diff --git a/cga_analysis/src/dyn_object.rs b/cga_analysis/src/dyn_object.rs
+index c74978e..ef17e3b 100644
+--- a/cga_analysis/src/dyn_object.rs
++++ b/cga_analysis/src/dyn_object.rs
+@@ -49,7 +49,13 @@ pub(crate) fn dyn_object_call_to_impl_methods<'tcx>(
+             );
+ 
+             if let Ok(instance_opt) = Instance::try_resolve(tcx, typing_env, virtual_def_id, trait_args) {
+-                instance_opt
++                instance_opt.filter(|instance| {
++                    let generic = instance.args.has_non_region_param() || instance.args.has_non_region_infer();
++                    if generic {
++                        eprintln!("cga-skipped-generic:{}", tcx.def_path_str(instance.def_id()));
++                    }
++                    !generic
++                })
+             } else {
+                 None
+             }
+diff --git a/cga_analysis/src/lib.rs b/cga_analysis/src/lib.rs
+index 4b11fbe..4056440 100644
+--- a/cga_analysis/src/lib.rs
++++ b/cga_analysis/src/lib.rs
+@@ -44,7 +44,7 @@ use rustc_span::Span;
+ declare_tool_lint! {
+     /// The `cga::panics` lint detects code that calls panicking functions.
+     pub cga::PANICS,
+-    Deny,
++    Warn,
+     "a function (indirectly) panics",
+     report_in_external_macro: true
+ }
+diff --git a/cga_cargo/src/command.rs b/cga_cargo/src/command.rs
+index 053864d..d62cf1b 100644
+--- a/cga_cargo/src/command.rs
++++ b/cga_cargo/src/command.rs
+@@ -46,6 +46,7 @@ fn prepare_cargo(input: &DriverInput, args: CargoArgs) -> Command {
+         // Force std to be freshly built so that we can get MIR.
+         .args(["-Z", build_std])
+         .arg("check")
++        .arg("--message-format=json")
+         .env("RUSTC", driver)
+         .env("CGA_INPUT", serde_json::to_string(&input).unwrap())
+         // Disable incremental compilation such that we always get MIR.

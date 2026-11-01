@@ -1,5 +1,5 @@
 # Configuration for Call Graph Analyzer (CGA) - finds panic paths in the
-# monomorphized MIR call graph. Local and optional, not a CI check yet.
+# monomorphized MIR call graph. CI tracks a partial skilj-core baseline.
 # How to install and run it: AGENTS.md, "Panic analysis (CGA)".
 #
 # Rule semantics, from cga_data/src/cmd.rs:

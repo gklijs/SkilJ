@@ -12973,6 +12973,8 @@ skilj moved its primary repository from Codeberg to GitHub. Codeberg's terms of 
 - **Caching.** `Swatinem/rust-cache` caches dependencies for `msrv` and `build-clippy-test`; Woodpecker built everything from scratch each run.
 - **`scripts/check-woodpecker-config.sh` is gone.** It existed because Woodpecker only warned on a schema problem (§166). GitHub refuses an invalid workflow outright, and an `actionlint` job checks the rest, including shellcheck on each `run:` block.
 
+**Partial panic analysis.** The blocking `check-cga` job runs `scripts/cga/check.mjs` against `skilj-core` with a pinned CGA revision/nightly and a compatibility patch for unresolved generic vtable calls (OpenDevicePartnership/cga#6). `scripts/cga/baseline.json` records finding identities and counts, plus skipped call targets: new findings or gaps fail, and reductions require lowering the baseline. Analyzer/build failures cannot become an empty passing baseline. Public library roots are included; GraphQL, REST and other crates are outside this initial scope. It is a regression check, not proof of panic freedom. `scripts/cga/README.md` describes the limitations and review procedure.
+
 **Not changed:** the bridge suites (Kafka, AMQP, NATS) still skip in CI. The runner has Docker, but the `rust:1-bookworm` container doesn't reach it. Running them in CI is a separate change, and the Kafka suite is flaky under load (§90).
 
 That last point was wrong: the container does reach the runner's Docker, and the first run failed on it. See §223.

@@ -57,31 +57,20 @@ Every public enum of the library crates is `#[non_exhaustive]` (docs/architectur
 
 ## Panic analysis (CGA)
 
-Optional and local only, not part of CI. [Call Graph Analyzer](https://github.com/OpenDevicePartnership/cga) walks the monomorphized MIR call graph from a crate's entrypoints and reports every reachable panic, with a backtrace back into our code. The REST and GraphQL surfaces take untrusted input, so a reachable panic there is a denial-of-service risk.
-
-CGA is a rustc driver pinned to its own nightly, so it is installed from a checkout rather than crates.io. skilj itself stays on stable:
+The blocking CI check analyzes `skilj-core` with a pinned [Call Graph Analyzer](https://github.com/OpenDevicePartnership/cga), pinned nightly, and a checked-in compatibility patch. Run:
 
 ```sh
-git clone https://github.com/OpenDevicePartnership/cga
-cd cga && cargo install --path .   # rustup fetches the pinned nightly (with rustc-dev) on first use
+node scripts/cga/check.mjs
+node --test scripts/cga/check.test.mjs
 ```
 
-It only starts from entrypoints (`fn main`, or `no_mangle`/`export_name` symbols), so the library crates can't be checked on their own. Check them through `skilj-demo`'s `server` binary, which pulls in skilj-core, skilj-graphql and skilj-rest; code the demo never calls is not covered. From the workspace root:
+The baseline compares finding identities and occurrence counts, so removing one finding cannot offset an unrelated new one. After an intended reduction, run `node scripts/cga/check.mjs --record` and review `scripts/cga/baseline.json`'s diff. Compiler failures and newly skipped generic calls fail the check. Tool/config changes require an explicit baseline update.
 
-```sh
-cargo cga check -p skilj-demo --profile cga --config-path cga.toml
-cargo cga extract -p skilj-demo --profile cga -Tdot -o target/cga/callgraph.dot   # the raw graph
-```
-
-`skilj-tui` and `skilj-inspector` are binaries too and can be checked the same way.
-
-- CGA builds std from source (`-Z build-std`) into `target/cga`, and is 2-3x slower than `cargo check`. If cargo says `build-std` needs an explicit target, add `--target x86_64-unknown-linux-gnu` (or your host triple).
-- `[profile.cga]` in `Cargo.toml` is release with opt-level 2, which CGA recommends.
-- `cga.toml` explains its rules. Most important: a whitelist rule hides a finding when any function in the backtrace matches, so whitelist specific functions, never whole crates like `core`, `std` or `tokio`.
+Coverage is partial: unresolved generic vtable calls are skipped with their names tracked ([CGA issue #6](https://github.com/OpenDevicePartnership/cga/issues/6)); GraphQL, REST, and other crates are outside the initial baseline. This does not establish that requests cannot panic. See `scripts/cga/README.md` for coverage, setup, artifacts, and the workaround. `[profile.cga]` is release with opt-level 2; normal builds stay on stable.
 
 ## CI checks
 
-The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each (12-15 and 17 are their own jobs; 16 is a weekly workflow):
+The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each (12-15 and 17-18 are their own jobs; 16 is a weekly workflow):
 1. actionlint — checks the workflow file itself, including shellcheck on its `run:` blocks
 2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`
 3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace, then runs its quickstart (embedded Postgres, a deposit accepted, an overdraft rejected); `--no-run` skips the run
@@ -99,3 +88,4 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 15. `cargo llvm-cov` — line coverage of the full test run, in the job summary and as an lcov artifact. Informational (`continue-on-error`), no threshold
 16. `cargo mutants` — weekly (`.github/workflows/mutants.yml`), on the access trail and the `*_with_trail` writers against the `access_trail` tests. Surviving mutants are listed in the job summary. Informational
 17. `scripts/check-template-docker.sh` — builds `templates/skilj-template`'s Dockerfile against this workspace and starts the image (its own job, needs Docker)
+18. `node scripts/cga/check.mjs` — pinned partial `skilj-core` panic analysis; fails on new findings, new analysis gaps, or analyzer failures. Its Node.js regression tests run in the same job.

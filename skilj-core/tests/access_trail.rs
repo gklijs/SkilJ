@@ -593,6 +593,35 @@ fn a_private_field_grant_that_cannot_be_recorded_is_not_made() {
 }
 
 #[test]
+fn a_private_field_grant_for_a_missing_command_is_an_error_not_a_panic() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let _serial = BASELINES.lock().await;
+        let grantor = seed_role(&pool).await;
+        let grantee = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        let mut grant = blanket_grant(&grantor, &grantee, &bc);
+        grant.command_id = Some("no-such-command".into());
+        for result in [
+            db::insert_private_field_grant(&pool, &grant).await,
+            db::grant_private_field_access_with_trail(&pool, &grant).await,
+        ] {
+            assert!(matches!(
+                result,
+                Err(skilj_core::Error::Database(sqlx::Error::RowNotFound))
+            ));
+        }
+        assert!(db::get_private_field_grant(&pool, &bc.name, &grant.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(private_field_events(&pool, &grant.id).await.is_empty());
+    });
+}
+
+#[test]
 fn private_field_events_carry_the_record_they_name_and_nothing_personal() {
     let grantor = Role {
         id: "grantor".into(),

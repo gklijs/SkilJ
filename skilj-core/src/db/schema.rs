@@ -1038,9 +1038,7 @@ pub(super) async fn private_field_grant_command_id(
         Some(external_id) => Some(
             command_internal_id(pool, &grant.bounded_context.name, external_id)
                 .await?
-                .expect(
-                    "insert_private_field_grant: command_id names a command that doesn't exist",
-                ),
+                .ok_or_else(crate::error::Error::row_not_found)?,
         ),
         None => None,
     })
