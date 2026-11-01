@@ -31,6 +31,9 @@ README.md, "Status and stability").
 
 ### Fixed
 
+- Inserting a private-field grant for a nonexistent command returns
+  `row_not_found` instead of panicking, for raw and access-trail writes.
+
 - Spec: an idempotency key is scoped to the submitting caller
   (`client_id`) as well as the bounded context and command type, matching
   `ProcessCommand`; the contradictory "not to the submitting Role"

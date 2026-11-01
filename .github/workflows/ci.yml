@@ -42,6 +42,31 @@ jobs:
       # headings (a past renumbering silently broke ~600 of them).
       - run: scripts/check-section-refs.sh
 
+  check-cga:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cga-nightly-2026-10-18
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test CGA regression guard
+        run: node --test scripts/cga/check.test.mjs
+      - name: Check potential panic baseline
+        run: node scripts/cga/check.mjs
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: cga-report
+          path: target/cga-report/
+
   check-spec:
     runs-on: ubuntu-24.04
     container: rust:1-bookworm
