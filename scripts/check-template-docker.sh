@@ -12,14 +12,20 @@
 # the check after a release. Needs a Docker daemon.
 #
 # Usage: scripts/check-template-docker.sh [--published]
+#        [--cache-from SPEC] [--cache-to SPEC]
 set -euo pipefail
 
 published=false
-for arg in "$@"; do
-    case "$arg" in
+cache_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --published) published=true ;;
-        *) echo "check-template-docker: unknown argument $arg" >&2; exit 2 ;;
+        --cache-from|--cache-to)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "check-template-docker: $1 needs a cache specification" >&2; exit 2; }
+            cache_args+=("$1" "$2"); shift ;;
+        *) echo "check-template-docker: unknown argument $1" >&2; exit 2 ;;
     esac
+    shift
 done
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -43,15 +49,38 @@ if ! $published; then
     # The Dockerfile's `COPY . .` carries the workspace into the build.
     mkdir skilj-workspace
     (cd "$root" && git ls-files -z | tar --null -T - -cf -) | tar -xf - -C skilj-workspace
-    cat >> Cargo.toml <<EOF2
-
-[patch.crates-io]
-skilj = { path = "skilj-workspace/skilj" }
-skilj-core = { path = "skilj-workspace/skilj-core" }
-EOF2
+    # cargo-chef records workspace members, not crates reached only through
+    # [patch]. Make the generated app and the copied libraries one workspace
+    # for this check, retaining the library manifests' inherited settings.
+    # The published-template path needs no such adaptation.
+    python3 - <<'PYTHON'
+from pathlib import Path
+import re
+manifest = Path("skilj-workspace/Cargo.toml")
+workspace = manifest.read_text()
+start = workspace.index("members = [")
+end = workspace.index("]", start) + 1
+# Cargo automatically adds their local path dependencies as members. Avoid
+# pulling unrelated demo/broker packages into dependency resolution.
+members = 'members = ["skilj-workspace/skilj", "skilj-workspace/skilj-core"]'
+workspace = workspace[:start] + members + workspace[end:]
+workspace = re.sub(r'path = "([^"\n]+)"', r'path = "skilj-workspace/\1"', workspace)
+app = Path("Cargo.toml")
+# Direct path dependencies let cargo-chef mask local package versions along
+# with their consumers; registry patches alone retain incompatible versions.
+contents = re.sub(r'(?m)^(skilj(?:-core)?) = "[^"\n]+"$',
+                  r'\1 = { path = "skilj-workspace/\1" }', app.read_text())
+app.write_text(contents + "\n" + workspace)
+manifest.unlink()
+PYTHON
 fi
 
-docker build --tag "$image" .
+if [[ ${#cache_args[@]} -gt 0 ]]; then
+    # --load keeps the existing smoke test exercising the locally built image.
+    docker buildx build --load "${cache_args[@]}" --tag "$image" .
+else
+    docker build --tag "$image" .
+fi
 
 # scratch has no shell, so the binary can't be inspected from inside the
 # image; the builder stage's `ldd` is the static-linking check, and

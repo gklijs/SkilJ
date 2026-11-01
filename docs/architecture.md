@@ -12975,6 +12975,36 @@ skilj moved its primary repository from Codeberg to GitHub. Codeberg's terms of 
 
 **Partial panic analysis.** The blocking `check-cga` job runs `scripts/cga/check.mjs` against `skilj-core` with a pinned CGA revision/nightly and a compatibility patch for unresolved generic vtable calls (OpenDevicePartnership/cga#6). `scripts/cga/baseline.json` records finding identities and counts, plus skipped call targets: new findings or gaps fail, and reductions require lowering the baseline. Analyzer/build failures cannot become an empty passing baseline. Public library roots are included; GraphQL, REST and other crates are outside this initial scope. It is a regression check, not proof of panic freedom. `scripts/cga/README.md` describes the limitations and review procedure.
 
+**CI execution and caching.** A successful run on 2026-11-01 spent 269 seconds
+compiling test binaries and 622 seconds running them; `graphql_business_surfaces`
+accounted for 203 seconds. The full instrumented coverage job took 22 minutes.
+Coverage now runs on `main` pushes and manual dispatch. Every PR retains the
+full blocking test suite, split into three whole-binary jobs: the business
+surface binary, the remaining `skilj` targets (including doctests), and every
+other workspace crate. Each job has its own database and keeps the skip guard
+from §223. The `skilj` shards explicitly enable `local`, preserving the feature
+that `skilj-demo` enables in a workspace run. `test` remains the required aggregate
+check and fails if any shard fails or is skipped. Cargo timing reports and logs
+are uploaded to compare the next runs; the shards compile their own selected
+targets rather than transferring the workspace's large test artifacts.
+
+Semver is the exception to main-only Rust-cache writes: it is PR-only, so a
+main-only `save-if` never populated its cache. It now saves within the PR.
+The native template is generated at a stable path under `target/template-check`,
+with its build directory cached separately from the generated sources. The
+Docker template has a pinned `cargo-chef` dependency layer and a BuildKit layer
+cache exported to a fresh directory each run; only `main` saves those exports.
+For workspace testing, the generated Docker project makes the copied library
+crates workspace members and direct path dependencies so the recipe includes
+them; the published-template path stays standalone. The final image is still
+started and required to refuse a missing `DATABASE_URL`.
+CGA's installed compiler driver has a dedicated cache outside `target`, keyed
+by tool revision, nightly, target, and compatibility-patch hash. Rust-cache's
+target cleanup cannot remove it. The nightly compiler components are still
+installed on cache hits, and the core analysis still runs on each PR.
+Clippy and docs remain together; MSRV, CGA, and instrumented coverage keep
+separate build configurations. The fast checks keep their existing check names.
+
 **Not changed:** the bridge suites (Kafka, AMQP, NATS) still skip in CI. The runner has Docker, but the `rust:1-bookworm` container doesn't reach it. Running them in CI is a separate change, and the Kafka suite is flaky under load (§90).
 
 That last point was wrong: the container does reach the runner's Docker, and the first run failed on it. See §223.
@@ -12994,9 +13024,9 @@ The first GitHub Actions run (§222) took 18 minutes and failed. Both have one f
 
 **`test` compiles with `cargo test --workspace --no-run`,** not `cargo build --workspace --all-targets`. After the latter, `cargo test` recompiled `skilj-macros` and the seven workspace crates depending on it, which took 1m43s of the test step. Why the two disagree wasn't pinned down; `--no-run` compiles exactly what the run uses.
 
-**rust-cache saves only on `main`** (`save-if`). A pull request reads `main`'s cache, and a cache scoped to one PR, which nothing else can read, would only push `main`'s out of the repository's 10 GB limit. The caches start paying off once this is on `main`.
+**Most rust-cache jobs save only on `main`** (`save-if`). A pull request reads `main`'s cache to limit duplication. The PR-only semver job is an exception: it saves a PR-scoped cache because it never runs on `main` (§222).
 
-Not done: `cargo-nextest`, which runs each test in its own process. Every test binary drops and recreates its own database on first use (§167), so processes of one binary would drop it from under each other. After these changes the test run itself is about 6.5 minutes, 157s of it `skilj/tests/graphql_business_surfaces.rs`.
+Still not used: `cargo-nextest`, which runs each test in its own process. Every test binary drops and recreates its own database on first use (§167), so processes of one binary would drop it from under each other. The initial split reduced test execution to about 6.5 minutes, 157s of it `skilj/tests/graphql_business_surfaces.rs`. Later timings and whole-binary sharding are described in §222.
 
 <a id="local-mode-postgres-pin"></a>
 ## 224. Local mode pins Postgres 18.6.0

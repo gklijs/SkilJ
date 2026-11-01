@@ -18,7 +18,8 @@
 # `--setup-only` settles the database and stops there. The CI step runs
 # that first and this in full at the end: a database that isn't there
 # should be visible in the first seconds of the log, not after twenty
-# minutes of compiling librdkafka. Both calls do the same setup, and
+# minutes of compiling librdkafka. `--build-only` compiles one whole-binary
+# shard without needing a database. Both database calls do the same setup, and
 # scripts/ci-postgres-local.sh is idempotent, so the second one is
 # cheap.
 
@@ -76,6 +77,19 @@ setup_database() {
   log "preflight: created a database on ${database_host}"
 }
 
+# Validate the group even for build-only runs, before any database work.
+# shellcheck source=scripts/ci-test-targets.sh
+source "$HERE/ci-test-targets.sh"
+ci_test_targets "${CI_TEST_GROUP:-all}"
+case "${1:-}" in
+    --build-only)
+        cargo test "${test_args[@]}" --no-run --timings
+        exit 0
+        ;;
+    ''|--setup-only) ;;
+    *) log "unknown argument: $1"; exit 2 ;;
+esac
+
 setup_database
 
 if [ "${1:-}" = "--setup-only" ]; then
@@ -108,7 +122,12 @@ test_exit=0
 # CI_CARGO_TEST swaps the runner for the coverage job (`cargo llvm-cov
 # --no-report`), which then reuses this skip guard.
 # shellcheck disable=SC2086 # the command is meant to word-split
-${CI_CARGO_TEST:-cargo test} --workspace --no-fail-fast -- --nocapture >"$log_output" 2>&1 || test_exit=$?
+${CI_CARGO_TEST:-cargo test} "${test_args[@]}" --no-fail-fast -- --nocapture >"$log_output" 2>&1 || test_exit=$?
+if $test_app_docs; then
+  # Preserve doctests for skilj, which the app shard's explicit targets omit.
+  # shellcheck disable=SC2086
+  ${CI_CARGO_TEST:-cargo test} -p skilj --features local --doc --no-fail-fast -- --nocapture >>"$log_output" 2>&1 || test_exit=$?
+fi
 cat "$log_output"
 
 if grep -qE 'skipping: ' "$log_output"; then
@@ -119,7 +138,7 @@ if grep -qE 'skipping: ' "$log_output"; then
 fi
 
 if [ "$test_exit" -ne 0 ]; then
-  log "ERROR: cargo test --workspace exited ${test_exit}"
+  log "ERROR: cargo test (${CI_TEST_GROUP:-all}) exited ${test_exit}"
   exit "$test_exit"
 fi
 

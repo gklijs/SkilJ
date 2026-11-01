@@ -35,3 +35,6 @@ Cargo.lock
 
 # scripts/federation (docs/architecture.md §194)
 scripts/federation/node_modules/
+
+# CGA compiler driver has a dedicated Actions cache, outside rust-cache cleanup.
+.ci-cga-tool/

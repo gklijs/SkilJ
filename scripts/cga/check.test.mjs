@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { compare, digest, fileName, findings, HERE, install, NIGHTLY, REVISION } from './check.mjs';
+import { compare, fileName, findings, HERE, install, NIGHTLY, REVISION, toolCacheKey } from './check.mjs';
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'skilj-cga-test-'));
@@ -93,7 +93,7 @@ test('cached binaries still require compiler and LLVM runtime installation', t =
   const binary = join(prefix, 'bin/cargo-cga');
   mkdirSync(join(prefix, 'bin'), { recursive: true });
   writeFileSync(binary, '');
-  writeFileSync(join(prefix, 'skilj-build'), `${REVISION}\n${digest(join(context.here, 'compat.patch'))}\n`);
+  writeFileSync(join(prefix, 'skilj-build'), `${toolCacheKey(context.here)}\n`);
   const commands = [];
   assert.equal(install({ ...context, run: (...args) => commands.push(args) }), binary);
   assert.deepEqual(commands, [['rustup', ['toolchain', 'install', NIGHTLY,
@@ -131,7 +131,7 @@ test('fresh installation uses pinned nightly and applies compatibility patch', t
   assert.equal(cargo[1][0], `+${NIGHTLY}`);
   assert.ok(commands.some(([command, args]) => command === 'git' && args.includes('--check')));
   assert.equal(readFileSync(join(context.root, 'target/cga-tool/skilj-build'), 'utf8'),
-    `${REVISION}\n${digest(join(context.here, 'compat.patch'))}\n`);
+    `${toolCacheKey(context.here)}\n`);
 });
 
 test('a restored source directory is initialized and the pinned commit fetched before checkout', t => {
@@ -160,6 +160,21 @@ test('a restored source directory is initialized and the pinned commit fetched b
   assert.ok(init >= 0 && init < fetch && fetch < checkout);
   assert.deepEqual(commands[fetch], ['git', ['-C', source, 'fetch', '--depth', '1',
     'https://github.com/OpenDevicePartnership/cga', REVISION]]);
+});
+
+test('tool cache key includes all compiler-driver pins and needs no Rust setup', t => {
+  const context = fixture(t);
+  const before = toolCacheKey(context.here);
+  assert.ok(before.includes(REVISION));
+  assert.ok(before.includes(NIGHTLY));
+  assert.ok(before.includes('x86_64-unknown-linux-gnu'));
+  writeFileSync(join(context.here, 'compat.patch'), 'another patch');
+  assert.notEqual(toolCacheKey(context.here), before);
+  const result = spawnSync(process.execPath, [join(HERE, 'check.mjs'), '--tool-cache-key'], {
+    env: { PATH: '' }, encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), toolCacheKey());
 });
 
 test('CLI help runs without Rust or a workspace lockfile', () => {
