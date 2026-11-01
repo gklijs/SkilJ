@@ -41,7 +41,7 @@ use zeroize::Zeroize;
 
 use crate::error::SkiljRejection;
 use crate::event_store::BoundedContext;
-use crate::shared::generate_token_id;
+use crate::shared::try_generate_token_id;
 
 /// The `encryption_keys.subject_key` namespace every secret version's
 /// `DataKey` lives under. **Reserved**: [`is_reserved_subject_key`] is
@@ -232,6 +232,10 @@ impl Drop for SecretValue {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The OS could not supply secure randomness for a grant identifier.
+    #[error("secure randomness is unavailable")]
+    RandomnessUnavailable,
+
     #[error(
         "a secret name must be 1-{MAX_NAME_LEN} characters of ASCII letters, digits, '_', '.' or '-'"
     )]
@@ -266,6 +270,7 @@ pub enum Error {
 impl SkiljRejection for Error {
     fn code(&self) -> &str {
         match self {
+            Error::RandomnessUnavailable => "secure_randomness_unavailable",
             Error::InvalidName => "secret_name_invalid",
             Error::NotActive { .. } => "secret_not_active",
             Error::AccessNotGranted { .. } => "secret_access_not_granted",
@@ -338,7 +343,7 @@ pub fn grant_secret_access(
         return Err(Error::InvalidGrantee);
     }
     Ok(SecretGrant {
-        id: generate_token_id(),
+        id: try_generate_token_id().map_err(|_| Error::RandomnessUnavailable)?,
         bounded_context: bounded_context.clone(),
         name: name.to_string(),
         grantee_role_id: grantee_role_id.to_string(),

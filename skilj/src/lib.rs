@@ -3635,7 +3635,7 @@ impl SkiljBuilder {
         // already did.
         let roles = skilj_core::db::list_roles(&pool).await?;
 
-        let bootstrap_secret = skilj_core::bootstrap::generate_bootstrap_secret(&roles);
+        let bootstrap_secret = skilj_core::bootstrap::try_generate_bootstrap_secret(&roles)?;
         // Shared by `Skilj` and every `GraphqlState` built from it, so a
         // claim through any of them consumes it (docs/architecture.md §109).
         let bootstrap = skilj_core::bootstrap::BootstrapGate::new(bootstrap_secret.clone());
@@ -3710,8 +3710,8 @@ impl SkiljBuilder {
             (service, _) => service,
         };
         let master_key_rotation = self.master_key_rotation.clone();
-        let event_broadcaster = EventBroadcaster::new(self.event_broadcast_capacity);
-        let revocation_broadcaster = RevocationBroadcaster::new();
+        let event_broadcaster = EventBroadcaster::try_new(self.event_broadcast_capacity)?;
+        let revocation_broadcaster = RevocationBroadcaster::try_new()?;
 
         // The in-memory per-bounded-context event cache (drift audit
         // finding #8) - warmed here, before the first request can be

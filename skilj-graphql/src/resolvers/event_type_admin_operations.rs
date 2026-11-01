@@ -96,8 +96,10 @@ pub fn create_event_read_token_field(n: &Naming) -> Field {
                 let token = skilj_core::access_control::create_event_read_token(
                     &access_mapping,
                     &target_type,
-                    skilj_core::shared::generate_token_id(),
-                    skilj_core::shared::generate_token_secret(),
+                    skilj_core::shared::try_generate_token_id()
+                        .map_err(crate::error::to_graphql_error)?,
+                    skilj_core::shared::try_generate_token_secret()
+                        .map_err(crate::error::to_graphql_error)?,
                     scope,
                     start_from,
                     start_at_sequence,

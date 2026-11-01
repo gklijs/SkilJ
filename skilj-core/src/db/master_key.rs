@@ -44,7 +44,7 @@ async fn record(
     change: MasterKeyChange,
 ) -> crate::error::Result<()> {
     let sequence = next_sequence(&mut **tx, &admin.name).await?;
-    let event = change.into_event(admin, sequence, Utc::now());
+    let event = change.try_into_event(admin, sequence, Utc::now())?;
     insert_event(&mut **tx, &event, None).await
 }
 

@@ -453,7 +453,7 @@ pub async fn insert_parked_delivery(
     last_failed_at: DateTime<Utc>,
 ) -> crate::error::Result<ParkedDelivery> {
     let schema = schema_ident(bounded_context);
-    let id = crate::shared::generate_token_id();
+    let id = crate::shared::try_generate_token_id()?;
     let row: ParkedDeliveryRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.parked_deliveries \
          (id, source, kind, identifier, access_token_id, target_bounded_context, \
@@ -809,7 +809,7 @@ pub(super) async fn parked_delivery_references_subject(
         (Some(rules), Some(payload)) => {
             let payload = serde_json::to_string(payload)
                 .expect("serde_json::Value serialization is infallible");
-            crate::event_store::sensitive_field_subjects(&rules.sensitive_fields, &payload)
+            crate::event_store::try_sensitive_field_subjects(&rules.sensitive_fields, &payload)?
                 .iter()
                 .any(|(key, value)| key == subject_key && value == subject_value)
         }
@@ -1097,7 +1097,7 @@ pub(super) async fn forget_subject_in_holder_deadlines(
             let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
             let names_subject = match (&sensitive_fields[command_type], &parsed) {
                 (Some(fields), Some(_)) => {
-                    crate::event_store::sensitive_field_subjects(fields, payload)
+                    crate::event_store::try_sensitive_field_subjects(fields, payload)?
                         .iter()
                         .any(|(key, value)| key == subject_key && value == subject_value)
                 }

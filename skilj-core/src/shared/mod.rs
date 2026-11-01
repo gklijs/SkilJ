@@ -410,8 +410,12 @@ pub struct EventSpec {
 /// safe to log, appear in a URL path, etc. - only
 /// `generate_token_secret` below carries the confidentiality requirement
 /// `secret_matches` is built to compare without leaking.
+///
+/// # Panics
+/// Panics if secure randomness is unavailable. Use [`try_generate_token_id`]
+/// to return the failure instead.
 pub fn generate_token_id() -> String {
-    random_hex::<16>()
+    try_generate_token_id().expect("secure randomness is unavailable")
 }
 
 /// Generates the `secret` half of an `AccessToken`/`BootstrapSecret` -
@@ -419,7 +423,21 @@ pub fn generate_token_id() -> String {
 /// lowercase hex characters). `ring`'s `SystemRandom` reads from the OS
 /// CSPRNG, so this is cryptographically unpredictable, not merely unique
 /// like `generate_token_id` only needs to be.
+///
+/// # Panics
+/// Panics if secure randomness is unavailable. Use [`try_generate_token_secret`]
+/// to return the failure instead.
 pub fn generate_token_secret() -> String {
+    try_generate_token_secret().expect("secure randomness is unavailable")
+}
+
+/// Generates a token identifier, returning OS randomness failures.
+pub fn try_generate_token_id() -> Result<String, crate::encryption::Error> {
+    random_hex::<16>()
+}
+
+/// Generates a token secret, returning OS randomness failures.
+pub fn try_generate_token_secret() -> Result<String, crate::encryption::Error> {
     random_hex::<32>()
 }
 
@@ -430,19 +448,15 @@ pub fn generate_token_secret() -> String {
 /// through: neither value grew any structure from being spelled as a
 /// UUID, only the 32/64 hex characters did, so a plain byte-string is the
 /// honest shape.
-fn random_hex<const N: usize>() -> String {
-    use ring::rand::{SecureRandom, SystemRandom};
+fn random_hex<const N: usize>() -> Result<String, crate::encryption::Error> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut bytes = [0u8; N];
-    SystemRandom::new().fill(&mut bytes).expect(
-        "SystemRandom::fill only fails on catastrophic OS RNG failure - see ring's own docs",
-    );
+    let bytes = crate::encryption::random_bytes::<N>()?;
     let mut out = String::with_capacity(N * 2);
     for byte in bytes {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    out
+    Ok(out)
 }
 
 /// Hashes the `secret` half of an `AccessToken` for storage - see the

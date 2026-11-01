@@ -30,7 +30,7 @@ use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, Rol
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
-use skilj_core::shared::{generate_token_id, generate_token_secret};
+use skilj_core::shared::{try_generate_token_id, try_generate_token_secret};
 use skilj_core::Error;
 
 /// An admin [`Role`] made by [`seed_admin`], with Admin access to each of
@@ -76,7 +76,7 @@ pub async fn seed_admin(
         }
     }
 
-    let id = generate_token_id();
+    let id = try_generate_token_id()?;
     let role = Role {
         external_subject: format!("dev-admin-{id}"),
         id,
@@ -154,8 +154,8 @@ impl DevAdmin {
         let token = access_control::create_command_token(
             mapping,
             &command_type,
-            generate_token_id(),
-            generate_token_secret(),
+            try_generate_token_id()?,
+            try_generate_token_secret()?,
             None,
             Utc::now(),
         )?;

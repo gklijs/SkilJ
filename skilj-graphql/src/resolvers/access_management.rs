@@ -12,7 +12,7 @@ use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use skilj_core::access_control::AccessLevel;
-use skilj_core::shared::generate_token_id;
+use skilj_core::shared::try_generate_token_id;
 
 /// `createRole(name: String!, superadmin: Boolean!, externalSubject: String!): Role!`
 pub fn create_role_field(n: &Naming) -> Field {
@@ -36,7 +36,7 @@ pub fn create_role_field(n: &Naming) -> Field {
                     superadmin,
                     external_subject,
                     &existing_roles,
-                    generate_token_id(),
+                    try_generate_token_id().map_err(crate::error::to_graphql_error)?,
                     chrono::Utc::now(),
                 )
                 .map_err(to_graphql_error)?;

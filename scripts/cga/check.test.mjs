@@ -134,6 +134,34 @@ test('fresh installation uses pinned nightly and applies compatibility patch', t
     `${REVISION}\n${digest(join(context.here, 'compat.patch'))}\n`);
 });
 
+test('a restored source directory is initialized and the pinned commit fetched before checkout', t => {
+  const context = fixture(t);
+  const source = join(context.root, 'target/cga-tool-source');
+  mkdirSync(source, { recursive: true });
+  mkdirSync(join(context.root, 'target/cga-tool'), { recursive: true });
+  // Simulate a target cache that kept sources but omitted Git metadata.
+  writeFileSync(join(source, 'Cargo.toml'), 'cached source');
+  assert.equal(spawnSync('git', ['init', context.root]).status, 0);
+  const commands = [];
+  install({ ...context, run: (command, args, options) => {
+    commands.push([command, args]);
+    if (command === 'git' && args[0] === 'init') {
+      assert.equal(spawnSync(command, args, options).status, 0);
+    }
+    if (command === 'git' && args.includes('checkout')) {
+      const top = spawnSync('git', ['-C', source, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+      assert.equal(top.status, 0);
+      assert.equal(top.stdout.trim(), source);
+    }
+  } });
+  const init = commands.findIndex(([cmd, args]) => cmd === 'git' && args[0] === 'init');
+  const fetch = commands.findIndex(([cmd, args]) => cmd === 'git' && args.includes('fetch'));
+  const checkout = commands.findIndex(([cmd, args]) => cmd === 'git' && args.includes('checkout'));
+  assert.ok(init >= 0 && init < fetch && fetch < checkout);
+  assert.deepEqual(commands[fetch], ['git', ['-C', source, 'fetch', '--depth', '1',
+    'https://github.com/OpenDevicePartnership/cga', REVISION]]);
+});
+
 test('CLI help runs without Rust or a workspace lockfile', () => {
   const result = spawnSync(process.execPath, [join(HERE, 'check.mjs'), '--help'], {
     env: { PATH: '' }, encoding: 'utf8',

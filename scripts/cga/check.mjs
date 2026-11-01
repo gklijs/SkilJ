@@ -32,9 +32,12 @@ export function install({ root = ROOT, here = HERE, run = runCommand } = {}) {
   const binary = join(prefix, 'bin/cargo-cga');
   if (existsSync(binary) && existsSync(marker) && readFileSync(marker, 'utf8') === stamp) return binary;
   const source = join(root, 'target/cga-tool-source');
-  if (!existsSync(source)) {
-    run('git', ['clone', '--no-checkout', 'https://github.com/OpenDevicePartnership/cga', source], { cwd: root });
-  }
+  // Target caches may retain the source directory while stripping its .git
+  // directory or objects. Initialize explicitly: otherwise git -C can find
+  // the enclosing SkilJ repository and operate on it instead.
+  run('git', ['init', source], { cwd: root });
+  run('git', ['-C', source, 'fetch', '--depth', '1',
+    'https://github.com/OpenDevicePartnership/cga', REVISION], { cwd: root });
   // This dedicated, ignored checkout contains only the downloaded tool.
   run('git', ['-C', source, 'checkout', '--force', REVISION], { cwd: root });
   run('git', ['-C', source, 'apply', '--check', join(here, 'compat.patch')], { cwd: root });

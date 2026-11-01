@@ -37,7 +37,6 @@
 //! astronomically unlikely) both call into.
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
-use ring::rand::{SecureRandom, SystemRandom};
 
 pub mod provider;
 pub mod service;
@@ -56,6 +55,10 @@ const KEY_LEN: usize = 32; // AES-256
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The operating system could not supply cryptographically secure randomness.
+    #[error("secure randomness is unavailable")]
+    RandomnessUnavailable,
+
     #[error(
         "sensitive_fields declares a field to encrypt, but no key provider was configured \
          (SkiljBuilder::key_provider)"
@@ -153,6 +156,7 @@ impl crate::error::SkiljRejection for Error {
     fn code(&self) -> &str {
         match self {
             Error::MasterKeyNotConfigured => "encryption_master_key_not_configured",
+            Error::RandomnessUnavailable => "secure_randomness_unavailable",
             Error::DecryptFailed => "encryption_decrypt_failed",
             Error::ProviderUnavailable { .. } => "encryption_key_provider_unavailable",
             Error::ProviderRefused { .. } => "encryption_key_provider_refused",
@@ -212,13 +216,46 @@ impl DataKey {
     }
 }
 
-fn random_bytes<const N: usize>() -> [u8; N] {
-    let rng = SystemRandom::new();
+pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N], Error> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    #[cfg(test)]
+    if RNG_FAILURE.with(|remaining| match remaining.get() {
+        Some(0) => true,
+        Some(n) => {
+            remaining.set(Some(n - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err(Error::RandomnessUnavailable);
+    }
     let mut bytes = [0u8; N];
-    rng.fill(&mut bytes).expect(
-        "SystemRandom::fill only fails on catastrophic OS RNG failure - see ring's own docs",
-    );
-    bytes
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| Error::RandomnessUnavailable)?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static RNG_FAILURE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_rng_failure<T>(f: impl FnOnce() -> T) -> T {
+    with_rng_failure_after(0, f)
+}
+
+#[cfg(test)]
+fn with_rng_failure_after<T>(successful_calls: usize, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RNG_FAILURE.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(RNG_FAILURE.with(|flag| flag.replace(Some(successful_calls))));
+    f()
 }
 
 fn seal(key_bytes: &[u8; KEY_LEN], nonce_bytes: [u8; NONCE_LEN], mut in_out: Vec<u8>) -> Vec<u8> {
@@ -253,11 +290,22 @@ fn open(
 /// own "provision" branch. Returns both the plaintext `DataKey` (for the
 /// caller to encrypt with immediately) and its wrapped bytes + nonce (for
 /// the caller to persist - never the plaintext key itself).
+///
+/// # Panics
+/// Panics if secure randomness is unavailable. Use [`try_generate_and_wrap_data_key`]
+/// to return the failure instead.
 pub fn generate_and_wrap_data_key(master_key: &EncryptionMasterKey) -> (DataKey, Vec<u8>, Vec<u8>) {
-    let data_key_bytes = random_bytes::<KEY_LEN>();
-    let nonce_bytes = random_bytes::<NONCE_LEN>();
+    try_generate_and_wrap_data_key(master_key).expect("secure randomness is unavailable")
+}
+
+/// Like [`generate_and_wrap_data_key`], returning OS randomness failures.
+pub fn try_generate_and_wrap_data_key(
+    master_key: &EncryptionMasterKey,
+) -> Result<(DataKey, Vec<u8>, Vec<u8>), Error> {
+    let data_key_bytes = random_bytes::<KEY_LEN>()?;
+    let nonce_bytes = random_bytes::<NONCE_LEN>()?;
     let wrapped = seal(&master_key.0, nonce_bytes, data_key_bytes.to_vec());
-    (DataKey(data_key_bytes), wrapped, nonce_bytes.to_vec())
+    Ok((DataKey(data_key_bytes), wrapped, nonce_bytes.to_vec()))
 }
 
 /// Recovers a previously-wrapped `DataKey` - `db::get_or_create_encryption_key`'s
@@ -278,13 +326,22 @@ pub fn unwrap_data_key(
 /// per-field operation. A fresh random nonce every call, prepended to the
 /// ciphertext+tag and base64-encoded as a single opaque string - the
 /// value that replaces the leaf's plaintext in the stored payload.
+///
+/// # Panics
+/// Panics if secure randomness is unavailable. Use [`try_encrypt_leaf`]
+/// to return the failure instead.
 pub fn encrypt_leaf(data_key: &DataKey, plaintext: &str) -> String {
-    let nonce_bytes = random_bytes::<NONCE_LEN>();
+    try_encrypt_leaf(data_key, plaintext).expect("secure randomness is unavailable")
+}
+
+/// Like [`encrypt_leaf`], returning OS randomness failures without ciphertext.
+pub fn try_encrypt_leaf(data_key: &DataKey, plaintext: &str) -> Result<String, Error> {
+    let nonce_bytes = random_bytes::<NONCE_LEN>()?;
     let sealed = seal(&data_key.0, nonce_bytes, plaintext.as_bytes().to_vec());
     let mut combined = Vec::with_capacity(NONCE_LEN + sealed.len());
     combined.extend_from_slice(&nonce_bytes);
     combined.extend_from_slice(&sealed);
-    crate::base64::encode(&combined)
+    Ok(crate::base64::encode(&combined))
 }
 
 /// Inverts `encrypt_leaf`.
@@ -347,5 +404,158 @@ pub fn decrypt_ciphertext_leaves(value: &mut serde_json::Value, data_keys: &[Dat
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod randomness_tests {
+    use super::*;
+    use crate::error::SkiljRejection;
+
+    #[test]
+    fn write_and_scheduler_paths_propagate_nonce_failures() {
+        use crate::event_store::{
+            self, EncryptionKey, EncryptionKeyStatus, MissedOccurrencePolicy,
+        };
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let admin = crate::bootstrap::stamp_admin_bounded_context(None, now).unwrap();
+        let key = EncryptionKey {
+            bounded_context: admin.clone(),
+            subject_key: "user".into(),
+            subject_value: "42".into(),
+            status: EncryptionKeyStatus::Active,
+            created_at: now,
+            destroyed_at: None,
+        };
+        let mut event_type =
+            trail::master_key_event_type(&admin, trail::MasterKeyEventKind::KeyDeleted);
+        event_type.system_triggered_allowed = true;
+        event_type.system_triggered_schedule = Some("* * * * * * *".into());
+        event_type.missed_occurrence_policy = Some(MissedOccurrencePolicy::ReplayBacklog);
+        event_type.schedule_position = Some(now - chrono::Duration::seconds(1));
+        event_type.sensitive_fields = vec![crate::shared::SensitiveField {
+            field: "email".into(),
+            subject_key: "user".into(),
+            subject_field: "user_id".into(),
+        }];
+        let payload = r#"{"email":"secret","user_id":"42"}"#;
+        with_rng_failure(|| {
+            let error = event_store::try_protect_sensitive_fields(
+                &event_type.sensitive_fields,
+                payload,
+                |_, _| (key.clone(), DataKey([2; 32])),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "secure_randomness_unavailable");
+            // RNG failures must propagate rather than become a stored redacted payload.
+            let error = event_store::try_create_system_event(
+                &event_type,
+                now,
+                now,
+                1,
+                || payload.into(),
+                |_, _| (key.clone(), DataKey([2; 32])),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "secure_randomness_unavailable");
+        });
+        assert_eq!(
+            event_type.schedule_position,
+            Some(now - chrono::Duration::seconds(1))
+        );
+        event_type.sensitive_fields.clear();
+        with_rng_failure(|| {
+            let error = event_store::try_create_system_event(
+                &event_type,
+                now,
+                now,
+                1,
+                || "{}".into(),
+                |_, _| panic!("no encryption needed"),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "secure_randomness_unavailable");
+            let change = trail::MasterKeyChange::deleted("file", true);
+            assert_eq!(
+                change.try_into_event(&admin, 1, now).unwrap_err().code(),
+                "secure_randomness_unavailable"
+            );
+            assert_eq!(
+                crate::secrets::grant_secret_access(&admin, "oauth", "role", now)
+                    .unwrap_err()
+                    .code(),
+                "secure_randomness_unavailable"
+            );
+        });
+    }
+
+    #[test]
+    fn rng_failure_returns_errors_without_tokens_keys_or_ciphertext() {
+        with_rng_failure(|| {
+            assert_eq!(
+                crate::shared::try_generate_token_id().unwrap_err().code(),
+                "secure_randomness_unavailable"
+            );
+            assert_eq!(
+                crate::shared::try_generate_token_secret()
+                    .unwrap_err()
+                    .code(),
+                "secure_randomness_unavailable"
+            );
+            assert_eq!(
+                crate::bootstrap::try_generate_bootstrap_secret(&[])
+                    .unwrap_err()
+                    .code(),
+                "secure_randomness_unavailable"
+            );
+            assert!(matches!(
+                try_generate_and_wrap_data_key(&EncryptionMasterKey::from_bytes([1; 32])),
+                Err(Error::RandomnessUnavailable)
+            ));
+            assert_eq!(
+                try_encrypt_leaf(&DataKey([2; 32]), "secret")
+                    .unwrap_err()
+                    .code(),
+                "secure_randomness_unavailable"
+            );
+            assert!(matches!(
+                provider::InMemoryKeyProvider::try_new(),
+                Err(Error::RandomnessUnavailable)
+            ));
+            assert!(matches!(
+                crate::event_store::EventBroadcaster::try_new(1),
+                Err(crate::error::Error::Encryption(
+                    Error::RandomnessUnavailable
+                ))
+            ));
+            assert!(matches!(
+                crate::access_control::RevocationBroadcaster::try_new(),
+                Err(crate::error::Error::Encryption(
+                    Error::RandomnessUnavailable
+                ))
+            ));
+        });
+        // The key can be generated successfully and nonce generation can still fail.
+        with_rng_failure_after(1, || {
+            assert!(matches!(
+                try_generate_and_wrap_data_key(&EncryptionMasterKey::from_bytes([1; 32])),
+                Err(Error::RandomnessUnavailable)
+            ));
+        });
+        // Fault injection is scoped to this thread and restored after the call.
+        assert_eq!(crate::shared::try_generate_token_id().unwrap().len(), 32);
+        assert_eq!(
+            crate::shared::try_generate_token_secret().unwrap().len(),
+            64
+        );
+        let key = DataKey([2; 32]);
+        let ciphertext = try_encrypt_leaf(&key, "secret").unwrap();
+        assert_eq!(decrypt_leaf(&key, &ciphertext).unwrap(), "secret");
+        let master = EncryptionMasterKey::from_bytes([1; 32]);
+        let (data_key, wrapped, nonce) = try_generate_and_wrap_data_key(&master).unwrap();
+        assert_eq!(
+            unwrap_data_key(&master, &wrapped, &nonce).unwrap().bytes(),
+            data_key.bytes()
+        );
     }
 }

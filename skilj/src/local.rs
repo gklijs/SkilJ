@@ -224,7 +224,8 @@ pub fn load_or_create_password(path: &Path) -> Result<String, Error> {
         }
         return Ok(password);
     }
-    let password = skilj_core::shared::generate_token_secret();
+    let password = skilj_core::shared::try_generate_token_secret()
+        .map_err(|error| io_error(std::io::Error::other(error)))?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

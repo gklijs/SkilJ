@@ -951,3 +951,115 @@ proptest! {
 // `skilj/tests/event_fetch_rest.rs` (a wrong-secret 401, a correct
 // EventFetch response, and `FetchEvents`/`ConsumeEvents`/
 // `AcknowledgeEvents` all at their real routes).
+
+#[test]
+fn consume_events_rejects_checkout_lease_timestamp_overflow() {
+    let t = token(TokenStatus::Active, event_type(true));
+    for (checked_out_at, lease) in [
+        (
+            chrono::DateTime::<Utc>::MAX_UTC,
+            chrono::Duration::seconds(1),
+        ),
+        (
+            chrono::DateTime::<Utc>::MIN_UTC,
+            chrono::Duration::seconds(-1),
+        ),
+        (timestamp(0), chrono::Duration::MAX),
+    ] {
+        let existing = ReadCursor {
+            token: t.clone(),
+            ack_mode: AckMode::ManualAck,
+            sequence: 5,
+            updated_at: timestamp(0),
+            checked_out_at: Some(checked_out_at),
+        };
+        let error =
+            event_store::consume_events(&t, Some(&existing), None, &[], &[], timestamp(0), lease)
+                .unwrap_err();
+        assert_eq!(error.code(), "database_error");
+        assert!(error
+            .internal_detail()
+            .unwrap()
+            .contains("checkout lease exceeds"));
+    }
+}
+
+#[test]
+fn consume_rejects_inconsistent_start_fields_before_reading_history() {
+    let mut t = token(TokenStatus::Active, event_type(true));
+    for (start, sequence, time, code) in [
+        (
+            EventReadStartPosition::AtSequence,
+            None,
+            None,
+            "start_at_sequence_mismatch",
+        ),
+        (
+            EventReadStartPosition::AtSequence,
+            Some(2),
+            Some(timestamp(0)),
+            "start_at_sequence_mismatch",
+        ),
+        (
+            EventReadStartPosition::AtTime,
+            None,
+            None,
+            "start_at_time_mismatch",
+        ),
+        (
+            EventReadStartPosition::AtTime,
+            Some(2),
+            Some(timestamp(0)),
+            "start_at_time_mismatch",
+        ),
+        (
+            EventReadStartPosition::Beginning,
+            Some(2),
+            None,
+            "start_at_value_not_allowed",
+        ),
+        (
+            EventReadStartPosition::Latest,
+            None,
+            Some(timestamp(0)),
+            "start_at_value_not_allowed",
+        ),
+    ] {
+        t.start_from = start;
+        t.start_at_sequence = sequence;
+        t.start_at_time = time;
+        let never_read = std::iter::from_fn(|| -> Option<&Event> {
+            panic!("invalid token must be rejected before reading history")
+        });
+        assert_eq!(
+            event_store::try_initial_consume_position(&t, never_read)
+                .unwrap_err()
+                .code(),
+            code
+        );
+        assert_eq!(
+            event_store::check_consume_events(&t, None, Some(AckMode::ManualAck), &[])
+                .unwrap_err()
+                .code(),
+            code
+        );
+        assert_eq!(
+            event_store::consume_events(
+                &t,
+                None,
+                Some(AckMode::ManualAck),
+                &[],
+                &[],
+                timestamp(0),
+                checkout_lease()
+            )
+            .unwrap_err()
+            .code(),
+            code
+        );
+        assert_eq!(
+            event_store::initial_consume_position(&t, std::iter::empty()),
+            i64::MAX
+        );
+    }
+}
