@@ -475,6 +475,11 @@ input BankTagMappingInput @inaccessible {
 	blind: Boolean @inaccessible
 }
 
+type BankUsedTag @inaccessible {
+	key: String!
+	value: String
+}
+
 type BankWouldBeEvent @inaccessible {
 	eventTypeName: String!
 	payload: String!
@@ -534,6 +539,7 @@ type Query {
 	bankEventTypes(boundedContext: String!): [BankEventType!]! @inaccessible
 	bankCommandTypes(boundedContext: String!): [BankCommandType!]! @inaccessible
 	bankQueryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [BankTagInput!], afterSequence: Int, correlationId: String): [BankQueriedEvent!]! @inaccessible
+	bankSearchUsedTags(boundedContext: String!, key: String!, prefix: String, limit: Int, eventTypeName: String): [BankUsedTag!]! @inaccessible
 	bankCountEvents(boundedContext: String!, eventTypes: [String!]!, tags: [BankTagInput!], correlationId: String): Int! @inaccessible
 	bankInspectEvent(boundedContext: String!, sequence: Int!): BankInspectedEvent! @inaccessible
 	bankEpoch: String!

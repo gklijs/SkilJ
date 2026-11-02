@@ -6,7 +6,7 @@
 [![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
 [![license: MIT OR Apache-2.0](https://img.shields.io/crates/l/skilj.svg)](#license)
 
-`skilj` is a Rust library for building event-sourced applications backed by Postgres. You define
+`skilj` is a Rust library for building event-sourced applications backed by Postgres 15 or later. You define
 your domain as **events** (facts that happened) and **commands** (requests to make something
 happen), and `skilj` handles storage, consistency checking, and exposing it all over GraphQL and
 REST — so you can focus on the domain logic itself.

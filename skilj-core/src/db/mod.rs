@@ -388,6 +388,8 @@ pub use access::*;
 
 mod events;
 pub use events::*;
+mod tags;
+pub use tags::search_used_tags;
 
 mod decision_history;
 use decision_history::decision_history;

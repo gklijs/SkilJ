@@ -475,6 +475,11 @@ input LedgerTagMappingInput @inaccessible {
 	blind: Boolean @inaccessible
 }
 
+type LedgerUsedTag @inaccessible {
+	key: String!
+	value: String
+}
+
 type LedgerWouldBeEvent @inaccessible {
 	eventTypeName: String!
 	payload: String!
@@ -534,6 +539,7 @@ type Query {
 	ledgerEventTypes(boundedContext: String!): [LedgerEventType!]! @inaccessible
 	ledgerCommandTypes(boundedContext: String!): [LedgerCommandType!]! @inaccessible
 	ledgerQueryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [LedgerTagInput!], afterSequence: Int, correlationId: String): [LedgerQueriedEvent!]! @inaccessible
+	ledgerSearchUsedTags(boundedContext: String!, key: String!, prefix: String, limit: Int, eventTypeName: String): [LedgerUsedTag!]! @inaccessible
 	ledgerCountEvents(boundedContext: String!, eventTypes: [String!]!, tags: [LedgerTagInput!], correlationId: String): Int! @inaccessible
 	ledgerInspectEvent(boundedContext: String!, sequence: Int!): LedgerInspectedEvent! @inaccessible
 	ledgerEpoch: String!

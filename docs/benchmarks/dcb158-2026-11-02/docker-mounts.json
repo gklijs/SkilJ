@@ -1,0 +1,1 @@
+[{"Type":"volume","Name":"1be25891574376617b52f19d7531303fbcd3f0d021caa7dbf3b4191fd3a78ff8","Source":"/var/lib/docker/volumes/1be25891574376617b52f19d7531303fbcd3f0d021caa7dbf3b4191fd3a78ff8/_data","Destination":"/var/lib/postgresql","Driver":"local","Mode":"","RW":true,"Propagation":""}]

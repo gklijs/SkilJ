@@ -67,6 +67,7 @@ impl Default for GraphqlLimits {
 /// query itself.
 pub const EXPENSIVE_FIELDS: &[&str] = &[
     "queryEvents",
+    "searchUsedTags",
     "countEvents",
     "fetchCommands",
     "projection",

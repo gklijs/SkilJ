@@ -51,7 +51,9 @@ use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::Pool;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
 use skilj_core::plugin::BoundedContextEvent;
-use skilj_core::shared::{generate_token_id, generate_token_secret, CommandDecision, EventSpec};
+use skilj_core::shared::{
+    generate_token_id, generate_token_secret, CommandDecision, EventSpec, TagMapping,
+};
 use tower::ServiceExt;
 
 const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
@@ -117,6 +119,10 @@ const DIVERGENCES: &[(&str, &str)] = &[
         "the same split as submit_without_credential",
     ),
     (
+        "search_tags_without_credential",
+        "the same JWT-versus-bearer authentication split as read_without_credential",
+    ),
+    (
         "read_after_past_latest",
         "`GET /v1/events`' `after` is a stream cursor and a cursor past the latest committed \
          sequence is refused (§148); `queryEvents`' `afterSequence` is an Admin's paging \
@@ -144,6 +150,10 @@ enum Op {
         after: Option<i64>,
     },
     ReadWithoutCredential,
+    SearchTags {
+        prefix: &'static str,
+        authenticated: bool,
+    },
     /// Archives the surface's bounded context - setup for the scenarios
     /// after it, with no outcome line of its own.
     Archive,
@@ -196,6 +206,34 @@ fn scenarios() -> Vec<(&'static str, Op)> {
         ("read_after_latest", Op::Read { after: Some(1) }),
         ("read_after_past_latest", Op::Read { after: Some(1000) }),
         ("read_without_credential", Op::ReadWithoutCredential),
+        (
+            "search_tags",
+            Op::SearchTags {
+                prefix: "",
+                authenticated: true,
+            },
+        ),
+        (
+            "search_tags_prefix",
+            Op::SearchTags {
+                prefix: "2",
+                authenticated: true,
+            },
+        ),
+        (
+            "search_tags_missing",
+            Op::SearchTags {
+                prefix: "missing",
+                authenticated: true,
+            },
+        ),
+        (
+            "search_tags_without_credential",
+            Op::SearchTags {
+                prefix: "",
+                authenticated: false,
+            },
+        ),
         ("archive", Op::Archive),
         ("submit_archived", submit(json!(20), None)),
         ("dry_run_archived", dry_run(json!(20))),
@@ -215,6 +253,9 @@ struct MoneyDeposited;
 impl EventType for MoneyDeposited {
     type Payload = MoneyDepositedPayload;
     const NAME: &'static str = "MoneyDeposited";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![TagMapping::new("amount", "amount")]
+    }
     fn event_read_allowed() -> bool {
         true
     }
@@ -636,6 +677,13 @@ async fn run(deployment: &Deployment, surface: Surface, op: &Op) -> Option<(u16,
         (Surface::Graphql, Op::ReadWithoutCredential) => {
             graphql(QUERY_EVENTS, read_variables(None), false).await
         }
+        (Surface::Graphql, Op::SearchTags { prefix, authenticated }) => {
+            graphql(
+                "query($bc: String!, $prefix: String!) { searchUsedTags(boundedContext: $bc, key: \"amount\", prefix: $prefix) { key value } }",
+                json!({"bc": deployment.bounded_context, "prefix": prefix}),
+                *authenticated,
+            ).await
+        }
         (
             Surface::Rest,
             Op::Submit {
@@ -683,6 +731,10 @@ async fn run(deployment: &Deployment, surface: Surface, op: &Op) -> Option<(u16,
         (Surface::Rest, Op::ReadWithoutCredential) => {
             send(&deployment.rest, "GET", &read_uri(None), &[], None).await
         }
+        (Surface::Rest, Op::SearchTags { prefix, authenticated }) => {
+            let headers = if *authenticated { vec![bearer(&deployment.read_credential)] } else { vec![] };
+            send(&deployment.rest, "GET", &format!("/v1/events/tags?key=amount&prefix={prefix}"), &headers, None).await
+        }
     };
     Some((status, outcome(surface, op, status, &body)))
 }
@@ -697,6 +749,7 @@ fn outcome(surface: Surface, op: &Op, status: u16, body: &Value) -> Value {
                 return json!({ "error": errors[0]["extensions"]["code"] });
             }
             let field = match op {
+                Op::SearchTags { .. } => "searchUsedTags",
                 Op::Read { .. } | Op::ReadWithoutCredential => "queryEvents",
                 Op::DryRun { .. } => "dryRunCommand",
                 _ => "submitCommand",
@@ -707,13 +760,18 @@ fn outcome(surface: Surface, op: &Op, status: u16, body: &Value) -> Value {
             if !(200..300).contains(&status) {
                 return json!({ "error": body["code"] });
             }
-            if reading {
+            if matches!(op, Op::SearchTags { .. }) {
+                body["tags"].clone()
+            } else if reading {
                 body["events"].clone()
             } else {
                 body.clone()
             }
         }
     };
+    if matches!(op, Op::SearchTags { .. }) {
+        return json!({ "tags": data });
+    }
     if reading {
         // An event is its sequence and its payload. GraphQL's payload is
         // a JSON string, REST's the JSON itself (§7.3): the value is

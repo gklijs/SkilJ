@@ -47,12 +47,65 @@ impl EventType for Deposited {
 
 pub enum AccountEvent {
     Deposited(DepositedPayload),
+    Linked(LinkedPayload),
+}
+
+/// One event carrying both accounts, to exercise overlapping boundaries.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LinkedPayload {
+    pub account_ids: Vec<String>,
+    pub amount: i64,
+}
+
+pub struct LinkedDeposited;
+
+impl EventType for LinkedDeposited {
+    type Payload = LinkedPayload;
+    const NAME: &'static str = "LinkedDeposited";
+    fn tag_mappings() -> Vec<TagMapping> {
+        LinkedDeposit::tag_mappings()
+    }
+}
+
+pub struct LinkedDeposit;
+
+impl CommandType for LinkedDeposit {
+    type Payload = LinkedPayload;
+    type Event = AccountEvent;
+    const NAME: &'static str = "LinkedDeposit";
+    fn rest_trigger_allowed() -> bool {
+        true
+    }
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![TagMapping {
+            key: "account".into(),
+            field: "account_ids".into(),
+            blind: false,
+        }]
+    }
+    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
+        if balance_of(matching_events) + payload.amount > i64::MAX / 2 {
+            return CommandDecision::Rejected {
+                reason: "balance cap".into(),
+                kind: "balance_cap".into(),
+            };
+        }
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: LinkedDeposited::NAME.into(),
+                payload: serde_json::to_value(payload).unwrap(),
+            }],
+        }
+    }
 }
 
 impl BoundedContextEvent for AccountEvent {
     fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
         match event.event_type.name.as_str() {
             "Deposited" => Some(serde_json::from_str(&event.payload).map(AccountEvent::Deposited)),
+            "LinkedDeposited" => {
+                Some(serde_json::from_str(&event.payload).map(AccountEvent::Linked))
+            }
             _ => None,
         }
     }
@@ -102,7 +155,10 @@ fn deposit_decision(payload: &DepositedPayload, balance: i64) -> CommandDecision
 fn balance_of(events: &[AccountEvent]) -> i64 {
     events
         .iter()
-        .map(|AccountEvent::Deposited(d)| d.amount)
+        .map(|event| match event {
+            AccountEvent::Deposited(d) => d.amount,
+            AccountEvent::Linked(d) => d.amount,
+        })
         .sum()
 }
 
@@ -119,8 +175,11 @@ impl Snapshot for Balance {
     const NAME: &'static str = "Balance";
     const TAG_KEY: &'static str = "account";
     const VERSION: u64 = 1;
-    fn fold(state: &mut Self::State, AccountEvent::Deposited(d): &Self::Event) {
-        state.balance += d.amount;
+    fn fold(state: &mut Self::State, event: &Self::Event) {
+        state.balance += match event {
+            AccountEvent::Deposited(d) => d.amount,
+            AccountEvent::Linked(d) => d.amount,
+        };
     }
 }
 
@@ -178,6 +237,8 @@ pub fn now() -> chrono::DateTime<Utc> {
 }
 
 pub struct Setup {
+    #[allow(dead_code)] // command_throughput.rs only
+    pub linked_credential: String,
     /// Owns the background tasks `router` relies on.
     pub skilj: Skilj,
     pub router: axum::Router,
@@ -275,6 +336,8 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
             )
             .bounded_context(bc_name.clone())
             .event_type::<Deposited>()
+            .event_type::<LinkedDeposited>()
+            .command_type::<LinkedDeposit>()
             .command_type::<Deposit>()
             .command_type::<DepositFast>()
             .command_type::<DepositBlind>()
@@ -294,7 +357,7 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
     }
 
     let mut credentials = Vec::new();
-    for name in ["Deposit", "DepositFast", "DepositBlind"] {
+    for name in ["Deposit", "DepositFast", "DepositBlind", "LinkedDeposit"] {
         let command_type = db::get_command_type(pool, &bc_name, name)
             .await
             .unwrap()
@@ -313,6 +376,7 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
     }
 
     Setup {
+        linked_credential: credentials.pop().unwrap(),
         router: skilj.rest_router(),
         skilj,
         others,
@@ -342,6 +406,28 @@ pub async fn deposit_through(
     account_id: &str,
 ) -> Duration {
     let body = serde_json::json!({ "payload": { "account_id": account_id, "amount": 1 } });
+    command_through(router, credential, body).await
+}
+
+#[allow(dead_code)] // command_throughput.rs only
+pub async fn linked_deposit_through(
+    router: &axum::Router,
+    credential: &str,
+    accounts: &[String],
+) -> Duration {
+    command_through(
+        router,
+        credential,
+        serde_json::json!({ "payload": { "account_ids": accounts, "amount": 1 } }),
+    )
+    .await
+}
+
+async fn command_through(
+    router: &axum::Router,
+    credential: &str,
+    body: serde_json::Value,
+) -> Duration {
     let request = Request::builder()
         .method("POST")
         .uri("/v1/commands/trigger")

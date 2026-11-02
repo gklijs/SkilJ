@@ -1,0 +1,20 @@
+    Finished `release` profile [optimized] target(s) in 0.28s
+     Running tests/dcb_concurrency_experiment.rs (target/release/deps/dcb_concurrency_experiment-d32012803a3a4c47)
+
+running 1 test
+SETTINGS [("fsync", "on"), ("full_page_writes", "on"), ("server_version", "18.6 (Debian 18.6-1.pgdg13+2)"), ("synchronous_commit", "on")]
+CDC commit order verified: ["0/2F54F900", "0/2F54F930"]
+CORRECTNESS passed: two pools, same-key cap, overlapping tags, idempotency, rollback, publication order; UUID cursor counterexample reproduced
+ROUND 1
+RESULT mode=serial-group wal_order=true cached_decision=true routing=key linger_us=100 batch_max=256 pause_us=20000 workload=Independent workers=1 commands=80 ingest_per_s=31.7 published_per_s=31.6 p50_ms=8.761 p99_ms=16.119 drain_ms=8.775 retries=0 publication_batches=80 stream_lag_p50_ms=7.393 stream_lag_p99_ms=13.197 ingest_batch_mean=1.00 ingest_batch_max=1
+RESULT mode=uuid-group wal_order=true cached_decision=true routing=key linger_us=100 batch_max=256 pause_us=20000 workload=Independent workers=1 commands=80 ingest_per_s=30.0 published_per_s=29.9 p50_ms=9.072 p99_ms=32.312 drain_ms=10.129 retries=0 publication_batches=80 stream_lag_p50_ms=8.512 stream_lag_p99_ms=44.977 ingest_batch_mean=1.00 ingest_batch_max=1
+ROUND 2
+RESULT mode=serial-group wal_order=true cached_decision=true routing=key linger_us=100 batch_max=256 pause_us=20000 workload=Independent workers=1 commands=80 ingest_per_s=30.2 published_per_s=30.1 p50_ms=8.706 p99_ms=15.933 drain_ms=12.782 retries=0 publication_batches=80 stream_lag_p50_ms=7.570 stream_lag_p99_ms=12.472 ingest_batch_mean=1.00 ingest_batch_max=1
+RESULT mode=uuid-group wal_order=true cached_decision=true routing=key linger_us=100 batch_max=256 pause_us=20000 workload=Independent workers=1 commands=80 ingest_per_s=33.8 published_per_s=33.7 p50_ms=8.341 p99_ms=11.376 drain_ms=11.026 retries=0 publication_batches=80 stream_lag_p50_ms=7.770 stream_lag_p99_ms=9.451 ingest_batch_mean=1.00 ingest_batch_max=1
+ROUND 3
+RESULT mode=uuid-group wal_order=true cached_decision=true routing=key linger_us=100 batch_max=256 pause_us=20000 workload=Independent workers=1 commands=80 ingest_per_s=33.1 published_per_s=32.9 p50_ms=8.363 p99_ms=15.984 drain_ms=9.961 retries=0 publication_batches=80 stream_lag_p50_ms=7.342 stream_lag_p99_ms=10.003 ingest_batch_mean=1.00 ingest_batch_max=1
+RESULT mode=serial-group wal_order=true cached_decision=true routing=key linger_us=100 batch_max=256 pause_us=20000 workload=Independent workers=1 commands=80 ingest_per_s=33.5 published_per_s=33.0 p50_ms=8.747 p99_ms=11.381 drain_ms=38.392 retries=0 publication_batches=80 stream_lag_p50_ms=9.066 stream_lag_p99_ms=37.206 ingest_batch_mean=1.00 ingest_batch_max=1
+test dcb_concurrency_experiment ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.94s
+

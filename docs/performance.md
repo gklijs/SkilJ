@@ -4,6 +4,14 @@ What limits command throughput in skilj, what has been measured, and the
 knobs you can turn. Design background: [docs/architecture.md](architecture.md)
 §58-§63.
 
+The [disjoint consistency boundaries investigation](disjoint-consistency-boundaries.md)
+examines alternatives to the context lock, their correctness obligations, and
+the durable measurements still needed for issue #158.
+The [Docker PostgreSQL follow-up](dcb158-postgres-experiment.md) adds measured
+UUID/concurrency controls, commit-ordered batch streaming, key-affine batching,
+linger, tag interning and indexed used-tag discovery. Its prototype rates are
+not measurements of a replacement production command path.
+
 ## The one ceiling that matters
 
 skilj is a DCB event store: every accepted command must be checked against

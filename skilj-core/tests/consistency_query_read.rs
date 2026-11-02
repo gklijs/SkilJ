@@ -241,7 +241,7 @@ async fn seed(pool: &Pool, tickets: usize) -> (CommandType, CommandType) {
     .await
     .unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ANALYZE \"bc_{}\".event_tags",
+        "ANALYZE \"bc_{}\".event_tag_refs",
         bc.name
     )))
     .execute(pool)

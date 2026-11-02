@@ -271,6 +271,7 @@ fn root_types(
         .field(admin(resolvers::type_registration::event_types_field(n)))
         .field(admin(resolvers::type_registration::command_types_field(n)))
         .field(admin(resolvers::event_query::query_events_field(n)))
+        .field(admin(resolvers::event_query::search_used_tags_field(n)))
         .field(admin(resolvers::event_query::count_events_field(n)))
         .field(admin(resolvers::event_query::inspect_event_field(n)))
         .field(resolvers::event_query::epoch_field(n))
@@ -431,6 +432,7 @@ fn static_types(n: &Naming) -> Vec<Type> {
         gql_types::command_token_object(n).into(),
         gql_types::access_token_union(n).into(),
         gql_types::tag_input(n).into(),
+        gql_types::used_tag_object(n).into(),
         gql_types::queried_event_object(n).into(),
         gql_types::queried_command_object(n).into(),
         gql_types::matching_event_object(n).into(),

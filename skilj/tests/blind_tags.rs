@@ -443,6 +443,7 @@ impl Crm {
             "SELECT EXISTS (SELECT 1 FROM {schema}.events \
                 WHERE tags::text LIKE $1 OR payload LIKE $1) \
              OR EXISTS (SELECT 1 FROM {schema}.event_tags WHERE tag_value LIKE $1) \
+             OR EXISTS (SELECT 1 FROM {schema}.event_tag_values WHERE tag_value LIKE $1) \
              OR EXISTS (SELECT 1 FROM {schema}.commands WHERE consistency_tags::text LIKE $1 \
                 OR consistency_query::text LIKE $1 OR payload LIKE $1)"
         )))

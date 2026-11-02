@@ -33,6 +33,14 @@ read_after_past_latest	graphql	200	{"events":[]}
 read_after_past_latest	rest	400	{"error":"invalid_request"}
 read_without_credential	graphql	200	{"error":"unauthenticated"}
 read_without_credential	rest	401	{"error":"missing_credential"}
+search_tags	graphql	200	{"tags":[{"key":"amount","value":"20"},{"key":"amount","value":"30"}]}
+search_tags	rest	200	{"tags":[{"key":"amount","value":"20"},{"key":"amount","value":"30"}]}
+search_tags_prefix	graphql	200	{"tags":[{"key":"amount","value":"20"}]}
+search_tags_prefix	rest	200	{"tags":[{"key":"amount","value":"20"}]}
+search_tags_missing	graphql	200	{"tags":[]}
+search_tags_missing	rest	200	{"tags":[]}
+search_tags_without_credential	graphql	200	{"error":"unauthenticated"}
+search_tags_without_credential	rest	401	{"error":"missing_credential"}
 submit_archived	graphql	200	{"error":"bounded_context_archived"}
 submit_archived	rest	409	{"error":"bounded_context_archived"}
 dry_run_archived	graphql	200	{"error":"bounded_context_archived"}

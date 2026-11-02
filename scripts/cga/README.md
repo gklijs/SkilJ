@@ -57,6 +57,18 @@ and uploaded by CI even when comparison fails.
 
 ## Reducing findings
 
+The issue #158 tag-dictionary/search change explicitly re-records the baseline
+after reviewing the analyzer output. New paths include SQLx query construction,
+binding and cleanup, formatting/replacement of the migration SQL, and allocation
+and cleanup while building Unicode prefix bounds. Sampled backtraces reach
+standard-library capacity/unsafe-precondition assertions and SQLx error/drop
+paths; they are retained as potential panics, not suppressed or declared
+impossible. Embedded closure line numbers also change some existing identities.
+The skipped generic target multiset, tool, dependencies and configuration remain
+unchanged. This baseline update accepts additional analyzed code, not a reduction
+in potential panics. Database and Unicode edge tests complement the analysis;
+they do not establish panic freedom.
+
 `baseline.json` records a multiset of `(file, diagnostic, normalized source
 span)`, rather than just a maximum count. Line numbers and indentation
 are excluded: moving code does not create findings. A new finding cannot

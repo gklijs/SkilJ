@@ -1,0 +1,50 @@
+   Compiling skilj v0.3.0 (/home/gklijs/projects/skilj/skilj)
+    Finished `release` profile [optimized] target(s) in 5.27s
+     Running tests/dcb_concurrency_experiment.rs (target/release/deps/dcb_concurrency_experiment-d32012803a3a4c47)
+
+running 1 test
+TAGS round=1 keys=1000 rows=200000 kind=raw probes=10000 probe_ms=134.150 raw_seed_ms=1052.977 intern_seed_ms=842.379 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=1 keys=1000 rows=200000 kind=interned probes=10000 probe_ms=126.030 raw_seed_ms=1052.977 intern_seed_ms=842.379 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=1 keys=1000 rows=200000 kind=cached probes=10000 probe_ms=97.846 raw_seed_ms=1052.977 intern_seed_ms=842.379 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=2 keys=1000 rows=200000 kind=raw probes=10000 probe_ms=126.279 raw_seed_ms=866.039 intern_seed_ms=727.174 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=2 keys=1000 rows=200000 kind=interned probes=10000 probe_ms=125.349 raw_seed_ms=866.039 intern_seed_ms=727.174 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=2 keys=1000 rows=200000 kind=cached probes=10000 probe_ms=92.461 raw_seed_ms=866.039 intern_seed_ms=727.174 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=3 keys=1000 rows=200000 kind=raw probes=10000 probe_ms=126.319 raw_seed_ms=842.000 intern_seed_ms=713.630 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=3 keys=1000 rows=200000 kind=interned probes=10000 probe_ms=126.288 raw_seed_ms=842.000 intern_seed_ms=713.630 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=3 keys=1000 rows=200000 kind=cached probes=10000 probe_ms=89.196 raw_seed_ms=842.000 intern_seed_ms=713.630 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=1 keys=200000 rows=200000 kind=raw probes=10000 probe_ms=80.211 raw_seed_ms=796.990 intern_seed_ms=1555.445 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=1 keys=200000 rows=200000 kind=interned probes=10000 probe_ms=100.938 raw_seed_ms=796.990 intern_seed_ms=1555.445 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=1 keys=200000 rows=200000 kind=cached probes=10000 probe_ms=55.088 raw_seed_ms=796.990 intern_seed_ms=1555.445 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=2 keys=200000 rows=200000 kind=raw probes=10000 probe_ms=75.237 raw_seed_ms=784.812 intern_seed_ms=1626.733 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=2 keys=200000 rows=200000 kind=interned probes=10000 probe_ms=100.512 raw_seed_ms=784.812 intern_seed_ms=1626.733 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=2 keys=200000 rows=200000 kind=cached probes=10000 probe_ms=51.615 raw_seed_ms=784.812 intern_seed_ms=1626.733 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=3 keys=200000 rows=200000 kind=raw probes=10000 probe_ms=74.229 raw_seed_ms=770.332 intern_seed_ms=1539.675 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=3 keys=200000 rows=200000 kind=interned probes=10000 probe_ms=98.822 raw_seed_ms=770.332 intern_seed_ms=1539.675 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=3 keys=200000 rows=200000 kind=cached probes=10000 probe_ms=50.657 raw_seed_ms=770.332 intern_seed_ms=1539.675 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+SEARCH dictionary_entries=200003 probes=200 max_results=20 p50_ms=2.638 p99_ms=37.034 literal_wildcards=checked unused_registrations=excluded
+SEARCH PLAN
+Limit  (cost=3333.33..3333.38 rows=20 width=45) (actual time=2.709..2.711 rows=20.00 loops=1)
+  Buffers: shared hit=3024
+  ->  Sort  (cost=3333.33..3334.02 rows=274 width=45) (actual time=2.708..2.709 rows=20.00 loops=1)
+        Sort Key: "*SELECT* 1".tag_value COLLATE "C"
+        Sort Method: top-N heapsort  Memory: 26kB
+        Buffers: shared hit=3024
+        ->  Subquery Scan on "*SELECT* 1"  (cost=0.42..3326.04 rows=274 width=45) (actual time=0.022..2.555 rows=753.00 loops=1)
+              Filter: EXISTS(SubPlan 1)
+              Buffers: shared hit=3024
+              ->  Index Scan using tag_dictionary_tag_key_tag_value_key on tag_dictionary d  (cost=0.42..888.81 rows=548 width=45) (actual time=0.017..0.811 rows=753.00 loops=1)
+                    Index Cond: ((tag_key = 'account'::text) AND (tag_value >= 'ff'::text) AND (tag_value < 'fg'::text))
+                    Index Searches: 1
+                    Buffers: shared hit=763
+              SubPlan 1
+                ->  Index Only Scan using interned_lookup on interned_tags t  (cost=0.42..4.44 rows=1 width=0) (actual time=0.002..0.002 rows=1.00 loops=753)
+                      Index Cond: (tag_id = "*SELECT* 1".id)
+                      Heap Fetches: 1
+                      Index Searches: 753
+                      Buffers: shared hit=2261
+Planning Time: 0.233 ms
+Execution Time: 2.722 ms
+test tag_interning_experiment ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 17.83s
+
