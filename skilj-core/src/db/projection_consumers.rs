@@ -1211,11 +1211,13 @@ pub(super) async fn fold_snapshot_chunk_in_tx(
     // state, and a fold can't be undone, so the row starts over like a reset
     // one, without the retracted event (docs/architecture.md §235).
     for (index, value) in &planned {
-        let event = &events[*index];
-        if crate::retraction::retracted_position(event).is_some() {
-            let row = rows
-                .get_mut(*value)
-                .expect("every planned value's row was just read");
+        let Some(event) = events.get(*index) else {
+            continue;
+        };
+        if crate::retraction::retracted_position(event).is_none() {
+            continue;
+        }
+        if let Some(row) = rows.get_mut(*value) {
             if row.as_of_sequence < event.sequence {
                 row.as_of_sequence = -1;
             }

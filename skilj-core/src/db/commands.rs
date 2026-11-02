@@ -617,7 +617,9 @@ async fn resolve_retractions(
 /// are built one per spec, in order.
 fn apply_retraction_tags(events: &mut [Event], retraction_tags: RetractionTags) {
     for (index, tags) in retraction_tags {
-        events[index].tags = tags;
+        if let Some(event) = events.get_mut(index) {
+            event.tags = tags;
+        }
     }
 }
 
@@ -3154,7 +3156,9 @@ pub async fn dry_run_command(
                 });
             }
             for (index, tags) in retraction_tags {
-                events[index].tags = tags;
+                if let Some(event) = events.get_mut(index) {
+                    event.tags = tags;
+                }
             }
             let mut needs_a_key = !crate::event_store::try_sensitive_field_subjects(
                 &command_type.sensitive_fields,
