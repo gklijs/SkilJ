@@ -954,6 +954,47 @@ pub enum Error {
         "this instance does not declare sync projection {0:?}, which consumes this event type"
     )]
     SyncProjectionNotDeclared(String),
+    /// Not spec-modeled (issue #132, docs/architecture.md §238): a payload
+    /// larger than its bounded context's
+    /// [`crate::payload_limits::PayloadLimits::max_payload_bytes`] -
+    /// measured as stored, so a sensitive field counts as its ciphertext.
+    /// A document belongs outside the payload, with a fact about it in it.
+    #[error("this {kind} is {size} bytes; this bounded context stores at most {limit} bytes per payload")]
+    PayloadTooLarge {
+        /// Which payload was too large.
+        kind: crate::payload_limits::PayloadKind,
+        /// Its size, in bytes.
+        size: usize,
+        /// The bounded context's limit, in bytes.
+        limit: usize,
+    },
+
+    /// Not spec-modeled (issue #132, docs/architecture.md §239): a `$blob`
+    /// value in a payload that can't be stored - in a field its type
+    /// doesn't declare as a blob field, not a [`crate::blob::BlobRef`], or
+    /// naming a blob this bounded context doesn't have, has deleted, or
+    /// holds with another size, hash or media type.
+    #[error("the blob reference in {field:?} is refused: {reason}")]
+    BlobReferenceInvalid {
+        /// The payload field holding it.
+        field: String,
+        /// Why.
+        reason: String,
+    },
+
+    /// Not spec-modeled (issue #132): an upload larger than the blob limit.
+    #[error("this blob is larger than the {limit} bytes a blob may hold")]
+    BlobTooLarge {
+        /// The limit, in bytes.
+        limit: u64,
+    },
+
+    /// Not spec-modeled (issue #132): a blob field declaration that can't
+    /// hold: an empty field, one declared twice, or one also declared
+    /// sensitive - until blobs are encrypted, the reference would be
+    /// encrypted and the bytes it points at would not.
+    #[error("invalid blob field: {0}")]
+    InvalidBlobField(String),
 }
 
 impl SkiljRejection for Error {
@@ -1004,6 +1045,10 @@ impl SkiljRejection for Error {
             Error::CorrelationIdTooLong => "correlation_id_too_long",
             Error::InvalidParkedDeliveryRequest(_) => "invalid_parked_delivery_request",
             Error::SyncProjectionNotDeclared(_) => "sync_projection_not_declared",
+            Error::PayloadTooLarge { .. } => "payload_too_large",
+            Error::BlobReferenceInvalid { .. } => "blob_reference_invalid",
+            Error::BlobTooLarge { .. } => "blob_too_large",
+            Error::InvalidBlobField(_) => "invalid_blob_field",
         }
     }
 

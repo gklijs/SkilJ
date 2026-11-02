@@ -29,6 +29,7 @@ pub mod access_trail;
 pub mod approvals;
 mod base64;
 pub mod blind;
+pub mod blob;
 pub mod bootstrap;
 #[doc(hidden)]
 pub mod command_batcher;
@@ -41,6 +42,7 @@ pub mod error;
 #[doc(hidden)]
 pub mod event_cache;
 pub mod event_store;
+pub mod payload_limits;
 pub mod plugin;
 pub mod projections;
 pub mod retraction;

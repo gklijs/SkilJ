@@ -372,7 +372,7 @@ pub async fn fire_system_event(
     // (the early `return Ok(None)`), rolling this allocation back too, so
     // no sequence number is ever burned on an occurrence that didn't
     // actually fire.
-    let next_seq = next_sequence(&mut *tx, bounded_context).await?;
+    let (next_seq, limits) = next_sequence_with_limits(&mut *tx, bounded_context).await?;
     let Some((event, new_position)) = crate::event_store::try_create_system_event(
         &event_type,
         occurrence_at,
@@ -392,6 +392,14 @@ pub async fn fire_system_event(
     else {
         return Ok(None);
     };
+    // As stored, after encryption (docs/architecture.md §238). Refused
+    // like any other failure to fire: the occurrence stays due, and the
+    // scheduler logs and retries it.
+    limits
+        .apply(projection_dispatcher.payload_limits())
+        .check_event(&event)?;
+    let blob_claims = event_blob_claims(projection_dispatcher, &event)?;
+    check_blob_claims(&mut tx, bounded_context, &blob_claims).await?;
 
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
     // Fetched only now - after `next_sequence` above already took this
@@ -408,6 +416,7 @@ pub async fn fire_system_event(
         &sync_projections,
     )
     .await?;
+    record_blob_claims(&mut tx, bounded_context, &blob_claims, None, now).await?;
 
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.event_types SET schedule_position = $1, last_fired_at = $2 WHERE name = $3"

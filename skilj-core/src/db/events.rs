@@ -71,6 +71,102 @@ pub async fn next_sequence_batch<'e>(
     Ok(((last - count + 1)..=last).collect())
 }
 
+/// A bounded context's override of the builder's payload limits, as its
+/// `sequence` row stores it - see [`crate::payload_limits`]
+/// (docs/architecture.md §238). Read by the same statement that locks the
+/// row for a write, so it costs no round trip and is never stale.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PayloadLimitsOverride {
+    /// Replaces `max_payload_bytes` when set.
+    pub max_payload_bytes: Option<i64>,
+    /// Replaces `warn_payload_bytes` when set.
+    pub warn_payload_bytes: Option<i64>,
+}
+
+impl PayloadLimitsOverride {
+    /// `base` - the builder's limits - with this override applied.
+    pub fn apply(
+        self,
+        base: crate::payload_limits::PayloadLimits,
+    ) -> crate::payload_limits::PayloadLimits {
+        base.overridden(self.max_payload_bytes, self.warn_payload_bytes)
+    }
+}
+
+/// The override columns of `{schema}.sequence s`, read through `to_jsonb`
+/// rather than by name: a bounded context an older instance provisioned
+/// mid rolling deploy has no such columns until a newer instance patches
+/// it (`ensure_payload_limit_columns`), and naming a missing column would
+/// fail every write to it. Absent reads as null - no override.
+pub(super) const PAYLOAD_LIMIT_COLUMNS: &str = "(to_jsonb(s) ->> 'max_payload_bytes')::bigint, \
+     (to_jsonb(s) ->> 'warn_payload_bytes')::bigint";
+
+/// [`next_sequence`], also returning the bounded context's payload-limit
+/// override from the row it locks.
+pub(super) async fn next_sequence_with_limits<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<(i64, PayloadLimitsOverride)> {
+    let schema = schema_ident(bounded_context);
+    let (next, max_payload_bytes, warn_payload_bytes): (i64, Option<i64>, Option<i64>) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.sequence s SET next_value = next_value + 1 \
+             RETURNING next_value, {PAYLOAD_LIMIT_COLUMNS}"
+        )))
+        .fetch_one(executor)
+        .await?;
+    Ok((
+        next,
+        PayloadLimitsOverride {
+            max_payload_bytes,
+            warn_payload_bytes,
+        },
+    ))
+}
+
+/// A bounded context's payload-limit override, read on its own - for a
+/// caller that doesn't hold the sequence lock and only needs to know the
+/// limits (`skilj`'s read surfaces, the admin console).
+pub async fn payload_limits_override(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<PayloadLimitsOverride> {
+    let schema = schema_ident(bounded_context);
+    let (max_payload_bytes, warn_payload_bytes): (Option<i64>, Option<i64>) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {PAYLOAD_LIMIT_COLUMNS} FROM {schema}.sequence s"
+        )))
+        .fetch_one(pool)
+        .await?;
+    Ok(PayloadLimitsOverride {
+        max_payload_bytes,
+        warn_payload_bytes,
+    })
+}
+
+/// Stores a bounded context's payload-limit override; `None` clears that
+/// half of it, back to the builder's value. Takes the sequence row's lock,
+/// so a write already holding it finishes under the old limits and the
+/// next one sees the new ones. Superadmin-only: the caller decides that
+/// with [`crate::bootstrap::set_payload_limits`] first.
+pub async fn set_payload_limits(
+    pool: &Pool,
+    bounded_context: &str,
+    limits: PayloadLimitsOverride,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    // A bounded context provisioned before the columns existed.
+    ensure_payload_limit_columns(pool, bounded_context).await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.sequence SET max_payload_bytes = $1, warn_payload_bytes = $2"
+    )))
+    .bind(limits.max_payload_bytes)
+    .bind(limits.warn_payload_bytes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// The identity of `bounded_context`'s `events` table (its OID) together
 /// with [`latest_sequence`], in one round trip. Hard-deleting a bounded
 /// context drops its schema and frees the name for reuse, and recreating
@@ -2481,7 +2577,8 @@ pub async fn create_and_insert_external_event(
     .await?;
 
     let mut tx = pool.begin().await?;
-    let next_seq = next_sequence(&mut *tx, &bounded_context_name).await?;
+    let (next_seq, limits) = next_sequence_with_limits(&mut *tx, &bounded_context_name).await?;
+    let payload_limits = limits.apply(projection_dispatcher.payload_limits());
     // docs/architecture.md §209: tags are derived below, under the lock a
     // rotation holds - of the generation stored now.
     refresh_blind_generations(&mut tx, &bounded_context_name, blind).await?;
@@ -2531,6 +2628,11 @@ pub async fn create_and_insert_external_event(
         },
         blind,
     )?;
+    // As stored, after encryption (docs/architecture.md §238). A
+    // redelivery above was answered before this: it was stored once.
+    payload_limits.check_event(&event)?;
+    let blob_claims = event_blob_claims(projection_dispatcher, &event)?;
+    check_blob_claims(&mut tx, &bounded_context_name, &blob_claims).await?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
     // Fetched only now - after `next_sequence` above already took this
     // bounded context's own lock - see `insert_event_and_update_sync_projections_in_tx`'s
@@ -2546,6 +2648,7 @@ pub async fn create_and_insert_external_event(
         &sync_projections,
     )
     .await?;
+    record_blob_claims(&mut tx, &bounded_context_name, &blob_claims, None, now).await?;
     match &dedupe {
         Some(ExternalEventDedupe::Watermark(cursor)) => {
             advance_dedupe_watermark(
@@ -2699,7 +2802,9 @@ pub async fn create_and_insert_external_events(
 
     let created = async {
         let mut tx = pool.begin().await?;
-        lock_bounded_context_sequence(&mut tx, &bounded_context_name).await?;
+        let (_, limits) =
+            lock_bounded_context_sequence_with_limits(&mut tx, &bounded_context_name).await?;
+        let payload_limits = limits.apply(projection_dispatcher.payload_limits());
         // docs/architecture.md §209: tags are derived below, under the lock
         // a rotation holds - of the generation stored now.
         refresh_blind_generations(&mut tx, &bounded_context_name, blind).await?;
@@ -2730,6 +2835,7 @@ pub async fn create_and_insert_external_events(
                 &resolved,
                 &sync_projections,
                 blind,
+                &payload_limits,
             )
             .await;
             match &outcome {
@@ -2796,6 +2902,7 @@ pub(super) async fn insert_external_event_in_tx(
     resolved: &std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
     sync_projections: &[String],
     blind: &crate::blind::BlindIndex,
+    payload_limits: &crate::payload_limits::PayloadLimits,
 ) -> crate::error::Result<CreateExternalEventOutcome> {
     match &dedupe {
         Some(ExternalEventDedupe::Watermark(cursor)) => {
@@ -2839,6 +2946,12 @@ pub(super) async fn insert_external_event_in_tx(
         },
         blind,
     )?;
+    // Refused alone: the savepoint takes the sequence number back
+    // (docs/architecture.md §238, §239).
+    payload_limits.check_event(&event)?;
+    let blob_claims = event_blob_claims(projection_dispatcher, &event)?;
+    let schema_name = &adapter.event_type.bounded_context.name;
+    check_blob_claims(&mut **tx, schema_name, &blob_claims).await?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, resolved);
     insert_event_and_update_sync_projections_in_tx(
         tx,
@@ -2849,6 +2962,7 @@ pub(super) async fn insert_external_event_in_tx(
         sync_projections,
     )
     .await?;
+    record_blob_claims(&mut **tx, schema_name, &blob_claims, None, now).await?;
     match &dedupe {
         Some(ExternalEventDedupe::Watermark(cursor)) => {
             advance_dedupe_watermark(
@@ -2910,7 +3024,7 @@ pub async fn create_and_insert_direct_event(
     .await?;
 
     let mut tx = pool.begin().await?;
-    let next_seq = next_sequence(&mut *tx, &bounded_context_name).await?;
+    let (next_seq, limits) = next_sequence_with_limits(&mut *tx, &bounded_context_name).await?;
     // docs/architecture.md §209: tags are derived below, under the lock a
     // rotation holds - of the generation stored now.
     refresh_blind_generations(&mut tx, &bounded_context_name, blind).await?;
@@ -2932,6 +3046,12 @@ pub async fn create_and_insert_direct_event(
         },
         blind,
     )?;
+    // As stored, after encryption (docs/architecture.md §238, §239).
+    limits
+        .apply(projection_dispatcher.payload_limits())
+        .check_event(&event)?;
+    let blob_claims = event_blob_claims(projection_dispatcher, &event)?;
+    check_blob_claims(&mut tx, &bounded_context_name, &blob_claims).await?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
     // Fetched only now - after `next_sequence` above already took this
     // bounded context's own lock - see `insert_event_and_update_sync_projections_in_tx`'s
@@ -2947,6 +3067,7 @@ pub async fn create_and_insert_direct_event(
         &sync_projections,
     )
     .await?;
+    record_blob_claims(&mut tx, &bounded_context_name, &blob_claims, None, now).await?;
     tx.commit().await?;
     broadcaster.publish(&event);
     record_event_appended(&event);

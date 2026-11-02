@@ -120,6 +120,10 @@ pub enum Error {
     /// This bounded context has no template to resync from.
     #[error("this bounded context has no template to resync from")]
     BoundedContextHasNoTemplate,
+
+    /// A payload limit below zero (docs/architecture.md §238).
+    #[error("a payload limit is a number of bytes, zero or more")]
+    InvalidPayloadLimit,
 }
 
 impl SkiljRejection for Error {
@@ -135,6 +139,7 @@ impl SkiljRejection for Error {
             Error::ExternalSubjectAlreadyClaimed => "external_subject_already_claimed",
             Error::TemplateItselfTemplated => "template_itself_templated",
             Error::BoundedContextHasNoTemplate => "bounded_context_has_no_template",
+            Error::InvalidPayloadLimit => "invalid_payload_limit",
         }
     }
 
@@ -442,6 +447,26 @@ pub fn archive_bounded_context(
         status: BoundedContextStatus::Archived,
         ..bounded_context.clone()
     })
+}
+
+/// Whether `caller` may set `bounded_context`'s payload-limit override to
+/// `limits` (issue #132, docs/architecture.md §238). Superadmin-only, like
+/// adding and deleting a bounded context: the limit protects every reader
+/// of the bounded context and the instances serving it, not one owner's
+/// data, so a per-context admin can't raise it. The admin context too -
+/// nothing in it is large. Archived contexts accept it: it changes no
+/// history, and applies again if the context is ever written to.
+pub fn set_payload_limits(
+    caller: &Role,
+    limits: &crate::db::PayloadLimitsOverride,
+) -> crate::error::Result<()> {
+    crate::access_control::require_active_superadmin(caller)?;
+    if limits.max_payload_bytes.is_some_and(|v| v < 0)
+        || limits.warn_payload_bytes.is_some_and(|v| v < 0)
+    {
+        return Err(Error::InvalidPayloadLimit.into());
+    }
+    Ok(())
 }
 
 /// See `rule DeleteBoundedContext`. Superadmin-gated like

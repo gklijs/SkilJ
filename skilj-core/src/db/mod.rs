@@ -388,6 +388,8 @@ pub use access::*;
 
 mod events;
 pub use events::*;
+mod blobs;
+pub use blobs::*;
 mod tags;
 pub use tags::search_used_tags;
 

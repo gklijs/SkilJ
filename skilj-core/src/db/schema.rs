@@ -533,8 +533,13 @@ pub(super) async fn provision_bounded_context_schema(
     // "nothing allocated yet", so the first call returns `0` - the same
     // convention `after_sequence.unwrap_or(-1)`/`highest_sequence`'s
     // `None` case use throughout skilj-core.
+    // `max_payload_bytes`/`warn_payload_bytes`: the bounded context's
+    // override of the builder's payload limits, null for none - on this
+    // row so the lock every write takes reads them too (§238).
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TABLE {schema}.sequence (next_value BIGINT NOT NULL)"
+        "CREATE TABLE {schema}.sequence (next_value BIGINT NOT NULL, \
+         max_payload_bytes BIGINT CHECK (max_payload_bytes >= 0), \
+         warn_payload_bytes BIGINT CHECK (warn_payload_bytes >= 0))"
     )))
     .execute(&mut **tx)
     .await?;
@@ -543,6 +548,11 @@ pub(super) async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
+
+    // Blob references (docs/architecture.md §239).
+    sqlx::raw_sql(sqlx::AssertSqlSafe(super::blobs::blob_tables_ddl(&schema)))
+        .execute(&mut **tx)
+        .await?;
 
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.events (
@@ -2741,11 +2751,37 @@ pub async fn make_bounded_context_current(
     ensure_event_tags_index(pool, &bounded_context.name).await?;
     ensure_blind_tags_table(pool, &bounded_context.name).await?;
     ensure_encryption_key_provider_columns(pool, &bounded_context.name).await?;
+    ensure_payload_limit_columns(pool, &bounded_context.name).await?;
+    ensure_blob_tables(pool, &bounded_context.name).await?;
     drop_events_by_tags_index(pool, &bounded_context.name).await?;
     current_bounded_contexts()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert((bounded_context.name.clone(), bounded_context.created_at));
+    Ok(())
+}
+
+/// The payload-limit override columns on a bounded context's `sequence`
+/// row (docs/architecture.md §238), for one provisioned before they
+/// existed. Writes read them through `to_jsonb`, so a bounded context
+/// without them works - with no override - until this runs.
+pub async fn ensure_payload_limit_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "sequence",
+        &["max_payload_bytes", "warn_payload_bytes"],
+        format!(
+            "ALTER TABLE {schema}.sequence \
+             ADD COLUMN IF NOT EXISTS max_payload_bytes BIGINT CHECK (max_payload_bytes >= 0), \
+             ADD COLUMN IF NOT EXISTS warn_payload_bytes BIGINT CHECK (warn_payload_bytes >= 0)"
+        ),
+    )))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

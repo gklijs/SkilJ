@@ -162,7 +162,9 @@ pub async fn submit_command(
     .await?;
 
     let mut tx = pool.begin().await?;
-    let locked_highest = lock_bounded_context_sequence(&mut tx, &bounded_context_name).await?;
+    let (locked_highest, limits) =
+        lock_bounded_context_sequence_with_limits(&mut tx, &bounded_context_name).await?;
+    let payload_limits = limits.apply(projection_dispatcher.payload_limits());
     // Fetched once for the whole submission, not once per event (
     // issue #32) - and only now, after the lock above is already held,
     // which is what keeps this read race-free against
@@ -195,6 +197,7 @@ pub async fn submit_command(
         resolved,
         covered_through,
         context,
+        &payload_limits,
     )
     .await?;
 
@@ -295,6 +298,29 @@ pub(super) async fn lock_bounded_context_sequence(
     .fetch_one(&mut **tx)
     .await?;
     Ok(locked_highest)
+}
+
+/// [`lock_bounded_context_sequence`], also returning the bounded context's
+/// payload-limit override from the row it locks (docs/architecture.md
+/// §238) - in the same statement, so it costs no round trip.
+pub(super) async fn lock_bounded_context_sequence_with_limits(
+    tx: &mut Transaction<'_, Postgres>,
+    bounded_context: &str,
+) -> crate::error::Result<(i64, PayloadLimitsOverride)> {
+    let schema = schema_ident(bounded_context);
+    let (locked_highest, max_payload_bytes, warn_payload_bytes): (i64, Option<i64>, Option<i64>) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT next_value, {PAYLOAD_LIMIT_COLUMNS} FROM {schema}.sequence s FOR UPDATE"
+        )))
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok((
+        locked_highest,
+        PayloadLimitsOverride {
+            max_payload_bytes,
+            warn_payload_bytes,
+        },
+    ))
 }
 
 /// `EventSubscription`'s own real-time delivery - after the commit, not
@@ -1374,6 +1400,7 @@ pub(super) async fn finish_accepted_command_in_tx(
     sequences: Vec<i64>,
     decided: AcceptedDecision,
     mut resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    payload_limits: &crate::payload_limits::PayloadLimits,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
@@ -1429,6 +1456,13 @@ pub(super) async fn finish_accepted_command_in_tx(
         &blind,
     )?;
     apply_stance_tags(&mut result.events, stance_tags);
+    // As stored - after encryption - and before anything is written
+    // (docs/architecture.md §238).
+    payload_limits.check_command(&result.command, &result.events)?;
+    // Every blob reference is to a blob this bounded context holds as
+    // referenced, before anything is written (§239).
+    let blob_claims = command_blob_claims(projection_dispatcher, &result.command, &result.events)?;
+    check_blob_claims(&mut **tx, &bounded_context_name, &blob_claims).await?;
 
     // Command and every one of its triggered events, in the one
     // (savepoint-scoped, in the batched path) transaction `tx` has held
@@ -1450,6 +1484,15 @@ pub(super) async fn finish_accepted_command_in_tx(
         )
         .await?;
     }
+
+    record_blob_claims(
+        &mut **tx,
+        &bounded_context_name,
+        &blob_claims,
+        Some(command_id),
+        now,
+    )
+    .await?;
 
     if let Some(key) = idempotency_key {
         let triggered_event_sequences: Vec<i64> =
@@ -1516,6 +1559,7 @@ pub(super) async fn submit_one_command_in_tx(
     resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
     covered_through: Option<i64>,
     context: &crate::plugin::DecisionContext,
+    payload_limits: &crate::payload_limits::PayloadLimits,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let decided = match decide_command_in_tx(
@@ -1576,6 +1620,7 @@ pub(super) async fn submit_one_command_in_tx(
         sequences,
         decided,
         resolved,
+        payload_limits,
     )
     .await
 }
@@ -1650,6 +1695,8 @@ pub struct CommandBatchLeaderTx {
     pub(super) bounded_context_name: String,
     pub(super) locked_highest: i64,
     pub(super) sync_projections: Vec<String>,
+    /// Read with the lock (docs/architecture.md §238).
+    pub(super) payload_limits: PayloadLimitsOverride,
 }
 
 /// The lock-acquiring half of [`submit_command_batch`], pulled out
@@ -1700,18 +1747,29 @@ pub async fn begin_command_batch_leader_tx(
     // timeout only counts time the session is idle, never a statement
     // waiting on a lock.
     let schema = schema_ident(bounded_context_name);
-    let (locked_highest,): (i64,) = match idle_in_transaction_session_timeout {
+    let (locked_highest, payload_limits) = match idle_in_transaction_session_timeout {
         Some(timeout) => {
-            sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT next_value FROM {schema}.sequence \
+            let (locked_highest, max_payload_bytes, warn_payload_bytes): (
+                i64,
+                Option<i64>,
+                Option<i64>,
+            ) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT next_value, {PAYLOAD_LIMIT_COLUMNS} FROM {schema}.sequence s \
                  WHERE set_config('idle_in_transaction_session_timeout', $1, true) IS NOT NULL \
                  FOR UPDATE"
             )))
             .bind(format!("{}ms", timeout.as_millis()))
             .fetch_one(&mut *tx)
-            .await?
+            .await?;
+            (
+                locked_highest,
+                PayloadLimitsOverride {
+                    max_payload_bytes,
+                    warn_payload_bytes,
+                },
+            )
         }
-        None => (lock_bounded_context_sequence(&mut tx, bounded_context_name).await?,),
+        None => lock_bounded_context_sequence_with_limits(&mut tx, bounded_context_name).await?,
     };
     let sync_projections = sync_projection_names(&mut tx, bounded_context_name).await?;
     Ok(CommandBatchLeaderTx {
@@ -1719,6 +1777,7 @@ pub async fn begin_command_batch_leader_tx(
         bounded_context_name: bounded_context_name.to_string(),
         locked_highest,
         sync_projections,
+        payload_limits,
     })
 }
 
@@ -1899,7 +1958,9 @@ pub async fn commit_command_batch(
         bounded_context_name,
         locked_highest,
         sync_projections,
+        payload_limits,
     } = leader_tx;
+    let payload_limits = payload_limits.apply(projection_dispatcher.payload_limits());
 
     COMMAND_BATCH_SIZE.record(
         batch.len() as u64,
@@ -1937,6 +1998,7 @@ pub async fn commit_command_batch(
         locked_highest,
         &sync_projections,
         slow,
+        &payload_limits,
     )
     .await
     {
@@ -1971,6 +2033,7 @@ pub async fn commit_command_batch(
                 &sync_projections,
                 batch,
                 slow,
+                &payload_limits,
             )
             .await?
         }
@@ -2053,6 +2116,8 @@ pub(super) struct PlannedCommand {
     pub(super) event_key_ids: Vec<Vec<i64>>,
     pub(super) idempotency_key: Option<String>,
     pub(super) now: DateTime<Utc>,
+    /// Its blob references, already checked (docs/architecture.md §239).
+    pub(super) blob_claims: Vec<BlobClaim>,
 }
 
 /// `commit_command_batch`'s set path (docs/architecture.md §196): decides
@@ -2085,6 +2150,7 @@ pub(super) async fn write_command_batch_as_set(
     locked_highest: i64,
     sync_projections: &[String],
     slow: Option<&crate::slow_command::SlowCommandWarnings>,
+    payload_limits: &crate::payload_limits::PayloadLimits,
 ) -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> {
     let mut timing = BatchPhaseTiming {
         as_set: true,
@@ -2216,6 +2282,39 @@ pub(super) async fn write_command_batch_as_set(
             }
         };
         apply_stance_tags(&mut result.events, stance_tags);
+        // Refused alone, before its sequence numbers are taken
+        // (docs/architecture.md §238).
+        if let Err(e) = payload_limits.check_command(&result.command, &result.events) {
+            results.push(Some(Err(e)));
+            continue;
+        }
+        // Checked here, refused alone; recorded with the writes below
+        // (docs/architecture.md §239). The savepoint first, so a failed
+        // read rolls back like a failed write and the batch is replayed.
+        let blob_claims =
+            match command_blob_claims(projection_dispatcher, &result.command, &result.events) {
+                Ok(claims) => claims,
+                Err(e) => {
+                    results.push(Some(Err(e)));
+                    continue;
+                }
+            };
+        if !blob_claims.is_empty() {
+            savepoint.write(tx, None).await?;
+            if let Err(e) = check_blob_claims(
+                &mut **tx,
+                &item.command_type.bounded_context.name,
+                &blob_claims,
+            )
+            .await
+            {
+                if matches!(e, crate::error::Error::Database(_)) {
+                    return Err(e);
+                }
+                results.push(Some(Err(e)));
+                continue;
+            }
+        }
         highest_assigned = assigned;
 
         if let Some(key) = &item.idempotency_key {
@@ -2242,6 +2341,7 @@ pub(super) async fn write_command_batch_as_set(
             events: result.events,
             idempotency_key: item.idempotency_key.clone(),
             now: item.now,
+            blob_claims,
         });
     }
     timing.decide = decide_started.elapsed();
@@ -2581,6 +2681,17 @@ pub(super) async fn write_planned_commands(
         .await?;
     }
 
+    let blob_claims: Vec<(&BlobClaim, Option<i64>)> = planned
+        .iter()
+        .flat_map(|p| {
+            let id = command_id(&p.command);
+            p.blob_claims.iter().map(move |claim| (claim, Some(id)))
+        })
+        .collect();
+    if let Some(first) = planned.first() {
+        record_blob_claims_by_command(&mut **tx, bounded_context, &blob_claims, first.now).await?;
+    }
+
     if !sync_projections.is_empty() {
         let events: Vec<&Event> = events.iter().map(|(event, _)| *event).collect();
         fold_events_into_sync_projections_in_tx(
@@ -2789,6 +2900,7 @@ pub(super) async fn commit_command_batch_per_command(
     sync_projections: &[String],
     batch: Vec<BatchedCommand>,
     slow: Option<&crate::slow_command::SlowCommandWarnings>,
+    payload_limits: &crate::payload_limits::PayloadLimits,
 ) -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> {
     // Per-phase wall-clock accumulators (issue #32,
     // round four investigation) - the batch-size histogram above already
@@ -2905,6 +3017,7 @@ pub(super) async fn commit_command_batch_per_command(
             sequences,
             decided,
             item.resolved,
+            payload_limits,
         )
         .await;
 
