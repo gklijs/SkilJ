@@ -5923,6 +5923,42 @@ rule FetchCommands {
 -- simply more slowly - the cache bounds how fast a read is answered,
 -- never how far back it reaches.
 
+rule SearchUsedTags {
+    when: SearchUsedTags(access_mapping, key, prefix?, limit?, selected_type?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: selected_type = null or type_belongs_to_context(selected_type, access_mapping.bounded_context)
+
+    let matched = Events where bounded_context = access_mapping.bounded_context
+        and (selected_type = null or event_type = selected_type)
+    let visible = filter(matched, e => event_owner_scope_satisfied(e, access_mapping.scope))
+    ensures:
+        UsedTagsDiscovered(tags: used_tags_with_prefix(visible, key, prefix ?? "",
+            min(limit ?? 20, min(100, config.max_events_per_read))))
+
+    @guidance
+        -- used_tags_with_prefix is a read-only black box: distinct tags
+        -- under key, their values beginning with the literal prefix,
+        -- in value order with null first. A null value matches only an
+        -- empty prefix. It takes at most the requested count, and counts
+        -- only tags on the visible events, never unused dictionary rows.
+        -- It does not interpret wildcard characters, decrypt blind tags,
+        -- register tags, or expose another owner's values.
+        -- type_belongs_to_context checks the optional type's context,
+        -- rather than allowing a foreign type to extend the grant.
+}
+
+rule SearchFetchedTags {
+    when: SearchFetchedTags(token, key, prefix?, limit?)
+    requires: token.status = active
+    requires: token.event_type.event_read_allowed = true
+    let matched = Events where event_type = token.event_type
+    let visible = filter(matched, e => event_owner_scope_satisfied(e, token.scope))
+    ensures:
+        UsedTagsDiscovered(tags: used_tags_with_prefix(visible, key, prefix ?? "",
+            min(limit ?? 20, min(100, config.max_events_per_read))))
+}
+
 rule QueryEvents {
     when: QueryEvents(access_mapping, event_types, tags?, after_sequence?)
     requires: access_mapping.status = active
@@ -9818,6 +9854,7 @@ surface EventFetch {
 
     provides:
         FetchEvents(token, event_type, filters, after_sequence?, epoch?)
+        SearchFetchedTags(token, key, prefix?, limit?)
         ConsumeEvents(token, ack_mode?, filters)
         AcknowledgeEvents(token, sequence, epoch?)
 
@@ -10359,6 +10396,7 @@ surface EventQuery {
 
     provides:
         QueryEvents(access_mapping, event_types, tags?, after_sequence?)
+        SearchUsedTags(access_mapping, key, prefix?, limit?, selected_type?)
         CountEvents(access_mapping, event_types, tags?)
         InspectEvent(access_mapping, event)
 

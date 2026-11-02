@@ -12,6 +12,75 @@ use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef
 use skilj_core::event_store::QueryTag;
 use skilj_core::shared::Tag;
 
+/// Bounded, literal-prefix discovery of tags referenced by visible events.
+pub fn search_used_tags_field(n: &Naming) -> Field {
+    Field::new(
+        n.root("searchUsedTags"),
+        TypeRef::named_nn_list_nn(n.ty("UsedTag")),
+        |ctx| {
+            FieldFuture::new(async move {
+                let state = ctx.data::<GraphqlState>()?;
+                let bounded_context = ctx.args.try_get("boundedContext")?.string()?;
+                let mapping = require_admin_mapping(&ctx, &state.pool, bounded_context).await?;
+                let key = ctx.args.try_get("key")?.string()?;
+                let prefix = ctx
+                    .args
+                    .get("prefix")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string())
+                    .transpose()?
+                    .unwrap_or("");
+                let limit = ctx
+                    .args
+                    .get("limit")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.u64())
+                    .transpose()?
+                    .unwrap_or(20)
+                    .min(100) as usize;
+                let limit = limit.min(state.max_events_per_read);
+                let event_type = ctx
+                    .args
+                    .get("eventTypeName")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string())
+                    .transpose()?;
+                if let Some(name) = event_type {
+                    skilj_core::db::get_event_type(&state.pool, bounded_context, name)
+                        .await
+                        .map_err(to_graphql_error)?
+                        .ok_or_else(|| not_found("EventType", name))?;
+                }
+                let tags = skilj_core::db::search_used_tags(
+                    &state.pool,
+                    bounded_context,
+                    key,
+                    prefix,
+                    limit,
+                    event_type,
+                    mapping.scope.as_deref(),
+                )
+                .await
+                .map_err(to_graphql_error)?;
+                Ok(Some(FieldValue::list(
+                    tags.into_iter().map(FieldValue::owned_any),
+                )))
+            })
+        },
+    )
+    .argument(InputValue::new(
+        "boundedContext",
+        TypeRef::named_nn(TypeRef::STRING),
+    ))
+    .argument(InputValue::new("key", TypeRef::named_nn(TypeRef::STRING)))
+    .argument(InputValue::new("prefix", TypeRef::named(TypeRef::STRING)))
+    .argument(InputValue::new("limit", TypeRef::named(TypeRef::INT)))
+    .argument(InputValue::new(
+        "eventTypeName",
+        TypeRef::named(TypeRef::STRING),
+    ))
+}
+
 /// Parses a `[TagInput!]` argument (nullable - absent means "no tag
 /// restriction", matching `query_events`'/`count_events`'s own
 /// `Option<&[Tag]>`) into `Vec<Tag>`, a `plaintext` value of a blind key

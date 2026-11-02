@@ -1,0 +1,76 @@
+   Compiling skilj v0.3.0 (/home/gklijs/projects/skilj/skilj)
+    Finished `release` profile [optimized] target(s) in 3.93s
+     Running tests/dcb_concurrency_experiment.rs (target/release/deps/dcb_concurrency_experiment-d32012803a3a4c47)
+
+running 1 test
+SETTINGS [("fsync", "on"), ("full_page_writes", "on"), ("server_version", "18.6 (Debian 18.6-1.pgdg13+2)"), ("synchronous_commit", "on")]
+CDC commit order verified: ["0/B299638", "0/B299668"]
+CORRECTNESS passed: two pools, same-key cap, overlapping tags, idempotency, rollback, publication order; UUID cursor counterexample reproduced
+ROUND 1
+RESULT mode=serial workload=Independent workers=1 commands=1600 ingest_per_s=213.0 published_per_s=212.8 p50_ms=4.347 p99_ms=8.271 drain_ms=8.515 retries=0 publication_batches=1600 stream_lag_p50_ms=6.482 stream_lag_p99_ms=10.182
+RESULT mode=serial-group workload=Independent workers=1 commands=1600 ingest_per_s=221.4 published_per_s=221.2 p50_ms=4.369 p99_ms=7.143 drain_ms=8.067 retries=0 publication_batches=1600 stream_lag_p50_ms=6.520 stream_lag_p99_ms=9.476
+RESULT mode=uuid-global workload=Independent workers=1 commands=1600 ingest_per_s=213.4 published_per_s=213.2 p50_ms=4.479 p99_ms=7.837 drain_ms=7.396 retries=0 publication_batches=1600 stream_lag_p50_ms=6.678 stream_lag_p99_ms=10.159
+RESULT mode=uuid workload=Independent workers=1 commands=1600 ingest_per_s=213.3 published_per_s=213.1 p50_ms=4.381 p99_ms=7.850 drain_ms=7.641 retries=0 publication_batches=1600 stream_lag_p50_ms=6.539 stream_lag_p99_ms=10.561
+RESULT mode=gapped workload=Independent workers=1 commands=1600 ingest_per_s=213.0 published_per_s=212.8 p50_ms=4.407 p99_ms=8.441 drain_ms=7.491 retries=0 publication_batches=1600 stream_lag_p50_ms=6.560 stream_lag_p99_ms=11.097
+RESULT mode=serial workload=Independent workers=8 commands=1600 ingest_per_s=210.7 published_per_s=210.5 p50_ms=35.860 p99_ms=94.777 drain_ms=7.335 retries=0 publication_batches=1597 stream_lag_p50_ms=6.569 stream_lag_p99_ms=16.704
+RESULT mode=serial-group workload=Independent workers=8 commands=1600 ingest_per_s=758.9 published_per_s=756.3 p50_ms=9.832 p99_ms=14.184 drain_ms=7.315 retries=0 publication_batches=341 stream_lag_p50_ms=6.680 stream_lag_p99_ms=8.917
+RESULT mode=uuid-global workload=Independent workers=8 commands=1600 ingest_per_s=216.2 published_per_s=216.0 p50_ms=35.834 p99_ms=47.015 drain_ms=7.384 retries=0 publication_batches=1600 stream_lag_p50_ms=6.578 stream_lag_p99_ms=10.312
+RESULT mode=uuid workload=Independent workers=8 commands=1600 ingest_per_s=1475.1 published_per_s=1465.5 p50_ms=4.683 p99_ms=8.296 drain_ms=7.146 retries=0 publication_batches=225 stream_lag_p50_ms=6.625 stream_lag_p99_ms=14.575
+RESULT mode=gapped workload=Independent workers=8 commands=1600 ingest_per_s=1456.6 published_per_s=1447.0 p50_ms=4.768 p99_ms=8.128 drain_ms=7.303 retries=0 publication_batches=235 stream_lag_p50_ms=6.465 stream_lag_p99_ms=11.545
+test dcb_concurrency_experiment has been running for over 60 seconds
+RESULT mode=serial workload=Independent workers=32 commands=1600 ingest_per_s=219.9 published_per_s=219.6 p50_ms=143.863 p99_ms=167.012 drain_ms=8.207 retries=0 publication_batches=1598 stream_lag_p50_ms=6.587 stream_lag_p99_ms=9.061
+RESULT mode=serial-group workload=Independent workers=32 commands=1600 ingest_per_s=1246.1 published_per_s=1240.6 p50_ms=25.313 p99_ms=35.468 drain_ms=5.714 retries=0 publication_batches=98 stream_lag_p50_ms=7.295 stream_lag_p99_ms=10.151
+RESULT mode=uuid-global workload=Independent workers=32 commands=1600 ingest_per_s=210.9 published_per_s=210.6 p50_ms=148.681 p99_ms=180.066 drain_ms=8.201 retries=0 publication_batches=1597 stream_lag_p50_ms=6.792 stream_lag_p99_ms=11.158
+RESULT mode=uuid workload=Independent workers=32 commands=1600 ingest_per_s=3767.9 published_per_s=3685.8 p50_ms=8.170 p99_ms=11.862 drain_ms=9.466 retries=0 publication_batches=53 stream_lag_p50_ms=12.989 stream_lag_p99_ms=25.283
+RESULT mode=gapped workload=Independent workers=32 commands=1600 ingest_per_s=3790.0 published_per_s=3708.9 p50_ms=8.143 p99_ms=11.860 drain_ms=9.229 retries=0 publication_batches=53 stream_lag_p50_ms=18.699 stream_lag_p99_ms=34.467
+RESULT mode=serial workload=Independent workers=80 commands=1600 ingest_per_s=215.4 published_per_s=215.2 p50_ms=365.961 p99_ms=445.827 drain_ms=8.282 retries=0 publication_batches=1593 stream_lag_p50_ms=6.652 stream_lag_p99_ms=9.823
+RESULT mode=serial-group workload=Independent workers=80 commands=1600 ingest_per_s=1395.8 published_per_s=1388.4 p50_ms=41.819 p99_ms=351.544 drain_ms=6.081 retries=0 publication_batches=40 stream_lag_p50_ms=6.972 stream_lag_p99_ms=12.333
+RESULT mode=uuid-global workload=Independent workers=80 commands=1600 ingest_per_s=216.3 published_per_s=216.1 p50_ms=363.476 p99_ms=453.212 drain_ms=7.796 retries=0 publication_batches=1599 stream_lag_p50_ms=6.635 stream_lag_p99_ms=8.841
+RESULT mode=uuid workload=Independent workers=80 commands=1600 ingest_per_s=4791.0 published_per_s=4630.0 p50_ms=15.206 p99_ms=26.666 drain_ms=11.616 retries=0 publication_batches=23 stream_lag_p50_ms=23.286 stream_lag_p99_ms=46.993
+RESULT mode=gapped workload=Independent workers=80 commands=1600 ingest_per_s=4676.9 published_per_s=4551.3 p50_ms=15.166 p99_ms=42.635 drain_ms=9.442 retries=0 publication_batches=24 stream_lag_p50_ms=22.294 stream_lag_p99_ms=73.238
+ROUND 2
+RESULT mode=serial-group workload=Independent workers=1 commands=1600 ingest_per_s=184.0 published_per_s=183.9 p50_ms=4.883 p99_ms=9.454 drain_ms=7.715 retries=0 publication_batches=1600 stream_lag_p50_ms=6.981 stream_lag_p99_ms=10.738
+RESULT mode=uuid-global workload=Independent workers=1 commands=1600 ingest_per_s=190.5 published_per_s=190.3 p50_ms=4.728 p99_ms=9.003 drain_ms=7.607 retries=0 publication_batches=1600 stream_lag_p50_ms=6.878 stream_lag_p99_ms=10.406
+RESULT mode=uuid workload=Independent workers=1 commands=1600 ingest_per_s=195.8 published_per_s=195.6 p50_ms=4.788 p99_ms=9.140 drain_ms=7.444 retries=0 publication_batches=1600 stream_lag_p50_ms=6.984 stream_lag_p99_ms=11.072
+RESULT mode=gapped workload=Independent workers=1 commands=1600 ingest_per_s=134.3 published_per_s=134.2 p50_ms=7.326 p99_ms=13.774 drain_ms=13.163 retries=0 publication_batches=1600 stream_lag_p50_ms=10.985 stream_lag_p99_ms=17.718
+RESULT mode=serial workload=Independent workers=1 commands=1600 ingest_per_s=130.0 published_per_s=129.9 p50_ms=7.192 p99_ms=15.028 drain_ms=11.903 retries=0 publication_batches=1600 stream_lag_p50_ms=10.758 stream_lag_p99_ms=19.430
+RESULT mode=serial-group workload=Independent workers=8 commands=1600 ingest_per_s=441.3 published_per_s=439.5 p50_ms=16.502 p99_ms=28.907 drain_ms=14.536 retries=0 publication_batches=400 stream_lag_p50_ms=11.342 stream_lag_p99_ms=18.153
+RESULT mode=uuid-global workload=Independent workers=8 commands=1600 ingest_per_s=122.2 published_per_s=122.1 p50_ms=62.732 p99_ms=104.228 drain_ms=17.780 retries=0 publication_batches=1599 stream_lag_p50_ms=11.607 stream_lag_p99_ms=19.202
+RESULT mode=uuid workload=Independent workers=8 commands=1600 ingest_per_s=843.2 published_per_s=839.3 p50_ms=8.197 p99_ms=20.150 drain_ms=8.810 retries=0 publication_batches=208 stream_lag_p50_ms=11.245 stream_lag_p99_ms=24.170
+RESULT mode=gapped workload=Independent workers=8 commands=1600 ingest_per_s=983.1 published_per_s=974.8 p50_ms=7.718 p99_ms=13.491 drain_ms=13.820 retries=0 publication_batches=202 stream_lag_p50_ms=11.658 stream_lag_p99_ms=23.367
+RESULT mode=serial workload=Independent workers=8 commands=1600 ingest_per_s=122.9 published_per_s=122.8 p50_ms=61.008 p99_ms=133.939 drain_ms=13.021 retries=0 publication_batches=1599 stream_lag_p50_ms=11.269 stream_lag_p99_ms=18.966
+RESULT mode=serial-group workload=Independent workers=32 commands=1600 ingest_per_s=1157.0 published_per_s=1145.3 p50_ms=26.918 p99_ms=32.586 drain_ms=14.179 retries=0 publication_batches=100 stream_lag_p50_ms=11.491 stream_lag_p99_ms=16.115
+RESULT mode=uuid-global workload=Independent workers=32 commands=1600 ingest_per_s=133.7 published_per_s=133.6 p50_ms=235.123 p99_ms=349.313 drain_ms=12.031 retries=0 publication_batches=1600 stream_lag_p50_ms=10.742 stream_lag_p99_ms=15.494
+RESULT mode=uuid workload=Independent workers=32 commands=1600 ingest_per_s=2719.0 published_per_s=2667.0 p50_ms=10.933 p99_ms=57.785 drain_ms=11.492 retries=0 publication_batches=56 stream_lag_p50_ms=12.445 stream_lag_p99_ms=58.607
+RESULT mode=gapped workload=Independent workers=32 commands=1600 ingest_per_s=2840.3 published_per_s=2782.8 p50_ms=11.038 p99_ms=18.367 drain_ms=11.632 retries=0 publication_batches=58 stream_lag_p50_ms=14.141 stream_lag_p99_ms=31.312
+RESULT mode=serial workload=Independent workers=32 commands=1600 ingest_per_s=131.2 published_per_s=131.0 p50_ms=235.090 p99_ms=580.482 drain_ms=12.118 retries=0 publication_batches=1599 stream_lag_p50_ms=10.704 stream_lag_p99_ms=18.546
+RESULT mode=serial-group workload=Independent workers=80 commands=1600 ingest_per_s=1316.6 published_per_s=1299.6 p50_ms=60.855 p99_ms=87.462 drain_ms=15.907 retries=0 publication_batches=40 stream_lag_p50_ms=11.081 stream_lag_p99_ms=22.057
+RESULT mode=uuid-global workload=Independent workers=80 commands=1600 ingest_per_s=135.2 published_per_s=135.0 p50_ms=590.484 p99_ms=632.636 drain_ms=12.715 retries=0 publication_batches=1598 stream_lag_p50_ms=10.719 stream_lag_p99_ms=16.063
+RESULT mode=uuid workload=Independent workers=80 commands=1600 ingest_per_s=5178.0 published_per_s=4981.1 p50_ms=14.140 p99_ms=28.510 drain_ms=12.211 retries=0 publication_batches=21 stream_lag_p50_ms=28.674 stream_lag_p99_ms=49.569
+RESULT mode=gapped workload=Independent workers=80 commands=1600 ingest_per_s=3705.3 published_per_s=3556.0 p50_ms=14.762 p99_ms=113.307 drain_ms=18.123 retries=0 publication_batches=24 stream_lag_p50_ms=28.077 stream_lag_p99_ms=150.065
+RESULT mode=serial workload=Independent workers=80 commands=1600 ingest_per_s=124.1 published_per_s=124.0 p50_ms=617.872 p99_ms=1067.721 drain_ms=13.078 retries=0 publication_batches=1599 stream_lag_p50_ms=11.174 stream_lag_p99_ms=19.385
+ROUND 3
+RESULT mode=uuid-global workload=Independent workers=1 commands=1600 ingest_per_s=129.8 published_per_s=129.7 p50_ms=7.388 p99_ms=12.354 drain_ms=12.600 retries=0 publication_batches=1600 stream_lag_p50_ms=11.047 stream_lag_p99_ms=17.439
+RESULT mode=uuid workload=Independent workers=1 commands=1600 ingest_per_s=125.3 published_per_s=125.2 p50_ms=7.411 p99_ms=13.899 drain_ms=12.527 retries=0 publication_batches=1600 stream_lag_p50_ms=11.097 stream_lag_p99_ms=18.748
+RESULT mode=gapped workload=Independent workers=1 commands=1600 ingest_per_s=128.7 published_per_s=128.6 p50_ms=7.375 p99_ms=13.424 drain_ms=12.427 retries=0 publication_batches=1600 stream_lag_p50_ms=11.014 stream_lag_p99_ms=18.095
+RESULT mode=serial workload=Independent workers=1 commands=1600 ingest_per_s=123.0 published_per_s=122.9 p50_ms=7.702 p99_ms=14.236 drain_ms=13.480 retries=0 publication_batches=1600 stream_lag_p50_ms=11.480 stream_lag_p99_ms=18.571
+RESULT mode=serial-group workload=Independent workers=1 commands=1600 ingest_per_s=118.3 published_per_s=118.2 p50_ms=7.445 p99_ms=15.558 drain_ms=10.292 retries=0 publication_batches=1600 stream_lag_p50_ms=11.107 stream_lag_p99_ms=20.887
+RESULT mode=uuid-global workload=Independent workers=8 commands=1600 ingest_per_s=133.9 published_per_s=133.7 p50_ms=57.753 p99_ms=144.120 drain_ms=13.062 retries=0 publication_batches=1595 stream_lag_p50_ms=10.647 stream_lag_p99_ms=30.546
+RESULT mode=uuid workload=Independent workers=8 commands=1600 ingest_per_s=893.1 published_per_s=885.5 p50_ms=7.837 p99_ms=16.650 drain_ms=15.276 retries=0 publication_batches=213 stream_lag_p50_ms=11.212 stream_lag_p99_ms=21.816
+RESULT mode=gapped workload=Independent workers=8 commands=1600 ingest_per_s=706.1 published_per_s=701.4 p50_ms=8.782 p99_ms=24.913 drain_ms=15.085 retries=0 publication_batches=225 stream_lag_p50_ms=12.460 stream_lag_p99_ms=28.917
+RESULT mode=serial workload=Independent workers=8 commands=1600 ingest_per_s=125.8 published_per_s=125.7 p50_ms=59.009 p99_ms=148.686 drain_ms=13.105 retries=0 publication_batches=1599 stream_lag_p50_ms=10.817 stream_lag_p99_ms=18.378
+RESULT mode=serial-group workload=Independent workers=8 commands=1600 ingest_per_s=523.0 published_per_s=521.0 p50_ms=14.976 p99_ms=19.671 drain_ms=11.922 retries=0 publication_batches=400 stream_lag_p50_ms=11.194 stream_lag_p99_ms=15.760
+RESULT mode=uuid-global workload=Independent workers=32 commands=1600 ingest_per_s=126.1 published_per_s=126.0 p50_ms=247.355 p99_ms=335.378 drain_ms=12.387 retries=0 publication_batches=1599 stream_lag_p50_ms=11.145 stream_lag_p99_ms=19.209
+RESULT mode=uuid workload=Independent workers=32 commands=1600 ingest_per_s=2782.5 published_per_s=2721.3 p50_ms=8.852 p99_ms=40.344 drain_ms=12.927 retries=0 publication_batches=61 stream_lag_p50_ms=11.687 stream_lag_p99_ms=39.764
+RESULT mode=gapped workload=Independent workers=32 commands=1600 ingest_per_s=3014.8 published_per_s=2901.3 p50_ms=8.835 p99_ms=17.315 drain_ms=20.774 retries=0 publication_batches=51 stream_lag_p50_ms=33.457 stream_lag_p99_ms=78.983
+RESULT mode=serial workload=Independent workers=32 commands=1600 ingest_per_s=121.3 published_per_s=121.2 p50_ms=257.551 p99_ms=437.518 drain_ms=12.414 retries=0 publication_batches=1600 stream_lag_p50_ms=11.066 stream_lag_p99_ms=23.279
+RESULT mode=serial-group workload=Independent workers=32 commands=1600 ingest_per_s=1076.7 published_per_s=1065.7 p50_ms=29.076 p99_ms=36.758 drain_ms=15.310 retries=0 publication_batches=100 stream_lag_p50_ms=10.450 stream_lag_p99_ms=15.522
+RESULT mode=uuid-global workload=Independent workers=80 commands=1600 ingest_per_s=126.2 published_per_s=126.0 p50_ms=631.231 p99_ms=733.633 drain_ms=13.646 retries=0 publication_batches=1600 stream_lag_p50_ms=10.982 stream_lag_p99_ms=21.537
+RESULT mode=uuid workload=Independent workers=80 commands=1600 ingest_per_s=3677.5 published_per_s=3545.6 p50_ms=19.489 p99_ms=46.132 drain_ms=16.192 retries=0 publication_batches=24 stream_lag_p50_ms=30.663 stream_lag_p99_ms=63.875
+RESULT mode=gapped workload=Independent workers=80 commands=1600 ingest_per_s=3005.8 published_per_s=2372.7 p50_ms=20.061 p99_ms=108.234 drain_ms=142.044 retries=0 publication_batches=24 stream_lag_p50_ms=158.838 stream_lag_p99_ms=278.443
+RESULT mode=serial workload=Independent workers=80 commands=1600 ingest_per_s=126.7 published_per_s=126.6 p50_ms=601.574 p99_ms=881.026 drain_ms=12.084 retries=0 publication_batches=1600 stream_lag_p50_ms=11.014 stream_lag_p99_ms=18.409
+RESULT mode=serial-group workload=Independent workers=80 commands=1600 ingest_per_s=1387.3 published_per_s=1371.0 p50_ms=56.874 p99_ms=91.198 drain_ms=13.708 retries=0 publication_batches=40 stream_lag_p50_ms=11.233 stream_lag_p99_ms=21.580
+test dcb_concurrency_experiment ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 380.20s
+

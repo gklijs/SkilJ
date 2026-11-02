@@ -10,10 +10,14 @@
 //! `Skilj::rest_router()` in-process - no network - from `workers`
 //! concurrent callers, each submitting its share one after another, into
 //! one bounded context: the per-bounded-context ceiling
-//! docs/performance.md is about. Two workloads:
+//! docs/performance.md is about. Workloads:
 //!
 //! - **spread**: every command on its own account - `decide()` sees an
 //!   empty history, the cheapest case;
+//! - **ind-hot**: one reused account per caller, so keys are independent
+//!   while each key's history grows;
+//! - **cross**: one event tagged with two adjacent callers' accounts,
+//!   forming a ring of overlapping consistency boundaries;
 //! - **hot**: every command on one account - `decide()` folds that
 //!   account's whole history, which grows as the run goes;
 //! - **hot-snap**: every command on one account, through `DepositFast`,
@@ -37,11 +41,17 @@
 //! that send their deposits `n` at a time through
 //! `POST /v1/commands/trigger/batch` (docs/architecture.md §227); a
 //! command's latency there is its call's.
+//!
+//! `SKILJ_BENCH_REQUIRE_DURABLE=1` refuses skipped database setup and
+//! requires fsync, synchronous_commit and full_page_writes to be on.
+//! See docs/disjoint-consistency-boundaries.md for issue #158's analysis
+//! and the remaining measurement work.
 
 mod deposit_bench;
 
 use deposit_bench::{
-    deposit_batch_through, deposit_through, latency_proxy, setup_instances, Setup,
+    deposit_batch_through, deposit_through, latency_proxy, linked_deposit_through, setup_instances,
+    Setup,
 };
 use skilj_core::db;
 use skilj_core::shared::generate_token_id;
@@ -165,6 +175,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 #[derive(Clone, Copy)]
 enum Workload {
     Spread,
+    IndependentHot,
+    CrossTag,
     Hot,
     HotSnapshot,
     HotNothing,
@@ -190,6 +202,8 @@ async fn scenario(
             let accounts: Vec<String> = (0..per_worker)
                 .map(|n| match workload {
                     Workload::Spread => format!("{run}-{worker}-{n}"),
+                    Workload::IndependentHot => format!("{run}-key-{worker}"),
+                    Workload::CrossTag => format!("{run}-key-{worker}"),
                     Workload::Hot | Workload::HotSnapshot | Workload::HotNothing => {
                         format!("{run}-hot")
                     }
@@ -200,7 +214,24 @@ async fn scenario(
                 Workload::HotNothing => &setup.blind_credential,
                 _ => &setup.credential,
             };
-            if batch > 1 {
+            if matches!(workload, Workload::CrossTag) {
+                for account in &accounts {
+                    // Adjacent pairs form a ring: each event overlaps two
+                    // workers' boundaries without one universal hot tag.
+                    let pair = [
+                        account.clone(),
+                        format!("{run}-key-{}", (worker + 1) % workers),
+                    ];
+                    latencies.push(
+                        linked_deposit_through(
+                            setup.router_for(worker),
+                            &setup.linked_credential,
+                            &pair,
+                        )
+                        .await,
+                    );
+                }
+            } else if batch > 1 {
                 // docs/architecture.md §227: `batch` deposits a call, each
                 // command's latency that of its call.
                 for chunk in accounts.chunks(batch) {
@@ -235,6 +266,8 @@ async fn scenario(
          decided again under lock {:>4} times, slowest {:>6.2} ms",
         match workload {
             Workload::Spread => "spread",
+            Workload::IndependentHot => "ind-hot",
+            Workload::CrossTag => "cross",
             Workload::Hot => "hot",
             Workload::HotSnapshot => "hot-snap",
             Workload::HotNothing => "hot-none",
@@ -278,10 +311,34 @@ fn command_throughput() {
         let Some(database_url) =
             skilj_test_support::database_url("skilj_command_throughput_bench").await
         else {
+            assert_ne!(
+                std::env::var("SKILJ_BENCH_REQUIRE_DURABLE").as_deref(),
+                Ok("1"),
+                "durable benchmark requires a working database; it cannot skip"
+            );
             eprintln!("skipping: no test database");
             return;
         };
         let pool = db::connect(&database_url).await.unwrap();
+        // Never report an embedded, non-durable run as production evidence.
+        let settings: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, setting FROM pg_settings WHERE name IN \
+             ('fsync', 'synchronous_commit', 'full_page_writes', 'server_version') ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        println!("Postgres settings: {settings:?}");
+        if std::env::var("SKILJ_BENCH_REQUIRE_DURABLE").as_deref() == Ok("1") {
+            for name in ["fsync", "synchronous_commit", "full_page_writes"] {
+                assert!(
+                    settings
+                        .iter()
+                        .any(|(key, value)| key == name && value == "on"),
+                    "durable benchmark requires {name}=on"
+                );
+            }
+        }
         db::migrate(&pool).await.unwrap();
         // docs/architecture.md §196: the in-process router makes every
         // round trip to Postgres nearly free, which understates what a
@@ -313,14 +370,37 @@ fn command_throughput() {
             println!("--- round {round} ---");
             for workload in [
                 Workload::Spread,
+                Workload::IndependentHot,
+                Workload::CrossTag,
                 Workload::Hot,
                 Workload::HotSnapshot,
                 Workload::HotNothing,
             ] {
+                let workload_name = match workload {
+                    Workload::Spread => "spread",
+                    Workload::IndependentHot => "ind-hot",
+                    Workload::CrossTag => "cross",
+                    Workload::Hot => "hot",
+                    Workload::HotSnapshot => "hot-snap",
+                    Workload::HotNothing => "hot-none",
+                };
+                if let Ok(selected) = std::env::var("SKILJ_BENCH_WORKLOADS") {
+                    if !selected.split(',').any(|name| name == workload_name) {
+                        continue;
+                    }
+                }
                 for workers in [1, 8, 32, 80] {
+                    if let Ok(selected) = std::env::var("SKILJ_BENCH_WORKERS") {
+                        if !selected
+                            .split(',')
+                            .any(|n| n.parse::<usize>().unwrap() == workers)
+                        {
+                            continue;
+                        }
+                    }
                     scenario(&setup, &stats, workload, workers, commands, 1).await;
                 }
-                if batch > 1 {
+                if batch > 1 && !matches!(workload, Workload::CrossTag) {
                     for workers in [1, 8] {
                         scenario(&setup, &stats, workload, workers, commands, batch).await;
                     }

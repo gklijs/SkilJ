@@ -580,7 +580,8 @@ fn a_bounded_context_without_event_tags_gets_them_from_its_first_command() {
         let schema = format!("\"bc_{}\"", h.bc.name);
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP TRIGGER events_index_tags ON {schema}.events; \
-             DROP FUNCTION {schema}.index_event_tags(); DROP TABLE {schema}.event_tags; \
+             DROP FUNCTION {schema}.index_event_tags(); DROP VIEW {schema}.event_tags; \
+             DROP TABLE {schema}.event_tag_refs; \
              ALTER TABLE {schema}.commands DROP COLUMN consistency_query"
         )))
         .execute(&pool)
@@ -1170,5 +1171,118 @@ fn all_null_default_tags_read_nothing_with_or_without_cache_and_in_a_batch() {
             *dispatcher.seen.lock().unwrap(),
             vec![Vec::<String>::new(), Vec::<String>::new()]
         );
+    });
+}
+
+#[test]
+fn interned_tags_preserve_nulls_rollback_and_exact_used_prefixes() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else { return; };
+        let h = seed(&pool).await;
+        let first = record(&pool, &h.bc, &h.created, "acme", Some("literal_%used")).await;
+        record(&pool, &h.bc, &h.created, "acme", Some("literalXYZ")).await;
+        record(&pool, &h.bc, &h.created, "acme", None).await;
+        let schema = format!("\"bc_{}\"", h.bc.name);
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {schema}.event_tag_values WHERE tag_key='company' AND tag_value='acme'"
+        ))).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1, "reused identities are stored once");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.event_tag_values(tag_key,tag_value) VALUES ('ticket','literal_%unused')"
+        ))).execute(&pool).await.unwrap();
+        let used = db::search_used_tags(&pool, &h.bc.name, "ticket", "literal_%", 20, None, None).await.unwrap();
+        assert_eq!(used.len(), 1);
+        assert_eq!(used[0].value.as_deref(), Some("literal_%used"));
+        let all = db::search_used_tags(&pool, &h.bc.name, "ticket", "", 20, None, None).await.unwrap();
+        assert_eq!(all.first().and_then(|t| t.value.as_deref()), None);
+        assert_eq!(all.len(), 3, "the explicit null identity is searchable");
+        assert!(db::search_used_tags(&pool, &h.bc.name, "ticket", "", 0, None, None).await.unwrap().is_empty());
+
+        let mut event = db::get_event_by_sequence(&pool, &h.bc.name, first).await.unwrap().unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        event.sequence = db::next_sequence(&mut *tx, &h.bc.name).await.unwrap();
+        event.tags = vec![Tag { key: "ticket".into(), value: Some("rolled-back".into()) }];
+        db::insert_event(&mut *tx, &event, None).await.unwrap();
+        tx.rollback().await.unwrap();
+        let present: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS(SELECT 1 FROM {schema}.event_tag_values WHERE tag_value='rolled-back')"
+        ))).fetch_one(&pool).await.unwrap();
+        assert!(!present, "dictionary insertion rolls back with the event");
+    });
+}
+
+#[test]
+fn used_tag_discovery_respects_event_type_and_owner_scope() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let mut h = seed(&pool).await;
+        h.created.owner_tag_key = Some("company".into());
+        db::upsert_event_type(&pool, &h.created).await.unwrap();
+        record(&pool, &h.bc, &h.created, "acme", Some("visible")).await;
+        record(&pool, &h.bc, &h.created, "other", Some("hidden")).await;
+        record(&pool, &h.bc, &h.signed_up, "public-company", None).await;
+        let scoped = db::search_used_tags(
+            &pool,
+            &h.bc.name,
+            "ticket",
+            "",
+            20,
+            Some("TicketCreated"),
+            Some("acme"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].value.as_deref(), Some("visible"));
+        assert!(db::search_used_tags(
+            &pool,
+            &h.bc.name,
+            "ticket",
+            "",
+            20,
+            Some("CompanySignedUp"),
+            None
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        let companies =
+            db::search_used_tags(&pool, &h.bc.name, "company", "", 20, None, Some("acme"))
+                .await
+                .unwrap();
+        assert_eq!(
+            companies
+                .iter()
+                .filter_map(|t| t.value.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["acme", "public-company"]
+        );
+    });
+}
+
+#[test]
+fn legacy_text_tag_index_migrates_atomically_and_idempotently() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else { return; };
+        let h = seed(&pool).await;
+        record(&pool, &h.bc, &h.created, "acme", None).await;
+        let schema = format!("\"bc_{}\"", h.bc.name);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE {schema}.old_tags AS SELECT tag_key,tag_value,event_type_name,sequence FROM {schema}.event_tags; \
+             DROP TRIGGER events_index_tags ON {schema}.events; \
+             DROP VIEW {schema}.event_tags; DROP TABLE {schema}.event_tag_refs; \
+             DROP TABLE {schema}.event_tag_values; \
+             ALTER TABLE {schema}.old_tags RENAME TO event_tags"
+        ))).execute(&pool).await.unwrap();
+        db::ensure_event_tags_index(&pool, &h.bc.name).await.unwrap();
+        db::ensure_event_tags_index(&pool, &h.bc.name).await.unwrap();
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT tag_key,tag_value FROM {schema}.event_tags ORDER BY tag_key"
+        ))).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![("company".into(),Some("acme".into())),("ticket".into(),None)]);
+        record(&pool, &h.bc, &h.created, "acme", Some("new")).await;
+        assert_eq!(db::search_used_tags(&pool, &h.bc.name, "ticket", "new", 20, None, None).await.unwrap().len(), 1);
     });
 }

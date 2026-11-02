@@ -44,7 +44,7 @@ use skilj_core::event_store::{
 };
 use skilj_core::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use skilj_core::shared::{
-    PrivateField, PrivateFieldKind, QueryItemMapping, SensitiveField, TagMapping,
+    PrivateField, PrivateFieldKind, QueryItemMapping, SensitiveField, Tag, TagMapping,
 };
 use skilj_macros::gql_object;
 
@@ -424,6 +424,13 @@ pub fn tag_mapping_object(n: &Naming) -> Object {
         scalar "key": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.key.clone()),
         scalar "field": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.field.clone()),
         scalar "blind": TypeRef::named_nn(TypeRef::BOOLEAN) => |t| Value::from(t.blind),
+    })
+}
+
+pub fn used_tag_object(n: &Naming) -> Object {
+    gql_object!(Tag => n.ty("UsedTag") {
+        scalar "key": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.key.clone()),
+        scalar "value": TypeRef::named(TypeRef::STRING) => |t| optional_string(t.value.clone()),
     })
 }
 

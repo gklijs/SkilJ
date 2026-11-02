@@ -2127,8 +2127,10 @@ pub async fn ensure_registrations_generation<'e>(
     Ok(())
 }
 
-/// `event_tags`: one row per tag of every event, `(tag_key, tag_value,
-/// event_type_name, sequence)`, indexed in that order - what a consistency
+/// Interns exact tag identities in `event_tag_values` and indexes their
+/// references in `event_tag_refs` by `(tag_id, event_type_name, sequence)`.
+/// `event_tags` remains a compatibility view. Requires PostgreSQL 15 or later.
+/// This is what a consistency
 /// tag read goes through (docs/architecture.md §198, §210). A GIN index on
 /// `events.tags` answered "which events carry this tag", but a query for
 /// the latest event of a few types carrying a company's tag still walked
@@ -2153,37 +2155,15 @@ pub async fn ensure_event_tags_index<'e>(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "SELECT pg_advisory_xact_lock(hashtext({lock_key})::bigint);
-        DO $patch$ BEGIN IF to_regclass({table}) IS NULL THEN
-            LOCK TABLE {schema}.events IN SHARE ROW EXCLUSIVE MODE;
-            CREATE TABLE {schema}.event_tags (
-                tag_key TEXT NOT NULL,
-                tag_value TEXT,
-                event_type_name TEXT NOT NULL,
-                sequence BIGINT NOT NULL
-            );
-            INSERT INTO {schema}.event_tags (tag_key, tag_value, event_type_name, sequence)
-                SELECT t->>'key', t->>'value', e.event_type_name, e.sequence
-                FROM {schema}.events e, jsonb_array_elements(e.tags) t;
-            CREATE INDEX event_tags_lookup ON {schema}.event_tags
-                (tag_key, tag_value, event_type_name, sequence);
-            CREATE FUNCTION {schema}.index_event_tags() RETURNS trigger
-                LANGUAGE plpgsql AS $index$ BEGIN
-                    INSERT INTO {schema}.event_tags (tag_key, tag_value, event_type_name, sequence)
-                        SELECT t->>'key', t->>'value', n.event_type_name, n.sequence
-                        FROM new_events n, jsonb_array_elements(n.tags) t;
-                    RETURN NULL;
-                END $index$;
-            CREATE TRIGGER events_index_tags AFTER INSERT ON {schema}.events
-                REFERENCING NEW TABLE AS new_events
-                FOR EACH STATEMENT EXECUTE FUNCTION {schema}.index_event_tags();
-        END IF; END $patch$",
-        table = sql_literal(&format!("{schema}.event_tags")),
-        lock_key = sql_literal(&format!("skilj_event_tags:{schema}"))
-    )))
-    .execute(executor)
-    .await?;
+    let sql = include_str!("sql/event_tag_dictionary.sql")
+        .replace("@SCHEMA@", &schema)
+        .replace(
+            "@LOCK_KEY@",
+            &sql_literal(&format!("skilj_event_tags:{schema}")),
+        );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(executor)
+        .await?;
     Ok(())
 }
 
@@ -2548,8 +2528,27 @@ pub async fn rotate_blind_tag(
     .execute(&mut *tx)
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "UPDATE {schema}.event_tags et SET tag_value = r.new FROM skilj_blind_rotation r \
-         WHERE et.tag_key = $1 AND et.tag_value = r.old"
+        "INSERT INTO {schema}.event_tag_values(tag_key, tag_value) \
+         SELECT DISTINCT $1, new FROM skilj_blind_rotation ORDER BY 1, 2 \
+         ON CONFLICT (tag_key, tag_value) DO NOTHING"
+    )))
+    .bind(tag_key)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.event_tag_refs refs SET tag_id = fresh.id \
+         FROM {schema}.event_tag_values old, skilj_blind_rotation r, \
+              {schema}.event_tag_values fresh \
+         WHERE refs.tag_id = old.id AND old.tag_key = $1 AND old.tag_value = r.old \
+           AND fresh.tag_key = $1 AND fresh.tag_value = r.new"
+    )))
+    .bind(tag_key)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {schema}.event_tag_values v USING skilj_blind_rotation r \
+         WHERE v.tag_key = $1 AND v.tag_value = r.old \
+           AND NOT EXISTS (SELECT 1 FROM {schema}.event_tag_refs refs WHERE refs.tag_id = v.id OFFSET 0)"
     )))
     .bind(tag_key)
     .execute(&mut *tx)

@@ -208,7 +208,7 @@ async fn write_history(pool: &Pool, bc: &str, events: i64) {
     .execute(pool)
     .await
     .unwrap();
-    for table in ["events", "event_tags", "commands"] {
+    for table in ["events", "event_tag_refs", "event_tag_values", "commands"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "VACUUM ANALYZE {schema}.{table}"
         )))

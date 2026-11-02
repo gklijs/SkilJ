@@ -214,6 +214,7 @@ pub fn router(
         )
         .route("/v1/events/direct", post(post_events_direct))
         .route("/v1/events", get(get_events))
+        .route("/v1/events/tags", get(get_used_tags))
         .route("/v1/events/consume", get(get_events_consume))
         .route("/v1/events/consume/ack", post(post_events_consume_ack))
         .route("/v1/commands/trigger", post(post_commands_trigger))
@@ -1148,6 +1149,60 @@ async fn post_events_direct(
             sequence: event.sequence,
         }),
     ))
+}
+
+#[derive(Default)]
+struct UsedTagsQuery {
+    key: Option<String>,
+    prefix: String,
+    limit: Option<String>,
+}
+
+impl FromQueryString for UsedTagsQuery {
+    fn from_query_string(raw: &str) -> Self {
+        let mut query = Self::default();
+        for (key, value) in query_pairs(raw) {
+            match key.as_str() {
+                "key" => query.key = Some(value),
+                "prefix" => query.prefix = value,
+                "limit" => query.limit = Some(value),
+                _ => {}
+            }
+        }
+        query
+    }
+}
+
+async fn get_used_tags(
+    State(state): State<AppState>,
+    credential: BearerCredential,
+    Query(query): Query<UsedTagsQuery>,
+) -> Result<impl IntoResponse, RestError> {
+    let token = resolve_token::<EventReadToken>(&state, &credential).await?;
+    event_store::check_fetch_events(&token, &[])?;
+    let key = query
+        .key
+        .ok_or_else(|| RestError::InvalidRequest("key is required".into()))?;
+    let limit = query
+        .limit
+        .as_deref()
+        .map(str::parse::<usize>)
+        .transpose()
+        .map_err(|_| RestError::InvalidRequest("limit must be a non-negative integer".into()))?
+        .unwrap_or(20)
+        .min(state.max_events_per_read)
+        .min(100);
+    let tags = db::search_used_tags(
+        &state.pool,
+        &token.event_type.bounded_context.name,
+        &key,
+        &query.prefix,
+        limit,
+        Some(&token.event_type.name),
+        token.scope.as_deref(),
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "tags": tags })))
 }
 
 async fn get_events(

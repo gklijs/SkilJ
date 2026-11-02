@@ -1,0 +1,31 @@
+{
+  "summary": [
+    {
+      "keys": 1000,
+      "rows": 200000,
+      "raw_probe_ms": 232.642,
+      "interned_probe_ms": 191.779,
+      "cached_probe_ms": 136.963,
+      "raw_seed_ms": 1125.598,
+      "intern_seed_ms": 1120.148,
+      "raw_bytes": 43458560,
+      "intern_tag_bytes": 23838720,
+      "dictionary_bytes": 262144,
+      "intern_total_bytes": 24100864
+    },
+    {
+      "keys": 200000,
+      "rows": 200000,
+      "raw_probe_ms": 77.299,
+      "interned_probe_ms": 104.592,
+      "cached_probe_ms": 54.597,
+      "raw_seed_ms": 826.973,
+      "intern_seed_ms": 1652.219,
+      "raw_bytes": 40992768,
+      "intern_tag_bytes": 23732224,
+      "dictionary_bytes": 39067648,
+      "intern_total_bytes": 62799872
+    }
+  ],
+  "search": "SEARCH dictionary_entries=200003 probes=200 max_results=20 p50_ms=0.272 p99_ms=0.420 generic_plan=true literal_wildcards=checked unused_registrations=excluded"
+}

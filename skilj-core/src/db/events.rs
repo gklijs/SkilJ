@@ -630,7 +630,8 @@ pub(super) fn all_event_types(schema: &str) -> String {
 /// `AND` conditions on `t`, its position and any further tags - in no
 /// particular order (docs/architecture.md §210).
 ///
-/// The index is `(tag_key, tag_value, event_type_name, sequence)`, so a
+/// The dictionary resolves the exact tag ID in the same SQL snapshot. The
+/// reference index is `(tag_id, event_type_name, sequence)`, so a
 /// tag's events are in sequence order within each type, not across them.
 /// Without `limit` that doesn't matter: one index range per type. With
 /// it - an item's `latest`, or a chunk - each type's range is read from
@@ -645,10 +646,17 @@ pub(super) fn event_tags_select(
     filter: &str,
     limit: Option<(TagOrder, String)>,
 ) -> String {
+    // Resolve the exact string identity once, before scanning any event
+    // references. An absent dictionary entry selects nothing. The lookup
+    // and history share one statement snapshot, including explicit nulls.
+    let tag_id = format!(
+        "(SELECT id FROM {schema}.event_tag_values \
+         WHERE tag_key = {key} AND tag_value {value_condition})"
+    );
     match limit {
         None => format!(
-            "(SELECT t.sequence FROM {schema}.event_tags t \
-             WHERE t.tag_key = {key} AND t.tag_value {value_condition} \
+            "(SELECT t.sequence FROM {schema}.event_tag_refs t \
+             WHERE t.tag_id = {tag_id} \
              AND t.event_type_name = ANY({types}){filter})"
         ),
         Some((order, limit)) => {
@@ -658,8 +666,8 @@ pub(super) fn event_tags_select(
             };
             format!(
                 "(SELECT l.sequence FROM unnest({types}) AS ty(name) \
-                 CROSS JOIN LATERAL (SELECT t.sequence FROM {schema}.event_tags t \
-                    WHERE t.tag_key = {key} AND t.tag_value {value_condition} \
+                 CROSS JOIN LATERAL (SELECT t.sequence FROM {schema}.event_tag_refs t \
+                    WHERE t.tag_id = {tag_id} \
                     AND t.event_type_name = ty.name{filter} \
                     ORDER BY t.sequence{direction} LIMIT {limit}) l \
                  ORDER BY l.sequence{direction} LIMIT {limit})"

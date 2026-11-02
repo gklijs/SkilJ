@@ -13277,3 +13277,35 @@ its usual already-taken rejection. It never accepts reuse on that account.
 A compiled fold whose schema differs from the live registration also pauses
 without a compatibility declaration. Discarding a staged rebuild therefore
 cannot accidentally resume an incompatible fold against the old state.
+
+## 232. Interned event tags and used-tag discovery (issue #158)
+
+PostgreSQL 15 or later is required. Each context stores exact `(tag_key,
+tag_value)` identities in `event_tag_values`, with bigint identity IDs and
+`UNIQUE NULLS NOT DISTINCT`. `event_tag_refs` indexes `(tag_id, event_type_name,
+sequence)`. Null values remain distinct from empty strings. A statement-level
+event trigger registers missing identities and writes their references in the
+same transaction. References are a derived index; event JSON remains authoritative.
+The migration locks event writes while backfilling and replaces the former
+physical `event_tags` table with a compatibility view. Startup repeats safely.
+Large existing histories therefore need a maintenance window for the first migration.
+
+Consistency reads resolve exact IDs within the history query's SQL snapshot.
+No cross-transaction ID cache is kept: blind-tag erasure and key rotation can
+remove dictionary entries. Both operations update references and remove unused
+sensitive identities under the existing append fence. Strict sequence ordering,
+DCB validation and group commit remain unchanged.
+
+`db::search_used_tags` returns up to 100 distinct referenced values by literal
+prefix under a key. Explicit C-collation ranges support the dictionary index;
+the correlated existence probe retains `OFFSET 0` to avoid generic plans hashing
+the full reference table. GraphQL `searchUsedTags` requires an admin mapping;
+REST `GET /v1/events/tags` uses an event-read token and its registered event type.
+Both apply owner scope and configured read limits. Null values appear only for
+an empty prefix. This is bounded discovery, without pagination or fuzzy search.
+
+Repeated-tag indexes are smaller, but unique tags cost more registration and
+storage. Integrated throughput has not shown a general improvement. See
+`docs/dcb158-postgres-experiment.md` for measurements, other DCB implementations,
+and the restricted UUID/WAL prototype. That prototype is not the production
+append path; neither distributed routing nor a linger setting is introduced.

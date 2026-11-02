@@ -1,0 +1,9 @@
+Linux 6.18.33.2-microsoft-standard-WSL2
+Filesystem     Type  1K-blocks     Used Available Use% Mounted on
+/dev/sde       ext4 1055762868 81076104 920983292   9% /var/lib/postgresql
+fsync|on
+full_page_writes|on
+max_connections|120
+server_version|18.6 (Debian 18.6-1.pgdg13+2)
+synchronous_commit|on
+wal_level|logical

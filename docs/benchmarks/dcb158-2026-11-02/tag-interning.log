@@ -1,0 +1,27 @@
+   Compiling skilj v0.3.0 (/home/gklijs/projects/skilj/skilj)
+    Finished `release` profile [optimized] target(s) in 7.74s
+     Running tests/dcb_concurrency_experiment.rs (target/release/deps/dcb_concurrency_experiment-d32012803a3a4c47)
+
+running 1 test
+TAGS round=1 keys=1000 rows=200000 kind=raw probes=10000 probe_ms=188.909 raw_seed_ms=1568.688 intern_seed_ms=1041.567 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=1 keys=1000 rows=200000 kind=interned probes=10000 probe_ms=178.152 raw_seed_ms=1568.688 intern_seed_ms=1041.567 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=1 keys=1000 rows=200000 kind=cached probes=10000 probe_ms=106.248 raw_seed_ms=1568.688 intern_seed_ms=1041.567 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=2 keys=1000 rows=200000 kind=raw probes=10000 probe_ms=194.614 raw_seed_ms=1338.840 intern_seed_ms=994.661 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=2 keys=1000 rows=200000 kind=interned probes=10000 probe_ms=170.961 raw_seed_ms=1338.840 intern_seed_ms=994.661 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=2 keys=1000 rows=200000 kind=cached probes=10000 probe_ms=134.057 raw_seed_ms=1338.840 intern_seed_ms=994.661 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=3 keys=1000 rows=200000 kind=raw probes=10000 probe_ms=172.552 raw_seed_ms=1408.398 intern_seed_ms=1048.067 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=3 keys=1000 rows=200000 kind=interned probes=10000 probe_ms=158.944 raw_seed_ms=1408.398 intern_seed_ms=1048.067 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=3 keys=1000 rows=200000 kind=cached probes=10000 probe_ms=108.174 raw_seed_ms=1408.398 intern_seed_ms=1048.067 raw_bytes=43458560 intern_tag_bytes=23838720 dictionary_bytes=262144 intern_total_bytes=24100864
+TAGS round=1 keys=200000 rows=200000 kind=raw probes=10000 probe_ms=114.171 raw_seed_ms=1370.807 intern_seed_ms=2376.255 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=1 keys=200000 rows=200000 kind=interned probes=10000 probe_ms=145.482 raw_seed_ms=1370.807 intern_seed_ms=2376.255 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=1 keys=200000 rows=200000 kind=cached probes=10000 probe_ms=57.573 raw_seed_ms=1370.807 intern_seed_ms=2376.255 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=2 keys=200000 rows=200000 kind=raw probes=10000 probe_ms=121.627 raw_seed_ms=1425.212 intern_seed_ms=2421.520 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=2 keys=200000 rows=200000 kind=interned probes=10000 probe_ms=140.906 raw_seed_ms=1425.212 intern_seed_ms=2421.520 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=2 keys=200000 rows=200000 kind=cached probes=10000 probe_ms=57.120 raw_seed_ms=1425.212 intern_seed_ms=2421.520 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=3 keys=200000 rows=200000 kind=raw probes=10000 probe_ms=120.237 raw_seed_ms=1429.959 intern_seed_ms=2502.364 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=3 keys=200000 rows=200000 kind=interned probes=10000 probe_ms=148.887 raw_seed_ms=1429.959 intern_seed_ms=2502.364 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+TAGS round=3 keys=200000 rows=200000 kind=cached probes=10000 probe_ms=51.892 raw_seed_ms=1429.959 intern_seed_ms=2502.364 raw_bytes=40992768 intern_tag_bytes=23732224 dictionary_bytes=39067648 intern_total_bytes=62799872
+test tag_interning_experiment ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 25.31s
+

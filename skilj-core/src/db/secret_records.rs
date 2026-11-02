@@ -580,6 +580,7 @@ pub async fn forget_subject_in_blind_tags(
     }
     ensure_registrations_generation(pool, bounded_context).await?;
     let mut tx = pool.begin().await?;
+    lock_bounded_context_sequence(&mut tx, bounded_context).await?;
     // A rotation of these tags (docs/architecture.md §209) holds their
     // rows while it rewrites the same events: wait for it here, before
     // touching any, rather than meet it half-way.
@@ -600,8 +601,9 @@ pub async fn forget_subject_in_blind_tags(
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT e.sequence, e.event_type_name, t->>'value' \
                  FROM {schema}.events e, jsonb_array_elements(e.tags) t \
-                 WHERE e.sequence = ANY(ARRAY(SELECT s.sequence FROM {schema}.event_tags s \
-                    WHERE s.tag_key = $1 AND s.tag_value = $2)) \
+                 WHERE e.sequence = ANY(ARRAY(SELECT s.sequence FROM {schema}.event_tag_refs s \
+                    WHERE s.tag_id = (SELECT id FROM {schema}.event_tag_values \
+                        WHERE tag_key = $1 AND tag_value = $2))) \
                  AND t->>'key' = $3"
             )))
             .bind(subject_tag)
@@ -634,9 +636,10 @@ pub async fn forget_subject_in_blind_tags(
                 })
                 .unzip();
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM {schema}.event_tags et \
-             USING unnest($2::text[], $3::text[], $4::bigint[]) AS x(value, event_type, sequence) \
-             WHERE et.tag_key = $1 AND et.tag_value = x.value \
+            "DELETE FROM {schema}.event_tag_refs et \
+             USING unnest($2::text[], $3::text[], $4::bigint[]) AS x(value, event_type, sequence), \
+                   {schema}.event_tag_values v \
+             WHERE et.tag_id = v.id AND v.tag_key = $1 AND v.tag_value = x.value \
              AND et.event_type_name = x.event_type AND et.sequence = x.sequence"
         )))
         .bind(tag_key)
@@ -648,14 +651,24 @@ pub async fn forget_subject_in_blind_tags(
         if !unvalued.is_empty() {
             let unvalued: Vec<i64> = unvalued.iter().map(|(sequence, _, _)| *sequence).collect();
             sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DELETE FROM {schema}.event_tags \
-                 WHERE tag_key = $1 AND tag_value IS NULL AND sequence = ANY($2)"
+                "DELETE FROM {schema}.event_tag_refs \
+                 WHERE tag_id = (SELECT id FROM {schema}.event_tag_values \
+                     WHERE tag_key = $1 AND tag_value IS NULL) AND sequence = ANY($2)"
             )))
             .bind(tag_key)
             .bind(&unvalued)
             .execute(&mut *tx)
             .await?;
         }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {schema}.event_tag_values v WHERE tag_key = $1 \
+             AND (tag_value = ANY($2) OR tag_value IS NULL) \
+             AND NOT EXISTS (SELECT 1 FROM {schema}.event_tag_refs r WHERE r.tag_id = v.id OFFSET 0)"
+        )))
+        .bind(tag_key)
+        .bind(&values)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.commands c SET \
                 consistency_tags = (\

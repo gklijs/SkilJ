@@ -1,0 +1,33 @@
+   Compiling skilj v0.3.0 (/home/gklijs/projects/skilj/skilj)
+    Finished `release` profile [optimized] target(s) in 4.62s
+     Running tests/dcb_concurrency_experiment.rs (target/release/deps/dcb_concurrency_experiment-d32012803a3a4c47)
+
+running 1 test
+SETTINGS [("fsync", "on"), ("full_page_writes", "on"), ("server_version", "18.6 (Debian 18.6-1.pgdg13+2)"), ("synchronous_commit", "on")]
+CDC commit order verified: ["0/1F29B688", "0/1F29B6B8"]
+CORRECTNESS passed: two pools, same-key cap, overlapping tags, idempotency, rollback, publication order; UUID cursor counterexample reproduced
+ROUND 1
+RESULT mode=serial-group wal_order=true cached_decision=true workload=Independent workers=32 commands=1600 ingest_per_s=1558.3 published_per_s=1519.3 p50_ms=19.799 p99_ms=48.033 drain_ms=26.412 retries=0 publication_batches=76 stream_lag_p50_ms=15.476 stream_lag_p99_ms=27.695
+RESULT mode=uuid wal_order=true cached_decision=true workload=Independent workers=32 commands=1600 ingest_per_s=3429.8 published_per_s=3209.5 p50_ms=8.027 p99_ms=46.859 drain_ms=32.027 retries=0 publication_batches=21 stream_lag_p50_ms=33.907 stream_lag_p99_ms=53.887
+RESULT mode=uuid-group wal_order=true cached_decision=true workload=Independent workers=32 commands=1600 ingest_per_s=2768.7 published_per_s=2574.2 p50_ms=11.469 p99_ms=17.862 drain_ms=43.673 retries=0 publication_batches=39 stream_lag_p50_ms=22.913 stream_lag_p99_ms=39.771
+RESULT mode=serial-group wal_order=true cached_decision=true workload=Independent workers=80 commands=1600 ingest_per_s=2222.7 published_per_s=2140.1 p50_ms=35.273 p99_ms=56.995 drain_ms=27.786 retries=0 publication_batches=38 stream_lag_p50_ms=16.869 stream_lag_p99_ms=28.732
+RESULT mode=uuid wal_order=true cached_decision=true workload=Independent workers=80 commands=1600 ingest_per_s=5054.2 published_per_s=4313.0 p50_ms=12.774 p99_ms=41.141 drain_ms=54.403 retries=0 publication_batches=9 stream_lag_p50_ms=59.933 stream_lag_p99_ms=110.739
+RESULT mode=uuid-group wal_order=true cached_decision=true workload=Independent workers=80 commands=1600 ingest_per_s=4690.5 published_per_s=4170.0 p50_ms=16.111 p99_ms=25.264 drain_ms=42.572 retries=0 publication_batches=17 stream_lag_p50_ms=35.393 stream_lag_p99_ms=59.628
+ROUND 2
+RESULT mode=serial-group wal_order=true cached_decision=true workload=Independent workers=32 commands=1600 ingest_per_s=1630.4 published_per_s=1593.3 p50_ms=19.061 p99_ms=25.924 drain_ms=22.818 retries=0 publication_batches=77 stream_lag_p50_ms=16.452 stream_lag_p99_ms=28.018
+RESULT mode=uuid wal_order=true cached_decision=true workload=Independent workers=32 commands=1600 ingest_per_s=3882.9 published_per_s=3484.9 p50_ms=7.866 p99_ms=13.215 drain_ms=47.053 retries=0 publication_batches=20 stream_lag_p50_ms=34.471 stream_lag_p99_ms=53.250
+RESULT mode=uuid-group wal_order=true cached_decision=true workload=Independent workers=32 commands=1600 ingest_per_s=2687.6 published_per_s=2516.5 p50_ms=11.264 p99_ms=21.288 drain_ms=40.496 retries=0 publication_batches=38 stream_lag_p50_ms=23.610 stream_lag_p99_ms=41.616
+RESULT mode=serial-group wal_order=true cached_decision=true workload=Independent workers=80 commands=1600 ingest_per_s=2422.2 published_per_s=2289.8 p50_ms=32.683 p99_ms=39.247 drain_ms=38.214 retries=0 publication_batches=37 stream_lag_p50_ms=17.585 stream_lag_p99_ms=32.484
+RESULT mode=uuid wal_order=true cached_decision=true workload=Independent workers=80 commands=1600 ingest_per_s=5692.4 published_per_s=4851.7 p50_ms=12.311 p99_ms=27.937 drain_ms=48.700 retries=0 publication_batches=8 stream_lag_p50_ms=64.722 stream_lag_p99_ms=108.073
+RESULT mode=uuid-group wal_order=true cached_decision=true workload=Independent workers=80 commands=1600 ingest_per_s=4685.4 published_per_s=4201.9 p50_ms=15.831 p99_ms=26.155 drain_ms=39.289 retries=0 publication_batches=20 stream_lag_p50_ms=28.020 stream_lag_p99_ms=48.997
+ROUND 3
+RESULT mode=uuid wal_order=true cached_decision=true workload=Independent workers=32 commands=1600 ingest_per_s=3855.8 published_per_s=3524.9 p50_ms=7.906 p99_ms=13.734 drain_ms=38.953 retries=0 publication_batches=19 stream_lag_p50_ms=34.197 stream_lag_p99_ms=56.727
+RESULT mode=uuid-group wal_order=true cached_decision=true workload=Independent workers=32 commands=1600 ingest_per_s=2713.3 published_per_s=2582.0 p50_ms=11.644 p99_ms=20.457 drain_ms=29.983 retries=0 publication_batches=39 stream_lag_p50_ms=23.005 stream_lag_p99_ms=46.387
+RESULT mode=serial-group wal_order=true cached_decision=true workload=Independent workers=32 commands=1600 ingest_per_s=1691.3 published_per_s=1624.5 p50_ms=18.983 p99_ms=24.279 drain_ms=38.894 retries=0 publication_batches=79 stream_lag_p50_ms=15.194 stream_lag_p99_ms=30.323
+RESULT mode=uuid wal_order=true cached_decision=true workload=Independent workers=80 commands=1600 ingest_per_s=5563.1 published_per_s=4801.8 p50_ms=12.372 p99_ms=29.795 drain_ms=45.597 retries=0 publication_batches=8 stream_lag_p50_ms=65.986 stream_lag_p99_ms=101.693
+RESULT mode=uuid-group wal_order=true cached_decision=true workload=Independent workers=80 commands=1600 ingest_per_s=4841.3 published_per_s=4318.3 p50_ms=15.303 p99_ms=28.638 drain_ms=40.026 retries=0 publication_batches=17 stream_lag_p50_ms=32.632 stream_lag_p99_ms=54.277
+RESULT mode=serial-group wal_order=true cached_decision=true workload=Independent workers=80 commands=1600 ingest_per_s=2426.0 published_per_s=2244.0 p50_ms=33.061 p99_ms=38.330 drain_ms=53.493 retries=0 publication_batches=31 stream_lag_p50_ms=30.072 stream_lag_p99_ms=53.190
+test dcb_concurrency_experiment ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.37s
+
