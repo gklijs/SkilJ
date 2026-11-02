@@ -474,55 +474,168 @@ pub(super) struct AcceptedDecision {
     /// What the command's events' blind tags are hashed with - the
     /// dispatcher's, carried to where they're derived.
     pub(super) blind: crate::blind::BlindIndex,
-    /// The tags of the retractions among `event_specs`, by index
-    /// (docs/architecture.md §235), replacing what their mappings derive.
-    pub(super) retraction_tags: RetractionTags,
+    /// The tags of the retractions and doubts among `event_specs`, by index
+    /// (docs/architecture.md §235, §236), replacing what their mappings derive.
+    pub(super) stance_tags: StanceTags,
 }
 
-/// Which of a decision's events are retractions, and the tags each gets.
-pub(super) type RetractionTags = Vec<(usize, Vec<Tag>)>;
+/// Which of a decision's events say something about an earlier event, and the
+/// tags each gets.
+pub(super) type StanceTags = Vec<(usize, Vec<Tag>)>;
 
-/// Why a decision's retraction can't be appended, a typed rejection like any
-/// other: `(reason, kind)`.
-type RetractionRefusal = (String, &'static str);
+/// Why a decision's retraction or doubt can't be appended, a typed rejection
+/// like any other: `(reason, kind)`.
+type StanceRefusal = (String, &'static str);
 
-/// Checks the retractions among `event_specs` and settles what the store adds
-/// to each (docs/architecture.md §235): the tags of the event it retracts, and
-/// that event's type and owner in its payload. A read on the lock holder's
-/// connection, so nothing can retract the same event between this and the
-/// append; `extra_committed_events` holds what an earlier command in the batch
-/// decided and hasn't written yet. Runs on a dry run too, without the lock,
-/// where it says what would have happened.
-async fn resolve_retractions(
+/// A retraction, a doubt or a lift, as found among a decision's events.
+enum Stance {
+    Retraction(crate::retraction::RetractionPayload),
+    Doubt(crate::retraction::DoubtPayload),
+    Lift(crate::retraction::DoubtPayload),
+}
+
+impl Stance {
+    /// `Some` for one of the three built-in types: `Ok` when its payload parses.
+    fn of(spec: &crate::shared::EventSpec) -> Option<Result<Self, StanceRefusal>> {
+        use crate::retraction::{
+            DOUBTED_EVENT_TYPE, DOUBT_LIFTED_EVENT_TYPE, RETRACTED_EVENT_TYPE,
+        };
+        let payload = spec.payload.clone();
+        match spec.event_type.as_str() {
+            RETRACTED_EVENT_TYPE => Some(
+                serde_json::from_value(payload)
+                    .map(Stance::Retraction)
+                    .map_err(|error| (format!("not a retraction: {error}"), "invalid_retraction")),
+            ),
+            DOUBTED_EVENT_TYPE => Some(
+                serde_json::from_value(payload)
+                    .map(Stance::Doubt)
+                    .map_err(|error| (format!("not a doubt: {error}"), "invalid_doubt")),
+            ),
+            DOUBT_LIFTED_EVENT_TYPE => Some(
+                serde_json::from_value(payload)
+                    .map(Stance::Lift)
+                    .map_err(|error| (format!("not a doubt: {error}"), "invalid_doubt")),
+            ),
+            _ => None,
+        }
+    }
+
+    fn position(&self) -> i64 {
+        match self {
+            Stance::Retraction(retraction) => retraction.position,
+            Stance::Doubt(doubt) | Stance::Lift(doubt) => doubt.position,
+        }
+    }
+
+    fn is_retraction(&self) -> bool {
+        matches!(self, Stance::Retraction(_))
+    }
+}
+
+/// Whether `position` has been retracted: earlier in this decision, in this
+/// batch, or in the store.
+async fn is_retracted(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    extra_committed_events: &[Event],
+    retracted_here: &std::collections::HashSet<i64>,
+    position: i64,
+) -> crate::error::Result<bool> {
+    use crate::retraction::{RETRACTED_EVENT_TYPE, RETRACTS_TAG_KEY};
+    if retracted_here.contains(&position) {
+        return Ok(true);
+    }
+    let position_tag = position.to_string();
+    if extra_committed_events.iter().any(|event| {
+        event.event_type.name == RETRACTED_EVENT_TYPE
+            && event.tags.iter().any(|tag| {
+                tag.key == RETRACTS_TAG_KEY && tag.value.as_deref() == Some(position_tag.as_str())
+            })
+    }) {
+        return Ok(true);
+    }
+    Ok(sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+        "SELECT EXISTS (SELECT 1 FROM {schema}.event_tags \
+         WHERE tag_key = $1 AND tag_value = $2 AND event_type_name = $3)"
+    )))
+    .bind(RETRACTS_TAG_KEY)
+    .bind(&position_tag)
+    .bind(RETRACTED_EVENT_TYPE)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// Whether a doubt about `position` is open: what happened last, in this
+/// decision, in this batch, or in the store. Both doubt types carry the
+/// position in their [`DOUBTS_TAG_KEY`](crate::retraction::DOUBTS_TAG_KEY) tag.
+async fn doubt_is_open(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    extra_committed_events: &[Event],
+    doubt_here: &std::collections::HashMap<i64, bool>,
+    position: i64,
+) -> crate::error::Result<bool> {
+    use crate::retraction::{DOUBTED_EVENT_TYPE, DOUBTS_TAG_KEY};
+    if let Some(open) = doubt_here.get(&position) {
+        return Ok(*open);
+    }
+    let position_tag = position.to_string();
+    let in_batch = extra_committed_events.iter().rev().find(|event| {
+        event.tags.iter().any(|tag| {
+            tag.key == DOUBTS_TAG_KEY && tag.value.as_deref() == Some(position_tag.as_str())
+        })
+    });
+    if let Some(event) = in_batch {
+        return Ok(event.event_type.name == DOUBTED_EVENT_TYPE);
+    }
+    let latest = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+        "SELECT event_type_name FROM {schema}.event_tags \
+         WHERE tag_key = $1 AND tag_value = $2 ORDER BY sequence DESC LIMIT 1"
+    )))
+    .bind(DOUBTS_TAG_KEY)
+    .bind(&position_tag)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(latest.as_deref() == Some(DOUBTED_EVENT_TYPE))
+}
+
+/// Checks the retractions and doubts among `event_specs` and settles what the
+/// store adds to each (docs/architecture.md §235, §236): the tags of the event
+/// it's about, and that event's type and owner in its payload. A read on the
+/// lock holder's connection, so nothing can change an event's standing between
+/// this and the append; `extra_committed_events` holds what an earlier command
+/// in the batch decided and hasn't written yet. Runs on a dry run too, without
+/// the lock, where it says what would have happened.
+async fn resolve_stances(
     conn: &mut sqlx::PgConnection,
     command_type: &CommandType,
     consistency_tags: &[Tag],
     event_specs: &mut [crate::shared::EventSpec],
     event_types_by_name: &std::collections::HashMap<String, EventType>,
     extra_committed_events: &[Event],
-) -> crate::error::Result<Result<RetractionTags, RetractionRefusal>> {
-    use crate::retraction::{RetractionPayload, RETRACTED_EVENT_TYPE, RETRACTS_TAG_KEY};
-    let mut resolved: RetractionTags = Vec::new();
-    let Some(retraction_type) = event_types_by_name.get(RETRACTED_EVENT_TYPE) else {
-        // Unregistered: `process_command_at_boundary` refuses it, as any.
-        return Ok(Ok(resolved));
+) -> crate::error::Result<Result<StanceTags, StanceRefusal>> {
+    use crate::retraction::{
+        DOUBTED_EVENT_TYPE, DOUBTS_TAG_KEY, DOUBT_LIFTED_EVENT_TYPE, RETRACTED_EVENT_TYPE,
+        RETRACTS_TAG_KEY,
     };
+    let mut resolved: StanceTags = Vec::new();
     let schema = schema_ident(&command_type.bounded_context.name);
-    let mut seen = std::collections::HashSet::new();
+    let mut retracted_here = std::collections::HashSet::new();
+    let mut doubt_here = std::collections::HashMap::new();
     for (index, spec) in event_specs.iter_mut().enumerate() {
-        if spec.event_type != RETRACTED_EVENT_TYPE {
+        let Some(stance) = Stance::of(spec) else {
             continue;
-        }
-        let mut retraction: RetractionPayload = match serde_json::from_value(spec.payload.clone()) {
-            Ok(retraction) => retraction,
-            Err(error) => {
-                return Ok(Err((
-                    format!("not a retraction: {error}"),
-                    "invalid_retraction",
-                )));
-            }
         };
-        let position = retraction.position;
+        // Unregistered: `process_command_at_boundary` refuses it, as any.
+        let Some(stance_type) = event_types_by_name.get(&spec.event_type) else {
+            continue;
+        };
+        let mut stance = match stance {
+            Ok(stance) => stance,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let position = stance.position();
         let position_tag = position.to_string();
         let target = match extra_committed_events
             .iter()
@@ -538,20 +651,48 @@ async fn resolve_retractions(
             .map(|(name, Json(tags))| (name, tags)),
         };
         let Some((target_type, target_tags)) = target else {
-            return Ok(Err((
-                format!("no event at position {position} to retract"),
-                "retraction_target_not_found",
-            )));
+            return Ok(Err(if stance.is_retraction() {
+                (
+                    format!("no event at position {position} to retract"),
+                    "retraction_target_not_found",
+                )
+            } else {
+                (
+                    format!("no event at position {position} to doubt"),
+                    "doubt_target_not_found",
+                )
+            }));
         };
-        if target_type == RETRACTED_EVENT_TYPE {
+        if stance.is_retraction() && target_type == RETRACTED_EVENT_TYPE {
             return Ok(Err((
                 format!(
-                    "position {position} is a retraction; record the event again instead of                      retracting the retraction"
+                    "position {position} is a retraction; record the event again instead of \
+                     retracting the retraction"
                 ),
                 "retraction_of_retraction",
             )));
         }
-        // A command scoped to an owner retracts that owner's events only: the
+        if stance.is_retraction()
+            && (target_type == DOUBTED_EVENT_TYPE || target_type == DOUBT_LIFTED_EVENT_TYPE)
+        {
+            return Ok(Err((
+                format!("position {position} is a doubt; lift it instead of retracting it"),
+                "retraction_of_doubt",
+            )));
+        }
+        if !stance.is_retraction()
+            && (target_type == RETRACTED_EVENT_TYPE
+                || target_type == DOUBTED_EVENT_TYPE
+                || target_type == DOUBT_LIFTED_EVENT_TYPE)
+        {
+            return Ok(Err((
+                format!(
+                    "position {position} says something about another event; it can't be doubted"
+                ),
+                "doubt_of_stance",
+            )));
+        }
+        // A command scoped to an owner acts on that owner's events only: the
         // position is the caller's to choose, and a retraction frees a value.
         if let Some(owner_key) = &command_type.owner_tag_key {
             let in_scope = consistency_tags
@@ -561,51 +702,90 @@ async fn resolve_retractions(
             if !in_scope {
                 return Ok(Err((
                     format!("the event at position {position} belongs to another {owner_key}"),
-                    "retraction_target_out_of_scope",
+                    if stance.is_retraction() {
+                        "retraction_target_out_of_scope"
+                    } else {
+                        "doubt_target_out_of_scope"
+                    },
                 )));
             }
         }
-        let mut already = !seen.insert(position);
-        if !already {
-            already = extra_committed_events.iter().any(|event| {
-                event.event_type.name == RETRACTED_EVENT_TYPE
-                    && event.tags.iter().any(|tag| {
-                        tag.key == RETRACTS_TAG_KEY
-                            && tag.value.as_deref() == Some(position_tag.as_str())
-                    })
-            });
+        let retracted = is_retracted(
+            &mut *conn,
+            &schema,
+            extra_committed_events,
+            &retracted_here,
+            position,
+        )
+        .await?;
+        if retracted {
+            return Ok(Err(if stance.is_retraction() {
+                (
+                    format!("the event at position {position} is already retracted"),
+                    "already_retracted",
+                )
+            } else {
+                (
+                    format!("the event at position {position} is retracted, which ended any doubt"),
+                    "doubt_target_retracted",
+                )
+            }));
         }
-        if !already {
-            already = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
-                "SELECT EXISTS (SELECT 1 FROM {schema}.event_tags                  WHERE tag_key = $1 AND tag_value = $2 AND event_type_name = $3)"
-            )))
-            .bind(RETRACTS_TAG_KEY)
-            .bind(&position_tag)
-            .bind(RETRACTED_EVENT_TYPE)
-            .fetch_one(&mut *conn)
-            .await?;
-        }
-        if already {
-            return Ok(Err((
-                format!("the event at position {position} is already retracted"),
-                "already_retracted",
-            )));
-        }
-        // The one owner tag an owner-scoped retraction type is read by. An
-        // event without it stays hidden from every scoped reader, failing
-        // closed rather than showing a scoped reader someone else's tags.
-        retraction.owner = retraction_type.owner_tag_key.as_ref().and_then(|key| {
+        // The one owner tag an owner-scoped type is read by. An event without
+        // it stays hidden from every scoped reader, failing closed rather than
+        // showing a scoped reader someone else's tags.
+        let owner = stance_type.owner_tag_key.as_ref().and_then(|key| {
             target_tags
                 .iter()
                 .find(|tag| &tag.key == key)
                 .and_then(|tag| tag.value.clone())
         });
-        retraction.retracted_event_type = Some(target_type);
-        spec.payload = serde_json::to_value(&retraction)
+        let tag_key = match &stance {
+            Stance::Retraction(_) => RETRACTS_TAG_KEY,
+            Stance::Doubt(_) | Stance::Lift(_) => DOUBTS_TAG_KEY,
+        };
+        let payload = match &mut stance {
+            Stance::Retraction(retraction) => {
+                retracted_here.insert(position);
+                retraction.owner = owner;
+                retraction.retracted_event_type = Some(target_type);
+                serde_json::to_value(&*retraction)
+            }
+            Stance::Doubt(doubt) | Stance::Lift(doubt) => {
+                doubt.owner = owner;
+                doubt.doubted_event_type = Some(target_type);
+                serde_json::to_value(&*doubt)
+            }
+        };
+        if !stance.is_retraction() {
+            let open = doubt_is_open(
+                &mut *conn,
+                &schema,
+                extra_committed_events,
+                &doubt_here,
+                position,
+            )
+            .await?;
+            let opening = matches!(stance, Stance::Doubt(_));
+            if opening && open {
+                return Ok(Err((
+                    format!("the event at position {position} is already in doubt"),
+                    "already_doubted",
+                )));
+            }
+            if !opening && !open {
+                return Ok(Err((
+                    format!("the event at position {position} isn't in doubt"),
+                    "no_open_doubt",
+                )));
+            }
+            doubt_here.insert(position, opening);
+        }
+        spec.payload = payload
             .map_err(|error| crate::event_store::Error::PayloadDecodeFailed(error.to_string()))?;
         let mut tags = target_tags;
         tags.push(Tag {
-            key: RETRACTS_TAG_KEY.to_string(),
+            key: tag_key.to_string(),
             value: Some(position_tag),
         });
         resolved.push((index, tags));
@@ -613,10 +793,10 @@ async fn resolve_retractions(
     Ok(Ok(resolved))
 }
 
-/// Gives a command's events the tags [`resolve_retractions`] settled on. Events
-/// are built one per spec, in order.
-fn apply_retraction_tags(events: &mut [Event], retraction_tags: RetractionTags) {
-    for (index, tags) in retraction_tags {
+/// Gives a command's events the tags [`resolve_stances`] settled on. Events are
+/// built one per spec, in order.
+fn apply_stance_tags(events: &mut [Event], stance_tags: StanceTags) {
+    for (index, tags) in stance_tags {
         if let Some(event) = events.get_mut(index) {
             event.tags = tags;
         }
@@ -1050,7 +1230,7 @@ pub(super) async fn decide_command_in_tx(
         }
     }
 
-    let retraction_tags = match resolve_retractions(
+    let stance_tags = match resolve_stances(
         &mut *conn,
         command_type,
         consistency_tags,
@@ -1084,7 +1264,7 @@ pub(super) async fn decide_command_in_tx(
         consistency_query,
         event_types_by_name,
         blind: dispatcher.blind_index(),
-        retraction_tags,
+        stance_tags,
     }))
 }
 
@@ -1203,7 +1383,7 @@ pub(super) async fn finish_accepted_command_in_tx(
         consistency_query,
         event_types_by_name,
         blind,
-        retraction_tags,
+        stance_tags,
     } = decided;
     let mut sequences = sequences.into_iter();
 
@@ -1248,7 +1428,7 @@ pub(super) async fn finish_accepted_command_in_tx(
         },
         &blind,
     )?;
-    apply_retraction_tags(&mut result.events, retraction_tags);
+    apply_stance_tags(&mut result.events, stance_tags);
 
     // Command and every one of its triggered events, in the one
     // (savepoint-scoped, in the batched path) transaction `tx` has held
@@ -1952,7 +2132,7 @@ pub(super) async fn write_command_batch_as_set(
             consistency_query,
             event_types_by_name,
             blind,
-            retraction_tags,
+            stance_tags,
         } = match decided {
             Ok(DecideOutcome::Terminal(outcome)) => {
                 results.push(Some(Ok(outcome)));
@@ -2035,7 +2215,7 @@ pub(super) async fn write_command_batch_as_set(
                 continue;
             }
         };
-        apply_retraction_tags(&mut result.events, retraction_tags);
+        apply_stance_tags(&mut result.events, stance_tags);
         highest_assigned = assigned;
 
         if let Some(key) = &item.idempotency_key {
@@ -3115,9 +3295,9 @@ pub async fn dry_run_command(
                 &dispatcher.blind_index(),
                 &command_type.bounded_context.name,
             )?;
-            let retraction_tags = {
+            let stance_tags = {
                 let mut conn = pool.acquire().await?;
-                match resolve_retractions(
+                match resolve_stances(
                     &mut conn,
                     command_type,
                     &consistency_tags,
@@ -3155,7 +3335,7 @@ pub async fn dry_run_command(
                     client_id: client_id.to_string(),
                 });
             }
-            for (index, tags) in retraction_tags {
+            for (index, tags) in stance_tags {
                 if let Some(event) = events.get_mut(index) {
                     event.tags = tags;
                 }

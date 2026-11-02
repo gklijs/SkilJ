@@ -166,14 +166,10 @@ pub(crate) async fn fetch_projection_result(
         .map_err(to_graphql_error)?,
     };
 
-    let stored = skilj_core::db::get_projection_state_and_owner(
-        &state.pool,
-        bounded_context_name,
-        name,
-        key,
-    )
-    .await
-    .map_err(to_graphql_error)?;
+    let stored =
+        skilj_core::db::get_stored_projection_row(&state.pool, bounded_context_name, name, key)
+            .await
+            .map_err(to_graphql_error)?;
     projection_instance(
         state,
         access_mapping,
@@ -206,16 +202,21 @@ async fn projection_instance(
     wait_for_sequence: Option<i64>,
     caught_up: bool,
     requires_capability: Option<&str>,
-    stored: Option<(String, Option<String>)>,
+    stored: Option<skilj_core::db::StoredProjectionRow>,
 ) -> async_graphql::Result<(crate::projection_types::ProjectionInstance, String)> {
     // Cross-tenant projection read fix (docs/architecture.md's own
     // write-up of this pass): `instance_owner` is this row's own `owner`
     // column, `None` for a row that doesn't exist yet - the same "no
     // proven owner" treatment either way, decided by `query_projection`
     // below, not here.
-    let instance_owner = stored.as_ref().and_then(|(_, owner)| owner.clone());
+    let instance_owner = stored.as_ref().and_then(|row| row.owner.clone());
+    // docs/architecture.md §237: what the served state was folded through.
+    let as_of_sequence = stored
+        .as_ref()
+        .map(|row| row.as_of_sequence)
+        .filter(|sequence| *sequence >= 0);
     let state_json = stored
-        .map(|(state_json, _)| state_json)
+        .map(|row| row.state)
         .or_else(|| {
             state
                 .projection_dispatcher
@@ -275,6 +276,7 @@ async fn projection_instance(
         crate::projection_types::ProjectionInstance {
             key: key.to_string(),
             state: value,
+            as_of_sequence,
         },
         state
             .naming

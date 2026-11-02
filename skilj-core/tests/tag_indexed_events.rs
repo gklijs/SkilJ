@@ -393,6 +393,7 @@ fn a_tagged_read_walks_matches_in_bounded_chunks() {
             &bc.name,
             &[tag("customer", "c1")],
             expected[1],
+            None,
             3,
             |chunk, room| Ok(chunk.iter().take(room).cloned().collect()),
         )
@@ -402,5 +403,28 @@ fn a_tagged_read_walks_matches_in_bounded_chunks() {
             page.iter().map(|e| e.sequence).collect::<Vec<_>>(),
             expected[2..5].to_vec()
         );
+
+        // An as-of read (docs/architecture.md §237) serves nothing past its
+        // bound, and doesn't ask for another chunk once it's passed it.
+        let mut selects = 0;
+        let page = db::collect_tagged_event_page(
+            &pool,
+            &bc.name,
+            &[tag("customer", "c1")],
+            -1,
+            Some(expected[1]),
+            2,
+            |chunk, room| {
+                selects += 1;
+                Ok(chunk.iter().take(room).cloned().collect())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            expected[..2].to_vec()
+        );
+        assert_eq!(selects, 1);
     });
 }

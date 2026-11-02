@@ -1,0 +1,62 @@
+# Seats, one holder each, with mistakes corrected and doubts raised
+# (docs/architecture.md §235, §236). `retractions` and `doubts` register the
+# built-in event types; `retractable` hands a command's decide_* events with
+# their positions and tags, and has its query read the retractions as well.
+# build.rs generates tests/seats.rs's types from this; the decide_* functions
+# there are hand-written.
+
+bounded_context = "seats"
+retractions = true
+doubts = true
+
+[[event_type]]
+name = "SeatClaimed"
+fields = [
+    { name = "seat", type = "string" },
+    { name = "holder", type = "string" },
+]
+tags = { seat = "seat", holder = "holder" }
+
+[[command_type]]
+name = "ClaimSeat"
+retractable = true
+fields = [
+    { name = "seat", type = "string" },
+    { name = "holder", type = "string" },
+]
+tags = { seat = "seat", holder = "holder" }
+
+[[command_type.query]]
+event_types = ["SeatClaimed"]
+tags = ["seat"]
+
+# Moves a holder to the seat they should have had: their mistaken claim is
+# retracted, and the new one recorded, in one append.
+[[command_type]]
+name = "CorrectSeat"
+retractable = true
+fields = [
+    { name = "seat", type = "string" },
+    { name = "holder", type = "string" },
+]
+tags = { seat = "seat", holder = "holder" }
+
+[[command_type.query]]
+event_types = ["SeatClaimed"]
+tags = ["seat"]
+
+[[command_type.query]]
+event_types = ["SeatClaimed"]
+tags = ["holder"]
+
+# Raises a doubt about what a holder holds, reading the doubts as well so a
+# second one is answered by the decision rather than by the store.
+[[command_type]]
+name = "QuestionSeat"
+retractable = true
+fields = [{ name = "holder", type = "string" }]
+tags = { holder = "holder" }
+
+[[command_type.query]]
+event_types = ["SeatClaimed", "EventDoubted", "DoubtLifted"]
+tags = ["holder"]

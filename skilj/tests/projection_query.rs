@@ -312,6 +312,8 @@ impl Projection for CustomerProfile {
     type Event = BankingEvent;
     const NAME: &'static str = "CustomerProfile";
     const SUBJECT_KEY: Option<&'static str> = Some("customer");
+    // The rebuilds in the test add an optional field the fold doesn't touch.
+    const LIVE_FOLD_COMPATIBLE: bool = true;
     fn consumed_event_types() -> Vec<&'static str> {
         vec!["AccountOpened"]
     }
@@ -1437,7 +1439,8 @@ const FORGET_SUBJECT_MUTATION: &str = "\
 /// key makes even the previously-granted caller see ciphertext again -
 /// the crypto-shredding guarantee verified through a projection this
 /// time, not just raw events (`skilj/tests/decrypt_on_read.rs` already
-/// covers that for events).
+/// covers that for events). Nor does a rebuild bring the value back, with or
+/// without a new key for the subject (docs/architecture.md §235, issue #133).
 #[test]
 fn keyed_projection_decrypt_on_read_end_to_end() {
     runtime().block_on(async {
@@ -1697,7 +1700,220 @@ fn keyed_projection_decrypt_on_read_end_to_end() {
             "unexpected errors: {response:?}"
         );
         assert_eq!(response["data"]["projection"]["email"], ciphertext);
+
+        // A rebuild folds what's stored, so the forgotten value can't come
+        // back through it.
+        rebuild_customer_profile(&graphql_router, &admin_jwt, &pool, &bc_name, &["first"]).await;
+        let response = graphql_request(
+            &graphql_router,
+            Some(&sensitive_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": "cust-1" }),
+        )
+        .await;
+        assert_eq!(response["data"]["projection"]["email"], ciphertext);
+
+        // Nor through a new key for the same subject: an event after the
+        // erasure is new data, readable, and the one before it stays shredded,
+        // also after another rebuild.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/direct")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "payload": { "customer_id": "cust-1", "email": "new@example.com" } })
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = skilj.rest_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        rebuild_customer_profile(
+            &graphql_router,
+            &admin_jwt,
+            &pool,
+            &bc_name,
+            &["first", "second"],
+        )
+        .await;
+        let response = graphql_request(
+            &graphql_router,
+            Some(&sensitive_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": "cust-1" }),
+        )
+        .await;
+        assert_eq!(response["data"]["projection"]["email"], "new@example.com");
+
+        // docs/architecture.md §237: the response says what it reflects, and
+        // an as-of read gets the events as they stood then. A rebuilt row has
+        // its own position, like any.
+        let positions: Vec<i64> = skilj_core::db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|event| event.sequence)
+            .collect();
+        let [first, second] = positions[..] else {
+            panic!("two events: {positions:?}");
+        };
+        let as_of_query = format!(
+            "query($bc: String!, $key: String) {{ \
+                projection(boundedContext: $bc, name: \"CustomerProfile\", key: $key) {{ \
+                    ... on {type_name} {{ asOfSequence }} \
+                }} \
+            }}"
+        );
+        let response = graphql_request(
+            &graphql_router,
+            Some(&sensitive_jwt),
+            &as_of_query,
+            json!({ "bc": bc_name, "key": "cust-1" }),
+        )
+        .await;
+        assert_eq!(response["data"]["projection"]["asOfSequence"], second);
+        let response = graphql_request(
+            &graphql_router,
+            Some(&sensitive_jwt),
+            &as_of_query,
+            json!({ "bc": bc_name, "key": "nobody" }),
+        )
+        .await;
+        assert!(
+            response["data"]["projection"]["asOfSequence"].is_null(),
+            "{response:?}"
+        );
+        // `queryEvents` is Admin-level.
+        let auditor = Role {
+            id: generate_token_id(),
+            external_subject: unique_name("auditor"),
+            name: "Auditor".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &auditor).await.unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: auditor.clone(),
+                bounded_context: bc.clone(),
+                level: AccessLevel::Admin,
+                can_read_sensitive: true,
+                scope: None,
+                capabilities: Default::default(),
+                delegable: Default::default(),
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let response = graphql_request(
+            &graphql_router,
+            Some(&sign_jwt(&auditor.external_subject)),
+            "query($bc: String!) { \
+                queryEvents(boundedContext: $bc, eventTypes: [\"AccountOpened\"]) { payload } \
+            }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        let events = response["data"]["queryEvents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{response:?}"));
+        assert_eq!(events.len(), 2, "{response:?}");
+        let payload = |index: usize| -> serde_json::Value {
+            serde_json::from_str(events[index]["payload"].as_str().unwrap()).unwrap()
+        };
+        assert_eq!(payload(0)["email"], ciphertext.as_str());
+        assert_eq!(payload(1)["email"], "new@example.com");
+
+        let response = graphql_request(
+            &graphql_router,
+            Some(&sign_jwt(&auditor.external_subject)),
+            "query($bc: String!, $upTo: Int) { \
+                queryEvents(boundedContext: $bc, eventTypes: [\"AccountOpened\"], \
+                    upToSequence: $upTo) { sequence } \
+            }",
+            json!({ "bc": bc_name, "upTo": first }),
+        )
+        .await;
+        assert_eq!(
+            response["data"]["queryEvents"],
+            json!([{ "sequence": first }]),
+            "{response:?}"
+        );
     });
+}
+
+/// Rebuilds `CustomerProfile` from history and waits for the promotion. A
+/// rebuild needs a changed schema to stage it, so this adds the
+/// optional fields `markers`, each rebuild's list holding the ones before it so
+/// the change stays backwards compatible.
+async fn rebuild_customer_profile(
+    router: &axum::Router,
+    admin_jwt: &str,
+    pool: &skilj_core::db::Pool,
+    bounded_context: &str,
+    markers: &[&str],
+) {
+    let mut properties = json!({ "email": { "type": "string" } });
+    for marker in markers {
+        properties[*marker] = json!({ "type": "string" });
+    }
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "CustomerProfileState",
+        "type": "object",
+        "properties": properties,
+        "required": ["email"],
+    })
+    .to_string();
+    let response = graphql_request(
+        router,
+        Some(admin_jwt),
+        "mutation($bc: String!, $schema: String!) { \
+            registerProjection(boundedContext: $bc, name: \"CustomerProfile\", schema: $schema, \
+                sync: true, consumedEventTypes: [\"AccountOpened\"]) { \
+                rebuild { status } \
+            } \
+        }",
+        json!({ "bc": bounded_context, "schema": schema }),
+    )
+    .await;
+    assert_eq!(
+        response["data"]["registerProjection"]["rebuild"]["status"], "PENDING",
+        "{response:?}"
+    );
+    let response = graphql_request(
+        router,
+        Some(admin_jwt),
+        "mutation($bc: String!, $name: String!) { \
+            rebuildProjection(boundedContext: $bc, name: $name) { status } \
+        }",
+        json!({ "bc": bounded_context, "name": "CustomerProfile" }),
+    )
+    .await;
+    assert_eq!(
+        response["data"]["rebuildProjection"]["status"], "BUILDING",
+        "{response:?}"
+    );
+    for _ in 0..200 {
+        let projection = skilj_core::db::get_projection(pool, bounded_context, "CustomerProfile")
+            .await
+            .unwrap()
+            .unwrap();
+        if markers
+            .iter()
+            .all(|marker| projection.schema.contains(marker))
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the rebuild was never promoted");
 }
 
 /// Two projections whose generated GraphQL type names collide - bounded
@@ -1831,7 +2047,7 @@ fn colliding_projection_type_names_serve_one_and_refuse_the_other() {
         .await;
         assert_eq!(
             response["data"]["__type"]["fields"],
-            json!([{ "name": served[0] }]),
+            json!([{ "name": served[0] }, { "name": "asOfSequence" }]),
             "the type is the served projection's own: {response:?}"
         );
     });

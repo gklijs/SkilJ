@@ -250,6 +250,8 @@ enum LedgerFilterOperator {
 type LedgerInspectedEvent @inaccessible {
 	event: LedgerEventMeta!
 	renderedPayload: String!
+	retractedBy: Int
+	doubtedBy: Int
 }
 
 type LedgerInspectedSnapshot @inaccessible {
@@ -488,6 +490,7 @@ type LedgerWouldBeEvent @inaccessible {
 
 type Ledgerfed_published_AccountBalance @key(fields: "projectionKey") {
 	total: Int!
+	asOfSequence: Int
 	projectionKey: String!
 }
 
@@ -539,7 +542,7 @@ type Query {
 	ledgerScheduledEventTypes(boundedContext: String!): [LedgerEventType!]! @inaccessible
 	ledgerEventTypes(boundedContext: String!): [LedgerEventType!]! @inaccessible
 	ledgerCommandTypes(boundedContext: String!): [LedgerCommandType!]! @inaccessible
-	ledgerQueryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [LedgerTagInput!], afterSequence: Int, correlationId: String): [LedgerQueriedEvent!]! @inaccessible
+	ledgerQueryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [LedgerTagInput!], afterSequence: Int, upToSequence: Int, correlationId: String): [LedgerQueriedEvent!]! @inaccessible
 	ledgerSearchUsedTags(boundedContext: String!, key: String!, prefix: String, limit: Int, eventTypeName: String): [LedgerUsedTag!]! @inaccessible
 	ledgerCountEvents(boundedContext: String!, eventTypes: [String!]!, tags: [LedgerTagInput!], correlationId: String): Int! @inaccessible
 	ledgerInspectEvent(boundedContext: String!, sequence: Int!): LedgerInspectedEvent! @inaccessible

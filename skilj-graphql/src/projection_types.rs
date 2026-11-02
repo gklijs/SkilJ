@@ -76,6 +76,10 @@ pub fn graphql_type_name(bounded_context: &str, projection_name: &str) -> String
     format!("{bounded_context}_{projection_name}")
 }
 
+/// The field every projection type has besides its state's: see
+/// [`ProjectionInstance::as_of_sequence`].
+const AS_OF_SEQUENCE_FIELD: &str = "asOfSequence";
+
 /// What a projection type's own fields resolve against: one instance's
 /// key and its decoded state. Nested shapes below it resolve against
 /// their part of `state` directly.
@@ -83,6 +87,9 @@ pub fn graphql_type_name(bounded_context: &str, projection_name: &str) -> String
 pub struct ProjectionInstance {
     pub key: String,
     pub state: serde_json::Value,
+    /// The sequence of the last event folded into `state`; `None` for an
+    /// instance nothing has been folded into.
+    pub as_of_sequence: Option<i64>,
 }
 
 /// Every registered projection's generated `Object` (including any
@@ -378,6 +385,20 @@ fn object_from_schema_value(
             extra_enums,
         );
         object = object.field(field);
+    }
+    // docs/architecture.md §237: which events the served state reflects, for a
+    // recipient to refer back to. A state's own field of this name stays.
+    if depth == 0 && field_names.insert(AS_OF_SEQUENCE_FIELD.to_string()) {
+        object = object.field(Field::new(
+            AS_OF_SEQUENCE_FIELD,
+            TypeRef::named(TypeRef::INT),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let instance = ctx.parent_value.try_downcast_ref::<ProjectionInstance>()?;
+                    Ok(instance.as_of_sequence.map(FieldValue::value))
+                })
+            },
+        ));
     }
     Some(object)
 }
@@ -750,6 +771,7 @@ mod tests {
                     Ok(Some(FieldValue::owned_any(ProjectionInstance {
                         key: String::new(),
                         state,
+                        as_of_sequence: None,
                     })))
                 })
             },
@@ -946,6 +968,7 @@ mod tests {
                         Ok(Some(FieldValue::owned_any(ProjectionInstance {
                             key: String::new(),
                             state,
+                            as_of_sequence: None,
                         })))
                     })
                 },

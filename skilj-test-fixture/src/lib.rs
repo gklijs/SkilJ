@@ -34,11 +34,15 @@
 //!
 //! See `skilj-demo/tests/banking_fixture.rs` for this against real,
 //! codegen'd `CommandType`/`Projection` impls.
+//!
+//! [`corrections`] is the one part that does need a running store: race
+//! scenarios to run against your own commands.
 
 // Every public item is documented; CI fails on a gap (`-D warnings`).
 #![warn(missing_docs)]
 
 pub mod command;
+pub mod corrections;
 pub mod projection;
 
 /// Shared by both `command::CommandOutcome` and `projection`'s state

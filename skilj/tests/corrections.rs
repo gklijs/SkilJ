@@ -6,8 +6,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::retraction::{
-    claim_query, corrected, correction_query, retract, Retractable, RetractionGround,
-    RetractionPayload, ValueClaims, ValueEffect, RETRACTED_EVENT_TYPE, RETRACTS_TAG_KEY,
+    claim_query, corrected, correction_query, doubt, lift_doubt, open_doubts, retract,
+    DoubtPayload, Retractable, RetractionGround, RetractionPayload, ValueClaims, ValueEffect,
+    DOUBTED_EVENT_TYPE, DOUBTS_TAG_KEY, DOUBT_EVENT_TYPES, DOUBT_LIFTED_EVENT_TYPE,
+    RETRACTED_EVENT_TYPE, RETRACTS_TAG_KEY,
 };
 use skilj::{
     normalize, BlindErasure, BlindIndexKey, BlindTag, CommandType, EventType, KeyService,
@@ -24,6 +26,7 @@ use skilj_core::plugin::BoundedContextEvent;
 use skilj_core::shared::{
     generate_token_id, CommandDecision, EventSpec, QueryItemMapping, SensitiveField, TagMapping,
 };
+use skilj_test_fixture::corrections::{all_races, UniqueValueCommands};
 
 struct Email;
 
@@ -472,6 +475,11 @@ async fn crm() -> Option<Crm> {
     let (bc, subject) = bounded_context(&pool).await;
     let (skilj, _) = builder(&database_url, &bc, &subject)
         .retractions()
+        .doubts()
+        .command_type::<DoubtAny>()
+        .command_type::<LiftDoubt>()
+        .command_type::<ReportDoubts>()
+        .command_type::<DoubtAndRetract>()
         .snapshot::<ClaimCount>()
         .snapshot::<PartitionedClaimCount>()
         .command_type::<ReportClaimCount>()
@@ -663,88 +671,61 @@ fn a_correction_to_a_value_someone_holds_is_rejected() {
     });
 }
 
-/// A correction racing a new claim of its target: they conflict on the new
-/// value's tag, so exactly one gets it.
-#[test]
-fn a_correction_racing_a_claim_of_the_target_lets_exactly_one_win() {
-    runtime().block_on(async {
-        let Some(crm) = crm().await else {
-            return;
-        };
-        for round in 0..8 {
-            let alice = id("c");
-            let target = format!("target{round}@example.com");
-            let start = format!("start{round}@example.com");
-            assert_eq!(crm.register(&alice, &start).await, "accepted");
-            let bob = id("c");
-            let (corrected, registered) =
-                tokio::join!(crm.correct(&alice, &target), crm.register(&bob, &target));
-            let outcomes = [corrected, registered];
-            assert_eq!(
-                outcomes.iter().filter(|k| *k == "accepted").count(),
-                1,
-                "{outcomes:?}"
-            );
-            assert_eq!(
-                outcomes.iter().filter(|k| *k == "email_taken").count(),
-                1,
-                "{outcomes:?}"
-            );
-        }
-        crm.shutdown().await;
-    });
+impl UniqueValueCommands for Crm {
+    async fn claim(&self, identity: &str, value: &str) -> Result<(), String> {
+        accepted(self.register(identity, value).await)
+    }
+
+    async fn correct(&self, identity: &str, value: &str) -> Result<(), String> {
+        accepted(Crm::correct(self, identity, value).await)
+    }
+
+    async fn retract_claim(&self, identity: &str) -> Result<(), String> {
+        let position =
+            self.events()
+                .await
+                .iter()
+                .rfind(|event| {
+                    event.event_type.name == "EmailClaimed"
+                        && event.tags.iter().any(|tag| {
+                            tag.key == "customer" && tag.value.as_deref() == Some(identity)
+                        })
+                })
+                .map(|event| event.sequence)
+                .ok_or("nothing_to_retract")?;
+        accepted(self.retract(position).await)
+    }
 }
 
-/// Two corrections of one customer conflict on the customer's tag. Whichever
-/// goes second sees the first's claim and retracts that, so one address stands
-/// at the end and the other is free.
+fn accepted(kind: String) -> Result<(), String> {
+    if kind == "accepted" {
+        Ok(())
+    } else {
+        Err(kind)
+    }
+}
+
+/// The published scenarios (`skilj_test_fixture::corrections`), against the
+/// store: a correction racing a claim of its target, corrections racing each
+/// other, and a retraction followed by a new claim.
 #[test]
-fn corrections_racing_each_other_leave_one_standing_claim() {
+fn the_published_correction_races_hold_against_the_store() {
     runtime().block_on(async {
         let Some(crm) = crm().await else {
             return;
         };
+        all_races(&crm).await;
+
+        // The scenario allows an application to reject the second of two
+        // corrections. The store's own retry goes further: it decides again, on
+        // what the first left, and both go through.
         let alice = id("c");
         assert_eq!(crm.register(&alice, "start@example.com").await, "accepted");
         let (first, second) = tokio::join!(
-            crm.correct(&alice, "first@example.com"),
-            crm.correct(&alice, "second@example.com"),
+            Crm::correct(&crm, &alice, "first@example.com"),
+            Crm::correct(&crm, &alice, "second@example.com"),
         );
         assert_eq!((first.as_str(), second.as_str()), ("accepted", "accepted"));
-
-        assert_eq!(
-            crm.register(&id("c"), "start@example.com").await,
-            "accepted"
-        );
-        let first_free = crm.register(&id("c"), "first@example.com").await == "accepted";
-        let second_free = crm.register(&id("c"), "second@example.com").await == "accepted";
-        assert_ne!(first_free, second_free, "one is held, the other free");
-        crm.shutdown().await;
-    });
-}
-
-/// Retraction followed by re-registration: the value is free for anyone, and
-/// the earlier claim, retracted, doesn't count against the new holder.
-#[test]
-fn a_retracted_claim_can_be_registered_again() {
-    runtime().block_on(async {
-        let Some(crm) = crm().await else {
-            return;
-        };
-        assert_eq!(
-            crm.register(&id("c"), "alice@example.com").await,
-            "accepted"
-        );
-        let position = crm.latest_position().await;
-        assert_eq!(crm.retract(position).await, "accepted");
-        assert_eq!(
-            crm.register(&id("c"), "alice@example.com").await,
-            "accepted"
-        );
-        assert_eq!(
-            crm.register(&id("c"), "alice@example.com").await,
-            "email_taken"
-        );
         crm.shutdown().await;
     });
 }
@@ -1393,6 +1374,1287 @@ fn the_retraction_type_name_is_reserved() {
         let (bc, subject) = bounded_context(&pool).await;
         let error = builder(&database_url, &bc, &subject)
             .event_type::<FakeRetraction>()
+            .build()
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(error.code(), "reserved_event_type_name", "{error}");
+    });
+}
+
+/// Folds the stored address into its state, the ciphertext being all a fold
+/// ever gets.
+#[derive(Debug)]
+struct StoredAddress(String);
+
+impl BoundedContextEvent for StoredAddress {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        (event.event_type.name == "EmailClaimed").then(|| {
+            serde_json::from_str::<EmailPayload>(&event.payload)
+                .map(|payload| StoredAddress(payload.email))
+        })
+    }
+}
+
+struct LastAddress;
+
+impl Snapshot for LastAddress {
+    type State = String;
+    type Event = StoredAddress;
+    const NAME: &'static str = "LastAddress";
+    const TAG_KEY: &'static str = "customer";
+    const VERSION: u64 = 1;
+    fn fold(state: &mut Self::State, event: &Self::Event) {
+        state.clone_from(&event.0);
+    }
+}
+
+/// A row refolded from history after `forgetSubject`, here because of a
+/// retraction, is folded from what's stored: the forgotten address can't come
+/// back through it. The issue asks this of a rebuild; `projection_query.rs`
+/// covers a projection's.
+#[test]
+fn a_snapshot_refolded_after_erasure_holds_no_plaintext() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc, subject) = bounded_context(&pool).await;
+        let (skilj, _) = builder(&database_url, &bc, &subject)
+            .retractions()
+            .snapshot::<LastAddress>()
+            .build()
+            .await
+            .unwrap();
+        let crm = Crm {
+            skilj,
+            pool,
+            bc,
+            cache: EventCache::new(1000),
+        };
+        let (customer, positions) = crm.customer_with_claims(2).await;
+        crm.catch_up_snapshots().await;
+        let stored = |crm: &Crm, customer: String| {
+            let (pool, bc) = (crm.pool.clone(), crm.bc.clone());
+            async move {
+                let (_, _, state, _) =
+                    db::get_snapshot_state(&pool, &bc, "LastAddress", "customer", &customer)
+                        .await
+                        .unwrap()
+                        .expect("a stored row");
+                serde_json::from_str::<String>(&state).unwrap()
+            }
+        };
+        assert!(!stored(&crm, customer.clone()).await.contains('@'));
+
+        db::forget_subject_in_blind_tags(&crm.pool, &crm.bc, "customer", &customer)
+            .await
+            .unwrap();
+        db::destroy_encryption_key(&crm.pool, &crm.bc, "customer", &customer, now())
+            .await
+            .unwrap();
+
+        // Retracting the event the row holds makes catch-up start it over.
+        assert_eq!(crm.retract(positions[1]).await, "accepted");
+        crm.catch_up_snapshots().await;
+
+        let first = crm
+            .events()
+            .await
+            .into_iter()
+            .find(|event| event.sequence == positions[0])
+            .unwrap();
+        let first: EmailPayload = serde_json::from_str(&first.payload).unwrap();
+        let state = stored(&crm, customer).await;
+        assert_eq!(state, first.email, "the fold of the event still standing");
+        assert!(!state.contains('@'), "{state}");
+        crm.shutdown().await;
+    });
+}
+
+/// What a retraction does to work its target already started: nothing. The
+/// store has no way from a retraction to a deadline or a route's delivery, so
+/// whether it matters is up to the commands they submit (docs/architecture.md
+/// §235).
+mod side_effects {
+    use super::*;
+    use skilj::retraction::standing;
+    use skilj::{CancelDeadline, CrossContextRoute, ScheduleDeadline};
+    use skilj_core::plugin::DeadlineSpec;
+    use skilj_core::shared::Tag;
+
+    const SHOP: &str = "skilj_corrections_shop";
+    const STOCK: &str = "skilj_corrections_stock";
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct Order {
+        order_id: String,
+        deadline_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct OrderId {
+        order_id: String,
+    }
+
+    fn order_tag() -> TagMapping {
+        TagMapping::new("order", "order_id")
+    }
+
+    macro_rules! shop_event {
+        ($name:ident, $payload:ty, $bc:expr) => {
+            struct $name;
+            impl EventType for $name {
+                type Payload = $payload;
+                const NAME: &'static str = stringify!($name);
+                const BOUNDED_CONTEXT: &'static str = $bc;
+                fn tag_mappings() -> Vec<TagMapping> {
+                    vec![order_tag()]
+                }
+            }
+        };
+    }
+
+    shop_event!(OrderPlaced, Order, SHOP);
+    shop_event!(OrderWithdrawn, OrderId, SHOP);
+    shop_event!(OrderExpired, OrderId, SHOP);
+    shop_event!(OrderExpiredAnyway, OrderId, SHOP);
+    shop_event!(StockReserved, OrderId, STOCK);
+
+    /// An order, to whichever command folds it.
+    struct Placed;
+
+    impl BoundedContextEvent for Placed {
+        fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+            (event.event_type.name == "OrderPlaced").then_some(Ok(Placed))
+        }
+    }
+
+    fn emit<P: Serialize>(event_type: &str, payload: &P) -> EventSpec {
+        EventSpec {
+            event_type: event_type.into(),
+            payload: serde_json::to_value(payload).unwrap(),
+        }
+    }
+
+    struct PlaceOrder;
+
+    impl CommandType for PlaceOrder {
+        type Payload = Order;
+        type Event = Placed;
+        const NAME: &'static str = "PlaceOrder";
+        const BOUNDED_CONTEXT: &'static str = SHOP;
+        fn tag_mappings() -> Vec<TagMapping> {
+            vec![order_tag()]
+        }
+        fn consistency_query() -> Vec<QueryItemMapping> {
+            vec![QueryItemMapping::nothing()]
+        }
+        fn decide(payload: &Order, _: &[Placed]) -> CommandDecision {
+            CommandDecision::Accepted {
+                events: vec![emit("OrderPlaced", payload)],
+            }
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct Withdrawal {
+        order_id: String,
+        position: i64,
+    }
+
+    fn withdrawn_by_retraction(payload: &Withdrawal) -> EventSpec {
+        retract(
+            payload.position,
+            RetractionGround::WrongDataSubmitted,
+            "never ordered",
+        )
+    }
+
+    /// A bare retraction, which nothing downstream can act on.
+    struct WithdrawOrder;
+
+    impl CommandType for WithdrawOrder {
+        type Payload = Withdrawal;
+        type Event = Placed;
+        const NAME: &'static str = "WithdrawOrder";
+        const BOUNDED_CONTEXT: &'static str = SHOP;
+        fn tag_mappings() -> Vec<TagMapping> {
+            vec![order_tag()]
+        }
+        fn consistency_query() -> Vec<QueryItemMapping> {
+            vec![QueryItemMapping::nothing()]
+        }
+        fn decide(payload: &Withdrawal, _: &[Placed]) -> CommandDecision {
+            CommandDecision::Accepted {
+                events: vec![withdrawn_by_retraction(payload)],
+            }
+        }
+    }
+
+    /// A retraction next to a domain event, which carries what a reactor
+    /// needs: a retraction's payload has no tags to cancel by.
+    struct WithdrawOrderAndSay;
+
+    impl CommandType for WithdrawOrderAndSay {
+        type Payload = Withdrawal;
+        type Event = Placed;
+        const NAME: &'static str = "WithdrawOrderAndSay";
+        const BOUNDED_CONTEXT: &'static str = SHOP;
+        fn tag_mappings() -> Vec<TagMapping> {
+            vec![order_tag()]
+        }
+        fn consistency_query() -> Vec<QueryItemMapping> {
+            vec![QueryItemMapping::nothing()]
+        }
+        fn decide(payload: &Withdrawal, _: &[Placed]) -> CommandDecision {
+            CommandDecision::Accepted {
+                events: vec![
+                    withdrawn_by_retraction(payload),
+                    emit(
+                        "OrderWithdrawn",
+                        &OrderId {
+                            order_id: payload.order_id.clone(),
+                        },
+                    ),
+                ],
+            }
+        }
+    }
+
+    /// Fired by a deadline, and checks the order still stands.
+    struct ExpireOrder;
+
+    impl CommandType for ExpireOrder {
+        type Payload = OrderId;
+        type Event = Retractable<Placed>;
+        const NAME: &'static str = "ExpireOrder";
+        const BOUNDED_CONTEXT: &'static str = SHOP;
+        fn tag_mappings() -> Vec<TagMapping> {
+            vec![order_tag()]
+        }
+        fn consistency_query() -> Vec<QueryItemMapping> {
+            claim_query(&["OrderPlaced"], order_tag())
+        }
+        fn decide(payload: &OrderId, events: &[Self::Event]) -> CommandDecision {
+            if standing(events).is_empty() {
+                return CommandDecision::Rejected {
+                    reason: "the order was withdrawn".into(),
+                    kind: "order_withdrawn".into(),
+                };
+            }
+            CommandDecision::Accepted {
+                events: vec![emit("OrderExpired", payload)],
+            }
+        }
+    }
+
+    /// Fired by a deadline, and looks at nothing.
+    struct ExpireOrderAnyway;
+
+    impl CommandType for ExpireOrderAnyway {
+        type Payload = OrderId;
+        type Event = Placed;
+        const NAME: &'static str = "ExpireOrderAnyway";
+        const BOUNDED_CONTEXT: &'static str = SHOP;
+        fn tag_mappings() -> Vec<TagMapping> {
+            vec![order_tag()]
+        }
+        fn consistency_query() -> Vec<QueryItemMapping> {
+            vec![QueryItemMapping::nothing()]
+        }
+        fn decide(payload: &OrderId, _: &[Placed]) -> CommandDecision {
+            CommandDecision::Accepted {
+                events: vec![emit("OrderExpiredAnyway", payload)],
+            }
+        }
+    }
+
+    struct ReserveStock;
+
+    impl CommandType for ReserveStock {
+        type Payload = OrderId;
+        type Event = Placed;
+        const NAME: &'static str = "ReserveStock";
+        const BOUNDED_CONTEXT: &'static str = STOCK;
+        fn tag_mappings() -> Vec<TagMapping> {
+            vec![order_tag()]
+        }
+        fn consistency_query() -> Vec<QueryItemMapping> {
+            vec![QueryItemMapping::nothing()]
+        }
+        fn decide(payload: &OrderId, _: &[Placed]) -> CommandDecision {
+            CommandDecision::Accepted {
+                events: vec![emit("StockReserved", payload)],
+            }
+        }
+    }
+
+    fn deadline(order: &Order) -> DeadlineSpec<OrderId> {
+        DeadlineSpec {
+            fire_at: order.deadline_at,
+            expires_at: None,
+            tags: vec![Tag {
+                key: "order".into(),
+                value: Some(order.order_id.clone()),
+            }],
+            payload: OrderId {
+                order_id: order.order_id.clone(),
+            },
+            recurrence: None,
+        }
+    }
+
+    struct ExpireDeadline;
+
+    impl ScheduleDeadline for ExpireDeadline {
+        type Source = OrderPlaced;
+        type Target = ExpireOrder;
+        const NAME: &'static str = "ExpireDeadline";
+        fn schedule(order: &Order) -> Option<DeadlineSpec<OrderId>> {
+            Some(deadline(order))
+        }
+    }
+
+    struct ExpireAnywayDeadline;
+
+    impl ScheduleDeadline for ExpireAnywayDeadline {
+        type Source = OrderPlaced;
+        type Target = ExpireOrderAnyway;
+        const NAME: &'static str = "ExpireAnywayDeadline";
+        fn schedule(order: &Order) -> Option<DeadlineSpec<OrderId>> {
+            Some(deadline(order))
+        }
+    }
+
+    struct CancelExpireAnyway;
+
+    impl CancelDeadline for CancelExpireAnyway {
+        type Source = OrderWithdrawn;
+        type Deadline = ExpireAnywayDeadline;
+        const NAME: &'static str = "CancelExpireAnyway";
+        fn cancel_tags(withdrawn: &OrderId) -> Option<Vec<Tag>> {
+            Some(vec![Tag {
+                key: "order".into(),
+                value: Some(withdrawn.order_id.clone()),
+            }])
+        }
+    }
+
+    struct ReserveOnOrder;
+
+    impl CrossContextRoute for ReserveOnOrder {
+        type Source = OrderPlaced;
+        type Target = ReserveStock;
+        const NAME: &'static str = "ReserveOnOrder";
+        fn route(order: &Order) -> Option<OrderId> {
+            Some(OrderId {
+                order_id: order.order_id.clone(),
+            })
+        }
+    }
+
+    async fn insert_context(pool: &Pool, name: &str, role: &Role) {
+        let bounded_context = BoundedContext {
+            name: name.to_string(),
+            status: BoundedContextStatus::Active,
+            created_at: now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(pool, &bounded_context)
+            .await
+            .unwrap();
+        db::insert_role_access_mapping(
+            pool,
+            &RoleAccessMapping {
+                role: role.clone(),
+                bounded_context,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                capabilities: Default::default(),
+                delegable: Default::default(),
+                status: RoleStatus::Active,
+                created_at: now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn shop_builder(database_url: &str, subject: &str) -> SkiljBuilder {
+        Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(8))
+            .key_service(master_key())
+            .reconciliation_role(subject)
+            .bounded_context(SHOP)
+            .retractions()
+            .event_type::<OrderPlaced>()
+            .event_type::<OrderWithdrawn>()
+            .event_type::<OrderExpired>()
+            .event_type::<OrderExpiredAnyway>()
+            .command_type::<PlaceOrder>()
+            .command_type::<WithdrawOrder>()
+            .command_type::<WithdrawOrderAndSay>()
+            .command_type::<ExpireOrder>()
+            .command_type::<ExpireOrderAnyway>()
+            .bounded_context(STOCK)
+            .event_type::<StockReserved>()
+            .command_type::<ReserveStock>()
+    }
+
+    fn orders_of(events: &[Event], event_type: &str) -> Vec<String> {
+        let mut orders: Vec<String> = events
+            .iter()
+            .filter(|event| event.event_type.name == event_type)
+            .map(|event| {
+                serde_json::from_str::<OrderId>(&event.payload)
+                    .unwrap()
+                    .order_id
+            })
+            .collect();
+        orders.sort();
+        orders
+    }
+
+    impl Crm {
+        async fn place(&self, order_id: &str, deadline_at: chrono::DateTime<chrono::Utc>) -> i64 {
+            let outcome = self
+                .submit(
+                    "PlaceOrder",
+                    serde_json::json!({ "order_id": order_id, "deadline_at": deadline_at }),
+                )
+                .await;
+            assert_eq!(outcome, "accepted");
+            self.latest_position().await
+        }
+
+        async fn withdraw(&self, command: &str, order_id: &str, position: i64) {
+            let outcome = self
+                .submit(
+                    command,
+                    serde_json::json!({ "order_id": order_id, "position": position }),
+                )
+                .await;
+            assert_eq!(outcome, "accepted");
+        }
+
+        async fn pending_deadlines(&self) -> i64 {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM \"bc_{SHOP}\".deadlines \
+                 WHERE status IN ('pending', 'firing')"
+            )))
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn a_retraction_leaves_what_its_target_started_to_the_commands_involved() {
+        runtime().block_on(async {
+            let Some((database_url, pool)) = test_db().await else {
+                return;
+            };
+            let subject = format!("subject_{}", generate_token_id());
+            let role = Role {
+                id: generate_token_id(),
+                external_subject: subject.clone(),
+                name: "Reconciliation Role".to_string(),
+                superadmin: false,
+                status: RoleStatus::Active,
+                created_at: now(),
+                revoked_at: None,
+            };
+            db::insert_role(&pool, &role).await.unwrap();
+            insert_context(&pool, SHOP, &role).await;
+            insert_context(&pool, STOCK, &role).await;
+
+            // Withdrawn before anything reacting to it exists: the reactors
+            // start from the beginning, and it's in the history they replay.
+            let (skilj, _) = shop_builder(&database_url, &subject).build().await.unwrap();
+            let before = Crm {
+                skilj,
+                pool: pool.clone(),
+                bc: SHOP.to_string(),
+                cache: EventCache::new(1000),
+            };
+            let far_off = now() + chrono::Duration::hours(1);
+            let position = before.place("replayed", far_off).await;
+            before.withdraw("WithdrawOrder", "replayed", position).await;
+            before.shutdown().await;
+
+            let (skilj, _) = shop_builder(&database_url, &subject)
+                .bounded_context(SHOP)
+                .schedule_deadline::<ExpireDeadline>()
+                .schedule_deadline::<ExpireAnywayDeadline>()
+                .cancel_deadline::<CancelExpireAnyway>()
+                .deadline_poll_interval(std::time::Duration::from_millis(30))
+                .cross_context_route::<ReserveOnOrder>()
+                .cross_context_route_poll_interval(std::time::Duration::from_millis(30))
+                .build()
+                .await
+                .unwrap();
+            let shop = Crm {
+                skilj,
+                pool: pool.clone(),
+                bc: SHOP.to_string(),
+                cache: EventCache::new(1000),
+            };
+
+            let stock_reserved = |pool: Pool| async move {
+                orders_of(
+                    &db::list_events_for_bounded_context(&pool, STOCK)
+                        .await
+                        .unwrap(),
+                    "StockReserved",
+                )
+            };
+
+            // Far enough off for each order to be routed and withdrawn first.
+            let due = now() + chrono::Duration::seconds(3);
+            let standing_order = shop.place("standing", due).await;
+            let bare = shop.place("withdrawn", due).await;
+            let announced = shop.place("announced", due).await;
+            assert!(standing_order < bare && bare < announced);
+            let mut routed = false;
+            for _ in 0..100 {
+                if stock_reserved(pool.clone()).await.len() == 4 {
+                    routed = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(routed, "{:?}", stock_reserved(pool.clone()).await);
+
+            shop.withdraw("WithdrawOrder", "withdrawn", bare).await;
+            shop.withdraw("WithdrawOrderAndSay", "announced", announced)
+                .await;
+
+            // `replayed`'s deadlines are an hour off, and fire now only so
+            // this test doesn't have to wait.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE \"bc_{SHOP}\".deadlines SET fire_at = $1 \
+                 WHERE fire_at > $1 AND status = 'pending'"
+            )))
+            .bind(due)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let mut settled = false;
+            for _ in 0..300 {
+                if now() > due && shop.pending_deadlines().await == 0 {
+                    settled = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(settled, "{} still pending", shop.pending_deadlines().await);
+
+            let events = shop.events().await;
+            // A route's delivery stands, and a replay delivers a withdrawn order.
+            assert_eq!(
+                stock_reserved(pool.clone()).await,
+                ["announced", "replayed", "standing", "withdrawn"]
+            );
+            // A deadline fires, and a target that looks refuses by itself.
+            assert_eq!(orders_of(&events, "OrderExpired"), ["standing"]);
+            // One that doesn't look goes ahead, unless a domain event next to
+            // the retraction cancelled it.
+            assert_eq!(
+                orders_of(&events, "OrderExpiredAnyway"),
+                ["replayed", "standing", "withdrawn"]
+            );
+            shop.shutdown().await;
+        });
+    }
+}
+
+/// Doubts whatever position it is given, the store being what checks it.
+struct DoubtAny;
+
+impl CommandType for DoubtAny {
+    type Payload = RetractPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "DoubtAny";
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::nothing()]
+    }
+    fn decide(payload: &Self::Payload, _events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![doubt(payload.position, "under investigation")],
+        }
+    }
+}
+
+/// [`DoubtAny`] for a caller scoped to one customer.
+struct DoubtOwn;
+
+impl CommandType for DoubtOwn {
+    type Payload = RetractPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "DoubtOwn";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![customer()]
+    }
+    fn owner_tag_key() -> Option<&'static str> {
+        Some("customer")
+    }
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::nothing()]
+    }
+    fn decide(payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
+        DoubtAny::decide(payload, events)
+    }
+}
+
+struct LiftDoubt;
+
+impl CommandType for LiftDoubt {
+    type Payload = RetractPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "LiftDoubt";
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::nothing()]
+    }
+    fn decide(payload: &Self::Payload, _events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![lift_doubt(payload.position, "looked fine after all")],
+        }
+    }
+}
+
+/// Doubts and retracts one position in one decision, in that order.
+struct DoubtAndRetract;
+
+impl CommandType for DoubtAndRetract {
+    type Payload = RetractPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "DoubtAndRetract";
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::nothing()]
+    }
+    fn decide(payload: &Self::Payload, _events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![
+                retract(payload.position, RetractionGround::ProcessedWrongly, "gone"),
+                doubt(payload.position, "too late"),
+            ],
+        }
+    }
+}
+
+/// Rejects with what `open_doubts` makes of the customer's history, for a test
+/// to read, and with the same query a decision acting on doubt would use.
+struct ReportDoubts;
+
+impl CommandType for ReportDoubts {
+    type Payload = CountPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "ReportDoubts";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![customer()]
+    }
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        claim_query(
+            &["EmailClaimed", DOUBT_EVENT_TYPES[0], DOUBT_EVENT_TYPES[1]],
+            customer(),
+        )
+    }
+    fn decide(_payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
+        let mut open: Vec<i64> = open_doubts(events).into_keys().collect();
+        open.sort_unstable();
+        CommandDecision::Rejected {
+            reason: "reporting".into(),
+            kind: format!("doubted_{open:?}"),
+        }
+    }
+}
+
+impl Crm {
+    async fn doubt(&self, position: i64) -> String {
+        self.submit("DoubtAny", serde_json::json!({ "position": position }))
+            .await
+    }
+
+    async fn lift(&self, position: i64) -> String {
+        self.submit("LiftDoubt", serde_json::json!({ "position": position }))
+            .await
+    }
+
+    async fn doubts_of(&self, customer: &str) -> String {
+        self.submit(
+            "ReportDoubts",
+            serde_json::json!({ "customer_id": customer }),
+        )
+        .await
+    }
+
+    /// Registers an address for a new customer, returning both and its position.
+    async fn claimed(&self) -> (String, String, i64) {
+        let customer = id("c");
+        let email = format!("{}@example.com", id("e"));
+        assert_eq!(self.register(&customer, &email).await, "accepted");
+        (customer, email, self.latest_position().await)
+    }
+}
+
+/// The whole cycle, as a decision sees it, with the store's refusals of what
+/// doesn't fit the state at each step.
+#[test]
+fn a_doubt_opens_lifts_and_can_open_again() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (customer, _, position) = crm.claimed().await;
+        assert_eq!(crm.doubts_of(&customer).await, "doubted_[]");
+        assert_eq!(crm.lift(position).await, "no_open_doubt");
+
+        assert_eq!(crm.doubt(position).await, "accepted");
+        assert_eq!(
+            crm.doubts_of(&customer).await,
+            format!("doubted_[{position}]")
+        );
+        assert_eq!(crm.doubt(position).await, "already_doubted");
+
+        assert_eq!(crm.lift(position).await, "accepted");
+        assert_eq!(crm.doubts_of(&customer).await, "doubted_[]");
+        assert_eq!(crm.lift(position).await, "no_open_doubt");
+
+        assert_eq!(crm.doubt(position).await, "accepted");
+        assert_eq!(
+            crm.doubts_of(&customer).await,
+            format!("doubted_[{position}]")
+        );
+        crm.shutdown().await;
+    });
+}
+
+/// Like a retraction it carries its target's tags, a blind hash included, so
+/// every query that found the event finds the doubt. Nothing else changes: the
+/// address stays taken, since a doubted event is still endorsed.
+#[test]
+fn a_doubt_carries_the_tags_and_leaves_the_value_held() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (customer, email, position) = crm.claimed().await;
+        let original = crm.events().await.pop().unwrap();
+        assert_eq!(crm.doubt(position).await, "accepted");
+        let doubted = crm.events().await.pop().unwrap();
+
+        assert_eq!(doubted.event_type.name, DOUBTED_EVENT_TYPE);
+        assert!(email_tag(&doubted).is_some());
+        assert_eq!(email_tag(&doubted), email_tag(&original));
+        assert!(doubted
+            .tags
+            .iter()
+            .any(|tag| tag.key == DOUBTS_TAG_KEY && tag.value == Some(position.to_string())));
+        let payload: DoubtPayload = serde_json::from_str(&doubted.payload).unwrap();
+        assert_eq!(payload.position, position);
+        assert_eq!(payload.doubted_event_type.as_deref(), Some("EmailClaimed"));
+
+        assert_eq!(crm.register(&id("c"), &email).await, "email_taken");
+
+        // Erasure reaches the copies, as it does a retraction's.
+        assert_eq!(crm.lift(position).await, "accepted");
+        db::forget_subject_in_blind_tags(&crm.pool, &crm.bc, "customer", &customer)
+            .await
+            .unwrap();
+        for event in crm.events().await {
+            if event.sequence >= position {
+                assert_eq!(email_tag(&event), None, "{event:?}");
+            }
+        }
+        crm.shutdown().await;
+    });
+}
+
+/// A doubt usually ends in a retraction or a correction, which ends it with no
+/// lift. After that there's nothing left to doubt.
+#[test]
+fn a_retraction_closes_a_doubt() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (customer, email, position) = crm.claimed().await;
+        assert_eq!(crm.doubt(position).await, "accepted");
+        assert_eq!(crm.retract(position).await, "accepted");
+        assert_eq!(crm.doubts_of(&customer).await, "doubted_[]");
+        assert_eq!(crm.doubt(position).await, "doubt_target_retracted");
+        assert_eq!(crm.lift(position).await, "doubt_target_retracted");
+        assert_eq!(crm.register(&id("c"), &email).await, "accepted");
+
+        // A correction is a retraction, with the same effect.
+        let (customer, _, position) = crm.claimed().await;
+        assert_eq!(crm.doubt(position).await, "accepted");
+        assert_eq!(
+            crm.correct(&customer, "fixed@example.com").await,
+            "accepted"
+        );
+        assert_eq!(crm.doubts_of(&customer).await, "doubted_[]");
+        assert_eq!(crm.lift(position).await, "doubt_target_retracted");
+
+        // In one decision too.
+        let (_, _, position) = crm.claimed().await;
+        assert_eq!(
+            crm.submit(
+                "DoubtAndRetract",
+                serde_json::json!({ "position": position })
+            )
+            .await,
+            "doubt_target_retracted"
+        );
+        crm.shutdown().await;
+    });
+}
+
+/// What a doubt or a retraction can't be about.
+#[test]
+fn the_store_refuses_a_doubt_it_cannot_honour() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (_, _, position) = crm.claimed().await;
+        assert_eq!(crm.doubt(position + 1000).await, "doubt_target_not_found");
+        assert_eq!(crm.lift(position + 1000).await, "doubt_target_not_found");
+
+        assert_eq!(crm.doubt(position).await, "accepted");
+        let doubted = crm.latest_position().await;
+        assert_eq!(crm.doubt(doubted).await, "doubt_of_stance");
+        assert_eq!(crm.lift(doubted).await, "doubt_of_stance");
+        assert_eq!(crm.retract(doubted).await, "retraction_of_doubt");
+
+        assert_eq!(crm.lift(position).await, "accepted");
+        let lifted = crm.latest_position().await;
+        assert_eq!(crm.doubt(lifted).await, "doubt_of_stance");
+        assert_eq!(crm.retract(lifted).await, "retraction_of_doubt");
+
+        assert_eq!(crm.retract(position).await, "accepted");
+        let retraction = crm.latest_position().await;
+        assert_eq!(crm.doubt(retraction).await, "doubt_of_stance");
+        crm.shutdown().await;
+    });
+}
+
+/// A batch decides everything before writing anything, so a later item has to
+/// see an earlier item's doubt and lift.
+#[test]
+fn a_batch_sees_its_own_doubts() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (_, _, position) = crm.claimed().await;
+        let item = |command_type: &skilj_core::event_store::CommandType| CommandBatchItem {
+            command_type: command_type.clone(),
+            payload: serde_json::json!({ "position": position }).to_string(),
+            client_id: "client".to_string(),
+            correlation_id: None,
+            causation_id: None,
+            idempotency_key: None,
+        };
+        let command = |name: &'static str| {
+            let (pool, bc) = (crm.pool.clone(), crm.bc.clone());
+            async move {
+                db::get_command_type(&pool, &bc, name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let (doubt, lift, retraction) = (
+            command("DoubtAny").await,
+            command("LiftDoubt").await,
+            command("RetractAny").await,
+        );
+        let outcomes = CommandBatcher::new()
+            .decide_and_submit_many(
+                &crm.pool,
+                &crm.skilj.command_dispatcher(),
+                &crm.skilj.projection_dispatcher(),
+                &*crm.skilj.snapshot_dispatcher(),
+                &EventBroadcaster::new(16),
+                &crm.cache,
+                Some(&master_key()),
+                &crm.bc,
+                vec![
+                    item(&lift),
+                    item(&doubt),
+                    item(&doubt),
+                    item(&lift),
+                    item(&lift),
+                    item(&doubt),
+                    item(&retraction),
+                    item(&doubt),
+                    item(&lift),
+                ],
+                false,
+            )
+            .await;
+        let kinds: Vec<String> = outcomes.iter().map(|o| kind(o.as_ref().unwrap())).collect();
+        assert_eq!(
+            kinds,
+            [
+                "no_open_doubt",
+                "accepted",
+                "already_doubted",
+                "accepted",
+                "no_open_doubt",
+                "accepted",
+                "accepted",
+                "doubt_target_retracted",
+                "doubt_target_retracted",
+            ]
+        );
+        crm.shutdown().await;
+    });
+}
+
+/// Concurrent doubts of one event: the lock orders them, and one gets through.
+#[test]
+fn doubts_racing_each_other_accept_one() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (_, _, position) = crm.claimed().await;
+        let (first, second) = tokio::join!(crm.doubt(position), crm.doubt(position));
+        let mut kinds = [first, second];
+        kinds.sort();
+        assert_eq!(kinds, ["accepted", "already_doubted"]);
+        crm.shutdown().await;
+    });
+}
+
+/// The marker doesn't touch a snapshot: no refold and no change in the state,
+/// stored or read, and the row keeps moving past a doubt.
+#[test]
+fn a_doubt_leaves_a_snapshot_alone() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (customer, positions) = crm.customer_with_claims(2).await;
+        crm.catch_up_snapshots().await;
+        assert_eq!(crm.stored_count("ClaimCount", &customer).await.0, 2);
+        assert_eq!(crm.doubt(positions[0]).await, "accepted");
+        assert_eq!(crm.reported_count(&customer).await, "count_2");
+        crm.catch_up_snapshots().await;
+        for snapshot in ["ClaimCount", "PartitionedClaimCount"] {
+            let (count, as_of) = crm.stored_count(snapshot, &customer).await;
+            assert_eq!(count, 2, "{snapshot}");
+            assert!(as_of >= positions[1], "{snapshot} at {as_of}");
+        }
+        assert_eq!(crm.lift(positions[0]).await, "accepted");
+        assert_eq!(crm.reported_count(&customer).await, "count_2");
+        crm.shutdown().await;
+    });
+}
+
+/// A row refolded from history after a doubt, here because of a retraction of
+/// another event, passes the doubt over and keeps the event in doubt.
+#[test]
+fn a_refold_passes_a_doubt_over_and_keeps_its_target() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (customer, positions) = crm.customer_with_claims(3).await;
+        crm.catch_up_snapshots().await;
+        assert_eq!(crm.doubt(positions[0]).await, "accepted");
+        assert_eq!(crm.retract(positions[2]).await, "accepted");
+        crm.catch_up_snapshots().await;
+        for snapshot in ["ClaimCount", "PartitionedClaimCount"] {
+            assert_eq!(
+                crm.stored_count(snapshot, &customer).await.0,
+                2,
+                "{snapshot}"
+            );
+        }
+        assert_eq!(crm.reported_count(&customer).await, "count_2");
+        crm.shutdown().await;
+    });
+}
+
+/// With no consistency query of its own, a command reads every event carrying
+/// its tags, doubts included, in an event enum that has never heard of them.
+#[test]
+fn a_command_reading_everything_under_a_tag_ignores_doubts_it_does_not_know() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc, subject) = bounded_context(&pool).await;
+        let (skilj, _) = builder(&database_url, &bc, &subject)
+            .retractions()
+            .doubts()
+            .command_type::<DoubtAny>()
+            .command_type::<PlainTagged>()
+            .build()
+            .await
+            .unwrap();
+        let crm = Crm {
+            skilj,
+            pool,
+            bc,
+            cache: EventCache::new(1000),
+        };
+        let (customer, _, position) = crm.claimed().await;
+        assert_eq!(crm.doubt(position).await, "accepted");
+        assert_eq!(
+            crm.submit(
+                "PlainTagged",
+                serde_json::json!({ "customer_id": customer })
+            )
+            .await,
+            "saw_1"
+        );
+        crm.shutdown().await;
+    });
+}
+
+struct PlainTagged;
+
+impl CommandType for PlainTagged {
+    type Payload = CountPayload;
+    type Event = CustomerEvent;
+    const NAME: &'static str = "PlainTagged";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![customer()]
+    }
+    fn decide(_payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Rejected {
+            reason: "reporting".into(),
+            kind: format!("saw_{}", events.len()),
+        }
+    }
+}
+
+/// `snapshot()` hands its decider the events past the stored row, a doubt among
+/// them, so it's refused here as it is next to retractions.
+#[test]
+fn build_refuses_doubts_next_to_the_old_snapshot_api() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc, subject) = bounded_context(&pool).await;
+        let error = Skilj::builder(&database_url)
+            .bounded_context(&bc)
+            .key_service(master_key())
+            .reconciliation_role(&subject)
+            .event_type::<EmailClaimed>()
+            .blind_tag::<Email>()
+            .blind_index_key(BlindIndexKey::from_bytes([11; 32]))
+            .doubts()
+            .snapshot::<ClaimCount>()
+            .command_type::<OldApiSnapshotCommand>()
+            .build()
+            .await
+            .err()
+            .expect("refused");
+        assert!(error.to_string().contains("snapshot()"), "{error}");
+    });
+}
+
+/// What the tools show, however far past its target a retraction landed.
+#[test]
+fn event_stances_say_what_was_said_about_each_event() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (_, positions) = crm.customer_with_claims(4).await;
+        let [plain, doubted, lifted, retracted] = positions[..] else {
+            panic!("four claims");
+        };
+        assert_eq!(crm.doubt(doubted).await, "accepted");
+        let doubt = crm.latest_position().await;
+        assert_eq!(crm.doubt(lifted).await, "accepted");
+        assert_eq!(crm.lift(lifted).await, "accepted");
+        assert_eq!(crm.doubt(retracted).await, "accepted");
+        assert_eq!(crm.retract(retracted).await, "accepted");
+        let retraction = crm.latest_position().await;
+
+        let stances = db::event_stances(&crm.pool, &crm.bc, &positions)
+            .await
+            .unwrap();
+        assert!(!stances.contains_key(&plain));
+        assert_eq!(stances[&doubted].doubted_by, Some(doubt));
+        assert_eq!(stances[&doubted].retracted_by, None);
+        assert_eq!(stances[&lifted].doubted_by, None);
+        assert_eq!(stances[&retracted].doubted_by, None);
+        assert_eq!(stances[&retracted].retracted_by, Some(retraction));
+        crm.shutdown().await;
+    });
+}
+
+/// A dry run answers the same, and writes nothing.
+#[test]
+fn a_dry_run_says_what_a_doubt_would_carry() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (_, _, position) = crm.claimed().await;
+        let dry_run = |name: &'static str| {
+            let crm = &crm;
+            async move {
+                let command_type = db::get_command_type(&crm.pool, &crm.bc, name)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                db::dry_run_command(
+                    &crm.pool,
+                    &*crm.skilj.command_dispatcher(),
+                    &*crm.skilj.snapshot_dispatcher(),
+                    &crm.cache,
+                    &command_type,
+                    &serde_json::json!({ "position": position }).to_string(),
+                    "client",
+                    Some(&master_key()),
+                    now(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let DryRunDecision::Rejected { kind, .. } = dry_run("LiftDoubt").await.decision else {
+            panic!("nothing to lift");
+        };
+        assert_eq!(kind, "no_open_doubt");
+        let DryRunDecision::Accepted { events } = dry_run("DoubtAny").await.decision else {
+            panic!("a doubt is accepted");
+        };
+        assert!(events[0]
+            .tags
+            .iter()
+            .any(|tag| tag.key == DOUBTS_TAG_KEY && tag.value == Some(position.to_string())));
+        assert_eq!(crm.latest_position().await, position);
+        crm.shutdown().await;
+    });
+}
+
+#[test]
+fn an_owner_scoped_doubt_stays_with_its_owner() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc, subject) = bounded_context(&pool).await;
+        let (skilj, _) = builder(&database_url, &bc, &subject)
+            .retractions_owned_by("customer")
+            .doubts_owned_by("customer")
+            .command_type::<DoubtOwn>()
+            .build()
+            .await
+            .unwrap();
+        let crm = Crm {
+            skilj,
+            pool,
+            bc,
+            cache: EventCache::new(1000),
+        };
+        let (alice, bob) = (id("c"), id("c"));
+        assert_eq!(crm.register(&alice, "alice@example.com").await, "accepted");
+        let position = crm.latest_position().await;
+        assert_eq!(
+            crm.submit(
+                "DoubtOwn",
+                serde_json::json!({ "position": position, "customer_id": bob }),
+            )
+            .await,
+            "doubt_target_out_of_scope"
+        );
+        assert_eq!(
+            crm.submit(
+                "DoubtOwn",
+                serde_json::json!({ "position": position, "customer_id": alice }),
+            )
+            .await,
+            "accepted"
+        );
+        let doubted = crm.events().await.pop().unwrap();
+        assert_eq!(
+            doubted.event_type.owner_tag_key.as_deref(),
+            Some("customer")
+        );
+        let payload: DoubtPayload = serde_json::from_str(&doubted.payload).unwrap();
+        assert_eq!(payload.owner.as_deref(), Some(alice.as_str()));
+        assert!(skilj_core::event_store::event_owner_scope_satisfied(
+            &doubted,
+            Some(alice.as_str())
+        ));
+        assert!(!skilj_core::event_store::event_owner_scope_satisfied(
+            &doubted,
+            Some(bob.as_str())
+        ));
+        crm.shutdown().await;
+    });
+}
+
+/// An unowned doubt next to owned types would show a scoped reader the tags of
+/// what it's about, as with a retraction.
+#[test]
+fn build_refuses_unowned_doubts_next_to_owned_types() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc, subject) = bounded_context(&pool).await;
+        let error = builder(&database_url, &bc, &subject)
+            .event_type::<OwnedEvent>()
+            .retractions_owned_by("customer")
+            .doubts()
+            .build()
+            .await
+            .err()
+            .expect("refused");
+        assert!(error.to_string().contains("doubts_owned_by"), "{error}");
+    });
+}
+
+struct FakeDoubt;
+
+impl EventType for FakeDoubt {
+    type Payload = EmailPayload;
+    const NAME: &'static str = DOUBTED_EVENT_TYPE;
+}
+
+struct FakeLift;
+
+impl EventType for FakeLift {
+    type Payload = EmailPayload;
+    const NAME: &'static str = DOUBT_LIFTED_EVENT_TYPE;
+}
+
+#[test]
+fn the_doubt_type_names_are_reserved() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc, subject) = bounded_context(&pool).await;
+        let error = builder(&database_url, &bc, &subject)
+            .retractions()
+            .event_type::<FakeDoubt>()
+            .build()
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(error.code(), "reserved_event_type_name", "{error}");
+        let (bc, subject) = bounded_context(&pool).await;
+        let error = builder(&database_url, &bc, &subject)
+            .retractions()
+            .event_type::<FakeLift>()
             .build()
             .await
             .err()

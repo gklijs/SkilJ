@@ -24,6 +24,26 @@ README.md, "Status and stability").
   retraction and takes the contribution out itself. `build()` refuses
   retractions next to a command type using `snapshot()`; use a
   `QueryItemMapping::snapshot` item (issue #133, docs/architecture.md §235).
+- Doubt: `SkiljBuilder::doubts()` (or `doubts_owned_by`) registers the built-in
+  `EventDoubted` and `DoubtLifted`. A decision marks an event as under
+  investigation with `skilj::retraction::doubt` and clears it with `lift_doubt`,
+  or a retraction ends it; `open_doubts` tells a decision what's in doubt. It's
+  a marker: the event still counts, and snapshots don't change. `build()` refuses
+  doubts next to a command type using `snapshot()` (issue #133,
+  docs/architecture.md §236).
+- `inspectEvent` answers `retractedBy` and `doubtedBy`, and `skilj-inspector` and
+  `skilj-tui` (the `s` key in the query tab) show them.
+- `.skilj.toml`: `retractions = true` and `doubts = true` register the built-in
+  types, and `retractable = true` on a command type gives its `decide_*`
+  `Retractable` events.
+- As-of reads: `queryEvents(upToSequence:)` and `GET /v1/events?upToSequence=`
+  serve what was known at a sequence, and each generated projection type has
+  `asOfSequence`, the last event folded into that instance (docs/architecture.md
+  §237).
+- `skilj_test_fixture::corrections`: race scenarios to run against your own
+  commands by implementing `UniqueValueCommands`: a correction racing a claim,
+  corrections racing each other, and a retraction followed by a new claim
+  (issue #133).
 - A private-field grant may name the one field it shares: an optional
   `field` argument on `grantPrivateFieldAccessForEvent` and
   `grantPrivateFieldAccessForCommand`, and `field` on `PrivateFieldGrant`

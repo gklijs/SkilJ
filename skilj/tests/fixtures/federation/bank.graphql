@@ -250,6 +250,8 @@ enum BankFilterOperator {
 type BankInspectedEvent @inaccessible {
 	event: BankEventMeta!
 	renderedPayload: String!
+	retractedBy: Int
+	doubtedBy: Int
 }
 
 type BankInspectedSnapshot @inaccessible {
@@ -488,6 +490,7 @@ type BankWouldBeEvent @inaccessible {
 
 type Bankfed_published_AccountBalance @key(fields: "projectionKey") {
 	total: Int!
+	asOfSequence: Int
 	projectionKey: String!
 }
 
@@ -539,7 +542,7 @@ type Query {
 	bankScheduledEventTypes(boundedContext: String!): [BankEventType!]! @inaccessible
 	bankEventTypes(boundedContext: String!): [BankEventType!]! @inaccessible
 	bankCommandTypes(boundedContext: String!): [BankCommandType!]! @inaccessible
-	bankQueryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [BankTagInput!], afterSequence: Int, correlationId: String): [BankQueriedEvent!]! @inaccessible
+	bankQueryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [BankTagInput!], afterSequence: Int, upToSequence: Int, correlationId: String): [BankQueriedEvent!]! @inaccessible
 	bankSearchUsedTags(boundedContext: String!, key: String!, prefix: String, limit: Int, eventTypeName: String): [BankUsedTag!]! @inaccessible
 	bankCountEvents(boundedContext: String!, eventTypes: [String!]!, tags: [BankTagInput!], correlationId: String): Int! @inaccessible
 	bankInspectEvent(boundedContext: String!, sequence: Int!): BankInspectedEvent! @inaccessible

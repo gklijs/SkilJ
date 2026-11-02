@@ -632,6 +632,8 @@ struct EventsQuery {
     // the REST-side counterpart to `queryEvents`'s own `correlationId`
     // GraphQL argument.
     correlation_id: Option<String>,
+    // docs/architecture.md §237: "as known at this sequence", inclusive.
+    up_to_sequence: Option<String>,
 }
 
 impl FromQueryString for EventsQuery {
@@ -641,6 +643,7 @@ impl FromQueryString for EventsQuery {
             after: None,
             epoch: None,
             correlation_id: None,
+            up_to_sequence: None,
         };
         for (key, value) in query_pairs(raw) {
             match key.as_str() {
@@ -648,6 +651,7 @@ impl FromQueryString for EventsQuery {
                 "after" => query.after = Some(value),
                 "epoch" => query.epoch = Some(value),
                 "correlationId" => query.correlation_id = Some(value),
+                "upToSequence" => query.up_to_sequence = Some(value),
                 _ => {}
             }
         }
@@ -1240,6 +1244,15 @@ async fn get_events(
             )));
         }
     }
+    let up_to = query
+        .up_to_sequence
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<i64>().map_err(|_| {
+                RestError::InvalidRequest(format!("upToSequence {raw:?} is not a sequence"))
+            })
+        })
+        .transpose()?;
     // At most `max_events_per_read`, loaded a chunk at a time - a caller
     // pages on with `after` = this response's `nextCursor`.
     let page = db::collect_scanned_event_page(
@@ -1248,6 +1261,7 @@ async fn get_events(
         &token.event_type.bounded_context.name,
         Some(&token.event_type.name),
         after.unwrap_or(-1),
+        up_to,
         state.max_events_per_read,
         |chunk, remaining| {
             event_store::fetch_events_page(
@@ -1387,6 +1401,7 @@ async fn get_events_consume(
             bounded_context_name,
             Some(&token.event_type.name),
             position,
+            None,
             state.max_events_per_read,
             |chunk, remaining| {
                 event_store::fetch_events_page(

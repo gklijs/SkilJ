@@ -169,8 +169,13 @@ fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .map(|e| {
                     ListItem::new(format!(
-                        "#{}  {}  {}",
-                        e.sequence, e.event_type.name, e.payload
+                        "#{}  {}{}  {}",
+                        e.sequence,
+                        e.event_type.name,
+                        d.event_stances
+                            .get(&e.sequence)
+                            .map_or_else(String::new, crate::data::stance_marker),
+                        e.payload
                     ))
                 })
                 .collect()

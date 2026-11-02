@@ -112,6 +112,53 @@ const you define per type. Full detail, including manual (non-macro)
 registration and what happens with no bounded-context module at all:
 [references/registration.md](references/registration.md).
 
+## When an event was wrong
+
+Events are immutable, so a wrong one stays in the journal and a later event says
+it's no longer endorsed. Opt in with `.retractions()` on the bounded context
+(`.retractions_owned_by(tag)` where event types declare an `owner_tag_key`), then
+a decision emits `skilj::retraction::retract(position, ground, reason)`, or
+`corrected(position, ground, reason, [replacement])` for both in one append. The
+store copies the retracted event's tags onto the retraction, so every query that
+found the original finds it too.
+
+Use `type Event = Retractable<MyEvent>` to get positions and tags, and
+`standing(events)` for what's still endorsed. Don't use `.latest()` on a query
+folding this way: `claim_query` reads every match, as this needs. A position is
+the caller's to choose, so check in `decide()` that it's one this command may
+touch, as `skilj-demo/tests/expenses.rs` does.
+
+What happens to what you've already built on the wrong event:
+
+- **Snapshots:** nothing to do. The store keeps retracted events out of their
+  state. `build()` refuses `CommandType::snapshot()` next to retractions.
+- **Projections:** not recomputed. One that should reflect it lists
+  `RETRACTED_EVENT_TYPE` in `consumed_event_types`, folds `Retractable` events,
+  and keeps enough in its state to take a contribution out. A projection that
+  doesn't consume it keeps the contribution, silently. The expense report total
+  in `skilj-demo/tests/expenses.rs` is the pattern to copy.
+- **Deadlines and routes:** not undone. A deadline still fires, so its target
+  should read `standing` and refuse. A route's delivery stands, and a replay
+  delivers a retracted event too. To cancel a deadline, emit a domain event next
+  to the retraction: `CancelDeadline` can't get tags from a retraction.
+
+Under investigation rather than wrong? `.doubts()` adds `doubt(position, reason)`
+and `lift_doubt(position, reason)`; a retraction or correction ends a doubt without
+a lift. It's only a marker: the event still counts, snapshots don't change, and a
+decision that cares lists `DOUBT_EVENT_TYPES` in its query and reads `open_doubts`.
+`build()` refuses `CommandType::snapshot()` next to it. Design: §236.
+
+In a `.skilj.toml`: `retractions = true`, `doubts = true`, and `retractable = true`
+on the command, which hands its `decide_*` `Retractable` events (see
+`skilj-demo/tests/seats.rs`). `inspectEvent` answers `retractedBy` and `doubtedBy`
+for tools; `queryEvents` and `GET /v1/events` take `upToSequence` to read as of a
+sequence, and a projection type's `asOfSequence` says what an answer reflects (§237).
+
+A dossier, legal basis or source goes in the correction command's payload, which
+the retraction's `causation_id` leads to; `reason` is stored in the clear. An
+occurrence time is a domain field, `occurred_at` by convention. A retraction
+erases nothing: that's `forgetSubject`. Full design: docs/architecture.md §235.
+
 ## Testing your `decide()`/`project()`
 
 Once a `CommandType`/`Projection` is written, test its own logic with

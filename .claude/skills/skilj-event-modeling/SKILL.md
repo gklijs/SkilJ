@@ -102,7 +102,9 @@ reference; the `skilj-uniqueness` skill implements it.
 Ask how a wrong value gets fixed. A mistake is a retraction and the right event
 in one decision (`skilj::retraction`, `docs/architecture.md` §235), not a domain
 change event; note in the summary which events can be retracted and which
-projections then have to take the contribution out (snapshots need nothing).
+projections then have to take the contribution out (snapshots need nothing). Ask
+too whether a value can be under investigation without being known wrong, which
+is doubt (`docs/architecture.md` §236), and whether a decision should act on that.
 
 ## Producing the summary
 

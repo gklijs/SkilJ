@@ -39,6 +39,16 @@ pub struct BoundedContextSpec {
     /// generated as `TagMapping::blind`.
     #[serde(default, rename = "blind_tag")]
     pub blind_tags: Vec<BlindTagSpec>,
+    /// Registers the built-in `EventRetracted`, as `SkiljBuilder::retractions`
+    /// does (docs/architecture.md §235), so a `retractable` command can emit
+    /// one.
+    #[serde(default)]
+    pub retractions: bool,
+    /// Registers the built-in `EventDoubted` and `DoubtLifted`, as
+    /// `SkiljBuilder::doubts` does (docs/architecture.md §236). A query item
+    /// names them to read them.
+    #[serde(default)]
+    pub doubts: bool,
 }
 
 /// A `BlindTag` impl (docs/architecture.md §205).
@@ -134,6 +144,13 @@ pub struct CommandTypeSpec {
     /// together with `query`.
     #[serde(default)]
     pub reads_nothing: bool,
+    /// `decide_*` gets `Retractable<...>` events, so with their positions and
+    /// tags, and it can emit a retraction. Each query item with event types
+    /// also reads the retractions, and can't have `latest`: the newest event
+    /// carrying a value may be the retraction of an old claim. Needs
+    /// `retractions = true` (docs/architecture.md §235).
+    #[serde(default)]
+    pub retractable: bool,
 }
 
 /// One consistency query item. `tags` names keys of the command type's
@@ -320,6 +337,14 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
         claim(name, what, problems)
     });
 
+    for name in crate::emit::built_in_event_types(spec) {
+        claim(
+            name.to_string(),
+            "the built-in event type".to_string(),
+            &mut problems,
+        );
+    }
+
     let types = spec
         .event_types
         .iter()
@@ -400,10 +425,32 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
             }
         }
     }
-    let event_type_names: std::collections::BTreeSet<&str> =
+    let built_in_event_types = crate::emit::built_in_event_types(spec);
+    for event in &spec.event_types {
+        if crate::emit::BUILT_IN_EVENT_TYPES.contains(&event.name.as_str()) {
+            problems.push(format!(
+                "event_type {:?}: this name is reserved for a built-in event type; set \
+                 retractions = true or doubts = true to register it",
+                event.name
+            ));
+        }
+    }
+    let mut event_type_names: std::collections::BTreeSet<&str> =
         spec.event_types.iter().map(|e| e.name.as_str()).collect();
+    event_type_names.extend(built_in_event_types.iter().copied());
     for command in &spec.command_types {
         let what = format!("command_type {:?}", command.name);
+        if command.retractable && !spec.retractions {
+            problems.push(format!(
+                "{what}: retractable needs retractions = true at the top of the file"
+            ));
+        }
+        if command.retractable && command.query.iter().any(|item| item.latest.is_some()) {
+            problems.push(format!(
+                "{what}: a retractable command folds around retractions, which needs every \
+                 match read, so its query items can't have latest"
+            ));
+        }
         if command.reads_nothing && !command.query.is_empty() {
             problems.push(format!(
                 "{what}: reads_nothing reads no events, so it can't have query items too"

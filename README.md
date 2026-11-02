@@ -54,6 +54,9 @@ What you get in one library on one Postgres database, without running a separate
   subscriptions.
 - **Personal data handling built in:** sensitive fields are encrypted per subject, and
   `forgetSubject` makes them unreadable. Blind tags check uniqueness without storing the value.
+- **Corrections without losing history:** a command can retract an earlier event, and the store
+  copies its tags onto the retraction, so a corrected unique value is freed even when it's a blind
+  tag. Snapshots leave retracted events out; projections take the contribution out themselves.
 - **The parts an event-sourced system usually builds itself:** projections, snapshots,
   deadlines and recurring schedules, idempotency keys, command approval, upcasting, parked
   deliveries with redrive, and bridges to Kafka, AMQP 1.0, NATS JetStream and Temporal.
