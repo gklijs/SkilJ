@@ -1462,7 +1462,7 @@ pub(super) async fn finish_accepted_command_in_tx(
     // Every blob reference is to a blob this bounded context holds as
     // referenced, before anything is written (§239).
     let blob_claims = command_blob_claims(projection_dispatcher, &result.command, &result.events)?;
-    check_blob_claims(&mut **tx, &bounded_context_name, &blob_claims).await?;
+    check_blob_claims(tx, &bounded_context_name, &blob_claims).await?;
 
     // Command and every one of its triggered events, in the one
     // (savepoint-scoped, in the batched path) transaction `tx` has held
@@ -1486,7 +1486,7 @@ pub(super) async fn finish_accepted_command_in_tx(
     }
 
     record_blob_claims(
-        &mut **tx,
+        tx,
         &bounded_context_name,
         &blob_claims,
         Some(command_id),
@@ -2301,12 +2301,8 @@ pub(super) async fn write_command_batch_as_set(
             };
         if !blob_claims.is_empty() {
             savepoint.write(tx, None).await?;
-            if let Err(e) = check_blob_claims(
-                &mut **tx,
-                &item.command_type.bounded_context.name,
-                &blob_claims,
-            )
-            .await
+            if let Err(e) =
+                check_blob_claims(tx, &item.command_type.bounded_context.name, &blob_claims).await
             {
                 if matches!(e, crate::error::Error::Database(_)) {
                     return Err(e);
@@ -2689,7 +2685,7 @@ pub(super) async fn write_planned_commands(
         })
         .collect();
     if let Some(first) = planned.first() {
-        record_blob_claims_by_command(&mut **tx, bounded_context, &blob_claims, first.now).await?;
+        record_blob_claims_by_command(tx, bounded_context, &blob_claims, first.now).await?;
     }
 
     if !sync_projections.is_empty() {

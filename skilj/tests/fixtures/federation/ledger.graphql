@@ -312,6 +312,14 @@ enum LedgerParkedDeliveryKind @inaccessible {
 	DEADLINE
 }
 
+type LedgerPayloadLimits @inaccessible {
+	boundedContext: String!
+	maxPayloadBytes: Int!
+	warnPayloadBytes: Int
+	maxPayloadBytesOverride: Int
+	warnPayloadBytesOverride: Int
+}
+
 type LedgerPrivateField {
 	field: String!
 	kind: LedgerPrivateFieldKind!
@@ -510,6 +518,7 @@ type Mutation {
 	ledgerResyncBoundedContextFromTemplate(boundedContext: String!): LedgerBoundedContext! @inaccessible
 	ledgerArchiveBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerDeleteBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
+	ledgerSetPayloadLimits(boundedContext: String!, maxPayloadBytes: Int, warnPayloadBytes: Int): LedgerPayloadLimits! @inaccessible
 	ledgerRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: LedgerMissedOccurrencePolicy): LedgerEventType! @inaccessible
 	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): LedgerCommandType! @inaccessible
 	ledgerRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, ownerTagKey: String, requiresCapability: String): LedgerProjectionRegistrationResult! @inaccessible
