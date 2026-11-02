@@ -4693,6 +4693,38 @@ rule AuthoriseCommandTrigger {
 -- optimistic decision and commit invalidates that decision. Missing optional
 -- sensitive leaves require no key. Summary states remain opaque ciphertext;
 -- this decryption contract applies to the selected event history itself.
+-- docs/architecture.md §235 (issue #133): a retraction says an earlier event
+-- is no longer endorsed; it erases nothing, which stays ForgetSubject's. It is
+-- an EventSpec a decision emits like any other, under the reserved type name
+-- EventRetracted, so it is appended atomically with the rest of the decision: a
+-- correction is a retraction and the event that should have been recorded, in
+-- one decision. What the store adds is what a decider can't get wrong: the
+-- retraction carries a copy of the retracted event's tags, a blind tag's hash
+-- included and no plaintext needed, plus its own skilj_retracts tag naming the
+-- position. So every query that found the original finds the retraction, and
+-- erasure and key rotation reach the copies as they reach any stored tag.
+--
+-- Checked under the bounded context's lock, each a typed rejection rather than
+-- an error, also answered by a dry run:
+--   retraction_target_not_found    - no event at that position
+--   retraction_of_retraction       - record the event again instead
+--   already_retracted              - including earlier in the same batch
+--   retraction_target_out_of_scope - the command type declares owner_tag_key,
+--                                    and the target doesn't carry the command's
+--                                    own value of it
+--   invalid_retraction             - the payload isn't a retraction
+--
+-- An event stays in every read. A snapshot's state is the fold of its value's
+-- standing events: the store passes over a retraction and what it retracts, and
+-- starts a state over from the value's history when a retraction names something
+-- already in it, in catch-up and in a command's read alike. A projection's state
+-- isn't recomputed: one that consumes EventRetracted takes the contribution out
+-- itself, and one that doesn't keeps it. A deployment with retractions refuses
+-- CommandType.snapshot(), whose decider folds the events past a stored row itself.
+--
+-- Hence tags_of_new_event below: derive_tags for every event but a retraction,
+-- and for a retraction the copied tags. Hence too the exception in
+-- invariant EventTagsMatchDeclaredMappings.
 rule ProcessCommand {
     when:
         CommandAuthorised(
@@ -4975,7 +5007,7 @@ rule ProcessCommand {
                     causation_id: command.id
                 },
                 sequence: next_sequence(command_type.bounded_context),
-                tags: derive_tags(spec.event_type, spec.payload),
+                tags: tags_of_new_event(spec),
                 encryption_keys: protected_event.encryption_keys,
                 command: command
             )
@@ -9389,7 +9421,10 @@ invariant ConsistencyTagKeysAreDeclared {
 }
 
 invariant EventTagsMatchDeclaredMappings {
-    for e in Events:
+    -- A retraction is the one exception: it carries the tags of the event it
+    -- retracts, whatever its own type maps (see the note above rule
+    -- ProcessCommand, docs/architecture.md §235).
+    for e in Events where e.event_type.name != "EventRetracted":
         for tag in e.tags:
             e.event_type.tag_mappings.any(m => m.key = tag.key)
 }

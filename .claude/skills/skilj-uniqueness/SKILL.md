@@ -112,10 +112,10 @@ annotated version. In short:
    }
    ```
 
-   `decide()` sees earlier events as stored, so their encrypted email is
-   ciphertext. That's fine and intended: the tag already selected exactly
-   the events with the same normalized address - decide on *which events
-   matched*, never by comparing payload values.
+   `decide()` gets decrypted copies of earlier events, but don't compare
+   values: the tag already selected exactly the events with the same
+   normalized address, so decide on *which events matched*. A read holding a
+   forgotten subject's event fails with `sensitive_history_unavailable`.
 
 4. **Configure the key** once per process, identical on every instance:
 
@@ -127,6 +127,73 @@ annotated version. In short:
    ```
 
    See "The key" below before the first deploy.
+
+## Correcting a value
+
+A wrong address isn't a change of address. Retract the wrong claim and record
+the right one, in one decision, and the store copies the old event's tags onto
+the retraction, so nobody has to supply the old value and the hash can't be
+missed (`docs/architecture.md` §235, `skilj/tests/corrections.rs`):
+
+```rust
+use skilj::retraction::{
+    claim_query, corrected, correction_query, Retractable, RetractionGround, ValueClaims, ValueEffect,
+};
+
+// builder.bounded_context("crm").retractions() - or
+// .retractions_owned_by("customer") when event types declare an owner_tag_key.
+
+const CLAIMS: [&str; 2] = ["EmailClaimed", "EmailReleased"];
+
+fn claims(events: &[Retractable<CustomerEvent>]) -> ValueClaims<'_, CustomerEvent> {
+    ValueClaims::fold(events, "email", |event| match event {
+        CustomerEvent::Claimed => ValueEffect::Claims,
+        CustomerEvent::Released => ValueEffect::Releases,
+    })
+}
+
+// CorrectEmail: type Event = Retractable<CustomerEvent>; tag_mappings has both.
+fn consistency_query() -> Vec<QueryItemMapping> {
+    correction_query(&CLAIMS, customer(), email("email"))
+}
+fn decide(payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
+    let claims = claims(events);
+    if claims.held_by_another("customer", &payload.customer_id).is_some() {
+        return taken();
+    }
+    let Some(current) = claims.held_by("customer", &payload.customer_id) else {
+        return nothing_to_correct();
+    };
+    corrected(current.position, RetractionGround::WrongDataSubmitted, "typo", [claim(payload)])
+}
+```
+
+**Once a bounded context has retractions, every command checking the value
+must see them:** use `claim_query(&CLAIMS, email("email"))` and
+`!claims(events).held().is_empty()` in place of the `.latest()` query above. A
+retraction of an old claim is the newest event carrying the value, so `.latest()`
+would call a value held by someone else free.
+
+- Use `ChangeEmail` for a real change and a correction for a mistake. They mean
+  different things to reactors and auditors.
+- Tell the user a retraction doesn't erase: `forgetSubject` does. Its `reason`
+  is stored in the clear, so no personal data in it.
+- A snapshot needs nothing: the store leaves retracted events out of its state.
+  `build()` refuses retractions next to a command using `snapshot()`; move it to
+  a `QueryItemMapping::snapshot` item. A projection isn't recomputed: it lists
+  `EventRetracted` in `consumed_event_types`, reads `Retractable` events and
+  takes the contribution out itself. One that doesn't keeps it, silently.
+- Not available from `.skilj.toml` yet: a generated `decide_*` has no position.
+
+| code | cause |
+|---|---|
+| `already_retracted` | that position is retracted already |
+| `retraction_of_retraction` | the target is a retraction; record the event again |
+| `retraction_target_not_found` | no event at that position |
+| `retraction_target_out_of_scope` | an owner-scoped command naming another owner's event |
+| `invalid_retraction` | a hand-built payload; use `retract` |
+| `reserved_event_type_name` | another shape registered as `EventRetracted` |
+| `snapshot_retracted_meanwhile` | a retraction reached a snapshot the command read, twice in a row or in a batch; retry |
 
 ## In a `.skilj.toml`
 

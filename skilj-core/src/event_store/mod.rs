@@ -659,6 +659,25 @@ pub enum Error {
     #[error("this owner_tag_key does not name a key present in tag_mappings")]
     InvalidOwnerTagKey,
 
+    /// A retraction committed between a command's read and its lock names an
+    /// event already in a snapshot state the command read (docs/architecture.md
+    /// §235). Single submission retries it once from the read; it surfaces when
+    /// a second one lands in between, and from a batch, where retrying one item
+    /// could reorder it.
+    #[error(
+        "a retraction in bounded context `{bounded_context}` reached a snapshot this command \
+         read; retry"
+    )]
+    SnapshotRetractedMeanwhile {
+        /// The bounded context.
+        bounded_context: String,
+    },
+
+    /// A type named `EventRetracted` with another shape than the built-in one
+    /// (docs/architecture.md §235): the store treats that name specially.
+    #[error("EventRetracted is reserved for the built-in retraction event type")]
+    ReservedEventTypeName,
+
     /// A TagMapping and a SensitiveField may not name the same field.
     #[error("a TagMapping and a SensitiveField may not name the same field")]
     SensitiveFieldTagOverlap,
@@ -947,6 +966,8 @@ impl SkiljRejection for Error {
             Error::InvalidSchema => "invalid_schema",
             Error::InvalidTagMapping => "invalid_tag_mapping",
             Error::InvalidOwnerTagKey => "invalid_owner_tag_key",
+            Error::ReservedEventTypeName => "reserved_event_type_name",
+            Error::SnapshotRetractedMeanwhile { .. } => "snapshot_retracted_meanwhile",
             Error::SensitiveFieldTagOverlap => "sensitive_field_tag_overlap",
             Error::InvalidSensitiveField => "invalid_sensitive_field",
             Error::InvalidPrivateField => "invalid_private_field",
@@ -3054,6 +3075,12 @@ pub fn register_event_type(
     }
     if !valid_schema(&schema) {
         return Err(Error::InvalidSchema.into());
+    }
+    if name == crate::retraction::RETRACTED_EVENT_TYPE
+        && serde_json::from_str::<serde_json::Value>(&schema).ok()
+            != Some(crate::retraction::retraction_schema())
+    {
+        return Err(Error::ReservedEventTypeName.into());
     }
     if !valid_tag_mappings(&schema, &tag_mappings) {
         return Err(Error::InvalidTagMapping.into());

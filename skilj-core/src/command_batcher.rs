@@ -626,9 +626,10 @@ impl CommandBatcher {
         now: DateTime<Utc>,
         idempotency_key: Option<&str>,
     ) -> Result<SubmitCommandOutcome> {
-        // docs/architecture.md §209: once more, rehashed, when a key
-        // rotation committed between deriving the tags and the lock.
-        let mut rotated_once = false;
+        // Once more, from the read, when a key rotation (docs/architecture.md
+        // §209) or a retraction reaching a snapshot state (§235) committed
+        // between the read and the lock.
+        let mut retried = false;
         loop {
             let outcome = self
                 .decide_and_submit_once(
@@ -649,9 +650,7 @@ impl CommandBatcher {
                 )
                 .await;
             match outcome {
-                Err(err) if crate::db::blind_tags_rotated(&err) && !rotated_once => {
-                    rotated_once = true
-                }
+                Err(err) if crate::db::back_to_the_read(&err) && !retried => retried = true,
                 outcome => return outcome,
             }
         }

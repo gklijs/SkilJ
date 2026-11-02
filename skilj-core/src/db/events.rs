@@ -865,10 +865,26 @@ pub(super) fn snapshot_state_of<'s>(
         .find(|state| state.snapshot == *name && state.tag_value == value)
 }
 
+/// Whether `event` belongs to `state`: it matches a snapshot item of `query`
+/// for that snapshot and value.
+fn event_belongs_to_state(
+    query: &[QueryItem],
+    state: &crate::plugin::SnapshotState,
+    event: &Event,
+) -> bool {
+    query.iter().any(|item| {
+        item.snapshot.as_deref() == Some(state.snapshot.as_str())
+            && item.tags.first().and_then(|t| t.value.as_deref()) == Some(state.tag_value.as_str())
+            && item.matches(event)
+    })
+}
+
 /// Folds every event of `events` (in sequence order) past a state's
 /// `folded_through` into each of `states` it belongs to - an event
 /// matching a snapshot item of `query` for that snapshot and value - with
-/// the snapshot's own fold for that value (docs/architecture.md §202).
+/// the snapshot's own fold for that value (docs/architecture.md §202). A
+/// retraction and what it retracts are passed over (§235); one whose target
+/// is already in a state is [`states_holding_retracted_events`]' to deal with.
 pub(super) fn fold_into_snapshot_states(
     snapshots: &dyn crate::plugin::SnapshotDispatcher,
     bounded_context: &str,
@@ -876,33 +892,71 @@ pub(super) fn fold_into_snapshot_states(
     states: &mut [crate::plugin::SnapshotState],
     events: &[Event],
 ) -> crate::error::Result<()> {
+    let retracted: std::collections::HashSet<i64> = events
+        .iter()
+        .filter_map(crate::retraction::retracted_position)
+        .collect();
     for event in events {
+        let passed_over = retracted.contains(&event.sequence)
+            || crate::retraction::retracted_position(event).is_some();
         for state in states.iter_mut() {
-            if event.sequence <= state.folded_through {
+            if event.sequence <= state.folded_through
+                || !event_belongs_to_state(query, state, event)
+            {
                 continue;
             }
-            let belongs = query.iter().any(|item| {
-                item.snapshot.as_deref() == Some(state.snapshot.as_str())
-                    && item.tags.first().and_then(|t| t.value.as_deref())
-                        == Some(state.tag_value.as_str())
-                    && item.matches(event)
-            });
-            if !belongs {
-                continue;
+            if !passed_over {
+                state.state_json = snapshots
+                    .fold_value(
+                        bounded_context,
+                        &state.snapshot,
+                        &state.tag_value,
+                        &state.state_json,
+                        event,
+                    )
+                    .ok_or_else(|| unregistered_snapshot(&state.snapshot))??;
             }
-            let folded = snapshots
-                .fold_value(
-                    bounded_context,
-                    &state.snapshot,
-                    &state.tag_value,
-                    &state.state_json,
-                    event,
-                )
-                .ok_or_else(|| unregistered_snapshot(&state.snapshot))??;
-            state.state_json = folded;
             state.folded_through = event.sequence;
         }
     }
+    Ok(())
+}
+
+/// The indexes of `states` a retraction among `events` makes wrong: it is
+/// past the state's position and retracts something at or before it, so the
+/// event's contribution is already in the state and can't be folded out
+/// (docs/architecture.md §235). Such a state starts over from its value's whole
+/// history; see [`reset_snapshot_state`].
+pub(super) fn states_holding_retracted_events(
+    query: &[QueryItem],
+    states: &[crate::plugin::SnapshotState],
+    events: &[Event],
+) -> Vec<usize> {
+    states
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| {
+            events.iter().any(|event| {
+                event.sequence > state.folded_through
+                    && crate::retraction::retracted_position(event)
+                        .is_some_and(|target| target <= state.folded_through)
+                    && event_belongs_to_state(query, state, event)
+            })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Puts `state` back to the snapshot's default state, before every event.
+pub(super) fn reset_snapshot_state(
+    snapshots: &dyn crate::plugin::SnapshotDispatcher,
+    bounded_context: &str,
+    state: &mut crate::plugin::SnapshotState,
+) -> crate::error::Result<()> {
+    state.state_json = snapshots
+        .default_state(bounded_context, &state.snapshot)
+        .ok_or_else(|| unregistered_snapshot(&state.snapshot))?;
+    state.folded_through = -1;
     Ok(())
 }
 
@@ -972,9 +1026,38 @@ pub(super) async fn read_query_with_snapshots(
         });
     }
 
+    // A stored row can hold an event retracted since it was folded. Each pass
+    // resets at least one state, and a state at -1 can't hold anything, so this
+    // ends (docs/architecture.md §235).
+    let (events, covered_through) = loop {
+        let (events, covered_through) =
+            read_query_past_snapshot_states(pool, cache, bounded_context, query, &states).await?;
+        let stale = states_holding_retracted_events(query, &states, &events);
+        if stale.is_empty() {
+            break (events, covered_through);
+        }
+        for index in stale {
+            reset_snapshot_state(snapshots, bounded_context, &mut states[index])?;
+        }
+    };
+    fold_into_snapshot_states(snapshots, bounded_context, query, &mut states, &events)?;
+    Ok((events, covered_through, states))
+}
+
+/// One read of every item of `query`: a snapshot item past its state's
+/// position, the others their whole history - from the event cache when its
+/// window holds everything after the lowest of those positions, else from
+/// Postgres. Returns the events and the position the read is complete through.
+async fn read_query_past_snapshot_states(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    query: &[QueryItem],
+    states: &[crate::plugin::SnapshotState],
+) -> crate::error::Result<(Vec<Event>, i64)> {
     let afters: Vec<Option<i64>> = query
         .iter()
-        .map(|item| snapshot_state_of(item, &states).map(|state| state.folded_through))
+        .map(|item| snapshot_state_of(item, states).map(|state| state.folded_through))
         .collect();
     let lowest = afters.iter().map(|a| a.unwrap_or(-1)).min().unwrap_or(-1);
     let past_its_item = |event: &Event| {
@@ -983,14 +1066,14 @@ pub(super) async fn read_query_with_snapshots(
             .zip(&afters)
             .any(|(item, after)| item.matches(event) && event.sequence > after.unwrap_or(-1))
     };
-    let (events, covered_through) = match cache
+    match cache
         .try_events_matching_query(pool, bounded_context, query, lowest)
         .await?
     {
-        Some((events, covered_through)) => (
+        Some((events, covered_through)) => Ok((
             events.into_iter().filter(|e| past_its_item(e)).collect(),
             covered_through,
-        ),
+        )),
         None => {
             let (covered_through, bc) = futures_util::try_join!(
                 latest_sequence(pool, bounded_context),
@@ -1004,11 +1087,9 @@ pub(super) async fn read_query_with_snapshots(
                 None,
             )
             .await?;
-            (events, covered_through.unwrap_or(-1))
+            Ok((events, covered_through.unwrap_or(-1)))
         }
-    };
-    fold_into_snapshot_states(snapshots, bounded_context, query, &mut states, &events)?;
-    Ok((events, covered_through, states))
+    }
 }
 
 /// `list_events_matching_query_with_bc` for a command's read before the

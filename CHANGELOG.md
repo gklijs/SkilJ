@@ -12,6 +12,18 @@ README.md, "Status and stability").
 
 ### Added
 
+- Retractions and corrections: `SkiljBuilder::retractions()` (or
+  `retractions_owned_by`) registers a built-in `EventRetracted`. A decision
+  emits one with `skilj::retraction::retract`, or `corrected` for a retraction
+  and its replacement in one append, and the store copies the retracted
+  event's tags onto it, a blind tag's hash included, so a value can't stay
+  taken because a tag was forgotten. `Retractable`, `standing` and
+  `ValueClaims` fold around them, and `correction_query` and `claim_query`
+  are the matching consistency queries. A snapshot's state leaves retracted
+  events out without any code in its fold; a projection consumes the
+  retraction and takes the contribution out itself. `build()` refuses
+  retractions next to a command type using `snapshot()`; use a
+  `QueryItemMapping::snapshot` item (issue #133, docs/architecture.md §235).
 - A private-field grant may name the one field it shares: an optional
   `field` argument on `grantPrivateFieldAccessForEvent` and
   `grantPrivateFieldAccessForCommand`, and `field` on `PrivateFieldGrant`

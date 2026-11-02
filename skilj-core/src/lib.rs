@@ -43,6 +43,7 @@ pub mod event_cache;
 pub mod event_store;
 pub mod plugin;
 pub mod projections;
+pub mod retraction;
 pub mod secrets;
 pub mod shared;
 #[doc(hidden)]

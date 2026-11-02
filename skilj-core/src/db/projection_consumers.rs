@@ -1207,6 +1207,21 @@ pub(super) async fn fold_snapshot_chunk_in_tx(
         })
         .collect();
 
+    // A retraction this row hasn't seen yet: what it retracts may be in the
+    // state, and a fold can't be undone, so the row starts over like a reset
+    // one, without the retracted event (docs/architecture.md §235).
+    for (index, value) in &planned {
+        let event = &events[*index];
+        if crate::retraction::retracted_position(event).is_some() {
+            let row = rows
+                .get_mut(*value)
+                .expect("every planned value's row was just read");
+            if row.as_of_sequence < event.sequence {
+                row.as_of_sequence = -1;
+            }
+        }
+    }
+
     // A row at -1 is refolded through its last event in the chunk. Each
     // keeps its events' `(sequence, index)`, in order, to say which event
     // a failing fold belongs to.
@@ -1384,6 +1399,27 @@ pub(super) async fn refold_snapshot_histories(
         .expect("refold is non-empty");
     let mut values: Vec<&str> = refold.keys().copied().collect();
     values.sort_unstable();
+    // Up front: a retraction can be pages past what it retracts. A retraction
+    // carries its target's tags, so it is found by the same value.
+    let retracted: std::collections::HashSet<i64> =
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "SELECT payload FROM {schema}.events \
+             WHERE sequence IN (SELECT sequence FROM {schema}.event_tags \
+                 WHERE tag_key = $1 AND tag_value = ANY($2) AND event_type_name = $3 \
+                 AND sequence <= $4)"
+        )))
+        .bind(tag_key)
+        .bind(&values)
+        .bind(crate::retraction::RETRACTED_EVENT_TYPE)
+        .bind(through_all)
+        .fetch_all(&mut *conn)
+        .await?
+        .iter()
+        .filter_map(|payload| {
+            serde_json::from_str::<crate::retraction::RetractionPayload>(payload).ok()
+        })
+        .map(|retraction| retraction.position)
+        .collect();
     for (value, planned) in refold {
         let row = rows.get_mut(*value).expect("every refolded row was read");
         row.state = default_state_json.to_string();
@@ -1413,6 +1449,11 @@ pub(super) async fn refold_snapshot_histories(
         let full = page.len() as i64 == PAGE;
         let page = events_from_rows(&mut *conn, bc, page, None).await?;
         for event in &page {
+            if retracted.contains(&event.sequence)
+                || crate::retraction::retracted_position(event).is_some()
+            {
+                continue;
+            }
             for value in snapshot_tag_values(event, tag_key) {
                 let Some(planned) = refold.get(value) else {
                     continue;

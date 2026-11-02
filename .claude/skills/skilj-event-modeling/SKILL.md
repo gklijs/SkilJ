@@ -99,6 +99,11 @@ in the summary and note whether forgetting the person should free the
 value or keep it taken - see "Uniqueness on personal data" in the
 reference; the `skilj-uniqueness` skill implements it.
 
+Ask how a wrong value gets fixed. A mistake is a retraction and the right event
+in one decision (`skilj::retraction`, `docs/architecture.md` §235), not a domain
+change event; note in the summary which events can be retracted and which
+projections then have to take the contribution out (snapshots need nothing).
+
 ## Producing the summary
 
 Once a handful of events/commands are named with real accept/reject
