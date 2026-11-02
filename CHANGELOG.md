@@ -12,6 +12,28 @@ README.md, "Status and stability").
 
 ### Added
 
+- Payload size limits (issue #132, docs/architecture.md §238):
+  `SkiljBuilder::payload_limits` bounds a stored command payload, event
+  payload and external event source message, each on its own and measured
+  as stored. A larger one is refused with `payload_too_large` (413 over
+  REST) on every write path - commands single and batched, the events a
+  `decide()` returns, direct and external events single and batched, and
+  scheduled events - and one above the warning threshold is logged, at most
+  once a minute per type. A superadmin overrides both values per bounded
+  context with `setPayloadLimits`, read under the write lock at no extra
+  round trip.
+- Blob references (issue #132, docs/architecture.md §239): a payload
+  carries a `BlobRef` (`{"$blob": id, "sha256", "size", "media_type"}`)
+  in place of large bytes. `EventType::blob_fields` and
+  `CommandType::blob_fields` declare where; a `$blob` anywhere else is
+  refused. `BlobStore` is the storage trait and `db::PostgresBlobStore`
+  the built-in backend, in the bounded context's own schema.
+  `db::upload_blob` stores a `pending` blob; an append checks every
+  reference under the write lock - the blob exists, isn't deleted, and
+  size, hash and media type match - refuses it with
+  `blob_reference_invalid` otherwise, records it in `blob_references` and
+  marks the blob `referenced`. `db::read_blob` streams it back, verified.
+  The REST routes, encryption and erasure, and orphan collection follow.
 - Retractions and corrections: `SkiljBuilder::retractions()` (or
   `retractions_owned_by`) registers a built-in `EventRetracted`. A decision
   emits one with `skilj::retraction::retract`, or `corrected` for a retraction
@@ -56,6 +78,9 @@ README.md, "Status and stability").
 
 ### Changed
 
+- Payloads larger than 256 KiB are now refused by default (§238). Raise
+  the limit with `SkiljBuilder::payload_limits`, or per bounded context
+  with `setPayloadLimits`, if you store larger ones today.
 - **Breaking:** `PrivateFieldGrant` has a new public `field`, and
   `grant_private_field_access_for_event` and `_for_command` a new `field`
   parameter; pass `None` for today's behaviour.

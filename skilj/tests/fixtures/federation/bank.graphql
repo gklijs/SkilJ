@@ -312,6 +312,14 @@ enum BankParkedDeliveryKind @inaccessible {
 	DEADLINE
 }
 
+type BankPayloadLimits @inaccessible {
+	boundedContext: String!
+	maxPayloadBytes: Int!
+	warnPayloadBytes: Int
+	maxPayloadBytesOverride: Int
+	warnPayloadBytesOverride: Int
+}
+
 type BankPrivateField {
 	field: String!
 	kind: BankPrivateFieldKind!
@@ -510,6 +518,7 @@ type Mutation {
 	bankResyncBoundedContextFromTemplate(boundedContext: String!): BankBoundedContext! @inaccessible
 	bankArchiveBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankDeleteBoundedContext(name: String!): BankBoundedContext! @inaccessible
+	bankSetPayloadLimits(boundedContext: String!, maxPayloadBytes: Int, warnPayloadBytes: Int): BankPayloadLimits! @inaccessible
 	bankRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: BankMissedOccurrencePolicy): BankEventType! @inaccessible
 	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): BankCommandType! @inaccessible
 	bankRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, ownerTagKey: String, requiresCapability: String): BankProjectionRegistrationResult! @inaccessible

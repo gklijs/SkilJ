@@ -2951,7 +2951,7 @@ pub(super) async fn insert_external_event_in_tx(
     payload_limits.check_event(&event)?;
     let blob_claims = event_blob_claims(projection_dispatcher, &event)?;
     let schema_name = &adapter.event_type.bounded_context.name;
-    check_blob_claims(&mut **tx, schema_name, &blob_claims).await?;
+    check_blob_claims(tx, schema_name, &blob_claims).await?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, resolved);
     insert_event_and_update_sync_projections_in_tx(
         tx,
@@ -2962,7 +2962,7 @@ pub(super) async fn insert_external_event_in_tx(
         sync_projections,
     )
     .await?;
-    record_blob_claims(&mut **tx, schema_name, &blob_claims, None, now).await?;
+    record_blob_claims(tx, schema_name, &blob_claims, None, now).await?;
     match &dedupe {
         Some(ExternalEventDedupe::Watermark(cursor)) => {
             advance_dedupe_watermark(
