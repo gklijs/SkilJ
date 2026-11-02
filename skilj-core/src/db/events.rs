@@ -1037,7 +1037,9 @@ pub(super) async fn read_query_with_snapshots(
             break (events, covered_through);
         }
         for index in stale {
-            reset_snapshot_state(snapshots, bounded_context, &mut states[index])?;
+            if let Some(state) = states.get_mut(index) {
+                reset_snapshot_state(snapshots, bounded_context, state)?;
+            }
         }
     };
     fold_into_snapshot_states(snapshots, bounded_context, query, &mut states, &events)?;
