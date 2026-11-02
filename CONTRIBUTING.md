@@ -118,25 +118,14 @@ the note on `/tmp` filling up below) for 15 days; they skip gracefully,
 the same tolerance the embedded-Postgres tests above already have, if
 that download can't reach the network.
 
-Building `skilj-kafka` ([docs/architecture.md §39](docs/architecture.md#external-message-dedup-create-external-event)/[§40](docs/architecture.md#skilj-kafka-bridge)) needs a C compiler
-that can see `curl/curl.h` at build time - `rdkafka-sys`'s own vendored
-`librdkafka` (`cmake-build` feature, which compiles it from source
-rather than needing a system `libcurl4-openssl-dev` package broadly
-installed) includes that header unconditionally in `rdkafka_conf.c`
-even with CURL support itself compiled out (`WITH_CURL=0`) - a real
-upstream quirk in this librdkafka version, not something a Cargo
-feature avoids. With no root available: `apt-get download
-libcurl4-openssl-dev` (no root needed, downloads the `.deb` to the
-current directory without installing it) then `dpkg-deb -x
-libcurl4-openssl-dev_*.deb extracted` and point `CPATH` at
-`extracted/usr/include` (and, on a multiarch system,
-`extracted/usr/include/x86_64-linux-gnu` too, where the actual
-`curl/curl.h` lives) - `CPATH` is a plain GCC/Clang env var honoured by
-angle-bracket `#include`s regardless of the build system driving the
-compiler, so no `cmake`/`rdkafka-sys` configuration is needed beyond
-setting it. Confirmed by testing, not assumed: a full real-Kafka
-integration test (produce, consume, assert the payload round-trips)
-compiled and ran clean with only this env var set.
+Building `skilj-kafka` ([docs/architecture.md §39](docs/architecture.md#external-message-dedup-create-external-event)/[§40](docs/architecture.md#skilj-kafka-bridge)) needs `cmake` and a C compiler, not a system libcurl: its TLS features build curl
+from source for the `curl/curl.h` that `librdkafka`'s source includes
+([§234](docs/architecture.md)). Only a build with `default-features =
+false` still needs that header on the system, from
+`libcurl4-openssl-dev` or, without root, from `apt-get download
+libcurl4-openssl-dev`, `dpkg-deb -x libcurl4-openssl-dev_*.deb extracted`
+and `CPATH` pointing at `extracted/usr/include` and, on a multiarch
+system, `extracted/usr/include/x86_64-linux-gnu`.
 
 `skilj-kafka`, `skilj-amqp`, `skilj-nats`, and `skilj-temporal`'s real-
 broker tests (`skilj-kafka/tests/`, `skilj-amqp/tests/`,

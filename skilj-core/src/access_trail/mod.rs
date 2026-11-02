@@ -131,6 +131,7 @@ impl AccessEventKind {
                 ("grant_id", "string", true),
                 ("event_sequence", "integer", false),
                 ("command_id", "string", false),
+                ("field", "string", false),
             ],
             AccessEventKind::PrivateFieldAccessRevoked => &[
                 ("actor_role_id", "string", false),
@@ -244,7 +245,8 @@ impl AccessChange {
 
     /// `PrivateFieldAccessGranted`: `grant` as it is made. `role_id` is the
     /// grantee, whose access it is, and the actor is the grantor. Both
-    /// record fields empty is a blanket grant.
+    /// record fields empty is a blanket grant; `field` empty, every private
+    /// field the grant reaches.
     pub fn private_field_granted(grant: &crate::access_control::PrivateFieldGrant) -> Self {
         Self::new(
             AccessEventKind::PrivateFieldAccessGranted,
@@ -255,6 +257,7 @@ impl AccessChange {
                 "grant_id": grant.id,
                 "event_sequence": grant.event_sequence,
                 "command_id": grant.command_id,
+                "field": grant.field,
             }),
         )
     }

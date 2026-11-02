@@ -10,8 +10,37 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Added
+
+- A private-field grant may name the one field it shares: an optional
+  `field` argument on `grantPrivateFieldAccessForEvent` and
+  `grantPrivateFieldAccessForCommand`, and `field` on `PrivateFieldGrant`
+  and on the `PrivateFieldAccessGranted` trail event. Named, it opens that
+  field alone, and the grantor must be that field's own default reader; a
+  field its type doesn't declare private is refused with
+  `private_field_not_declared`. Omitted, it covers every field, as far as
+  the Security entry below allows. The `field` column is added at startup
+  (issue #155, docs/architecture.md §233).
+
+### Changed
+
+- **Breaking:** `PrivateFieldGrant` has a new public `field`, and
+  `grant_private_field_access_for_event` and `_for_command` a new `field`
+  parameter; pass `None` for today's behaviour.
+- `skilj-kafka` no longer needs a system libcurl: its `ssl` and
+  `ssl-vendored` features, one of them the default, build curl from source
+  for the header librdkafka includes, and link it statically. With
+  `default-features = false` the header is still needed on the system
+  (docs/architecture.md §234).
+
 ### Security
 
+- A private-field grant, including one already made, opens a field only
+  while its grantor is that field's own default reader. An addressee's
+  record-wide grant no longer opens the creator's `own` fields, a creator's
+  no longer opens a field addressed to someone else, and a per-record grant
+  stops reaching a field its grantor can no longer read after a
+  re-registration (docs/architecture.md §233).
 - A sensitive field whose value is present but whose `subject_field` is
   absent (or not a scalar) is no longer stored in plaintext. The write is
   refused with `sensitive_field_without_subject`; the infallible

@@ -26,27 +26,31 @@ skilj-retry.workspace = true
 # The skilj REST client side every bridge shares (docs/architecture.md §165).
 skilj-bridge.workspace = true
 # cmake-build: vendors and compiles librdkafka from source rather than
-# needing it (and its -dev headers) present on the system - see
-# CONTRIBUTING.md's own note on the one real build-time snag this hits
-# (an unconditional `#include <curl/curl.h>` in this librdkafka version,
-# regardless of WITH_CURL).
+# needing it (and its -dev headers) present on the system.
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
 
 # Pass-throughs to rdkafka's own features (GitHub issue #124). TLS is on
 # by default because most managed Kafka requires it, and it is the
 # vendored OpenSSL, linked statically, so the binary still runs in a
 # `FROM scratch` image. Build with `default-features = false` to drop it
-# (no OpenSSL, perl or make needed; `SSL`/`SASL_SSL` then fail at client
-# creation), or `default-features = false, features = ["ssl"]` to link
-# the system OpenSSL instead.
+# (no OpenSSL, perl or make needed, but librdkafka's source then needs
+# `curl/curl.h` on the system; `SSL`/`SASL_SSL` fail at client creation),
+# or `default-features = false, features = ["ssl"]` to link the system
+# OpenSSL instead.
+#
+# Both TLS features add `curl-static`, which builds curl from source. Its
+# one job here is the header: this librdkafka includes `curl/curl.h` even
+# with curl compiled out (docs/architecture.md §234), fixed in librdkafka
+# 2.15.0, so drop it once rdkafka-sys carries that. It can't be on
+# unconditionally, since curl-sys turns on OpenSSL.
 [features]
 default = ["ssl-vendored"]
 # `security.protocol=SSL` / `SASL_SSL` and `SCRAM-SHA-*`, linking the
 # system OpenSSL dynamically.
-ssl = ["rdkafka/ssl"]
+ssl = ["rdkafka/ssl", "rdkafka/curl-static"]
 # The same, building OpenSSL from source and linking it statically (needs
 # a C compiler, perl and make).
-ssl-vendored = ["rdkafka/ssl-vendored"]
+ssl-vendored = ["rdkafka/ssl-vendored", "rdkafka/curl-static"]
 # Kerberos (`sasl.mechanism=GSSAPI`), linking the system libsasl2
 # (libsasl2-dev on Debian, cyrus-sasl-devel on RHEL).
 gssapi = ["rdkafka/gssapi"]

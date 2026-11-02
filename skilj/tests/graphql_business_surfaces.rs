@@ -2329,6 +2329,77 @@ fn private_field_grant_lifecycle_end_to_end() {
             r#"{"note":null}"#
         );
 
+        // A grant may name the one field it shares (issue #155), and the
+        // name comes back on the grant.
+        const GRANT_FIELD: &str = "\
+            mutation($bc: String!, $grantee: ID!, $seq: Int!, $field: String) { \
+                grantPrivateFieldAccessForEvent(boundedContext: $bc, granteeRoleId: $grantee, eventSequence: $seq, field: $field) { \
+                    id field \
+                } \
+            }";
+        let response = graphql_request(
+            &router,
+            Some(&creator_jwt),
+            GRANT_FIELD,
+            json!({ "bc": bc_name, "grantee": colleague_role.id, "seq": sequence, "field": "note" }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let field_grant_id = response["data"]["grantPrivateFieldAccessForEvent"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(response["data"]["grantPrivateFieldAccessForEvent"]["field"], "note");
+        let response = graphql_request(
+            &router,
+            Some(&colleague_jwt),
+            INSPECT_EVENT,
+            json!({ "bc": bc_name, "seq": sequence }),
+        )
+        .await;
+        assert_eq!(
+            response["data"]["inspectEvent"]["renderedPayload"],
+            r#"{"note":"call back Monday"}"#
+        );
+        // Read back from the table, and recorded in the access trail.
+        let stored = skilj_core::db::get_private_field_grant(&pool, &bc_name, &field_grant_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.field.as_deref(), Some("note"));
+        let trail = skilj_core::db::list_events_for_bounded_context(
+            &pool,
+            skilj_core::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.payload.contains(&field_grant_id))
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&trail.payload).unwrap();
+        assert_eq!(payload["field"], "note");
+        // A name the type doesn't declare private is refused, not recorded.
+        let response = graphql_request(
+            &router,
+            Some(&creator_jwt),
+            GRANT_FIELD,
+            json!({ "bc": bc_name, "grantee": colleague_role.id, "seq": sequence, "field": "not_declared" }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "private_field_not_declared",
+            "{response:?}"
+        );
+        let response = graphql_request(
+            &router,
+            Some(&creator_jwt),
+            REVOKE_GRANT,
+            json!({ "bc": bc_name, "id": field_grant_id }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+
         // A colleague with no grant of their own may not revoke - a
         // grantor-only action - nor may they list someone else's grants
         // without admin level, even though this colleague happens to
@@ -2367,8 +2438,8 @@ fn private_field_grant_lifecycle_end_to_end() {
         .await;
         assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
         let grants = response["data"]["listPrivateFieldGrants"].as_array().unwrap();
-        assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0]["status"], "REVOKED");
+        assert_eq!(grants.len(), 2);
+        assert!(grants.iter().all(|grant| grant["status"] == "REVOKED"));
     });
 }
 
@@ -3015,6 +3086,7 @@ fn a_readers_grants_are_its_own_active_ones_with_their_records_resolved() {
                 grantee: grantee.clone(),
                 event_sequence,
                 command_id,
+                field: None,
                 status: if revoked {
                     skilj_core::access_control::TokenStatus::Revoked
                 } else {

@@ -323,6 +323,7 @@ type BankPrivateFieldGrant {
 	grantee: BankRole!
 	eventSequence: Int
 	commandId: ID
+	field: String
 	status: BankAccessTokenStatus!
 	createdAt: String!
 	revokedAt: String
@@ -523,8 +524,8 @@ type Mutation {
 	bankApproveCommand(boundedContext: String!, proposalId: ID!): BankCommandProposalDecisionPayload! @inaccessible
 	bankRejectCommand(boundedContext: String!, proposalId: ID!, reason: String): BankCommandProposalDecisionPayload! @inaccessible
 	bankForgetSubject(boundedContext: String!, subjectKey: String!, subjectValue: String!): BankEncryptionKey! @inaccessible
-	bankGrantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int): BankPrivateFieldGrant!
-	bankGrantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID): BankPrivateFieldGrant!
+	bankGrantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int, field: String): BankPrivateFieldGrant!
+	bankGrantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID, field: String): BankPrivateFieldGrant!
 	bankRevokePrivateFieldAccess(boundedContext: String!, grantId: ID!): BankPrivateFieldGrant!
 }
 

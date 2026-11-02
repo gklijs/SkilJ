@@ -18,10 +18,12 @@ use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
-/// `grantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int): PrivateFieldGrant!` -
+/// `grantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int, field: String): PrivateFieldGrant!` -
 /// `eventSequence` omitted mints a blanket grant (see `value PrivateField`'s
 /// own doc comment on what that reaches); named, a per-record one,
-/// checked against `is_default_private_reader`.
+/// checked against `is_default_private_reader`. `field` omitted shares
+/// every `own`/`addressed` field the grant reaches; named, only that one
+/// (see `access_control::grant_private_field_access_for_event`).
 pub fn grant_private_field_access_for_event_field(n: &Naming) -> Field {
     Field::new(
         n.root("grantPrivateFieldAccessForEvent"),
@@ -39,6 +41,12 @@ pub fn grant_private_field_access_for_event_field(n: &Naming) -> Field {
                     .get("eventSequence")
                     .filter(|v| !v.is_null())
                     .map(|v| v.i64())
+                    .transpose()?;
+                let field = ctx
+                    .args
+                    .get("field")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string())
                     .transpose()?;
 
                 let grantee = skilj_core::db::get_role(&state.pool, &grantee_role_id)
@@ -63,6 +71,7 @@ pub fn grant_private_field_access_for_event_field(n: &Naming) -> Field {
                     &access_mapping,
                     &grantee,
                     event.as_ref(),
+                    field,
                     skilj_core::shared::try_generate_token_id()
                         .map_err(crate::error::to_graphql_error)?,
                     chrono::Utc::now(),
@@ -88,9 +97,10 @@ pub fn grant_private_field_access_for_event_field(n: &Naming) -> Field {
         "eventSequence",
         TypeRef::named(TypeRef::INT),
     ))
+    .argument(InputValue::new("field", TypeRef::named(TypeRef::STRING)))
 }
 
-/// `grantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID): PrivateFieldGrant!` -
+/// `grantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID, field: String): PrivateFieldGrant!` -
 /// same shape and reasoning as `grantPrivateFieldAccessForEvent` above,
 /// checked against a `Command` instead of an `Event`.
 pub fn grant_private_field_access_for_command_field(n: &Naming) -> Field {
@@ -110,6 +120,12 @@ pub fn grant_private_field_access_for_command_field(n: &Naming) -> Field {
                     .get("commandId")
                     .filter(|v| !v.is_null())
                     .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
+                let field = ctx
+                    .args
+                    .get("field")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string())
                     .transpose()?;
 
                 let grantee = skilj_core::db::get_role(&state.pool, &grantee_role_id)
@@ -134,6 +150,7 @@ pub fn grant_private_field_access_for_command_field(n: &Naming) -> Field {
                     &access_mapping,
                     &grantee,
                     command.as_ref(),
+                    field,
                     skilj_core::shared::try_generate_token_id()
                         .map_err(crate::error::to_graphql_error)?,
                     chrono::Utc::now(),
@@ -156,6 +173,7 @@ pub fn grant_private_field_access_for_command_field(n: &Naming) -> Field {
         TypeRef::named_nn(TypeRef::ID),
     ))
     .argument(InputValue::new("commandId", TypeRef::named(TypeRef::ID)))
+    .argument(InputValue::new("field", TypeRef::named(TypeRef::STRING)))
 }
 
 /// `revokePrivateFieldAccess(boundedContext: String!, grantId: ID!): PrivateFieldGrant!` -

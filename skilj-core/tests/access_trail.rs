@@ -497,6 +497,7 @@ fn blanket_grant(grantor: &Role, grantee: &Role, bc: &BoundedContext) -> Private
         grantee: grantee.clone(),
         event_sequence: None,
         command_id: None,
+        field: None,
         status: TokenStatus::Active,
         created_at: now(),
         revoked_at: None,
@@ -653,6 +654,60 @@ fn private_field_events_carry_the_record_they_name_and_nothing_personal() {
     assert_eq!(payload["event_sequence"], 42);
     assert_eq!(payload["role_id"], "grantee");
     assert_eq!(payload["actor_role_id"], "grantor");
+}
+
+/// A context provisioned before grants could name a field: the startup
+/// patch adds the column, repeatably, and a grant already there keeps its
+/// record-wide meaning (issue #155).
+#[test]
+fn a_grant_from_before_the_field_column_reads_back_naming_no_field() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let grantor = seed_role(&pool).await;
+        let grantee = seed_role(&pool).await;
+        let bc = seed_bounded_context(&pool).await;
+        let grant_id = generate_token_id();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE \"bc_{}\".private_field_grants DROP COLUMN field",
+            bc.name
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO \"bc_{}\".private_field_grants \
+             (id, grantor_role_id, grantee_role_id, status, created_at) \
+             VALUES ($1, $2, $3, 'active', now())",
+            bc.name
+        )))
+        .bind(&grant_id)
+        .bind(&grantor.id)
+        .bind(&grantee.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        db::ensure_private_field_grants_table(&pool, &bc.name)
+            .await
+            .unwrap();
+        db::ensure_private_field_grants_table(&pool, &bc.name)
+            .await
+            .unwrap();
+
+        let grant = db::get_private_field_grant(&pool, &bc.name, &grant_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.field, None);
+        assert_eq!(grant.grantee, grantee);
+        let active = db::list_active_private_field_grants_for_grantee(&pool, &bc.name, &grantee)
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].field, None);
+    });
 }
 
 #[test]

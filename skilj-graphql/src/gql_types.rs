@@ -526,6 +526,7 @@ pub fn private_field_grant_object(n: &Naming) -> Object {
             None => Value::Null,
         },
         scalar "commandId": TypeRef::named(TypeRef::ID) => |g| optional_string(g.command_id.clone()),
+        scalar "field": TypeRef::named(TypeRef::STRING) => |g| optional_string(g.field.clone()),
         scalar "status": TypeRef::named_nn(n.ty("AccessTokenStatus")) => |g| Value::from(access_token_status_name(g.status)),
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |g| Value::from(g.created_at.to_rfc3339()),
         scalar "revokedAt": TypeRef::named(TypeRef::STRING) => |g| optional_timestamp(g.revoked_at),

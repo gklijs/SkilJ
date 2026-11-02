@@ -207,7 +207,7 @@ jobs:
       # libsasl2-dev: semver-checks builds every feature not named like
       # `unstable`, so skilj-kafka's `gssapi` (Kerberos, issue #124) too,
       # and its sasl2-sys links the system libsasl2.
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev libsasl2-dev
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake libsasl2-dev
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks@0.51.0
@@ -222,7 +222,7 @@ jobs:
       # (skilj-demo, skilj-test-support) and binary-only ones (skilj-tui,
       # skilj-inspector), and a new crate is skipped until it has a
       # release to compare with. skilj-kafka is why this job installs
-      # cmake and libcurl: building its baseline compiles librdkafka.
+      # cmake: building its baseline compiles librdkafka.
       - run: cargo semver-checks --workspace
 
   machete:
@@ -246,7 +246,7 @@ jobs:
       # The workspace's declared `rust-version` (Cargo.toml) must keep
       # building. Libraries and binaries only - what a dependent compiles;
       # the tests run on stable below.
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake
       - run: rustup toolchain install 1.95 --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
@@ -264,7 +264,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       # rdkafka's build script still builds librdkafka under clippy.
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake
       - run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -331,13 +331,12 @@ jobs:
       - name: Free runner disk space
         run: rm -rf /host/dotnet/* /host/android/* /host/ghc/* /host/codeql/* && df -h /
       - uses: actions/checkout@v5
-      # cmake and libcurl4-openssl-dev: skilj-kafka's rdkafka vendors
-      # librdkafka via cmake, and that source #includes curl/curl.h even
-      # with curl support compiled out. `postgresql` is the server: the
+      # cmake: skilj-kafka's rdkafka vendors librdkafka via cmake.
+      # `postgresql` is the server: the
       # failover test (skilj_test_support::FailoverServer, docs/architecture.md
       # §176) runs a primary and a standby of its own, as the `postgres`
       # user this package creates, since Postgres refuses to run as root.
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev postgresql-client postgresql
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake postgresql-client postgresql
       # Settle the database first, so a missing one shows in seconds
       # rather than after the whole workspace is built. Prefers the
       # service and falls back to a Postgres inside this container.
@@ -430,13 +429,12 @@ jobs:
       - name: Free runner disk space
         run: rm -rf /host/dotnet/* /host/android/* /host/ghc/* /host/codeql/* && df -h /
       - uses: actions/checkout@v5
-      # cmake and libcurl4-openssl-dev: skilj-kafka's rdkafka vendors
-      # librdkafka via cmake, and that source #includes curl/curl.h even
-      # with curl support compiled out. `postgresql` is the server: the
+      # cmake: skilj-kafka's rdkafka vendors librdkafka via cmake.
+      # `postgresql` is the server: the
       # failover test (skilj_test_support::FailoverServer, docs/architecture.md
       # §176) runs a primary and a standby of its own, as the `postgres`
       # user this package creates, since Postgres refuses to run as root.
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev postgresql-client postgresql
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake postgresql-client postgresql
       # Settle the database first, so a missing one shows in seconds
       # rather than after the whole workspace is built. Prefers the
       # service and falls back to a Postgres inside this container.
