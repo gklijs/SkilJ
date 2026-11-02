@@ -474,6 +474,151 @@ pub(super) struct AcceptedDecision {
     /// What the command's events' blind tags are hashed with - the
     /// dispatcher's, carried to where they're derived.
     pub(super) blind: crate::blind::BlindIndex,
+    /// The tags of the retractions among `event_specs`, by index
+    /// (docs/architecture.md §235), replacing what their mappings derive.
+    pub(super) retraction_tags: RetractionTags,
+}
+
+/// Which of a decision's events are retractions, and the tags each gets.
+pub(super) type RetractionTags = Vec<(usize, Vec<Tag>)>;
+
+/// Why a decision's retraction can't be appended, a typed rejection like any
+/// other: `(reason, kind)`.
+type RetractionRefusal = (String, &'static str);
+
+/// Checks the retractions among `event_specs` and settles what the store adds
+/// to each (docs/architecture.md §235): the tags of the event it retracts, and
+/// that event's type and owner in its payload. A read on the lock holder's
+/// connection, so nothing can retract the same event between this and the
+/// append; `extra_committed_events` holds what an earlier command in the batch
+/// decided and hasn't written yet. Runs on a dry run too, without the lock,
+/// where it says what would have happened.
+async fn resolve_retractions(
+    conn: &mut sqlx::PgConnection,
+    command_type: &CommandType,
+    consistency_tags: &[Tag],
+    event_specs: &mut [crate::shared::EventSpec],
+    event_types_by_name: &std::collections::HashMap<String, EventType>,
+    extra_committed_events: &[Event],
+) -> crate::error::Result<Result<RetractionTags, RetractionRefusal>> {
+    use crate::retraction::{RetractionPayload, RETRACTED_EVENT_TYPE, RETRACTS_TAG_KEY};
+    let mut resolved: RetractionTags = Vec::new();
+    let Some(retraction_type) = event_types_by_name.get(RETRACTED_EVENT_TYPE) else {
+        // Unregistered: `process_command_at_boundary` refuses it, as any.
+        return Ok(Ok(resolved));
+    };
+    let schema = schema_ident(&command_type.bounded_context.name);
+    let mut seen = std::collections::HashSet::new();
+    for (index, spec) in event_specs.iter_mut().enumerate() {
+        if spec.event_type != RETRACTED_EVENT_TYPE {
+            continue;
+        }
+        let mut retraction: RetractionPayload = match serde_json::from_value(spec.payload.clone()) {
+            Ok(retraction) => retraction,
+            Err(error) => {
+                return Ok(Err((
+                    format!("not a retraction: {error}"),
+                    "invalid_retraction",
+                )));
+            }
+        };
+        let position = retraction.position;
+        let position_tag = position.to_string();
+        let target = match extra_committed_events
+            .iter()
+            .find(|event| event.sequence == position)
+        {
+            Some(event) => Some((event.event_type.name.clone(), event.tags.clone())),
+            None => sqlx::query_as::<_, (String, Json<Vec<Tag>>)>(sqlx::AssertSqlSafe(format!(
+                "SELECT event_type_name, tags FROM {schema}.events WHERE sequence = $1"
+            )))
+            .bind(position)
+            .fetch_optional(&mut *conn)
+            .await?
+            .map(|(name, Json(tags))| (name, tags)),
+        };
+        let Some((target_type, target_tags)) = target else {
+            return Ok(Err((
+                format!("no event at position {position} to retract"),
+                "retraction_target_not_found",
+            )));
+        };
+        if target_type == RETRACTED_EVENT_TYPE {
+            return Ok(Err((
+                format!(
+                    "position {position} is a retraction; record the event again instead of                      retracting the retraction"
+                ),
+                "retraction_of_retraction",
+            )));
+        }
+        // A command scoped to an owner retracts that owner's events only: the
+        // position is the caller's to choose, and a retraction frees a value.
+        if let Some(owner_key) = &command_type.owner_tag_key {
+            let in_scope = consistency_tags
+                .iter()
+                .filter(|tag| &tag.key == owner_key)
+                .any(|tag| target_tags.contains(tag));
+            if !in_scope {
+                return Ok(Err((
+                    format!("the event at position {position} belongs to another {owner_key}"),
+                    "retraction_target_out_of_scope",
+                )));
+            }
+        }
+        let mut already = !seen.insert(position);
+        if !already {
+            already = extra_committed_events.iter().any(|event| {
+                event.event_type.name == RETRACTED_EVENT_TYPE
+                    && event.tags.iter().any(|tag| {
+                        tag.key == RETRACTS_TAG_KEY
+                            && tag.value.as_deref() == Some(position_tag.as_str())
+                    })
+            });
+        }
+        if !already {
+            already = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+                "SELECT EXISTS (SELECT 1 FROM {schema}.event_tags                  WHERE tag_key = $1 AND tag_value = $2 AND event_type_name = $3)"
+            )))
+            .bind(RETRACTS_TAG_KEY)
+            .bind(&position_tag)
+            .bind(RETRACTED_EVENT_TYPE)
+            .fetch_one(&mut *conn)
+            .await?;
+        }
+        if already {
+            return Ok(Err((
+                format!("the event at position {position} is already retracted"),
+                "already_retracted",
+            )));
+        }
+        // The one owner tag an owner-scoped retraction type is read by. An
+        // event without it stays hidden from every scoped reader, failing
+        // closed rather than showing a scoped reader someone else's tags.
+        retraction.owner = retraction_type.owner_tag_key.as_ref().and_then(|key| {
+            target_tags
+                .iter()
+                .find(|tag| &tag.key == key)
+                .and_then(|tag| tag.value.clone())
+        });
+        retraction.retracted_event_type = Some(target_type);
+        spec.payload = serde_json::to_value(&retraction)
+            .map_err(|error| crate::event_store::Error::PayloadDecodeFailed(error.to_string()))?;
+        let mut tags = target_tags;
+        tags.push(Tag {
+            key: RETRACTS_TAG_KEY.to_string(),
+            value: Some(position_tag),
+        });
+        resolved.push((index, tags));
+    }
+    Ok(Ok(resolved))
+}
+
+/// Gives a command's events the tags [`resolve_retractions`] settled on. Events
+/// are built one per spec, in order.
+fn apply_retraction_tags(events: &mut [Event], retraction_tags: RetractionTags) {
+    for (index, tags) in retraction_tags {
+        events[index].tags = tags;
+    }
 }
 
 /// [`decide_command_in_tx`]'s own return type - either a terminal outcome
@@ -775,6 +920,20 @@ pub(super) async fn decide_command_in_tx(
             let snapshots = dispatcher
                 .snapshots()
                 .ok_or_else(|| unregistered_snapshot(&redispatch_states[0].snapshot))?;
+            // A retraction committed since the read can name an event already
+            // in a state. Rebuilding it takes the value's whole history, and
+            // here every other writer to the bounded context would wait for
+            // that, so the command goes back to its read, before the lock,
+            // which does it for nobody's time but its own
+            // (docs/architecture.md §235).
+            if !states_holding_retracted_events(&consistency_query, &redispatch_states, &extended)
+                .is_empty()
+            {
+                return Err(crate::event_store::Error::SnapshotRetractedMeanwhile {
+                    bounded_context: bounded_context_name,
+                }
+                .into());
+            }
             fold_into_snapshot_states(
                 snapshots,
                 &bounded_context_name,
@@ -866,6 +1025,7 @@ pub(super) async fn decide_command_in_tx(
         }
         crate::shared::CommandDecision::Accepted { events } => events,
     };
+    let mut event_specs = event_specs;
 
     // process_command's own resolve_event_type stays a plain sync closure
     // (decide() and everything downstream is I/O-free per §1.1) - every
@@ -888,12 +1048,41 @@ pub(super) async fn decide_command_in_tx(
         }
     }
 
+    let retraction_tags = match resolve_retractions(
+        &mut *conn,
+        command_type,
+        consistency_tags,
+        &mut event_specs,
+        &event_types_by_name,
+        extra_committed_events,
+    )
+    .await?
+    {
+        Ok(tags) => tags,
+        Err((reason, kind)) => {
+            COMMANDS_PROCESSED.add(
+                1,
+                &[
+                    KeyValue::new("bounded_context", command_type.bounded_context.name.clone()),
+                    KeyValue::new("command_type", command_type.name.clone()),
+                    KeyValue::new("outcome", "rejected"),
+                ],
+            );
+            return Ok(DecideOutcome::Terminal(SubmitCommandOutcome::Rejected {
+                reason,
+                kind: kind.to_string(),
+                matching_events: final_matching_events.unwrap_or_else(|| matching_events.to_vec()),
+            }));
+        }
+    };
+
     Ok(DecideOutcome::Accepted(AcceptedDecision {
         event_specs,
         consistency_boundary,
         consistency_query,
         event_types_by_name,
         blind: dispatcher.blind_index(),
+        retraction_tags,
     }))
 }
 
@@ -1012,6 +1201,7 @@ pub(super) async fn finish_accepted_command_in_tx(
         consistency_query,
         event_types_by_name,
         blind,
+        retraction_tags,
     } = decided;
     let mut sequences = sequences.into_iter();
 
@@ -1026,7 +1216,7 @@ pub(super) async fn finish_accepted_command_in_tx(
     )
     .await?;
 
-    let result = crate::event_store::process_command_at_boundary(
+    let mut result = crate::event_store::process_command_at_boundary(
         crate::shared::try_generate_token_id()?,
         command_type,
         payload,
@@ -1056,6 +1246,7 @@ pub(super) async fn finish_accepted_command_in_tx(
         },
         &blind,
     )?;
+    apply_retraction_tags(&mut result.events, retraction_tags);
 
     // Command and every one of its triggered events, in the one
     // (savepoint-scoped, in the batched path) transaction `tx` has held
@@ -1759,6 +1950,7 @@ pub(super) async fn write_command_batch_as_set(
             consistency_query,
             event_types_by_name,
             blind,
+            retraction_tags,
         } = match decided {
             Ok(DecideOutcome::Terminal(outcome)) => {
                 results.push(Some(Ok(outcome)));
@@ -1834,13 +2026,14 @@ pub(super) async fn write_command_batch_as_set(
             },
             &blind,
         );
-        let result = match processed {
+        let mut result = match processed {
             Ok(result) => result,
             Err(e) => {
                 results.push(Some(Err(e)));
                 continue;
             }
         };
+        apply_retraction_tags(&mut result.events, retraction_tags);
         highest_assigned = assigned;
 
         if let Some(key) = &item.idempotency_key {
@@ -2898,11 +3091,10 @@ pub async fn dry_run_command(
         crate::shared::CommandDecision::Rejected { reason, kind } => {
             DryRunDecision::Rejected { reason, kind }
         }
-        crate::shared::CommandDecision::Accepted { events: specs } => {
+        crate::shared::CommandDecision::Accepted { events: mut specs } => {
             let mut event_types: std::collections::HashMap<String, EventType> =
                 std::collections::HashMap::new();
-            let mut events = Vec::with_capacity(specs.len());
-            for spec in specs {
+            for spec in &specs {
                 if !event_types.contains_key(&spec.event_type) {
                     let event_type =
                         get_event_type(pool, &command_type.bounded_context.name, &spec.event_type)
@@ -2914,6 +3106,39 @@ pub async fn dry_run_command(
                             })?;
                     event_types.insert(spec.event_type.clone(), event_type);
                 }
+            }
+            let consistency_tags = crate::event_store::derive_tags(
+                &command_type.tag_mappings,
+                payload,
+                &dispatcher.blind_index(),
+                &command_type.bounded_context.name,
+            )?;
+            let retraction_tags = {
+                let mut conn = pool.acquire().await?;
+                match resolve_retractions(
+                    &mut conn,
+                    command_type,
+                    &consistency_tags,
+                    &mut specs,
+                    &event_types,
+                    &[],
+                )
+                .await?
+                {
+                    Ok(tags) => tags,
+                    Err((reason, kind)) => {
+                        return Ok(CommandDryRun {
+                            decision: DryRunDecision::Rejected {
+                                reason,
+                                kind: kind.to_string(),
+                            },
+                            matching_events: resolved.matching_events,
+                        });
+                    }
+                }
+            };
+            let mut events = Vec::with_capacity(specs.len());
+            for spec in specs {
                 let event_type = event_types[&spec.event_type].clone();
                 let payload = spec.payload.to_string();
                 events.push(WouldBeEvent {
@@ -2927,6 +3152,9 @@ pub async fn dry_run_command(
                     payload,
                     client_id: client_id.to_string(),
                 });
+            }
+            for (index, tags) in retraction_tags {
+                events[index].tags = tags;
             }
             let mut needs_a_key = !crate::event_store::try_sensitive_field_subjects(
                 &command_type.sensitive_fields,
@@ -2999,7 +3227,7 @@ pub async fn decide_and_submit_command(
     idempotency_key: Option<&str>,
     deadline: Option<crate::plugin::DeadlineContext>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
-    let mut rotated_once = false;
+    let mut retried = false;
     loop {
         let outcome = decide_and_submit_command_once(
             pool,
@@ -3020,19 +3248,23 @@ pub async fn decide_and_submit_command(
         )
         .await;
         match outcome {
-            Err(err) if blind_tags_rotated(&err) && !rotated_once => rotated_once = true,
+            Err(err) if back_to_the_read(&err) && !retried => retried = true,
             outcome => return outcome,
         }
     }
 }
 
-/// Whether `err` is a command sent round again because its blind tags were
-/// derived before a key rotation (docs/architecture.md §209) - retried once
-/// by the submission functions, rehashed.
-pub fn blind_tags_rotated(err: &crate::error::Error) -> bool {
+/// Whether `err` is a command sent back to its read before the lock - retried
+/// once by the submission functions: its blind tags were derived before a key
+/// rotation (docs/architecture.md §209), or a retraction committed since the
+/// read names an event already in a snapshot state (§235).
+pub fn back_to_the_read(err: &crate::error::Error) -> bool {
     matches!(
         err,
         crate::error::Error::Blind(crate::blind::Error::Rotated { .. })
+            | crate::error::Error::EventStore(
+                crate::event_store::Error::SnapshotRetractedMeanwhile { .. }
+            )
     )
 }
 

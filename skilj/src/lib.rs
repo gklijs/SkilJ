@@ -305,6 +305,7 @@ pub use skilj_core::plugin::{
     EventType, MissedRunPolicy, Projection, RecurrenceSpec, ScheduleDeadline, Snapshot,
     DEFAULT_BOUNDED_CONTEXT,
 };
+pub use skilj_core::retraction;
 pub use skilj_graphql::federation::FederationOptions;
 pub use skilj_graphql::limits::GraphqlLimits;
 /// See `skilj_macros::auto_register`'s own doc comment - unlike
@@ -2350,6 +2351,57 @@ async fn reconcile_blind_tags(
 /// and among the command type's, or with event types or `latest`, and a
 /// query together with `snapshot()`, which folds by
 /// tag and knows nothing of the query.
+/// Refuses what retractions can't work with (docs/architecture.md §235): an
+/// unowned [`EventRetracted`](skilj_core::retraction::EventRetracted) next to
+/// owner-scoped event types, since an event type with no owner key is visible to
+/// every scoped reader and a retraction carries the tags of what it retracts; and
+/// a command type using `snapshot()`, whose decider folds the events past the
+/// stored row itself.
+fn validate_retractions(
+    event_types: &HashMap<(String, String), RegisteredEventType>,
+    command_types: &HashMap<(String, String), RegisteredCommandType>,
+) -> Result<(), skilj_core::Error> {
+    let mut commands: Vec<&(String, String)> = command_types.keys().collect();
+    commands.sort();
+    for key in commands {
+        let (bounded_context, name) = key;
+        let retractions = (
+            bounded_context.clone(),
+            skilj_core::retraction::RETRACTED_EVENT_TYPE.to_string(),
+        );
+        if command_types[key].snapshot_name.is_some() && event_types.contains_key(&retractions) {
+            return Err(skilj_core::Error::configuration(format!(
+                "command type {name} in bounded context {bounded_context}: snapshot() folds the \
+                 events since the stored row itself, which can't take a retracted event out \
+                 of it; read the state with a QueryItemMapping::snapshot item instead"
+            )));
+        }
+    }
+    let mut names: Vec<&(String, String)> = event_types.keys().collect();
+    names.sort();
+    for key in names {
+        let (bounded_context, name) = key;
+        if name == skilj_core::retraction::RETRACTED_EVENT_TYPE
+            || event_types[key].owner_tag_key.is_none()
+        {
+            continue;
+        }
+        let retractions = (
+            bounded_context.clone(),
+            skilj_core::retraction::RETRACTED_EVENT_TYPE.to_string(),
+        );
+        if event_types
+            .get(&retractions)
+            .is_some_and(|registered| registered.owner_tag_key.is_none())
+        {
+            return Err(skilj_core::Error::configuration(format!(
+                "bounded context {bounded_context}: event type {name} is scoped by an owner tag,                  so its retractions must be too; use retractions_owned_by instead of retractions"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_consistency_queries(
     command_types: &HashMap<(String, String), RegisteredCommandType>,
     event_types: &HashMap<(String, String), RegisteredEventType>,
@@ -2965,6 +3017,37 @@ impl SkiljBuilder {
         self
     }
 
+    /// Lets commands in the current bounded context retract events with
+    /// [`skilj_core::retraction::retract`] and
+    /// [`corrected`](skilj_core::retraction::corrected)
+    /// (docs/architecture.md §235), by registering the built-in
+    /// [`EventRetracted`](skilj_core::retraction::EventRetracted). A retraction
+    /// carries the retracted event's tags, so where event types declare an
+    /// `owner_tag_key` use [`retractions_owned_by`](Self::retractions_owned_by);
+    /// [`build`](Self::build) refuses this one there.
+    pub fn retractions(self) -> Self {
+        self.event_type::<skilj_core::retraction::EventRetracted>()
+    }
+
+    /// [`retractions`](Self::retractions) where readers are scoped by the
+    /// owner tag `owner_tag_key`: a scoped reader sees the retractions of its
+    /// own events only.
+    pub fn retractions_owned_by(mut self, owner_tag_key: impl Into<String>) -> Self {
+        let owner_tag_key = owner_tag_key.into();
+        let bc = self.current_bounded_context();
+        let mut registered = registered_event_type::<skilj_core::retraction::EventRetracted>();
+        registered.tag_mappings = vec![skilj_core::shared::TagMapping::new(
+            owner_tag_key.clone(),
+            "owner",
+        )];
+        registered.owner_tag_key = Some(owner_tag_key);
+        self.event_types.insert(
+            (bc, skilj_core::retraction::RETRACTED_EVENT_TYPE.to_string()),
+            registered,
+        );
+        self
+    }
+
     /// [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events). Same shape as `.projection::<T>()`
     /// above; unlike it, has no matching GraphQL registration mutation -
     /// see `skilj_core::plugin::Snapshot`'s own doc comment for why.
@@ -3547,6 +3630,7 @@ impl SkiljBuilder {
         }
         // docs/architecture.md §198.
         validate_consistency_queries(&self.command_types, &self.event_types, &self.snapshots)?;
+        validate_retractions(&self.event_types, &self.command_types)?;
         // docs/architecture.md §209.
         if !self.previous_blind_index_keys.is_empty() && self.blind_index_key.is_none() {
             return Err(skilj_core::Error::configuration(
