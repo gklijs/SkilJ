@@ -778,6 +778,7 @@ pub(super) fn private_field_grants_table_ddl(schema: &str) -> String {
             status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
             created_at TIMESTAMPTZ NOT NULL,
             revoked_at TIMESTAMPTZ,
+            field TEXT,
             CHECK (event_sequence IS NULL OR command_id IS NULL)
         )"
     )
@@ -797,6 +798,16 @@ pub async fn ensure_private_field_grants_table(
         .execute(pool)
         .await?;
     sqlx::query(sqlx::AssertSqlSafe(create_index_patch(&schema, "private_field_grants_by_grantee", format!("CREATE INDEX IF NOT EXISTS private_field_grants_by_grantee ON {schema}.private_field_grants (grantee_role_id, status)"))))
+    .execute(pool)
+    .await?;
+    // Added after the table first shipped; null keeps an existing grant's
+    // record-wide reach.
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "private_field_grants",
+        &["field"],
+        format!("ALTER TABLE {schema}.private_field_grants ADD COLUMN IF NOT EXISTS field TEXT"),
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -964,6 +975,7 @@ pub(super) struct PrivateFieldGrantRow {
     pub(super) grantee_role_id: String,
     pub(super) event_sequence: Option<i64>,
     pub(super) command_id: Option<i64>,
+    pub(super) field: Option<String>,
     pub(super) status: String,
     pub(super) created_at: DateTime<Utc>,
     pub(super) revoked_at: Option<DateTime<Utc>>,
@@ -1005,6 +1017,7 @@ impl PrivateFieldGrantRow {
             grantee,
             event_sequence: self.event_sequence,
             command_id,
+            field: self.field,
             status: token_status_from_str(&self.status),
             created_at: self.created_at,
             revoked_at: self.revoked_at,
@@ -1013,7 +1026,7 @@ impl PrivateFieldGrantRow {
 }
 
 pub(super) const PRIVATE_FIELD_GRANT_COLUMNS: &str =
-    "id, grantor_role_id, grantee_role_id, event_sequence, command_id, status, created_at, revoked_at";
+    "id, grantor_role_id, grantee_role_id, event_sequence, command_id, status, created_at, revoked_at, field";
 
 /// Inserts the grant and records nothing: how tests seed one, and a
 /// bypass of the access trail (docs/architecture.md §229) for anyone else.
@@ -1052,7 +1065,7 @@ pub(super) async fn insert_private_field_grant_row<'e>(
     let schema = schema_ident(&grant.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"
     )))
     .bind(&grant.id)
     .bind(&grant.grantor.id)
@@ -1062,6 +1075,7 @@ pub(super) async fn insert_private_field_grant_row<'e>(
     .bind(token_status_to_str(grant.status))
     .bind(grant.created_at)
     .bind(grant.revoked_at)
+    .bind(grant.field.as_deref())
     .execute(executor)
     .await?;
     Ok(())
@@ -1182,6 +1196,7 @@ pub(super) async fn grants_from_rows(
                 grantee: roles.get(&row.grantee_role_id)?.clone(),
                 event_sequence: row.event_sequence,
                 command_id,
+                field: row.field,
                 status: token_status_from_str(&row.status),
                 created_at: row.created_at,
                 revoked_at: row.revoked_at,

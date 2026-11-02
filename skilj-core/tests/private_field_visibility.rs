@@ -204,6 +204,7 @@ fn blanket_grant(grantor: Role, grantee: Role) -> PrivateFieldGrant {
         grantee,
         event_sequence: None,
         command_id: None,
+        field: None,
         status: TokenStatus::Active,
         created_at: timestamp(0),
         revoked_at: None,
@@ -627,6 +628,7 @@ fn render_event_a_per_record_grant_opens_an_own_field_to_its_grantee() {
         grantee,
         event_sequence: Some(0),
         command_id: None,
+        field: None,
         status: TokenStatus::Active,
         created_at: timestamp(0),
         revoked_at: None,
@@ -650,6 +652,7 @@ fn render_event_a_per_record_grant_does_not_open_a_different_record() {
         grantee,
         event_sequence: Some(0), // names a different event
         command_id: None,
+        field: None,
         status: TokenStatus::Active,
         created_at: timestamp(0),
         revoked_at: None,
@@ -807,6 +810,285 @@ fn redact_private_fields_is_a_no_op_when_the_type_declares_none() {
 }
 
 // ---------------------------------------------------------------------
+// A grant naming one field (issue #155)
+// ---------------------------------------------------------------------
+
+/// An event with an `own` note and a `message` addressed to the customer.
+const MIXED_PAYLOAD: &str = r#"{"note":"mine","message":"yours","addressee_id":"customer@x"}"#;
+
+fn mixed_event(sequence: i64) -> Event {
+    let et = event_type(vec![own_field(), addressed_message_field()]);
+    event(&et, sequence, "role-1", MIXED_PAYLOAD)
+}
+
+fn field_grant(
+    grantor: Role,
+    grantee: Role,
+    event_sequence: Option<i64>,
+    field: &str,
+) -> PrivateFieldGrant {
+    PrivateFieldGrant {
+        event_sequence,
+        field: Some(field.into()),
+        ..blanket_grant(grantor, grantee)
+    }
+}
+
+fn agent() -> Role {
+    role("role-1", "Agent", "agent@x")
+}
+
+fn colleague() -> Role {
+    role("role-2", "Colleague", "colleague@x")
+}
+
+fn customer() -> Role {
+    role("role-3", "Customer", "customer@x")
+}
+
+fn rendered_for_colleague(e: &Event, grant: PrivateFieldGrant) -> serde_json::Value {
+    let mapping = access_mapping(colleague(), AccessLevel::Read);
+    let rendered = event_store::render_event(e, &mapping, &no_key, &[grant]);
+    serde_json::from_str(&rendered).unwrap()
+}
+
+#[test]
+fn a_per_record_grant_naming_a_field_opens_that_field_alone() {
+    let grant = field_grant(agent(), colleague(), Some(0), "note");
+    let rendered = rendered_for_colleague(&mixed_event(0), grant);
+    assert_eq!(rendered["note"], "mine");
+    assert_eq!(rendered["message"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_per_record_grant_naming_a_field_does_not_open_another_record() {
+    let grant = field_grant(agent(), colleague(), Some(0), "note");
+    let rendered = rendered_for_colleague(&mixed_event(5), grant);
+    assert_eq!(rendered["note"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_blanket_grant_naming_a_field_opens_that_field_where_the_grantor_reads_it() {
+    let grant = field_grant(agent(), colleague(), None, "note");
+    let rendered = rendered_for_colleague(&mixed_event(7), grant);
+    assert_eq!(rendered["note"], "mine");
+    assert_eq!(rendered["message"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_blanket_grant_is_re_derived_per_field_not_per_record() {
+    // The addressee is a default reader of this record, but not of `note`,
+    // so its blanket grant opens `message` and not `note`, named or not.
+    let named = field_grant(customer(), colleague(), None, "note");
+    assert_eq!(
+        rendered_for_colleague(&mixed_event(7), named)["note"],
+        serde_json::Value::Null
+    );
+    let rendered = rendered_for_colleague(&mixed_event(7), blanket_grant(customer(), colleague()));
+    assert_eq!(rendered["note"], serde_json::Value::Null);
+    assert_eq!(rendered["message"], "yours");
+}
+
+#[test]
+fn a_record_wide_grant_opens_only_what_its_grantor_reads() {
+    // Neither party can hand over the other's field, even naming the record
+    // and no field.
+    let per_record = |grantor| PrivateFieldGrant {
+        event_sequence: Some(7),
+        ..blanket_grant(grantor, colleague())
+    };
+    let from_addressee = rendered_for_colleague(&mixed_event(7), per_record(customer()));
+    assert_eq!(from_addressee["note"], serde_json::Value::Null);
+    assert_eq!(from_addressee["message"], "yours");
+
+    let from_creator = rendered_for_colleague(&mixed_event(7), per_record(agent()));
+    assert_eq!(from_creator["note"], "mine");
+    assert_eq!(from_creator["message"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_record_wide_grant_stops_when_its_grantor_no_longer_reads_the_field() {
+    let et = event_type(vec![addressed_field()]);
+    let e = event(
+        &et,
+        0,
+        "role-1",
+        r#"{"note":"mine","addressee_id":"customer@x"}"#,
+    );
+    let grant = PrivateFieldGrant {
+        event_sequence: Some(0),
+        ..blanket_grant(agent(), colleague())
+    };
+    assert_eq!(
+        rendered_for_colleague(&e, grant)["note"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn a_grant_naming_a_field_stops_when_the_grantor_no_longer_reads_it() {
+    // Made while `note` was own, read after a registration addressed it to
+    // someone else: the creator can no longer read it, so can't share it.
+    let et = event_type(vec![addressed_field()]);
+    let e = event(
+        &et,
+        0,
+        "role-1",
+        r#"{"note":"mine","addressee_id":"customer@x"}"#,
+    );
+    let grant = field_grant(agent(), colleague(), Some(0), "note");
+    assert_eq!(
+        rendered_for_colleague(&e, grant)["note"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn a_grant_naming_a_field_gets_nothing_from_a_capability_field() {
+    let et = event_type(vec![capability_field("support")]);
+    let e = event(&et, 0, "role-1", r#"{"note":"mine"}"#);
+    let grant = field_grant(agent(), colleague(), Some(0), "note");
+    assert_eq!(
+        rendered_for_colleague(&e, grant)["note"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn a_grant_naming_a_field_declared_only_later_opens_it_where_it_is_present() {
+    // A blanket grant can name a field no type declares yet. It opens
+    // nothing until a registration declares it; then it opens the field on
+    // records of the grantor's that carry it, old ones included.
+    let grant = field_grant(agent(), colleague(), None, "note");
+    let before = event_type(vec![]);
+    let e = event(&before, 0, "role-1", r#"{"message":"public"}"#);
+    assert_eq!(
+        rendered_for_colleague(&e, grant.clone())["message"],
+        "public"
+    );
+
+    let after = event_type(vec![own_field()]);
+    let carrying = event(&after, 1, "role-1", r#"{"note":"mine"}"#);
+    assert_eq!(rendered_for_colleague(&carrying, grant)["note"], "mine");
+}
+
+#[test]
+fn granting_a_field_needs_that_fields_own_default_reader() {
+    let e = mixed_event(0);
+    let grant_as = |r: Role, field: &str| {
+        access_control::grant_private_field_access_for_event(
+            &access_mapping(r, AccessLevel::Read),
+            &colleague(),
+            Some(&e),
+            Some(field),
+            "grant-1".into(),
+            timestamp(0),
+        )
+    };
+
+    let grant = grant_as(agent(), "note").unwrap();
+    assert_eq!(grant.field.as_deref(), Some("note"));
+    assert!(grant_as(customer(), "message").is_ok());
+    // Each is a default reader of the record, but not of the other's field.
+    for err in [
+        grant_as(agent(), "message").unwrap_err(),
+        grant_as(customer(), "note").unwrap_err(),
+    ] {
+        assert_eq!(
+            err.code(),
+            access_control::Error::NotDefaultPrivateReader.code()
+        );
+    }
+}
+
+#[test]
+fn granting_a_field_the_type_does_not_declare_private_is_refused() {
+    let e = mixed_event(0);
+    let err = access_control::grant_private_field_access_for_event(
+        &access_mapping(agent(), AccessLevel::Read),
+        &colleague(),
+        Some(&e),
+        Some("addressee_id"),
+        "grant-1".into(),
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "private_field_not_declared");
+}
+
+#[test]
+fn granting_a_capability_field_by_name_is_refused() {
+    let et = event_type(vec![capability_field("support")]);
+    let e = event(&et, 0, "role-1", r#"{"note":"mine"}"#);
+    let err = access_control::grant_private_field_access_for_event(
+        &access_mapping(agent(), AccessLevel::Read),
+        &colleague(),
+        Some(&e),
+        Some("note"),
+        "grant-1".into(),
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.code(),
+        access_control::Error::NotDefaultPrivateReader.code()
+    );
+}
+
+#[test]
+fn granting_a_command_field_checks_the_same_way() {
+    let ct = command_type(vec![own_field(), addressed_message_field()]);
+    let c = command(&ct, "cmd-1", "role-1", MIXED_PAYLOAD);
+    let grant_as = |field: &str| {
+        access_control::grant_private_field_access_for_command(
+            &access_mapping(agent(), AccessLevel::Read),
+            &colleague(),
+            Some(&c),
+            Some(field),
+            "grant-1".into(),
+            timestamp(0),
+        )
+    };
+    let grant = grant_as("note").unwrap();
+    assert_eq!(grant.command_id.as_deref(), Some("cmd-1"));
+    assert_eq!(grant.field.as_deref(), Some("note"));
+    assert_eq!(
+        grant_as("message").unwrap_err().code(),
+        access_control::Error::NotDefaultPrivateReader.code()
+    );
+    assert_eq!(
+        grant_as("missing").unwrap_err().code(),
+        "private_field_not_declared"
+    );
+
+    let rendered = event_store::render_command(
+        &c,
+        &access_mapping(colleague(), AccessLevel::Admin),
+        &no_key,
+        &[grant],
+    );
+    let rendered: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(rendered["note"], "mine");
+    assert_eq!(rendered["message"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_blanket_grant_may_name_a_field_but_not_an_empty_one() {
+    let grant = |field| {
+        access_control::grant_private_field_access_for_event(
+            &access_mapping(agent(), AccessLevel::Read),
+            &colleague(),
+            None,
+            Some(field),
+            "grant-1".into(),
+            timestamp(0),
+        )
+    };
+    assert_eq!(grant("note").unwrap().field.as_deref(), Some("note"));
+    assert_eq!(grant("").unwrap_err().code(), "private_field_not_declared");
+}
+
+// ---------------------------------------------------------------------
 // grant_private_field_access_for_event / _for_command
 // ---------------------------------------------------------------------
 
@@ -821,6 +1103,7 @@ fn grant_private_field_access_for_event_succeeds_for_the_events_own_creator() {
         &mapping,
         &grantee,
         Some(&e),
+        None,
         "grant-1".into(),
         timestamp(0),
     )
@@ -842,6 +1125,7 @@ fn grant_private_field_access_for_event_rejects_a_caller_who_is_not_the_default_
         &mapping,
         &grantee,
         Some(&e),
+        None,
         "grant-1".into(),
         timestamp(0),
     )
@@ -868,6 +1152,7 @@ fn grant_private_field_access_for_event_rejects_a_record_from_another_bounded_co
         &mapping,
         &grantee,
         Some(&e),
+        None,
         "grant-1".into(),
         timestamp(0),
     )
@@ -887,6 +1172,7 @@ fn grant_private_field_access_for_event_a_blanket_grant_needs_no_record_at_all()
     let grant = access_control::grant_private_field_access_for_event(
         &mapping,
         &grantee,
+        None,
         None,
         "grant-1".into(),
         timestamp(0),
@@ -908,6 +1194,7 @@ fn grant_private_field_access_for_command_succeeds_for_the_commands_own_creator(
         &mapping,
         &grantee,
         Some(&c),
+        None,
         "grant-1".into(),
         timestamp(0),
     )
@@ -930,6 +1217,7 @@ fn grant_private_field_access_rejects_an_inactive_grantee() {
         &mapping,
         &grantee,
         Some(&e),
+        None,
         "grant-1".into(),
         timestamp(0),
     )

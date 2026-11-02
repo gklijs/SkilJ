@@ -181,6 +181,12 @@ pub struct PrivateFieldGrant {
     pub event_sequence: Option<i64>,
     /// The `Command::id` of the one command shared; see `event_sequence`.
     pub command_id: Option<String>,
+    /// The one private field shared, as its `PrivateField.field` path, or
+    /// `None` for every `Own`/`Addressed` field. Either way the grant
+    /// reaches a field only where `grantor` is that field's own default
+    /// reader, re-derived at every read for a per-record and a blanket
+    /// grant alike.
+    pub field: Option<String>,
     /// Whether the grant is in force.
     pub status: TokenStatus,
     /// When it was granted.
@@ -490,6 +496,11 @@ pub enum Error {
     #[error("the caller is not this record's own default private reader")]
     NotDefaultPrivateReader,
 
+    /// A grant named a `field` that the record's type does not declare
+    /// private, or, on a blanket grant, an empty one.
+    #[error("this field is not declared private on this record's type")]
+    PrivateFieldNotDeclared,
+
     /// `rule RevokePrivateFieldAccess`'s own guard: only the `Role` that
     /// made a `PrivateFieldGrant` may end it - not the grantee, and not an
     /// admin. The self-service counterpart to every other grant in this
@@ -600,6 +611,7 @@ impl SkiljRejection for Error {
             Error::CapabilityNotDelegable => "capability_not_delegable",
             Error::SelfGrantRefused => "self_grant_refused",
             Error::NotDefaultPrivateReader => "not_default_private_reader",
+            Error::PrivateFieldNotDeclared => "private_field_not_declared",
             Error::NotGrantor => "not_grantor",
             Error::PrivateFieldGrantNotActive => "private_field_grant_not_active",
             Error::PrivateFieldRecordWrongBoundedContext => {
@@ -1271,15 +1283,53 @@ pub fn revoke_role_access_mapping(
     })
 }
 
+/// The grant-time check both minting rules share. With a record, the
+/// grantor must be its default private reader: of the record when no
+/// `field` is named (`is_default_private_reader`), of that field when one
+/// is, which also requires the type to declare it private. A
+/// `Capability`-kind field has no default reader, so naming one is
+/// refused. Without a record there is nothing to check a name against, so
+/// it is trusted here and re-derived at every read, as a blanket grant
+/// always is; only an empty name, which could never match, is refused.
+fn require_may_share<R: crate::event_store::PrivateFieldRecord>(
+    record: Option<&R>,
+    field: Option<&str>,
+    role: &Role,
+) -> crate::error::Result<()> {
+    let Some(record) = record else {
+        return match field {
+            Some("") => Err(Error::PrivateFieldNotDeclared.into()),
+            _ => Ok(()),
+        };
+    };
+    let entitled = match field {
+        None => crate::event_store::is_default_private_reader(record, role),
+        Some(name) => {
+            let declared = record
+                .private_fields()
+                .iter()
+                .find(|p| p.field == name)
+                .ok_or(Error::PrivateFieldNotDeclared)?;
+            crate::event_store::private_field_default_reader(record, declared, role)
+        }
+    };
+    if !entitled {
+        return Err(Error::NotDefaultPrivateReader.into());
+    }
+    Ok(())
+}
+
 /// See `rule GrantPrivateFieldAccessForEvent`. `id` is the caller's own
 /// `generate_token_id()` output, not this function's to generate - the
 /// same treatment `create_role`'s `id`/every `create_*_token` function's
 /// `id` already gets. `event: None` mints a blanket grant; `Some` a
-/// per-record one, checked against `is_default_private_reader` below.
+/// per-record one, checked by `require_may_share` above. `field: None`
+/// shares every `Own`/`Addressed` field; `Some` only that one.
 pub fn grant_private_field_access_for_event(
     access_mapping: &RoleAccessMapping,
     grantee: &Role,
     event: Option<&crate::event_store::Event>,
+    field: Option<&str>,
     id: String,
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<PrivateFieldGrant> {
@@ -1296,10 +1346,8 @@ pub fn grant_private_field_access_for_event(
         {
             return Err(Error::PrivateFieldRecordWrongBoundedContext.into());
         }
-        if !crate::event_store::is_default_private_reader(event, &access_mapping.role) {
-            return Err(Error::NotDefaultPrivateReader.into());
-        }
     }
+    require_may_share(event, field, &access_mapping.role)?;
     Ok(PrivateFieldGrant {
         id,
         bounded_context: access_mapping.bounded_context.clone(),
@@ -1307,6 +1355,7 @@ pub fn grant_private_field_access_for_event(
         grantee: grantee.clone(),
         event_sequence: event.map(|e| e.sequence),
         command_id: None,
+        field: field.map(str::to_string),
         status: TokenStatus::Active,
         created_at: now,
         revoked_at: None,
@@ -1320,6 +1369,7 @@ pub fn grant_private_field_access_for_command(
     access_mapping: &RoleAccessMapping,
     grantee: &Role,
     command: Option<&crate::event_store::Command>,
+    field: Option<&str>,
     id: String,
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<PrivateFieldGrant> {
@@ -1336,10 +1386,8 @@ pub fn grant_private_field_access_for_command(
         {
             return Err(Error::PrivateFieldRecordWrongBoundedContext.into());
         }
-        if !crate::event_store::is_default_private_reader(command, &access_mapping.role) {
-            return Err(Error::NotDefaultPrivateReader.into());
-        }
     }
+    require_may_share(command, field, &access_mapping.role)?;
     Ok(PrivateFieldGrant {
         id,
         bounded_context: access_mapping.bounded_context.clone(),
@@ -1347,6 +1395,7 @@ pub fn grant_private_field_access_for_command(
         grantee: grantee.clone(),
         event_sequence: None,
         command_id: command.map(|c| c.id.clone()),
+        field: field.map(str::to_string),
         status: TokenStatus::Active,
         created_at: now,
         revoked_at: None,

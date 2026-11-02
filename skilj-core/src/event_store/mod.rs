@@ -2634,13 +2634,13 @@ pub fn is_default_private_reader<R: PrivateFieldRecord>(record: &R, role: &Role)
 /// `Capability`-kind needs no `record`/grant lookup at all: holding the
 /// capability is the entitlement. `Own`/`Addressed` hold when this exact
 /// field's own default reader is the caller, or an active
-/// `PrivateFieldGrant` reaches this caller - either a per-record one
+/// `PrivateFieldGrant` reaches this caller and this field (see
+/// `grant_reaches_field` below) - either a per-record one
 /// `matches_this_record` identifies, or a blanket one (naming neither an
-/// event nor a command) whose own `grantor` independently satisfies
-/// `is_default_private_reader` for `record` - re-derived here, against the
-/// record actually being read, which is what keeps a blanket grant a
-/// convenience rather than a wider trust boundary (see `entity
-/// PrivateFieldGrant`'s own doc comment).
+/// event nor a command) - whose own `grantor` is this field's default
+/// reader, re-derived here, against the record actually being read, which
+/// is what keeps a grant from being a wider trust boundary than the
+/// grantor's own (see `entity PrivateFieldGrant`'s own doc comment).
 ///
 /// The default-reader half is deliberately per field, not per record:
 /// an `Own` field is visible only to the record's creator, and an
@@ -2667,20 +2667,41 @@ fn entitled_to_read_private_field<R: PrivateFieldRecord>(
                     g.status == TokenStatus::Active
                         && g.grantor.status == RoleStatus::Active
                         && g.grantee == access_mapping.role
-                        && (matches_this_record(g)
-                            || (g.event_sequence.is_none()
-                                && g.command_id.is_none()
-                                && is_default_private_reader(record, &g.grantor)))
+                        && grant_reaches_field(record, field, g, &matches_this_record)
                 })
         }
     }
 }
 
+/// Whether an active grant's own terms reach this field of `record`. A
+/// grant naming a record has to name this one, and a grant naming a field
+/// has to name this one. Then, whatever it names, it opens the field only
+/// while its grantor is that field's own default reader: a grant hands
+/// out nothing the grantor can't read itself, so an addressee's record-wide
+/// grant doesn't open the creator's `Own` fields, and re-declaring a
+/// field's kind or addressee takes a share of it back.
+fn grant_reaches_field<R: PrivateFieldRecord>(
+    record: &R,
+    field: &PrivateField,
+    grant: &PrivateFieldGrant,
+    matches_this_record: impl Fn(&PrivateFieldGrant) -> bool,
+) -> bool {
+    let is_blanket = grant.event_sequence.is_none() && grant.command_id.is_none();
+    (is_blanket || matches_this_record(grant))
+        && grant
+            .field
+            .as_deref()
+            .is_none_or(|named| named == field.field)
+        && private_field_default_reader(record, field, &grant.grantor)
+}
+
 /// The per-field half of the default-reader rule: `Own` holds for the
 /// record's creator, `Addressed` for whoever the field's own
 /// `addressee_field` names in `record`'s payload. `Capability` has no
-/// default reader (see `entitled_to_read_private_field` above).
-fn private_field_default_reader<R: PrivateFieldRecord>(
+/// default reader (see `entitled_to_read_private_field` above). Also what
+/// a grant naming this field checks its grantor against, when it is made
+/// and at every read.
+pub(crate) fn private_field_default_reader<R: PrivateFieldRecord>(
     record: &R,
     field: &PrivateField,
     role: &Role,

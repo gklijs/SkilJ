@@ -2413,13 +2413,20 @@ entity PrivateFieldGrant {
     -- A blanket grant is a convenience, not a wider trust boundary. It
     -- cannot be checked against records that do not exist yet, so it is
     -- trusted when it is made and re-derived at every read against the
-    -- specific record being read: the grantor must still be that record's
-    -- own default private reader for the grant to let anyone through it
+    -- specific record being read: the grantor must still be the default
+    -- reader of the field being read for the grant to let anyone through it
     -- (see the render_event note above rule DeliverToSubscriptions). So it
     -- never reaches further than the same grantor could have reached one
     -- record at a time.
     event: Event?
     command: Command?
+
+    -- The one private field shared, by its PrivateField.field path. Null
+    -- is every own-kind and addressed-kind field the grant reaches. Named,
+    -- it reaches that field alone. Either way a grant opens a field only
+    -- where its grantor is that field's own default reader, re-derived at
+    -- every read for a per-record grant and a blanket grant alike.
+    field: String?
 
     status: active | revoked
     created_at: Timestamp
@@ -4378,19 +4385,19 @@ rule DeliverProjectionUpdates {
 -- may grant on a record, not for which field a reader sees.
 --
 -- For an own-kind or addressed-kind field, the caller is entitled when
--- any of three things is true:
+-- either of two things is true:
 --   - the caller is that field's own default reader, as described above,
 --     or
---   - an active PrivateFieldGrant names this exact record and this
---     caller's Role as grantee, or
---   - an active blanket PrivateFieldGrant - one naming neither an event
---     nor a command - names this caller's Role as grantee, and its own
---     grantor independently satisfies is_default_private_reader for this
---     same record. The grantor's standing is re-derived here, against the
---     record actually being read, rather than trusted from when the grant
---     was made. That is what keeps a blanket grant a convenience instead
---     of a wider trust boundary: it can never let a grantee see something
---     its grantor could not have handed over one record at a time.
+--   - an active PrivateFieldGrant names this caller's Role as grantee,
+--     names this exact record or no record at all, names this field or no
+--     field at all, and its own grantor is this field's own default reader
+--     (is_field_default_reader). The grantor's standing is re-derived here,
+--     against the record actually being read, rather than trusted from
+--     when the grant was made. That is what keeps a grant from being a
+--     wider trust boundary than the grantor's own: it can never let a
+--     grantee see something its grantor can't read itself, so an
+--     addressee's grant does not open the creator's own-kind fields, nor
+--     the creator's a field addressed to someone else.
 --
 -- A grant whose own grantor is no longer active has no effect: a revoked
 -- Role's outgoing shares stop reaching their grantees at the next read,
@@ -8952,7 +8959,7 @@ rule DeleteMasterKey {
 -- colleague - an administrative ticket.
 
 rule GrantPrivateFieldAccessForEvent {
-    when: GrantPrivateFieldAccessForEvent(access_mapping, grantee, event?)
+    when: GrantPrivateFieldAccessForEvent(access_mapping, grantee, event?, field?)
     requires: access_mapping.status = active
     requires: grantee.status = active
 
@@ -8970,7 +8977,18 @@ rule GrantPrivateFieldAccessForEvent {
     -- here and re-derived at every read instead - see the guidance below.
     requires:
         event = null
+        or field != null
         or is_default_private_reader(event, access_mapping)
+
+    -- Naming a field narrows the check to that field: its type must declare
+    -- it private and the grantor must be its own default reader. With no
+    -- record there is no type to check a name against, so only an empty
+    -- name is refused here; the rest is re-derived at every read.
+    requires:
+        event = null
+        or field = null
+        or is_field_default_reader(event, field, access_mapping)
+    requires: field != ""
 
     ensures:
         let grant_id = generate_id()
@@ -8981,6 +8999,7 @@ rule GrantPrivateFieldAccessForEvent {
             grantee: grantee,
             event: event,
             command: null,
+            field: field,
             status: active,
             created_at: now
         )
@@ -8992,7 +9011,8 @@ rule GrantPrivateFieldAccessForEvent {
                 actor_role_id: access_mapping.role.id,
                 grant_id: grant_id,
                 event_sequence: event?.sequence,
-                command_id: null
+                command_id: null,
+                field: field
             }
         )
 
@@ -9051,15 +9071,32 @@ rule GrantPrivateFieldAccessForEvent {
         -- that reaches no such check, because there is no record to ask
         -- about. It is trusted when made and re-derived per record at
         -- every read, which is what stops it being a wider trust boundary
-        -- than the per-record form: a reader coming through a blanket
-        -- grant sees a private field only where the grantor would itself
-        -- have been that record's default reader, so the grant never
+        -- than the per-record form: a reader coming through either form
+        -- sees a private field only where the grantor would itself have
+        -- been that field's default reader, so the grant never
         -- reaches past what the grantor could have handed over one record
         -- at a time.
+        --
+        -- is_field_default_reader(record, field, access_mapping) is the
+        -- same question about one field: the record's type declares a
+        -- private field at that path, and it is own-kind with the caller
+        -- as the record's creator, or addressed-kind with the caller as the
+        -- party that field's own addressee_field names. A capability-kind
+        -- field has no default reader, so naming one is refused.
+        --
+        -- That a named field is declared private is a check on making the
+        -- grant, not an invariant over grants. A blanket grant may name a
+        -- field no type declares yet, and a registration may stop declaring
+        -- one a grant already names. Neither needs handling: a field no
+        -- longer private is no longer redacted, and a blanket grant naming
+        -- a field not yet declared opens nothing until one is. A per-record
+        -- grant on a field its type doesn't declare yet is refused and made
+        -- again after the registration. A grant naming no field already
+        -- covers fields declared after it, wherever its grantor reads them.
 }
 
 rule GrantPrivateFieldAccessForCommand {
-    when: GrantPrivateFieldAccessForCommand(access_mapping, grantee, command?)
+    when: GrantPrivateFieldAccessForCommand(access_mapping, grantee, command?, field?)
     requires: access_mapping.status = active
     requires: grantee.status = active
 
@@ -9072,7 +9109,13 @@ rule GrantPrivateFieldAccessForCommand {
         or command?.bounded_context = access_mapping.bounded_context
     requires:
         command = null
+        or field != null
         or is_default_private_reader(command, access_mapping)
+    requires:
+        command = null
+        or field = null
+        or is_field_default_reader(command, field, access_mapping)
+    requires: field != ""
 
     ensures:
         let grant_id = generate_id()
@@ -9083,6 +9126,7 @@ rule GrantPrivateFieldAccessForCommand {
             grantee: grantee,
             event: null,
             command: command,
+            field: field,
             status: active,
             created_at: now
         )
@@ -9094,7 +9138,8 @@ rule GrantPrivateFieldAccessForCommand {
                 actor_role_id: access_mapping.role.id,
                 grant_id: grant_id,
                 event_sequence: null,
-                command_id: command?.id
+                command_id: command?.id,
+                field: field
             }
         )
 }
@@ -11939,12 +11984,13 @@ surface PrivateFieldGrantManagement {
             grant.grantee.name
             grant.event
             grant.command
+            grant.field
             grant.status
             grant.created_at
 
     provides:
-        GrantPrivateFieldAccessForEvent(access_mapping, grantee, event?)
-        GrantPrivateFieldAccessForCommand(access_mapping, grantee, command?)
+        GrantPrivateFieldAccessForEvent(access_mapping, grantee, event?, field?)
+        GrantPrivateFieldAccessForCommand(access_mapping, grantee, command?, field?)
         RevokePrivateFieldAccess(access_mapping, grant)
         ListPrivateFieldGrants(access_mapping, grantor?, after_grant_id?)
 
@@ -11964,7 +12010,11 @@ surface PrivateFieldGrantManagement {
         -- default private reader of: the creator of an own-kind field's
         -- record, or the party an addressed-kind field points at. Naming
         -- anything else is refused outright rather than recorded and
-        -- silently ignored at read time.
+        -- silently ignored at read time. Naming one field of a record means
+        -- being that field's own default reader, not just the record's. A
+        -- per-record grant is re-derived per field at read time just as a
+        -- blanket one is, so neither shows a grantee what its grantor can't
+        -- read itself.
 
     @guarantee BlanketGrantsAreReDerivedAtRenderTime
         -- A grant naming no record at all is a convenience, never a wider
@@ -11972,10 +12022,10 @@ surface PrivateFieldGrantManagement {
         -- the records it covers need not exist yet, so it is checked
         -- instead at every read against the specific record being read:
         -- the grantee sees a private field only where the grantor would
-        -- itself have been that record's default reader at that moment. A
+        -- itself have been that field's default reader at that moment. A
         -- blanket grant therefore never reaches past what the same grantor
         -- could have handed over one record at a time, and it stops
-        -- reaching a record the moment the grantor stops being its default
+        -- reaching a field the moment the grantor stops being its default
         -- reader - including when a re-registration changes what the type
         -- declares private (see the render_event note above rule
         -- DeliverToSubscriptions).

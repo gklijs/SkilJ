@@ -7,7 +7,7 @@
     "package": "skilj-core",
     "patch_sha256": "b771644542d9176e189cb0006ff956c615a788a31ab3077579cf8e25d9cb1be8",
     "config_sha256": "7267bd5509507f1fe263118c0f32535c62dec160edc37040119646219f90e469",
-    "lock_sha256": "f67f7eaf582a0ad68cabbf88d8addeaa028921b4292ccd43604bedf214f988c2"
+    "lock_sha256": "f14984744ec2fd4b74b41442b9cf92dda4258ef3ce45d4c6965f94dfebd2de06"
   },
   "skipped_generic_targets": {
     "<jsonschema::keywords::additional_items::AdditionalItemsBooleanValidator as jsonschema::validator::Validate<F>>::is_valid": 1,
@@ -834,7 +834,7 @@
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/access_control/mod.rs:988:5: 988:82}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/access_control/mod.rs:1000:5: 1000:82}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(jwks_endpoint = %self.jwks_endpoint))]",
       "count": 1
     },
@@ -1093,7 +1093,7 @@
     {
       "file": "skilj-core/src/access_trail/mod.rs",
       "message": "call to associated function `access_trail::AccessChange::new` which can panic",
-      "source": "Self::new( AccessEventKind::PrivateFieldAccessGranted, &grant.grantee.id, &grant.bounded_context.name, Some(&grant.grantor.id), json!({ \"grant_id\": grant.id, \"event_sequence\": grant.event_sequence, \"command_id\": grant.command_id, }), )",
+      "source": "Self::new( AccessEventKind::PrivateFieldAccessGranted, &grant.grantee.id, &grant.bounded_context.name, Some(&grant.grantor.id), json!({ \"grant_id\": grant.id, \"event_sequence\": grant.event_sequence, \"command_id\": grant.command_id, \"field\": grant.field, }), )",
       "count": 1
     },
     {
@@ -18319,6 +18319,12 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "format!(\"ALTER TABLE {schema}.private_field_grants ADD COLUMN IF NOT EXISTS field TEXT\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "format!(\"ALTER TABLE {schema}.projection_state ADD COLUMN IF NOT EXISTS owner TEXT\"),",
       "count": 1
     },
@@ -18452,6 +18458,12 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".bind(format!(\"skilj_blind_tags:{schema}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".bind(grant.field.as_deref())",
       "count": 1
     },
     {
@@ -18630,49 +18642,49 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1226:1: 1226:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1241:1: 1241:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1341:1: 1341:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1356:1: 1356:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1605:1: 1605:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1620:1: 1620:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1983:1: 1983:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1998:1: 1998:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2012:1: 2012:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2027:1: 2027:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2062:1: 2062:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2077:1: 2077:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2152:1: 2152:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2167:1: 2167:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2659:1: 2659:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2674:1: 2674:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -18710,7 +18722,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
-      "count": 50
+      "count": 51
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -19106,6 +19118,12 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(add_columns_patch( &schema, \"events\", &[\"metadata_correlation_id\"], format!( \"ALTER TABLE {schema}.events ADD COLUMN IF NOT EXISTS metadata_correlation_id TEXT\" ), )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(add_columns_patch( &schema, \"private_field_grants\", &[\"field\"], format!(\"ALTER TABLE {schema}.private_field_grants ADD COLUMN IF NOT EXISTS field TEXT\"), )))",
       "count": 1
     },
     {
@@ -19513,7 +19531,7 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\" )))",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" )))",
       "count": 1
     },
     {
@@ -19963,49 +19981,55 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\" ))) .bind(&grant.id)",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" ))) .bind(&grant.id)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\" ))) .bind(&grant.id) .bind(&grant.grantor.id)",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" ))) .bind(&grant.id) .bind(&grant.grantor.id)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id)",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence)",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence) .bind(command_id)",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence) .bind(command_id)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence) .bind(command_id) .bind(token_status_to_str(grant.status))",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence) .bind(command_id) .bind(token_status_to_str(grant.status))",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence) .bind(command_id) .bind(token_status_to_str(grant.status)) .bind(grant.created_at)",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence) .bind(command_id) .bind(token_status_to_str(grant.status)) .bind(grant.created_at)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence) .bind(command_id) .bind(token_status_to_str(grant.status)) .bind(grant.created_at) .bind(grant.revoked_at)",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence) .bind(command_id) .bind(token_status_to_str(grant.status)) .bind(grant.created_at) .bind(grant.revoked_at)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\" ))) .bind(&grant.id) .bind(&grant.grantor.id) .bind(&grant.grantee.id) .bind(grant.event_sequence) .bind(command_id) .bind(token_status_to_str(grant.status)) .bind(grant.created_at) .bind(grant.revoked_at) .bind(grant.field.as_deref())",
       "count": 1
     },
     {

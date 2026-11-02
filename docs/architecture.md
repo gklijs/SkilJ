@@ -5346,6 +5346,7 @@ so it is trusted when made and *re-derived per record at every read*
 instead - what stops it being a wider trust boundary than the per-record
 form: a reader coming through a blanket grant sees a field only where
 the grantor would itself have been that exact record's default reader.
+(§233 later made this per field, for per-record grants too.)
 A grant whose grantor is no longer active reaches nothing, per-record
 or blanket, even while its row says `active`. `revoke_private_field_access` - only the grantor may end
 it, not the grantee, not an admin. `list_private_field_grants` - a
@@ -6658,7 +6659,8 @@ actual C source, not a Cargo feature misconfiguration. With no root
 available in this environment: `apt-get download
 libcurl4-openssl-dev` (no root needed) + `dpkg-deb -x` to extract just
 the headers, `CPATH` pointed at them. See CONTRIBUTING.md's own new
-note for the full recipe.
+note for the full recipe. (§234 later removed the need for this, except
+with `default-features = false`.)
 
 **Verified against a real, ephemeral Kafka broker, not mocked at the
 protocol level that matters** - `testcontainers-modules`' `kafka`
@@ -13309,3 +13311,30 @@ storage. Integrated throughput has not shown a general improvement. See
 `docs/dcb158-postgres-experiment.md` for measurements, other DCB implementations,
 and the restricted UUID/WAL prototype. That prototype is not the production
 append path; neither distributed routing nor a linger setting is introduced.
+
+## 233. A private-field grant may name one field (issue #155)
+
+§31's grants were record-wide on purpose, and issue #136 kept them so when it made the default entitlement per field. So a record with an `own` note, a message addressed to the customer and an `own` field meant for a colleague couldn't be shared field by field. `PrivateFieldGrant.field` names the one field a grant shares, by its `PrivateField.field` path; null is every field the grant reaches. The column is nullable and added at startup by `ensure_private_field_grants_table`. `grantPrivateFieldAccessForEvent` and `grantPrivateFieldAccessForCommand` take an optional `field`, `PrivateFieldGrant` returns it, and `PrivateFieldAccessGranted` records it.
+
+**At grant time.** With a record, a named field must be declared private on its type (`private_field_not_declared`) and the grantor must be that field's own default reader (`not_default_private_reader`), not merely the record's. So an addressee can't share the creator's `own` field by name, and a capability field, having no default reader, can't be named. A grant naming no field is still checked by `is_default_private_reader`: the grantor has to read something on the record.
+
+**At read time, every grant is per field.** `grant_reaches_field` opens a field only while the grantor is that field's own default reader, whether the grant names it or not and whether it names a record or not. This changes existing grants, by the user's choice and against the issue's "null means exactly today's meaning". Until now an addressee's record-wide grant also opened the creator's `own` fields, which the addressee can't read: the bleed #136 closed for default readers, still open through a grant, and contrary to the spec's claim that a grant hands out nothing its grantor doesn't hold. 0.3.0 not being released yet made this the moment to close it. Two things follow. A grant from an addressee shows the grantee what was addressed to the grantor and no more, and a creator's grant doesn't open a field addressed to someone else, so sharing both fields of a mixed record takes a grant from each party. And a per-record grant is re-derived as a blanket one always was, so changing a field from `own` to `addressed` takes back a share of it.
+
+**A blanket grant may name a field.** The issue left this open, and the user chose to allow it. Nothing can be checked when it is made, the same as any blanket grant, and it reaches strictly less than one with no field, so refusing it would protect nothing. Only an empty name, which could never match, is refused.
+
+**A field that isn't there yet.** What happens depends on which grant is asked for, and nothing has to be pending for any of it:
+
+- A grant naming no field covers a private field declared later, without being made again. Per record, that is the record it names; blanket, every record. Either way, only where the grantor reads the new field. A caller who wanted to share only today's fields should name them.
+- A blanket grant naming a field no type declares yet is accepted and opens nothing until a registration declares it. It then applies to history too, wherever the grantor is that field's default reader. A misspelt name looks the same: it is accepted and opens nothing, which fails closed, and `listPrivateFieldGrants` shows the name.
+- A per-record grant naming a field its type doesn't declare yet is refused with `private_field_not_declared`; make it again after the registration. The refusal is the point: a record names a type to check against.
+- A field declared on the type but absent from an older record's payload can be granted, and there is simply no leaf to show. Payloads aren't rewritten, so an older record never gains the value.
+
+Whether a named field is declared private is therefore a check on making a grant and not an invariant over grants, which is why the spec has it as a `requires` and not the invariant the issue suggested: a later registration can stop declaring a field a grant names, and a blanket grant can name one not declared yet. A field that is no longer private isn't redacted at all, so such a grant needs no handling.
+
+## 234. skilj-kafka builds without a system libcurl
+
+Every build needed `curl/curl.h`, and §40 worked around it, with `libcurl4-openssl-dev` in CI and `CPATH` without root. §40 called the include unconditional. The cause is narrower: `packaging/cmake/config.h.in` has `#cmakedefine01 WITH_OAUTHBEARER_OIDC`, which always defines it, to 0 or 1, and `rdkafka_conf.c` tests it with `#ifdef`. rdkafka 0.39 / rdkafka-sys 4.10 (librdkafka 2.12.1) is the latest release, so upgrading doesn't help yet. librdkafka changed the test to `#if` in v2.15.0 (its issue #5204); once an rdkafka-sys release carries that, `curl-static` and §40's recipe can both go.
+
+skilj-kafka's `ssl` and `ssl-vendored` features now add rdkafka's `curl-static`, which builds curl from source and hands librdkafka its headers. The default build therefore needs `cmake` and a C compiler, and so do its users, who a `.cargo/config.toml` or `[patch]` in this repository wouldn't have reached. The cost is compiling and linking curl, statically. `WITH_CURL` is on as a result, so with TLS librdkafka's `sasl.oauthbearer.method=oidc` support is compiled in too; skilj's own code makes no use of it and nothing here tests it.
+
+It can't be unconditional: curl-sys's default features turn on OpenSSL, and rdkafka-sys doesn't turn them off, so `default-features = false` would stop being the build with no OpenSSL (issue #124). That build still needs the header on the system, and is the one case left for §40's recipe (CONTRIBUTING.md).

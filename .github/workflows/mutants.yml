@@ -46,7 +46,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v5
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants@25.3.1

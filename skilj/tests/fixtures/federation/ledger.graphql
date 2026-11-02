@@ -323,6 +323,7 @@ type LedgerPrivateFieldGrant {
 	grantee: LedgerRole!
 	eventSequence: Int
 	commandId: ID
+	field: String
 	status: LedgerAccessTokenStatus!
 	createdAt: String!
 	revokedAt: String
@@ -523,8 +524,8 @@ type Mutation {
 	ledgerApproveCommand(boundedContext: String!, proposalId: ID!): LedgerCommandProposalDecisionPayload! @inaccessible
 	ledgerRejectCommand(boundedContext: String!, proposalId: ID!, reason: String): LedgerCommandProposalDecisionPayload! @inaccessible
 	ledgerForgetSubject(boundedContext: String!, subjectKey: String!, subjectValue: String!): LedgerEncryptionKey! @inaccessible
-	ledgerGrantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int): LedgerPrivateFieldGrant!
-	ledgerGrantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID): LedgerPrivateFieldGrant!
+	ledgerGrantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int, field: String): LedgerPrivateFieldGrant!
+	ledgerGrantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID, field: String): LedgerPrivateFieldGrant!
 	ledgerRevokePrivateFieldAccess(boundedContext: String!, grantId: ID!): LedgerPrivateFieldGrant!
 }
 
