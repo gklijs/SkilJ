@@ -69,6 +69,7 @@ pub mod event_subscription;
 pub mod event_type_admin_operations;
 pub mod master_key_rotation;
 pub mod parked_deliveries;
+pub mod payload_limits;
 pub mod private_field_grant_management;
 pub mod projection_query;
 pub mod projection_subscription;

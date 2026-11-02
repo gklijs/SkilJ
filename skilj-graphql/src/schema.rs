@@ -325,6 +325,9 @@ fn root_types(
         ))
         .field(admin(resolvers::bounded_context_archival::field(n)))
         .field(admin(resolvers::bounded_context_deletion::field(n)))
+        .field(admin(resolvers::payload_limits::set_payload_limits_field(
+            n,
+        )))
         .field(admin(
             resolvers::type_registration::register_event_type_field(n),
         ))
@@ -399,6 +402,7 @@ fn static_types(n: &Naming) -> Vec<Type> {
         gql_types::capability_overview_entry_object(n).into(),
         gql_types::capability_history_object(n).into(),
         gql_types::master_key_object(n).into(),
+        gql_types::payload_limits_object(n).into(),
         gql_types::context_creator_object(n).into(),
         gql_types::bounded_context_object(n).into(),
         gql_types::role_status_enum(n).into(),

@@ -332,6 +332,40 @@ pub fn master_key_object(n: &Naming) -> Object {
     })
 }
 
+/// A bounded context's payload limits (issue #132, docs/architecture.md
+/// §238): the ones its writes are checked against, and the override a
+/// superadmin stored, if any.
+pub struct PayloadLimitsOverview {
+    /// The bounded context.
+    pub bounded_context: String,
+    /// The builder's limits with the override applied.
+    pub effective: skilj_core::payload_limits::PayloadLimits,
+    /// The override, as stored.
+    pub stored: skilj_core::db::PayloadLimitsOverride,
+}
+
+/// A byte count as a GraphQL `Int` - a 32-bit signed integer by the
+/// spec, so a count past it (a limit of 2 GiB or more, which no payload
+/// can usefully reach) reads as its maximum.
+fn bytes_value(bytes: i64) -> Value {
+    Value::from(i32::try_from(bytes).unwrap_or(i32::MAX))
+}
+
+fn optional_bytes(bytes: Option<i64>) -> Value {
+    bytes.map_or(Value::Null, bytes_value)
+}
+
+/// `PayloadLimitsOverview` - `setPayloadLimits`' answer.
+pub fn payload_limits_object(n: &Naming) -> Object {
+    gql_object!(PayloadLimitsOverview => n.ty("PayloadLimits") {
+        scalar "boundedContext": TypeRef::named_nn(TypeRef::STRING) => |l| Value::from(l.bounded_context.clone()),
+        scalar "maxPayloadBytes": TypeRef::named_nn(TypeRef::INT) => |l| bytes_value(i64::try_from(l.effective.max_payload_bytes).unwrap_or(i64::MAX)),
+        scalar "warnPayloadBytes": TypeRef::named(TypeRef::INT) => |l| optional_bytes(l.effective.warn_payload_bytes.map(|w| i64::try_from(w).unwrap_or(i64::MAX))),
+        scalar "maxPayloadBytesOverride": TypeRef::named(TypeRef::INT) => |l| optional_bytes(l.stored.max_payload_bytes),
+        scalar "warnPayloadBytesOverride": TypeRef::named(TypeRef::INT) => |l| optional_bytes(l.stored.warn_payload_bytes),
+    })
+}
+
 /// `entity ContextCreator`. `kind` stands in for the Rust sum type's own
 /// variant tag (the same "the enum variant tag is the field" treatment
 /// the Rust side already gives it - see `ContextCreator`'s own doc

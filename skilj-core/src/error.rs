@@ -131,6 +131,11 @@ pub enum Error {
     /// sending it for the first time.
     #[error("not processed: an earlier item of the batch failed")]
     NotProcessed,
+
+    /// A [`crate::blob::BlobStore`] failed to store or serve bytes (issue
+    /// #132). Like `Database`, the detail is for the server log only.
+    #[error("blob store error: {0}")]
+    BlobStore(String),
 }
 
 impl Error {
@@ -190,6 +195,7 @@ impl SkiljRejection for Error {
             Error::BatchFailed { code, .. } => code,
             Error::Unsupported { .. } => "unsupported",
             Error::NotProcessed => "not_processed",
+            Error::BlobStore(_) => "blob_store_error",
         }
     }
 
@@ -220,6 +226,7 @@ impl SkiljRejection for Error {
             Error::BatchFailed { message, .. } => message.clone(),
             Error::Unsupported { .. } => self.to_string(),
             Error::NotProcessed => self.to_string(),
+            Error::BlobStore(_) => "an internal blob store error occurred".to_string(),
         }
     }
 
@@ -227,6 +234,7 @@ impl SkiljRejection for Error {
         match self {
             Error::Database(e) => Some(e.to_string()),
             Error::Migration(e) => Some(e.to_string()),
+            Error::BlobStore(e) => Some(e.clone()),
             _ => None,
         }
     }

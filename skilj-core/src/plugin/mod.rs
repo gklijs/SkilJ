@@ -210,6 +210,14 @@ pub trait CommandType {
         Vec::new()
     }
 
+    /// Payload fields that hold a [`crate::blob::BlobRef`], or a list of
+    /// them, in place of large bytes (docs/architecture.md §239). A
+    /// `$blob` value in any other field is refused. A blob field can't
+    /// also be sensitive yet. Empty by default.
+    fn blob_fields() -> Vec<crate::blob::BlobField> {
+        Vec::new()
+    }
+
     /// See `EventType::private_fields()`'s own doc comment - identical
     /// role, for `Command.payload` instead of `Event.payload`.
     fn private_fields() -> Vec<PrivateField> {
@@ -450,6 +458,14 @@ pub trait EventType {
     /// Payload fields encrypted per subject, so `forgetSubject` makes them
     /// unreadable. Empty by default.
     fn sensitive_fields() -> Vec<SensitiveField> {
+        Vec::new()
+    }
+
+    /// Payload fields that hold a [`crate::blob::BlobRef`], or a list of
+    /// them, in place of large bytes (docs/architecture.md §239). A
+    /// `$blob` value in any other field is refused. A blob field can't
+    /// also be sensitive yet. Empty by default.
+    fn blob_fields() -> Vec<crate::blob::BlobField> {
         Vec::new()
     }
 
@@ -1292,6 +1308,38 @@ pub trait ProjectionDispatcher: Send + Sync {
     /// Explicit permission to fold the live generation during a rebuild.
     fn live_fold_compatible(&self, _bounded_context: &str, _projection_name: &str) -> bool {
         false
+    }
+
+    /// How large a stored payload may be, before a bounded context's own
+    /// override (`SkiljBuilder::payload_limits`, docs/architecture.md §238).
+    /// Here rather than on a trait of its own because this dispatcher is
+    /// the one collaborator every write path - commands, direct, external
+    /// and scheduled events - already takes. The defaults, unless
+    /// overridden.
+    fn payload_limits(&self) -> crate::payload_limits::PayloadLimits {
+        crate::payload_limits::PayloadLimits::default()
+    }
+
+    /// The fields of `bounded_context`'s event type `event_type` that hold
+    /// blob references (`EventType::blob_fields`, docs/architecture.md
+    /// §239). A `$blob` value in any other field of its payload is
+    /// refused. Here for the same reason as [`Self::payload_limits`]. None
+    /// by default.
+    fn event_blob_fields(
+        &self,
+        _bounded_context: &str,
+        _event_type: &str,
+    ) -> Vec<crate::blob::BlobField> {
+        Vec::new()
+    }
+
+    /// [`Self::event_blob_fields`] for a command type.
+    fn command_blob_fields(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+    ) -> Vec<crate::blob::BlobField> {
+        Vec::new()
     }
 
     /// The registered projection's own `Projection::REQUIRES_CAPABILITY` - the

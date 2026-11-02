@@ -411,6 +411,12 @@ pub struct Skilj {
     /// ProjectionDispatcher>` without `Skilj` itself needing to live
     /// behind an `Arc`.
     projections: Arc<HashMap<(String, String), RegisteredProjection>>,
+    /// `SkiljBuilder::payload_limits` (docs/architecture.md §238), handed
+    /// to every write path through `projection_dispatcher()`.
+    payload_limits: skilj_core::payload_limits::PayloadLimits,
+    /// Declared blob fields, handed out the same way (§239).
+    event_blob_fields: BlobFieldsByType,
+    command_blob_fields: BlobFieldsByType,
     /// `Arc`-wrapped for the identical reason `command_types`/`projections`
     /// are - `event_dispatcher()` hands out a cheap `Arc<dyn
     /// EventDispatcher>`, and the background scheduler task spawned in
@@ -675,6 +681,11 @@ impl CommandDispatcher for Dispatcher {
 struct ProjectionDispatcherImpl {
     projections: Arc<HashMap<(String, String), RegisteredProjection>>,
     template_cache: skilj_core::template_cache::TemplateCache,
+    /// `SkiljBuilder::payload_limits` (docs/architecture.md §238).
+    payload_limits: skilj_core::payload_limits::PayloadLimits,
+    /// Declared blob fields (docs/architecture.md §239).
+    event_blob_fields: BlobFieldsByType,
+    command_blob_fields: BlobFieldsByType,
 }
 
 impl ProjectionDispatcherImpl {
@@ -747,6 +758,38 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
     fn live_fold_compatible(&self, bounded_context: &str, projection_name: &str) -> bool {
         self.registered(bounded_context, projection_name)
             .is_some_and(|p| p.live_fold_compatible)
+    }
+
+    fn payload_limits(&self) -> skilj_core::payload_limits::PayloadLimits {
+        self.payload_limits
+    }
+
+    fn event_blob_fields(
+        &self,
+        bounded_context: &str,
+        event_type: &str,
+    ) -> Vec<skilj_core::blob::BlobField> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        self.event_blob_fields
+            .get(&(bounded_context, event_type.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn command_blob_fields(
+        &self,
+        bounded_context: &str,
+        command_type: &str,
+    ) -> Vec<skilj_core::blob::BlobField> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        self.command_blob_fields
+            .get(&(bounded_context, command_type.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn subject_key(&self, bounded_context: &str, projection_name: &str) -> Option<&'static str> {
@@ -1069,6 +1112,7 @@ impl Skilj {
             slow_command_decide_warning: Some(
                 skilj_core::slow_command::DEFAULT_SLOW_DECIDE_WARNING,
             ),
+            payload_limits: skilj_core::payload_limits::PayloadLimits::default(),
             application_version: None,
         }
     }
@@ -1104,6 +1148,9 @@ impl Skilj {
         Arc::new(ProjectionDispatcherImpl {
             projections: self.projections.clone(),
             template_cache: self.template_cache.clone(),
+            payload_limits: self.payload_limits,
+            event_blob_fields: self.event_blob_fields.clone(),
+            command_blob_fields: self.command_blob_fields.clone(),
         })
     }
 
@@ -1914,6 +1961,8 @@ struct RegisteredEventType {
     owner_tag_key: Option<String>,
     sensitive_fields: Vec<skilj_core::shared::SensitiveField>,
     private_fields: Vec<skilj_core::shared::PrivateField>,
+    /// `EventType::blob_fields` (docs/architecture.md §239).
+    blob_fields: Vec<skilj_core::blob::BlobField>,
     external_creation_allowed: bool,
     direct_creation_allowed: bool,
     event_read_allowed: bool,
@@ -1937,6 +1986,7 @@ fn registered_event_type<T: EventType + 'static>() -> RegisteredEventType {
         owner_tag_key: T::owner_tag_key().map(str::to_string),
         sensitive_fields: T::sensitive_fields(),
         private_fields: T::private_fields(),
+        blob_fields: T::blob_fields(),
         external_creation_allowed: T::external_creation_allowed(),
         direct_creation_allowed: T::direct_creation_allowed(),
         event_read_allowed: T::event_read_allowed(),
@@ -1994,6 +2044,8 @@ struct RegisteredCommandType {
     owner_tag_key: Option<String>,
     sensitive_fields: Vec<skilj_core::shared::SensitiveField>,
     private_fields: Vec<skilj_core::shared::PrivateField>,
+    /// `CommandType::blob_fields` (docs/architecture.md §239).
+    blob_fields: Vec<skilj_core::blob::BlobField>,
     rest_trigger_allowed: bool,
     /// issue #98: `Some` when `requires_approval()` is true.
     /// Written into `command_approval_policies` at reconciliation; `None`
@@ -2025,6 +2077,45 @@ struct RegisteredCommandType {
     /// derived tags matched.
     decide_from_snapshot: DecideFromSnapshotFn,
 }
+
+/// What `build()` refuses about blob fields (docs/architecture.md §239):
+/// an empty field, one declared twice by a type, or one also declared
+/// sensitive - until blobs are encrypted under the subject's key, the
+/// reference would be encrypted and its bytes would not.
+fn validate_blob_fields(
+    kind: &str,
+    bounded_context: &str,
+    name: &str,
+    blob_fields: &[skilj_core::blob::BlobField],
+    sensitive_fields: &[skilj_core::shared::SensitiveField],
+) -> Result<(), skilj_core::Error> {
+    let refuse = |why: String| {
+        Err(skilj_core::event_store::Error::InvalidBlobField(format!(
+            "{kind} {name:?} in bounded context {bounded_context:?}: {why}"
+        ))
+        .into())
+    };
+    let mut seen = std::collections::HashSet::new();
+    for blob in blob_fields {
+        if blob.field.is_empty() {
+            return refuse("a blob field names no field".to_string());
+        }
+        if !seen.insert(blob.field.as_str()) {
+            return refuse(format!("blob field {:?} is declared twice", blob.field));
+        }
+        if sensitive_fields.iter().any(|s| s.field == blob.field) {
+            return refuse(format!(
+                "{:?} is declared both a blob field and a sensitive field",
+                blob.field
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Each registered type's blob fields, by `(bounded context, type name)`,
+/// for `ProjectionDispatcher::event_blob_fields`/`command_blob_fields`.
+type BlobFieldsByType = Arc<HashMap<(String, String), Vec<skilj_core::blob::BlobField>>>;
 
 /// What `build()` refuses about blind tags (docs/architecture.md §205): a
 /// declared `BlindTag` without a `blind_index_key`; a type mapping a key
@@ -2539,6 +2630,7 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
         owner_tag_key: T::owner_tag_key().map(str::to_string),
         sensitive_fields: T::sensitive_fields(),
         private_fields: T::private_fields(),
+        blob_fields: T::blob_fields(),
         rest_trigger_allowed: T::rest_trigger_allowed(),
         approval_policy: T::requires_approval().then(|| {
             skilj_core::approvals::CommandApprovalPolicy::new(
@@ -2960,6 +3052,7 @@ pub struct SkiljBuilder {
     deadline_retention: Option<std::time::Duration>,
     slow_command_read_warning: Option<std::time::Duration>,
     slow_command_decide_warning: Option<std::time::Duration>,
+    payload_limits: skilj_core::payload_limits::PayloadLimits,
     application_version: Option<u64>,
 }
 
@@ -3612,6 +3705,20 @@ impl SkiljBuilder {
         self
     }
 
+    /// How large a stored payload may be: a command's, an event's, or the
+    /// source message an external event keeps (docs/architecture.md §238).
+    /// A larger one is refused with `payload_too_large`; one above the
+    /// warning threshold is stored and logged, at most once a minute per
+    /// type. Defaults to [`skilj_core::payload_limits::PayloadLimits::default`]:
+    /// 256 KiB, warning above 64 KiB. A superadmin can override it per
+    /// bounded context with `setPayloadLimits`; that override wins. The
+    /// size is what is stored, so a sensitive field counts as its
+    /// ciphertext.
+    pub fn payload_limits(mut self, limits: skilj_core::payload_limits::PayloadLimits) -> Self {
+        self.payload_limits = limits;
+        self
+    }
+
     /// Never delete resolved deadlines: each bounded context's `deadlines`
     /// table keeps one row per deadline ever scheduled.
     pub fn keep_resolved_deadlines_forever(mut self) -> Self {
@@ -3713,6 +3820,33 @@ impl SkiljBuilder {
             &self.command_types,
             &self.snapshots,
         )?;
+        // docs/architecture.md §239.
+        for ((bc, name), t) in &self.event_types {
+            validate_blob_fields("event type", bc, name, &t.blob_fields, &t.sensitive_fields)?;
+        }
+        for ((bc, name), t) in &self.command_types {
+            validate_blob_fields(
+                "command type",
+                bc,
+                name,
+                &t.blob_fields,
+                &t.sensitive_fields,
+            )?;
+        }
+        let event_blob_fields: BlobFieldsByType = Arc::new(
+            self.event_types
+                .iter()
+                .filter(|(_, t)| !t.blob_fields.is_empty())
+                .map(|(key, t)| (key.clone(), t.blob_fields.clone()))
+                .collect(),
+        );
+        let command_blob_fields: BlobFieldsByType = Arc::new(
+            self.command_types
+                .iter()
+                .filter(|(_, t)| !t.blob_fields.is_empty())
+                .map(|(key, t)| (key.clone(), t.blob_fields.clone()))
+                .collect(),
+        );
         // docs/architecture.md §194.
         let graphql_naming = match &self.graphql_federation {
             Some(options) => options.naming().map_err(skilj_core::Error::configuration)?,
@@ -3821,6 +3955,7 @@ impl SkiljBuilder {
         let bounded_contexts_for_warm_up = skilj_core::db::list_bounded_contexts(&pool).await?;
         warn_on_small_statement_cache(statement_cache_capacity, &bounded_contexts_for_warm_up);
         let template_cache = skilj_core::template_cache::TemplateCache::new();
+        let payload_limits = self.payload_limits;
         template_cache.refresh(&pool).await?;
         let blind_index = match &self.blind_index_key {
             Some(key) => skilj_core::blind::BlindIndex::new(
@@ -4144,6 +4279,9 @@ impl SkiljBuilder {
             let reconciliation_dispatcher = ProjectionDispatcherImpl {
                 projections: projections.clone(),
                 template_cache: template_cache.clone(),
+                payload_limits,
+                event_blob_fields: event_blob_fields.clone(),
+                command_blob_fields: command_blob_fields.clone(),
             };
             reconcile_projections(
                 &pool,
@@ -4198,6 +4336,9 @@ impl SkiljBuilder {
                 projection_dispatcher: Arc::new(ProjectionDispatcherImpl {
                     projections: projections.clone(),
                     template_cache: template_cache.clone(),
+                    payload_limits,
+                    event_blob_fields: event_blob_fields.clone(),
+                    command_blob_fields: command_blob_fields.clone(),
                 }),
                 snapshot_dispatcher: Arc::new(SnapshotDispatcherImpl {
                     snapshots: snapshots.clone(),
@@ -4245,6 +4386,9 @@ impl SkiljBuilder {
             template_cache,
             command_batcher,
             blind_index,
+            payload_limits,
+            event_blob_fields,
+            command_blob_fields,
             background: background.clone(),
         };
 
