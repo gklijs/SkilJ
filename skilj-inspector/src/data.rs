@@ -33,6 +33,9 @@ pub struct BoundedContextData {
     pub command_types: Vec<CommandType>,
     pub projections: Vec<Projection>,
     pub recent_events: Vec<Event>,
+    /// What has been said about those events, retracted or in doubt
+    /// (docs/architecture.md §235, §236). By position, for those it applies to.
+    pub event_stances: std::collections::HashMap<i64, skilj_core::retraction::EventStance>,
 }
 
 pub async fn load_bounded_context_data(
@@ -56,6 +59,7 @@ pub async fn load_bounded_context_data(
             command_types: Vec::new(),
             projections: Vec::new(),
             recent_events: Vec::new(),
+            event_stances: Default::default(),
         });
     }
 
@@ -71,10 +75,39 @@ pub async fn load_bounded_context_data(
         RECENT_EVENTS_LIMIT,
     )
     .await?;
+    let sequences: Vec<i64> = recent_events.iter().map(|event| event.sequence).collect();
+    let event_stances = skilj_core::db::event_stances(pool, bounded_context, &sequences).await?;
     Ok(BoundedContextData {
         event_types,
         command_types,
         projections,
         recent_events,
+        event_stances,
     })
+}
+
+/// What the event list shows next to an event something was said about: a
+/// retraction ends a doubt, so never both.
+pub fn stance_marker(stance: &skilj_core::retraction::EventStance) -> String {
+    match (stance.retracted_by, stance.doubted_by) {
+        (Some(retraction), _) => format!(" [retracted by #{retraction}]"),
+        (None, Some(doubt)) => format!(" [in doubt by #{doubt}]"),
+        (None, None) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skilj_core::retraction::EventStance;
+
+    #[test]
+    fn the_marker_says_what_was_said() {
+        let mut stance = EventStance::default();
+        assert_eq!(stance_marker(&stance), "");
+        stance.doubted_by = Some(8);
+        assert_eq!(stance_marker(&stance), " [in doubt by #8]");
+        stance.retracted_by = Some(9);
+        assert_eq!(stance_marker(&stance), " [retracted by #9]");
+    }
 }

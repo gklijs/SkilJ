@@ -519,3 +519,104 @@ fn an_unusable_blind_tag_or_sensitive_field_is_refused() {
     ));
     assert!(problems.contains("names field \"id\""), "{problems}");
 }
+
+const SEATS_TOML: &str = r#"
+bounded_context = "seats"
+retractions = true
+doubts = true
+
+[[event_type]]
+name = "SeatClaimed"
+fields = [
+    { name = "seat", type = "string" },
+    { name = "holder", type = "string" },
+]
+tags = { seat = "seat" }
+
+[[command_type]]
+name = "ClaimSeat"
+retractable = true
+fields = [
+    { name = "seat", type = "string" },
+    { name = "holder", type = "string" },
+]
+tags = { seat = "seat" }
+
+[[command_type.query]]
+event_types = ["SeatClaimed", "EventDoubted", "DoubtLifted"]
+tags = ["seat"]
+
+[[command_type]]
+name = "CountSeats"
+fields = [{ name = "seat", type = "string" }]
+tags = { seat = "seat" }
+"#;
+
+/// docs/architecture.md §235, §236: the built-ins register under the reserved
+/// names, and only a `retractable` command's `decide_*` sees positions.
+#[test]
+fn retractions_and_doubts_generate_the_built_ins_and_a_retractable_decide() {
+    let output = skilj_codegen::generate(SEATS_TOML).unwrap();
+    assert!(output.contains("impl ::skilj::EventType for EventRetracted"));
+    assert!(output.contains("type Payload = ::skilj_core::retraction::RetractionPayload"));
+    assert!(output.contains("impl ::skilj::EventType for EventDoubted"));
+    assert!(output.contains("impl ::skilj::EventType for DoubtLifted"));
+    assert!(output.contains("type Payload = ::skilj_core::retraction::DoubtPayload"));
+    assert!(output.contains("type Event = ::skilj_core::retraction::Retractable<SeatsEvent>"));
+    assert!(output.contains("type Event = SeatsEvent;"));
+    // A retractable command's query reads retractions without naming them.
+    assert!(
+        output.contains(r#""EventRetracted".to_string()"#),
+        "{output}"
+    );
+    // Not part of the enum: `Retractable` is what hands them to a decision.
+    let event_enum = &output[output.find("pub enum SeatsEvent").unwrap()..];
+    assert!(!event_enum.contains("EventRetracted"), "{event_enum}");
+}
+
+#[test]
+fn a_file_without_them_generates_none_of_them() {
+    let output = skilj_codegen::generate(BANKING_TOML).unwrap();
+    assert!(!output.contains("EventRetracted"));
+    assert!(!output.contains("Retractable"));
+}
+
+#[test]
+fn an_unusable_retractable_command_or_reserved_name_is_a_named_problem() {
+    let problems = invalid(
+        r#"
+bounded_context = "seats"
+
+[[event_type]]
+name = "EventRetracted"
+fields = [{ name = "seat", type = "string" }]
+
+[[event_type]]
+name = "SeatClaimed"
+fields = [{ name = "seat", type = "string" }]
+
+[[command_type]]
+name = "ClaimSeat"
+retractable = true
+fields = [{ name = "seat", type = "string" }]
+tags = { seat = "seat" }
+
+[[command_type.query]]
+event_types = ["SeatClaimed", "EventDoubted"]
+tags = ["seat"]
+latest = 1
+"#,
+    );
+    let expected = [
+        "event_type \"EventRetracted\": this name is reserved",
+        "command_type \"ClaimSeat\": retractable needs retractions = true",
+        "its query items can't have latest",
+        "names event type \"EventDoubted\", which this file doesn't declare",
+    ];
+    for expected in expected {
+        assert!(
+            problems.iter().any(|p| p.contains(expected)),
+            "missing {expected:?} in {problems:?}"
+        );
+    }
+}

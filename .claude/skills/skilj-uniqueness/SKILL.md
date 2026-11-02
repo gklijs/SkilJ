@@ -177,13 +177,21 @@ would call a value held by someone else free.
 - Use `ChangeEmail` for a real change and a correction for a mistake. They mean
   different things to reactors and auditors.
 - Tell the user a retraction doesn't erase: `forgetSubject` does. Its `reason`
-  is stored in the clear, so no personal data in it.
+  is stored in the clear, so no personal data in it. A dossier number goes in
+  the correction command's payload, which can be sensitive and which the
+  retraction's `causation_id` leads to.
+- Test the races with `skilj_test_fixture::corrections`: implement
+  `UniqueValueCommands` over the real commands and call `all_races` from a test
+  against a real Postgres.
 - A snapshot needs nothing: the store leaves retracted events out of its state.
   `build()` refuses retractions next to a command using `snapshot()`; move it to
   a `QueryItemMapping::snapshot` item. A projection isn't recomputed: it lists
   `EventRetracted` in `consumed_event_types`, reads `Retractable` events and
   takes the contribution out itself. One that doesn't keeps it, silently.
-- Not available from `.skilj.toml` yet: a generated `decide_*` has no position.
+- In a `.skilj.toml`: `retractions = true`, and `retractable = true` on the
+  commands that fold around them (see below).
+- `.doubts()` marks a claim as under investigation (`docs/architecture.md` §236).
+  The value stays held: `ValueClaims` goes on counting the claim.
 
 | code | cause |
 |---|---|
@@ -193,6 +201,7 @@ would call a value held by someone else free.
 | `retraction_target_out_of_scope` | an owner-scoped command naming another owner's event |
 | `invalid_retraction` | a hand-built payload; use `retract` |
 | `reserved_event_type_name` | another shape registered as `EventRetracted` |
+| `already_doubted`, `no_open_doubt`, `doubt_target_retracted` | a doubt or lift that doesn't fit where the event stands (§236) |
 | `snapshot_retracted_meanwhile` | a retraction reached a snapshot the command read, twice in a row or in a batch; retry |
 
 ## In a `.skilj.toml`
@@ -217,6 +226,11 @@ sensitive = [{ field = "email", subject_key = "customer", subject_field = "custo
 
 The `decide_*` functions stay hand-written. Complete example:
 `skilj-demo/tests/customers.skilj.toml` with `skilj-demo/tests/customers.rs`.
+
+To correct values, set `retractions = true` at the top of the file and
+`retractable = true` on a command: its `decide_*` gets `Retractable<...Event>`, and
+its query items read the retractions too, so they can't have `latest`. Example:
+`skilj-demo/tests/seats.skilj.toml` with `skilj-demo/tests/seats.rs`.
 
 ## The key
 

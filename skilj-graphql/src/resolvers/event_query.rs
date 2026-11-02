@@ -179,6 +179,13 @@ pub fn query_events_field(n: &Naming) -> Field {
                     .filter(|v| !v.is_null())
                     .map(|v| v.i64())
                     .transpose()?;
+                // docs/architecture.md §237: "as known at this sequence".
+                let up_to = ctx
+                    .args
+                    .get("upToSequence")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.i64())
+                    .transpose()?;
                 // issue #18 - "show me everything in this
                 // transaction".
                 let correlation_id = ctx
@@ -216,6 +223,7 @@ pub fn query_events_field(n: &Naming) -> Field {
                             &bounded_context_name,
                             wanted,
                             after_sequence.unwrap_or(-1),
+                            up_to,
                             state.max_events_per_read,
                             select,
                         )
@@ -228,6 +236,7 @@ pub fn query_events_field(n: &Naming) -> Field {
                             &bounded_context_name,
                             None,
                             after_sequence.unwrap_or(-1),
+                            up_to,
                             state.max_events_per_read,
                             select,
                         )
@@ -296,6 +305,10 @@ pub fn query_events_field(n: &Naming) -> Field {
     ))
     .argument(InputValue::new(
         "afterSequence",
+        TypeRef::named(TypeRef::INT),
+    ))
+    .argument(InputValue::new(
+        "upToSequence",
         TypeRef::named(TypeRef::INT),
     ))
     .argument(InputValue::new(
@@ -489,9 +502,17 @@ pub fn inspect_event_field(n: &Naming) -> Field {
                 )
                 .map_err(to_graphql_error)?;
 
+                let stance =
+                    skilj_core::db::event_stances(&state.pool, &bounded_context_name, &[sequence])
+                        .await
+                        .map_err(to_graphql_error)?
+                        .remove(&sequence)
+                        .unwrap_or_default();
+
                 Ok(Some(FieldValue::owned_any(InspectedEventData {
                     event: inspected.event,
                     rendered_payload: inspected.rendered_payload,
+                    stance,
                 })))
             })
         },

@@ -2356,7 +2356,8 @@ async fn reconcile_blind_tags(
 /// owner-scoped event types, since an event type with no owner key is visible to
 /// every scoped reader and a retraction carries the tags of what it retracts; and
 /// a command type using `snapshot()`, whose decider folds the events past the
-/// stored row itself.
+/// stored row itself. The same for doubts (§236): the owner rule, and a fold
+/// past the stored row that would meet one.
 fn validate_retractions(
     event_types: &HashMap<(String, String), RegisteredEventType>,
     command_types: &HashMap<(String, String), RegisteredCommandType>,
@@ -2376,26 +2377,43 @@ fn validate_retractions(
                  of it; read the state with a QueryItemMapping::snapshot item instead"
             )));
         }
+        let doubts = (
+            bounded_context.clone(),
+            skilj_core::retraction::DOUBTED_EVENT_TYPE.to_string(),
+        );
+        if command_types[key].snapshot_name.is_some() && event_types.contains_key(&doubts) {
+            return Err(skilj_core::Error::configuration(format!(
+                "command type {name} in bounded context {bounded_context}: snapshot() folds the \
+                 events since the stored row itself, which include doubts, its event type \
+                 doesn't convert; read the state with a QueryItemMapping::snapshot item instead"
+            )));
+        }
     }
     let mut names: Vec<&(String, String)> = event_types.keys().collect();
     names.sort();
     for key in names {
         let (bounded_context, name) = key;
-        if name == skilj_core::retraction::RETRACTED_EVENT_TYPE
-            || event_types[key].owner_tag_key.is_none()
-        {
+        if event_types[key].owner_tag_key.is_none() {
             continue;
         }
-        let retractions = (
-            bounded_context.clone(),
-            skilj_core::retraction::RETRACTED_EVENT_TYPE.to_string(),
-        );
-        if event_types
-            .get(&retractions)
-            .is_some_and(|registered| registered.owner_tag_key.is_none())
+        let unowned = |built_in: &str| {
+            event_types
+                .get(&(bounded_context.clone(), built_in.to_string()))
+                .is_some_and(|registered| registered.owner_tag_key.is_none())
+        };
+        if unowned(skilj_core::retraction::RETRACTED_EVENT_TYPE) {
+            return Err(skilj_core::Error::configuration(format!(
+                "bounded context {bounded_context}: event type {name} is scoped by an owner tag, \
+                 so its retractions must be too; use retractions_owned_by instead of retractions"
+            )));
+        }
+        if skilj_core::retraction::DOUBT_EVENT_TYPES
+            .iter()
+            .any(|built_in| unowned(built_in))
         {
             return Err(skilj_core::Error::configuration(format!(
-                "bounded context {bounded_context}: event type {name} is scoped by an owner tag,                  so its retractions must be too; use retractions_owned_by instead of retractions"
+                "bounded context {bounded_context}: event type {name} is scoped by an owner tag, \
+                 so its doubts must be too; use doubts_owned_by instead of doubts"
             )));
         }
     }
@@ -3045,6 +3063,48 @@ impl SkiljBuilder {
             (bc, skilj_core::retraction::RETRACTED_EVENT_TYPE.to_string()),
             registered,
         );
+        self
+    }
+
+    /// Lets commands in the current bounded context mark events as in doubt
+    /// with [`skilj_core::retraction::doubt`] and
+    /// [`lift_doubt`](skilj_core::retraction::lift_doubt)
+    /// (docs/architecture.md §236), by registering the built-in
+    /// [`EventDoubted`](skilj_core::retraction::EventDoubted) and
+    /// [`DoubtLifted`](skilj_core::retraction::DoubtLifted). Separate from
+    /// [`retractions`](Self::retractions), though a doubt usually ends in one.
+    /// Where event types declare an `owner_tag_key` use
+    /// [`doubts_owned_by`](Self::doubts_owned_by); [`build`](Self::build) refuses
+    /// this one there.
+    pub fn doubts(self) -> Self {
+        self.event_type::<skilj_core::retraction::EventDoubted>()
+            .event_type::<skilj_core::retraction::DoubtLifted>()
+    }
+
+    /// [`doubts`](Self::doubts) where readers are scoped by the owner tag
+    /// `owner_tag_key`: a scoped reader sees the doubts about its own events
+    /// only.
+    pub fn doubts_owned_by(mut self, owner_tag_key: impl Into<String>) -> Self {
+        let owner_tag_key = owner_tag_key.into();
+        let bc = self.current_bounded_context();
+        for (name, mut registered) in [
+            (
+                skilj_core::retraction::DOUBTED_EVENT_TYPE,
+                registered_event_type::<skilj_core::retraction::EventDoubted>(),
+            ),
+            (
+                skilj_core::retraction::DOUBT_LIFTED_EVENT_TYPE,
+                registered_event_type::<skilj_core::retraction::DoubtLifted>(),
+            ),
+        ] {
+            registered.tag_mappings = vec![skilj_core::shared::TagMapping::new(
+                owner_tag_key.clone(),
+                "owner",
+            )];
+            registered.owner_tag_key = Some(owner_tag_key.clone());
+            self.event_types
+                .insert((bc.clone(), name.to_string()), registered);
+        }
         self
     }
 

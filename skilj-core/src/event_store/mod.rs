@@ -673,9 +673,10 @@ pub enum Error {
         bounded_context: String,
     },
 
-    /// A type named `EventRetracted` with another shape than the built-in one
-    /// (docs/architecture.md §235): the store treats that name specially.
-    #[error("EventRetracted is reserved for the built-in retraction event type")]
+    /// A type named `EventRetracted`, `EventDoubted` or `DoubtLifted` with
+    /// another shape than the built-in one (docs/architecture.md §235, §236):
+    /// the store treats those names specially.
+    #[error("this name is reserved for a built-in event type")]
     ReservedEventTypeName,
 
     /// A TagMapping and a SensitiveField may not name the same field.
@@ -3076,11 +3077,10 @@ pub fn register_event_type(
     if !valid_schema(&schema) {
         return Err(Error::InvalidSchema.into());
     }
-    if name == crate::retraction::RETRACTED_EVENT_TYPE
-        && serde_json::from_str::<serde_json::Value>(&schema).ok()
-            != Some(crate::retraction::retraction_schema())
-    {
-        return Err(Error::ReservedEventTypeName.into());
+    if let Some(reserved) = crate::retraction::reserved_event_type_schema(&name) {
+        if serde_json::from_str::<serde_json::Value>(&schema).ok() != Some(reserved) {
+            return Err(Error::ReservedEventTypeName.into());
+        }
     }
     if !valid_tag_mappings(&schema, &tag_mappings) {
         return Err(Error::InvalidTagMapping.into());

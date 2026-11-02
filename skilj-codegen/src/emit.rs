@@ -35,13 +35,55 @@ pub fn emit(spec: &BoundedContextSpec) -> TokenStream {
         .iter()
         .map(|c| emit_command_type(c, &event_enum_ident, &blind));
     let event_enum = emit_event_enum(spec, &event_enum_ident);
+    let built_in_items = built_in_event_types(spec)
+        .into_iter()
+        .map(emit_built_in_event_type);
 
     quote! {
         #bc_const
         #(#blind_items)*
+        #(#built_in_items)*
         #(#event_items)*
         #(#command_items)*
         #event_enum
+    }
+}
+
+/// What a `.skilj.toml` can't declare an event type of its own under: the store
+/// treats these names specially (docs/architecture.md §235, §236).
+pub(crate) const BUILT_IN_EVENT_TYPES: [&str; 3] =
+    ["EventRetracted", "EventDoubted", "DoubtLifted"];
+
+/// The built-in event types this spec registers.
+pub(crate) fn built_in_event_types(spec: &BoundedContextSpec) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if spec.retractions {
+        names.push("EventRetracted");
+    }
+    if spec.doubts {
+        names.extend(["EventDoubted", "DoubtLifted"]);
+    }
+    names
+}
+
+/// A marker registering a built-in event type under `#[auto_register]`, with the
+/// payload the store's check of the reserved name expects.
+fn emit_built_in_event_type(name: &str) -> TokenStream {
+    let marker = format_ident!("{}", name);
+    let payload = if name == "EventRetracted" {
+        quote! { ::skilj_core::retraction::RetractionPayload }
+    } else {
+        quote! { ::skilj_core::retraction::DoubtPayload }
+    };
+    quote! {
+        pub struct #marker;
+
+        #[::skilj::auto_register(BOUNDED_CONTEXT)]
+        impl ::skilj::EventType for #marker {
+            type Payload = #payload;
+            const NAME: &'static str = #name;
+            fn event_read_allowed() -> bool { true }
+        }
     }
 }
 
@@ -122,6 +164,7 @@ fn tag_mappings_fn(tags: &BTreeMap<String, String>, blind: &BlindKeys) -> Option
 fn consistency_query_fn(
     query: &[QueryItemSpec],
     reads_nothing: bool,
+    retractable: bool,
     tags: &BTreeMap<String, String>,
     blind: &BlindKeys,
 ) -> Option<TokenStream> {
@@ -136,7 +179,15 @@ fn consistency_query_fn(
         return None;
     }
     let items = query.iter().map(|item| {
-        let event_types = &item.event_types;
+        // A retraction carries the tags of what it retracts, and a decision
+        // folding around them needs each: docs/architecture.md §235.
+        let mut event_types = item.event_types.clone();
+        if retractable
+            && !event_types.is_empty()
+            && !event_types.iter().any(|name| name == "EventRetracted")
+        {
+            event_types.push("EventRetracted".to_string());
+        }
         let tag_mappings = item
             .tags
             .iter()
@@ -267,8 +318,18 @@ fn emit_command_type(
     let name_lit = &command.name;
     let tag_fn = tag_mappings_fn(&command.tags, blind);
     let sensitive_fn = sensitive_fields_fn(&command.sensitive);
-    let query_fn =
-        consistency_query_fn(&command.query, command.reads_nothing, &command.tags, blind);
+    let query_fn = consistency_query_fn(
+        &command.query,
+        command.reads_nothing,
+        command.retractable,
+        &command.tags,
+        blind,
+    );
+    let event_type = if command.retractable {
+        quote! { ::skilj_core::retraction::Retractable<#event_enum_ident> }
+    } else {
+        quote! { #event_enum_ident }
+    };
     let rest_fn = command.rest_trigger_allowed.then(|| {
         quote! {
             fn rest_trigger_allowed() -> bool { true }
@@ -284,7 +345,7 @@ fn emit_command_type(
         #[::skilj::auto_register(BOUNDED_CONTEXT)]
         impl ::skilj::CommandType for #marker_ident {
             type Payload = #payload_ident;
-            type Event = #event_enum_ident;
+            type Event = #event_type;
             const NAME: &'static str = #name_lit;
             #tag_fn
             #sensitive_fn

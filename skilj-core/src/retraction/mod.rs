@@ -20,13 +20,19 @@
 //! A retraction doesn't erase anything. The original stays in the journal and
 //! readable, which is what `forgetSubject` is for instead, and a reason is
 //! stored in the clear, so it shouldn't hold personal data.
+//!
+//! Doubt is the step before: an [`EventDoubted`] says an event is still
+//! endorsed but under investigation (docs/architecture.md §236). It carries
+//! the same copied tags and ends in a [`DoubtLifted`] or a retraction. It is
+//! only a marker: a snapshot's fold never sees one, and [`open_doubts`] tells a
+//! decision what's in doubt, for the decision to act on or not.
 
 use crate::event_store::Event;
 use crate::plugin::{BoundedContextEvent, EventType};
 use crate::shared::{CommandDecision, EventSpec, QueryItemMapping, Tag, TagMapping};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The name [`EventRetracted`] registers under. Reserved: a type of this name
 /// with any other shape is refused at registration.
@@ -35,6 +41,25 @@ pub const RETRACTED_EVENT_TYPE: &str = "EventRetracted";
 /// The tag the store adds to a retraction, its value the retracted position.
 /// Finds what retracted an event, and is how the store refuses a second one.
 pub const RETRACTS_TAG_KEY: &str = "skilj_retracts";
+
+/// The name [`EventDoubted`] registers under. Reserved like
+/// [`RETRACTED_EVENT_TYPE`].
+pub const DOUBTED_EVENT_TYPE: &str = "EventDoubted";
+
+/// The name [`DoubtLifted`] registers under. Reserved like
+/// [`RETRACTED_EVENT_TYPE`].
+pub const DOUBT_LIFTED_EVENT_TYPE: &str = "DoubtLifted";
+
+/// Both doubt event types, for a consistency query whose decision wants
+/// [`open_doubts`]: `claim_query(&["MyEvent", DOUBT_EVENT_TYPES[0],
+/// DOUBT_EVENT_TYPES[1]], tag)`. They have to be registered, by
+/// `SkiljBuilder::doubts`.
+pub const DOUBT_EVENT_TYPES: [&str; 2] = [DOUBTED_EVENT_TYPE, DOUBT_LIFTED_EVENT_TYPE];
+
+/// The tag the store adds to an [`EventDoubted`] and a [`DoubtLifted`], its
+/// value the position they're about. How the store finds whether a doubt is
+/// open.
+pub const DOUBTS_TAG_KEY: &str = "skilj_doubts";
 
 /// Why a claim is no longer endorsed. Erasure is not among them: a request to
 /// be forgotten or an expired retention period is `forgetSubject`.
@@ -88,6 +113,94 @@ impl EventType for EventRetracted {
 pub fn retraction_schema() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(RetractionPayload))
         .expect("JSON Schema serialization is infallible")
+}
+
+/// The payload of an [`EventDoubted`] and a [`DoubtLifted`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DoubtPayload {
+    /// The sequence of the event in doubt.
+    pub position: i64,
+    /// A human-readable explanation, stored in the clear. A dossier belongs in
+    /// the command's payload, which this event's `causation_id` leads to.
+    pub reason: String,
+    /// The type of the event in doubt. Filled in by the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doubted_event_type: Option<String>,
+    /// That event's owner tag value, when the type is registered with
+    /// `doubts_owned_by`. Filled in by the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+/// The built-in event saying an earlier event is still endorsed, but in doubt.
+/// Only a command's decision can emit one, with [`doubt`]; registered per
+/// bounded context by `SkiljBuilder::doubts`.
+pub struct EventDoubted;
+
+impl EventType for EventDoubted {
+    type Payload = DoubtPayload;
+    const NAME: &'static str = DOUBTED_EVENT_TYPE;
+
+    /// A reader who can follow an event has to be able to learn it's in doubt.
+    fn event_read_allowed() -> bool {
+        true
+    }
+}
+
+/// The built-in event saying a doubt turned out unfounded. Only a command's
+/// decision can emit one, with [`lift_doubt`]; registered with [`EventDoubted`].
+pub struct DoubtLifted;
+
+impl EventType for DoubtLifted {
+    type Payload = DoubtPayload;
+    const NAME: &'static str = DOUBT_LIFTED_EVENT_TYPE;
+
+    /// [`EventDoubted`]'s reason.
+    fn event_read_allowed() -> bool {
+        true
+    }
+}
+
+/// The schema [`EventDoubted`] and [`DoubtLifted`] register with.
+pub fn doubt_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(DoubtPayload))
+        .expect("JSON Schema serialization is infallible")
+}
+
+/// The schema a reserved event type name has to be registered with, or `None`
+/// when the name isn't reserved.
+pub fn reserved_event_type_schema(name: &str) -> Option<serde_json::Value> {
+    match name {
+        RETRACTED_EVENT_TYPE => Some(retraction_schema()),
+        DOUBTED_EVENT_TYPE | DOUBT_LIFTED_EVENT_TYPE => Some(doubt_schema()),
+        _ => None,
+    }
+}
+
+/// The event saying `position` is in doubt, for a decision to emit.
+pub fn doubt(position: i64, reason: impl Into<String>) -> EventSpec {
+    doubt_spec(DOUBTED_EVENT_TYPE, position, reason.into())
+}
+
+/// The event saying the doubt about `position` was unfounded, for a decision to
+/// emit. A doubt that was founded ends in a retraction or a correction instead,
+/// with no lift first.
+pub fn lift_doubt(position: i64, reason: impl Into<String>) -> EventSpec {
+    doubt_spec(DOUBT_LIFTED_EVENT_TYPE, position, reason.into())
+}
+
+fn doubt_spec(event_type: &str, position: i64, reason: String) -> EventSpec {
+    EventSpec {
+        event_type: event_type.to_string(),
+        payload: serde_json::json!({ "position": position, "reason": reason }),
+    }
+}
+
+/// Whether `event` is an [`EventDoubted`] or a [`DoubtLifted`]. A snapshot's fold
+/// has no use for one: it carries the tags of what it's about, so catch-up and a
+/// command's read pass it over, and a doubted event stays in the state.
+pub fn is_doubt_event(event: &Event) -> bool {
+    DOUBT_EVENT_TYPES.contains(&event.event_type.name.as_str())
 }
 
 /// The position `event` retracts, when it is a retraction.
@@ -184,6 +297,24 @@ pub enum Retractable<E> {
         /// Its payload, naming the position it retracts.
         retraction: RetractionPayload,
     },
+    /// A doubt, read only by a query listing [`DOUBT_EVENT_TYPES`].
+    Doubt {
+        /// The doubt's own sequence.
+        position: i64,
+        /// Its tags, copied from the event in doubt.
+        tags: Vec<Tag>,
+        /// Its payload, naming the position in doubt.
+        doubt: DoubtPayload,
+    },
+    /// A lifted doubt, read only by a query listing [`DOUBT_EVENT_TYPES`].
+    DoubtLift {
+        /// The lift's own sequence.
+        position: i64,
+        /// Its tags, copied from the event that was in doubt.
+        tags: Vec<Tag>,
+        /// Its payload, naming the position that was in doubt.
+        lift: DoubtPayload,
+    },
 }
 
 impl<E> Retractable<E> {
@@ -210,6 +341,33 @@ impl<E> Retractable<E> {
             },
         }
     }
+
+    /// A doubt about `doubted`, for a test of a `decide()`.
+    pub fn doubt(position: i64, tags: Vec<Tag>, doubted: i64) -> Self {
+        Self::Doubt {
+            position,
+            tags,
+            doubt: test_doubt_payload(doubted),
+        }
+    }
+
+    /// A lift of the doubt about `doubted`, for a test of a `decide()`.
+    pub fn doubt_lift(position: i64, tags: Vec<Tag>, doubted: i64) -> Self {
+        Self::DoubtLift {
+            position,
+            tags,
+            lift: test_doubt_payload(doubted),
+        }
+    }
+}
+
+fn test_doubt_payload(position: i64) -> DoubtPayload {
+    DoubtPayload {
+        position,
+        reason: String::new(),
+        doubted_event_type: None,
+        owner: None,
+    }
 }
 
 impl<E: BoundedContextEvent> BoundedContextEvent for Retractable<E> {
@@ -220,6 +378,24 @@ impl<E: BoundedContextEvent> BoundedContextEvent for Retractable<E> {
                     position: event.sequence,
                     tags: event.tags.clone(),
                     retraction,
+                }),
+            );
+        }
+        if event.event_type.name == DOUBTED_EVENT_TYPE {
+            return Some(
+                serde_json::from_str(&event.payload).map(|doubt| Self::Doubt {
+                    position: event.sequence,
+                    tags: event.tags.clone(),
+                    doubt,
+                }),
+            );
+        }
+        if event.event_type.name == DOUBT_LIFTED_EVENT_TYPE {
+            return Some(
+                serde_json::from_str(&event.payload).map(|lift| Self::DoubtLift {
+                    position: event.sequence,
+                    tags: event.tags.clone(),
+                    lift,
                 }),
             );
         }
@@ -269,7 +445,7 @@ pub fn standing<E>(events: &[Retractable<E>]) -> Vec<Standing<'_, E>> {
         .iter()
         .filter_map(|event| match event {
             Retractable::Retraction { retraction, .. } => Some(retraction.position),
-            Retractable::Event { .. } => None,
+            _ => None,
         })
         .collect();
     events
@@ -287,6 +463,59 @@ pub fn standing<E>(events: &[Retractable<E>]) -> Vec<Standing<'_, E>> {
             _ => None,
         })
         .collect()
+}
+
+/// The events of `events` in doubt right now: each position, and the position
+/// of the doubt that raised it, for showing or citing. A doubt stays open until
+/// it's lifted or its event is retracted. Needs the query to list
+/// [`DOUBT_EVENT_TYPES`] and every retraction: no `.latest()`. What to do about
+/// a doubt is the decision's: the event is still endorsed.
+pub fn open_doubts<E>(events: &[Retractable<E>]) -> HashMap<i64, i64> {
+    let mut open = HashMap::new();
+    for event in events {
+        match event {
+            Retractable::Doubt {
+                position, doubt, ..
+            } => {
+                open.insert(doubt.position, *position);
+            }
+            Retractable::DoubtLift { lift, .. } => {
+                open.remove(&lift.position);
+            }
+            Retractable::Retraction { retraction, .. } => {
+                open.remove(&retraction.position);
+            }
+            Retractable::Event { .. } => {}
+        }
+    }
+    open
+}
+
+/// What has been said about an event since it was recorded. For tools and an
+/// audit, not a decision: `decide()` works from its read, with [`standing`] and
+/// [`open_doubts`], which is consistent with what it decides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EventStance {
+    /// The sequence of the retraction, when it's retracted.
+    pub retracted_by: Option<i64>,
+    /// The sequence of the doubt, when one is open. A retraction ends a doubt.
+    pub doubted_by: Option<i64>,
+}
+
+impl EventStance {
+    /// Takes in the next event about this position, in sequence order.
+    pub(crate) fn apply(&mut self, event_type: &str, sequence: i64) {
+        match event_type {
+            RETRACTED_EVENT_TYPE => {
+                self.retracted_by = Some(sequence);
+                self.doubted_by = None;
+            }
+            DOUBTED_EVENT_TYPE => self.doubted_by = Some(sequence),
+            DOUBT_LIFTED_EVENT_TYPE => self.doubted_by = None,
+            _ => {}
+        }
+    }
 }
 
 /// What an event does to a unique value.
@@ -456,6 +685,60 @@ mod tests {
         let claims = fold(&events);
         assert_eq!(claims.held_by("customer", "a").unwrap().position, 1);
         assert_eq!(claims.held_by_another("customer", "a").unwrap().position, 2);
+    }
+
+    #[test]
+    fn a_doubt_stays_open_until_lifted_or_retracted() {
+        let claimed = claim(1, "a", "x");
+        let doubted = Retractable::doubt(2, tags("a", "x"), 1);
+        assert_eq!(
+            open_doubts(&[claim(1, "a", "x"), doubted]),
+            HashMap::from([(1, 2)])
+        );
+        let lifted = [
+            claimed,
+            Retractable::doubt(2, tags("a", "x"), 1),
+            Retractable::doubt_lift(3, tags("a", "x"), 1),
+        ];
+        assert!(open_doubts(&lifted).is_empty());
+        let retracted = [
+            claim(1, "a", "x"),
+            Retractable::doubt(2, tags("a", "x"), 1),
+            Retractable::retraction(3, tags("a", "x"), 1),
+        ];
+        assert!(open_doubts(&retracted).is_empty());
+        let again = [
+            claim(1, "a", "x"),
+            Retractable::doubt(2, tags("a", "x"), 1),
+            Retractable::doubt_lift(3, tags("a", "x"), 1),
+            Retractable::doubt(4, tags("a", "x"), 1),
+        ];
+        assert_eq!(open_doubts(&again), HashMap::from([(1, 4)]));
+    }
+
+    #[test]
+    fn a_stance_follows_what_was_said_in_order() {
+        let mut stance = EventStance::default();
+        stance.apply(DOUBTED_EVENT_TYPE, 2);
+        assert_eq!(stance.doubted_by, Some(2));
+        stance.apply(DOUBT_LIFTED_EVENT_TYPE, 3);
+        assert_eq!(stance.doubted_by, None);
+        stance.apply(DOUBTED_EVENT_TYPE, 4);
+        stance.apply(RETRACTED_EVENT_TYPE, 5);
+        assert_eq!(
+            stance,
+            EventStance {
+                retracted_by: Some(5),
+                doubted_by: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_doubted_event_still_stands_and_still_holds_its_value() {
+        let events = [claim(1, "a", "x"), Retractable::doubt(2, tags("a", "x"), 1)];
+        assert_eq!(standing(&events).len(), 1);
+        assert_eq!(fold(&events).held_by("customer", "a").unwrap().position, 1);
     }
 
     #[test]

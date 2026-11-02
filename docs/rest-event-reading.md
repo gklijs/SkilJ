@@ -12,6 +12,9 @@ based on how your own process fails, not just on which is "best":
 
 A few things that trip people up:
 
+- **`GET /v1/events?upToSequence=N` reads as of a sequence.** You get the events as known at `N`,
+  inclusive, paged as usual, and `nextCursor` stays within the bound. A bound past the latest event
+  isn't refused, so such a read shows more later. `consume` has no bound.
 - **Every read returns one page, not everything.** Each `GET /v1/events` and each `consume` call
   returns at most `max_events_per_read` events (default 1000, set on the server's
   `SkiljBuilder`), oldest first. A short page just means you're caught up for now; a full page

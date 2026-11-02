@@ -430,6 +430,73 @@ fn get_events_filter_param_supports_the_in_operator_for_real_over_rest() {
     });
 }
 
+/// docs/architecture.md §237: `upToSequence` reads the events as known at that
+/// sequence, inclusive, paging as usual, and a cursor it hands out stays within
+/// the bound.
+#[test]
+fn get_events_up_to_a_sequence_serves_what_was_known_then() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup().await;
+        let router = skilj.rest_router();
+        for amount in [1, 2, 3] {
+            deposit(&router, &direct_credential, amount).await;
+        }
+
+        let (status, all) = get_events(&router, &read_credential, "").await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        let sequences: Vec<i64> = all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["sequence"].as_i64().unwrap())
+            .collect();
+        let [_, middle, last] = sequences[sequences.len() - 3..] else {
+            panic!("three events: {sequences:?}");
+        };
+
+        let (status, up_to) =
+            get_events(&router, &read_credential, &format!("upToSequence={middle}")).await;
+        assert_eq!(status, StatusCode::OK, "{up_to}");
+        let events = up_to["events"].as_array().unwrap();
+        assert_eq!(events.last().unwrap()["sequence"], middle, "{up_to}");
+        assert!(
+            events
+                .iter()
+                .all(|e| e["sequence"].as_i64().unwrap() <= middle),
+            "{up_to}"
+        );
+
+        // Paging on from its cursor with the same bound finds nothing more.
+        let cursor = up_to["nextCursor"].as_str().unwrap();
+        let (status, next) = get_events(
+            &router,
+            &read_credential,
+            &format!("after={cursor}&upToSequence={middle}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{next}");
+        assert_eq!(next["events"], serde_json::json!([]), "{next}");
+
+        // Past the latest it's just the latest.
+        let (_, beyond) = get_events(
+            &router,
+            &read_credential,
+            &format!("upToSequence={}", last + 1000),
+        )
+        .await;
+        assert_eq!(
+            beyond["events"].as_array().unwrap().last().unwrap()["sequence"],
+            last
+        );
+
+        let (status, refused) = get_events(&router, &read_credential, "upToSequence=soon").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    });
+}
+
 #[test]
 fn get_events_rejects_a_malformed_filter_param_with_400() {
     runtime().block_on(async {

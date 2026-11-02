@@ -73,6 +73,8 @@ pub enum AppEvent {
     LiveEvent(Result<Value, ClientError>),
     /// `true` when this is a next page (`n`) to append, not a fresh query.
     QueryEventsResult(Result<Value, ClientError>, bool),
+    /// What `inspectEvent` said about a batch of the shown events.
+    QueryEventsStanceResult(Result<Value, ClientError>),
     QueryEventsTypesResult(Result<Value, ClientError>),
     CommandResult(Result<Value, ClientError>),
     CommandTypesResult(Result<Value, ClientError>),
@@ -117,6 +119,24 @@ fn parse_type_options(data: &Value, field: &str) -> Vec<TypeOption> {
         .unwrap_or_default()
 }
 
+/// How many events one press of `s` in the query tab checks.
+pub const EVENT_STANCE_BATCH: usize = 50;
+
+/// The document asking what's been said about `sequences`, one aliased
+/// `inspectEvent` each: `e12` for sequence 12.
+pub fn event_stance_query(sequences: &[i64]) -> String {
+    let fields: String = sequences
+        .iter()
+        .map(|sequence| {
+            format!(
+                "e{sequence}: inspectEvent(boundedContext: $bc, sequence: {sequence}) \
+                 {{ retractedBy doubtedBy }} "
+            )
+        })
+        .collect();
+    format!("query($bc: String!) {{ {fields}}}")
+}
+
 /// Query Events - issue #8: the free-text, comma-separated
 /// `event_types` field became a real picker over `eventTypes(boundedContext)`
 /// ([§13](../../docs/architecture.md#self-describing-graphql-surface)/issue #6's "5a"). One flat struct rather than a
@@ -136,6 +156,9 @@ pub struct QueryEventsTab {
     /// The event types the shown results were queried with - what `n`
     /// (next page) re-queries, even if the checkboxes changed since.
     pub queried_types: Vec<Value>,
+    /// How many of the shown results `s` has checked for a retraction or a
+    /// doubt: `queryEvents` doesn't say (docs/architecture.md §236).
+    pub stances_checked: usize,
 }
 
 /// Commands - issue #8. Picking a type and filling in its
@@ -255,6 +278,7 @@ impl App {
                 query_error: None,
                 query_loading: false,
                 queried_types: Vec::new(),
+                stances_checked: 0,
             },
             commands: CommandsTab {
                 stage: CommandsStage::Picking {
@@ -318,12 +342,17 @@ impl App {
                             self.query_events.results.extend(page);
                         } else {
                             self.query_events.results = page;
+                            self.query_events.stances_checked = 0;
                         }
                         self.query_events.query_error = None;
                     }
                     Err(e) => self.query_events.query_error = Some(e.to_string()),
                 }
             }
+            AppEvent::QueryEventsStanceResult(result) => match result {
+                Ok(data) => self.apply_event_stances(&data),
+                Err(e) => self.query_events.query_error = Some(e.to_string()),
+            },
             AppEvent::QueryEventsTypesResult(result) => {
                 self.query_events.types_loading = false;
                 match result {
@@ -570,6 +599,7 @@ impl App {
             KeyCode::Char('r') => self.fetch_event_types(),
             KeyCode::Enter => self.submit_query_events(),
             KeyCode::Char('n') => self.next_query_events_page(),
+            KeyCode::Char('s') => self.fetch_event_stances(),
             _ => {}
         }
     }
@@ -624,6 +654,60 @@ impl App {
             return;
         };
         self.run_query_events(self.query_events.queried_types.clone(), Some(after));
+    }
+
+    /// Checks the next [`EVENT_STANCE_BATCH`] shown events: one `inspectEvent`
+    /// each, so on a key rather than for every page.
+    fn fetch_event_stances(&mut self) {
+        let sequences: Vec<i64> = self
+            .query_events
+            .results
+            .iter()
+            .skip(self.query_events.stances_checked)
+            .take(EVENT_STANCE_BATCH)
+            .filter_map(|event| event.get("sequence").and_then(Value::as_i64))
+            .collect();
+        if sequences.is_empty() {
+            self.status = Some("every shown event has been checked".into());
+            return;
+        }
+        self.query_events.stances_checked += sequences.len();
+        let document = event_stance_query(&sequences);
+        let client = self.client.clone();
+        let tx = self.events_tx.clone();
+        let bounded_context = self.bounded_context.clone();
+        tokio::spawn(async move {
+            let result = client
+                .request(&document, serde_json::json!({ "bc": bounded_context }))
+                .await;
+            let _ = tx.send(AppEvent::QueryEventsStanceResult(result));
+        });
+    }
+
+    /// Adds `retractedBy`/`doubtedBy` to the shown events it's true of, where
+    /// the results list renders them with the rest of the row.
+    fn apply_event_stances(&mut self, data: &Value) {
+        for row in &mut self.query_events.results {
+            let Some(sequence) = row.get("sequence").and_then(Value::as_i64) else {
+                continue;
+            };
+            let Some(stance) = data.get(format!("e{sequence}")) else {
+                continue;
+            };
+            let Some(row) = row.as_object_mut() else {
+                continue;
+            };
+            for field in ["retractedBy", "doubtedBy"] {
+                match stance.get(field).filter(|value| !value.is_null()) {
+                    Some(value) => {
+                        row.insert(field.to_string(), value.clone());
+                    }
+                    None => {
+                        row.remove(field);
+                    }
+                }
+            }
+        }
     }
 
     fn run_query_events(&mut self, event_types: Vec<Value>, after: Option<i64>) {

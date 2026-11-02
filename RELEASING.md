@@ -23,8 +23,8 @@ therefore:
    `skilj-graphql`, `skilj-macros`, `skilj-rest`, `skilj`,
    `skilj-codegen`, `skilj-test-fixture`, `skilj-retry`, `skilj-bridge` - these are the
    only crates any other workspace member depends on via a
-   `workspace = true` reference (`skilj-demo`'s own `[dev-dependencies]`
-   is `skilj-test-fixture`'s one dependent); `skilj-tui`/`skilj-inspector`
+   `workspace = true` reference (the `[dev-dependencies]` of `skilj-demo`
+   and `skilj` are `skilj-test-fixture`'s dependents); `skilj-tui`/`skilj-inspector`
    have no internal dependents and need no such entry).
 
 Not 15 separate per-crate edits - one field plus 9 matching version
@@ -106,7 +106,7 @@ Derived from the real internal dependency graph:
    `skilj-codegen` has zero internal deps, `skilj-rest`/
    `skilj-test-fixture` each depend only on `skilj-core`)
 4. `skilj` (depends on `skilj-core`, `skilj-graphql`, `skilj-rest`,
-   `skilj-macros`)
+   `skilj-macros`, and for its tests `skilj-test-fixture`)
 5. `skilj-tui` (zero internal deps), `skilj-inspector` (depends on
    `skilj-core` only), `skilj-temporal` (depends on `skilj-retry` and
    `skilj-bridge` - it speaks only skilj's wire protocol, the same posture

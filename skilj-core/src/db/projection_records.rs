@@ -591,6 +591,43 @@ pub async fn get_projection_state_and_owner(
     Ok(row)
 }
 
+/// A projection instance as stored, read in one statement, so the position
+/// is the one the state was folded to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredProjectionRow {
+    /// The state, JSON-encoded.
+    pub state: String,
+    /// The owner column; `None` when no event has proven one.
+    pub owner: Option<String>,
+    /// The sequence of the last event folded into it, -1 for none.
+    pub as_of_sequence: i64,
+}
+
+/// One instance's stored row, for serving it: `None` for an untouched key.
+pub async fn get_stored_projection_row(
+    pool: &Pool,
+    bounded_context: &str,
+    projection_name: &str,
+    key: &str,
+) -> crate::error::Result<Option<StoredProjectionRow>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<(String, Option<String>, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT state, owner, as_of_sequence FROM {schema}.projection_state \
+         WHERE projection_name = $1 AND key = $2"
+    )))
+    .bind(projection_name)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map(|(state, owner, as_of_sequence)| StoredProjectionRow {
+            state,
+            owner,
+            as_of_sequence,
+        }),
+    )
+}
+
 /// [`get_projection_state_and_owner`] for many `keys` of one projection in
 /// one statement - federation's `_entities` resolves a router's whole page
 /// of instances at once (docs/architecture.md §199). Keys with no row are
@@ -600,19 +637,27 @@ pub async fn get_projection_states_and_owners(
     bounded_context: &str,
     projection_name: &str,
     keys: &[String],
-) -> crate::error::Result<std::collections::HashMap<String, (String, Option<String>)>> {
+) -> crate::error::Result<std::collections::HashMap<String, StoredProjectionRow>> {
     let schema = schema_ident(bounded_context);
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT key, state, owner FROM {schema}.projection_state \
-         WHERE projection_name = $1 AND key = ANY($2)"
-    )))
-    .bind(projection_name)
-    .bind(keys)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, String, Option<String>, i64)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT key, state, owner, as_of_sequence FROM {schema}.projection_state \
+             WHERE projection_name = $1 AND key = ANY($2)"
+        )))
+        .bind(projection_name)
+        .bind(keys)
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
-        .map(|(key, state, owner)| (key, (state, owner)))
+        .map(|(key, state, owner, as_of_sequence)| {
+            let row = StoredProjectionRow {
+                state,
+                owner,
+                as_of_sequence,
+            };
+            (key, row)
+        })
         .collect())
 }
 

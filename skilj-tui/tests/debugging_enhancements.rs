@@ -181,3 +181,59 @@ async fn an_unparseable_wait_for_sequence_blocks_submission_with_an_inline_error
     );
     assert!(app.projections.error.is_some());
 }
+
+// --- Retractions and doubts on queried events ---
+
+/// `s` adds what `inspectEvent` said to the shown rows, only where something
+/// was: `queryEvents` itself doesn't say.
+#[tokio::test]
+async fn event_stances_are_added_to_the_rows_they_apply_to() {
+    let mut app = new_app();
+    app.handle(AppEvent::QueryEventsResult(
+        Ok(json!({ "queryEvents": [
+            { "sequence": 1, "payload": "{}" },
+            { "sequence": 2, "payload": "{}" },
+            { "sequence": 3, "payload": "{}" },
+        ]})),
+        false,
+    ));
+    app.handle(AppEvent::QueryEventsStanceResult(Ok(json!({
+        "e1": { "retractedBy": 9, "doubtedBy": null },
+        "e2": { "retractedBy": null, "doubtedBy": 8 },
+        "e3": { "retractedBy": null, "doubtedBy": null },
+    }))));
+    let rows = &app.query_events.results;
+    assert_eq!(rows[0]["retractedBy"], 9);
+    assert!(rows[0].get("doubtedBy").is_none());
+    assert_eq!(rows[1]["doubtedBy"], 8);
+    assert_eq!(rows[2], json!({ "sequence": 3, "payload": "{}" }));
+}
+
+/// A later check replaces an earlier answer: a lifted doubt goes away.
+#[tokio::test]
+async fn a_new_stance_replaces_the_shown_one() {
+    let mut app = new_app();
+    app.handle(AppEvent::QueryEventsResult(
+        Ok(json!({ "queryEvents": [{ "sequence": 2, "payload": "{}" }] })),
+        false,
+    ));
+    let doubted = json!({ "e2": { "retractedBy": null, "doubtedBy": 8 } });
+    app.handle(AppEvent::QueryEventsStanceResult(Ok(doubted)));
+    let lifted = json!({ "e2": { "retractedBy": null, "doubtedBy": null } });
+    app.handle(AppEvent::QueryEventsStanceResult(Ok(lifted)));
+    assert!(app.query_events.results[0].get("doubtedBy").is_none());
+}
+
+/// The aliases keep working under a federation name prefix.
+#[test]
+fn the_stance_query_survives_a_name_prefix() {
+    let document = skilj_tui::app::event_stance_query(&[12, 13]);
+    assert!(document.contains("e12: inspectEvent(boundedContext: $bc, sequence: 12)"));
+    let prefixed = skilj_tui::graphql::with_prefix(&document, "ledger");
+    assert!(
+        prefixed.contains("e12: ledgerInspectEvent(boundedContext: $bc, sequence: 12)"),
+        "{prefixed}"
+    );
+    assert!(prefixed.contains("e13: ledgerInspectEvent("), "{prefixed}");
+    assert!(!prefixed.contains("ledgerE12"), "{prefixed}");
+}

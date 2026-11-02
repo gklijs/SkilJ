@@ -130,7 +130,8 @@ fn draw_query_events(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.query_events.types_loading {
         "Event types - loading...".to_string()
     } else {
-        "Event types - Space to toggle, Enter to run, n for the next page, r to refresh".to_string()
+        "Event types - Space to toggle, Enter to run, n next page, s retracted/in doubt, r refresh"
+            .to_string()
     };
     let items: Vec<ListItem> = app
         .query_events

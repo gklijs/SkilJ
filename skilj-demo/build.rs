@@ -18,12 +18,15 @@
 //! `tests/customers.rs` alone: its blind tag (docs/architecture.md §205)
 //! needs a `blind_index_key`, which the demo's own bounded contexts and
 //! server don't configure, so it stays out of the library.
+//! `tests/seats.skilj.toml` the same, for `tests/seats.rs`: retractions
+//! and doubts from a `.skilj.toml` (docs/architecture.md §235, §236).
 
 use std::path::PathBuf;
 
 fn main() {
     generate("src/banking.skilj.toml", "banking_generated.rs");
     generate("tests/customers.skilj.toml", "customers_generated.rs");
+    generate("tests/seats.skilj.toml", "seats_generated.rs");
 }
 
 fn generate(toml_path: &str, output: &str) {

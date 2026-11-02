@@ -1264,10 +1264,14 @@ pub(super) async fn fold_snapshot_chunk_in_tx(
             if row.as_of_sequence >= event.sequence {
                 continue;
             }
-            if let Some(result) =
-                dispatcher.fold_value(bounded_context, name, value, &row.state, event)
-            {
-                row.state = result.inspect_err(|_| *reached = *index)?;
+            // A doubt carries its target's tags and leaves the state as it is
+            // (docs/architecture.md §236).
+            if !crate::retraction::is_doubt_event(event) {
+                if let Some(result) =
+                    dispatcher.fold_value(bounded_context, name, value, &row.state, event)
+                {
+                    row.state = result.inspect_err(|_| *reached = *index)?;
+                }
             }
             row.as_of_sequence = event.sequence;
         }
@@ -1453,6 +1457,7 @@ pub(super) async fn refold_snapshot_histories(
         for event in &page {
             if retracted.contains(&event.sequence)
                 || crate::retraction::retracted_position(event).is_some()
+                || crate::retraction::is_doubt_event(event)
             {
                 continue;
             }

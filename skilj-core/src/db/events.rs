@@ -883,8 +883,9 @@ fn event_belongs_to_state(
 /// `folded_through` into each of `states` it belongs to - an event
 /// matching a snapshot item of `query` for that snapshot and value - with
 /// the snapshot's own fold for that value (docs/architecture.md §202). A
-/// retraction and what it retracts are passed over (§235); one whose target
-/// is already in a state is [`states_holding_retracted_events`]' to deal with.
+/// retraction and what it retracts are passed over (§235), and so is a doubt
+/// (§236), its target staying in; a retraction whose target is already in a
+/// state is [`states_holding_retracted_events`]' to deal with.
 pub(super) fn fold_into_snapshot_states(
     snapshots: &dyn crate::plugin::SnapshotDispatcher,
     bounded_context: &str,
@@ -898,7 +899,8 @@ pub(super) fn fold_into_snapshot_states(
         .collect();
     for event in events {
         let passed_over = retracted.contains(&event.sequence)
-            || crate::retraction::retracted_position(event).is_some();
+            || crate::retraction::retracted_position(event).is_some()
+            || crate::retraction::is_doubt_event(event);
         for state in states.iter_mut() {
             if event.sequence <= state.folded_through
                 || !event_belongs_to_state(query, state, event)
@@ -920,6 +922,41 @@ pub(super) fn fold_into_snapshot_states(
         }
     }
     Ok(())
+}
+
+/// What has been said about each of `sequences` (docs/architecture.md §235,
+/// §236): an entry for those something was said about. Goes by the tags the
+/// store adds, so finding a retraction pages past its target costs the same.
+/// Not under the lock, so not something to decide on.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn event_stances(
+    pool: &Pool,
+    bounded_context: &str,
+    sequences: &[i64],
+) -> crate::error::Result<std::collections::HashMap<i64, crate::retraction::EventStance>> {
+    let schema = schema_ident(bounded_context);
+    let positions: Vec<String> = sequences.iter().map(i64::to_string).collect();
+    let rows: Vec<(String, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT tag_value, sequence, event_type_name FROM {schema}.event_tags \
+         WHERE tag_key = ANY($1) AND tag_value = ANY($2) ORDER BY sequence"
+    )))
+    .bind([
+        crate::retraction::RETRACTS_TAG_KEY,
+        crate::retraction::DOUBTS_TAG_KEY,
+    ])
+    .bind(&positions)
+    .fetch_all(pool)
+    .await?;
+    let mut stances = std::collections::HashMap::new();
+    for (position, sequence, event_type) in rows {
+        if let Ok(position) = position.parse::<i64>() {
+            stances
+                .entry(position)
+                .or_insert_with(crate::retraction::EventStance::default)
+                .apply(&event_type, sequence);
+        }
+    }
+    Ok(stances)
 }
 
 /// The indexes of `states` a retraction among `events` makes wrong: it is
@@ -1608,7 +1645,9 @@ pub async fn for_each_event_chunk(
 /// the rule's own pure function (`event_store::fetch_events_page` and
 /// friends), so the page is exactly the first `max_events` it would have
 /// served over the whole history. It runs at least once, even on an
-/// empty history, so its own validation errors still surface.
+/// empty history, so its own validation errors still surface. `up_to` is an
+/// as-of read (docs/architecture.md §237): nothing past that sequence is
+/// served, and the walk stops there rather than going on to the end.
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_event_page(
     pool: &Pool,
@@ -1616,6 +1655,7 @@ pub async fn collect_event_page(
     bounded_context: &str,
     event_type_name: Option<&str>,
     after_sequence: i64,
+    up_to: Option<i64>,
     max_events: usize,
     select: impl FnMut(&[Event], usize) -> crate::error::Result<Vec<Event>>,
 ) -> crate::error::Result<Vec<Event>> {
@@ -1625,6 +1665,7 @@ pub async fn collect_event_page(
         bounded_context,
         event_type_name,
         after_sequence,
+        up_to,
         max_events,
         select,
     )
@@ -1638,6 +1679,17 @@ pub async fn collect_event_page(
 pub struct ScannedEventPage {
     pub events: Vec<Event>,
     pub scanned_through: Option<i64>,
+}
+
+/// The part of `chunk`, which is in sequence order, at or below `up_to`.
+fn chunk_up_to(chunk: &[Event], up_to: Option<i64>) -> &[Event] {
+    match up_to {
+        Some(up_to) => {
+            let end = chunk.partition_point(|event| event.sequence <= up_to);
+            chunk.get(..end).unwrap_or_default()
+        }
+        None => chunk,
+    }
 }
 
 /// [`collect_event_page`], also reporting how far it walked. When the
@@ -1656,6 +1708,7 @@ pub async fn collect_scanned_event_page(
     bounded_context: &str,
     event_type_name: Option<&str>,
     after_sequence: i64,
+    up_to: Option<i64>,
     max_events: usize,
     mut select: impl FnMut(&[Event], usize) -> crate::error::Result<Vec<Event>>,
 ) -> crate::error::Result<ScannedEventPage> {
@@ -1669,11 +1722,12 @@ pub async fn collect_scanned_event_page(
         after_sequence,
         max_events,
         |chunk| {
-            if let Some(last) = chunk.last() {
+            let wanted = chunk_up_to(chunk, up_to);
+            if let Some(last) = wanted.last() {
                 scanned_through = Some(last.sequence);
             }
-            page.extend(select(chunk, max_events - page.len())?);
-            Ok(page.len() < max_events)
+            page.extend(select(wanted, max_events - page.len())?);
+            Ok(page.len() < max_events && wanted.len() == chunk.len())
         },
     )
     .await?;
@@ -1721,12 +1775,14 @@ pub async fn for_each_tagged_event_chunk(
 
 /// [`collect_event_page`] over [`for_each_tagged_event_chunk`]: the first
 /// `max_events` events `select` serves out of those carrying any of
-/// `tags` after `after_sequence`, read a chunk at a time.
+/// `tags` after `after_sequence`, read a chunk at a time. `up_to` as there.
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_tagged_event_page(
     pool: &Pool,
     bounded_context: &str,
     tags: &[Tag],
     after_sequence: i64,
+    up_to: Option<i64>,
     max_events: usize,
     mut select: impl FnMut(&[Event], usize) -> crate::error::Result<Vec<Event>>,
 ) -> crate::error::Result<Vec<Event>> {
@@ -1738,8 +1794,9 @@ pub async fn collect_tagged_event_page(
         after_sequence,
         max_events,
         |chunk| {
-            page.extend(select(chunk, max_events - page.len())?);
-            Ok(page.len() < max_events)
+            let wanted = chunk_up_to(chunk, up_to);
+            page.extend(select(wanted, max_events - page.len())?);
+            Ok(page.len() < max_events && wanted.len() == chunk.len())
         },
     )
     .await?;

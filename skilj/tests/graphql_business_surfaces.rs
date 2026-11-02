@@ -970,6 +970,168 @@ const SUBMIT_COMMAND_MUTATION: &str = "\
         } \
     }";
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct SayAboutAnEventPayload {
+    position: i64,
+    action: String,
+}
+
+/// Retracts, doubts or lifts the doubt about any position.
+struct SayAboutAnEvent;
+
+impl CommandType for SayAboutAnEvent {
+    type Payload = SayAboutAnEventPayload;
+    type Event = BankingEvent;
+    const NAME: &'static str = "SayAboutAnEvent";
+    fn consistency_query() -> Vec<skilj_core::shared::QueryItemMapping> {
+        vec![skilj_core::shared::QueryItemMapping::nothing()]
+    }
+    fn decide(payload: &Self::Payload, _events: &[Self::Event]) -> CommandDecision {
+        use skilj::retraction::{doubt, lift_doubt, retract, RetractionGround};
+        let event = match payload.action.as_str() {
+            "doubt" => doubt(payload.position, "under investigation"),
+            "lift" => lift_doubt(payload.position, "fine after all"),
+            _ => retract(
+                payload.position,
+                RetractionGround::ProcessedWrongly,
+                "wrong",
+            ),
+        };
+        CommandDecision::Accepted {
+            events: vec![event],
+        }
+    }
+}
+
+/// docs/architecture.md §236: `inspectEvent` says what has been said about the
+/// event, the one thing about it `queryEvents` leaves out.
+#[test]
+fn inspect_event_says_whether_it_is_retracted_or_in_doubt() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        // Its own bounded context: `setup()`'s has a command using `snapshot()`,
+        // which `build()` refuses next to retractions and doubts.
+        let database_url = test_database_url().await.unwrap();
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: unique_name("admin"),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &role).await.unwrap();
+        let bc_name = unique_name("accounts");
+        let bounded_context = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bounded_context)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: role.clone(),
+                bounded_context,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                capabilities: Default::default(),
+                delegable: Default::default(),
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (skilj, _) = Skilj::builder(database_url.clone())
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+            .identity_provider(IdpConfig::new(
+                serve_jwks().await.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .retractions()
+            .doubts()
+            .event_type::<MoneyDeposited>()
+            .command_type::<WithdrawMoney>()
+            .command_type::<SayAboutAnEvent>()
+            .reconciliation_role(role.external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        let jwt = sign_jwt(&role.external_subject);
+        let router = skilj.graphql_router().await.unwrap();
+        let submit = |name: &'static str, payload: String| {
+            let (router, jwt, bc_name) = (router.clone(), jwt.clone(), bc_name.clone());
+            async move {
+                let response = graphql_request(
+                    &router,
+                    Some(&jwt),
+                    SUBMIT_COMMAND_MUTATION,
+                    json!({ "bc": bc_name, "name": name, "payload": payload }),
+                )
+                .await;
+                assert_eq!(
+                    response["data"]["submitCommand"]["accepted"], true,
+                    "{response:?}"
+                );
+                response["data"]["submitCommand"]["triggeredEventSequences"][0]
+                    .as_i64()
+                    .unwrap()
+            }
+        };
+        let say = |position: i64, action: &'static str| {
+            submit(
+                "SayAboutAnEvent",
+                json!({ "position": position, "action": action }).to_string(),
+            )
+        };
+        let inspect = |position: i64| {
+            let (router, jwt, bc_name) = (router.clone(), jwt.clone(), bc_name.clone());
+            async move {
+                let response = graphql_request(
+                    &router,
+                    Some(&jwt),
+                    "query($bc: String!, $seq: Int!) { \
+                        inspectEvent(boundedContext: $bc, sequence: $seq) { \
+                            retractedBy doubtedBy \
+                        } \
+                    }",
+                    json!({ "bc": bc_name, "seq": position }),
+                )
+                .await;
+                assert!(response.get("errors").is_none(), "{response:?}");
+                (
+                    response["data"]["inspectEvent"]["retractedBy"].as_i64(),
+                    response["data"]["inspectEvent"]["doubtedBy"].as_i64(),
+                )
+            }
+        };
+
+        let position = submit("WithdrawMoney", r#"{"amount":20}"#.to_string()).await;
+        assert_eq!(inspect(position).await, (None, None));
+        let doubt = say(position, "doubt").await;
+        assert_eq!(inspect(position).await, (None, Some(doubt)));
+        say(position, "lift").await;
+        assert_eq!(inspect(position).await, (None, None));
+        say(position, "doubt").await;
+        let retraction = say(position, "retract").await;
+        assert_eq!(inspect(position).await, (Some(retraction), None));
+    });
+}
+
 #[test]
 fn full_business_surfaces_lifecycle_end_to_end() {
     runtime().block_on(async {

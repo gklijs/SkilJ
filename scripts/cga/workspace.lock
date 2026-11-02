@@ -5176,6 +5176,7 @@ dependencies = [
  "skilj-macros",
  "skilj-rest",
  "skilj-retry",
+ "skilj-test-fixture",
  "skilj-test-support",
  "sqlx",
  "testcontainers-modules",
@@ -5432,6 +5433,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skilj-core",
+ "tokio",
 ]
 
 [[package]]

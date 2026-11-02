@@ -3643,7 +3643,9 @@ rule SkipMissedOccurrences {
 -- quickly.
 
 rule FetchEvents {
-    when: FetchEvents(token, read_type, filters, after_sequence?, epoch?)
+    -- up_to_sequence is an as-of read (docs/architecture.md §237): the events
+    -- as known at that sequence, inclusive; one past the latest changes nothing.
+    when: FetchEvents(token, read_type, filters, after_sequence?, up_to_sequence?, epoch?)
     requires: token.status = active
     -- after_sequence read in another epoch: see current_epoch() above.
     requires: epoch = null or epoch = current_epoch()
@@ -3660,6 +3662,7 @@ rule FetchEvents {
         Events where bounded_context = read_type.bounded_context
             and event_type = read_type
             and sequence > (after_sequence ?? -1)
+            and (up_to_sequence = null or sequence <= up_to_sequence)
 
     -- The token's own ownership check, composed into the filter beside the
     -- caller's rather than standing apart from it: an event this token is
@@ -4040,6 +4043,10 @@ rule AcknowledgeEvents {
 -- context to be active: archiving stops writes, and reading what was
 -- built before that is the point.
 
+-- Beside its state, the wire answer says what it reflects: as_of_sequence, the
+-- last event folded into this instance, absent when nothing has been. A
+-- recipient can refer back to it (docs/architecture.md §237). A state with its
+-- own field of that name keeps it.
 rule QueryProjection {
     when: QueryProjection(access_mapping, projection, key?, wait_for_sequence?)
     requires: access_mapping.status = active
@@ -4722,9 +4729,28 @@ rule AuthoriseCommandTrigger {
 -- itself, and one that doesn't keeps it. A deployment with retractions refuses
 -- CommandType.snapshot(), whose decider folds the events past a stored row itself.
 --
--- Hence tags_of_new_event below: derive_tags for every event but a retraction,
--- and for a retraction the copied tags. Hence too the exception in
--- invariant EventTagsMatchDeclaredMappings.
+-- docs/architecture.md §236: doubt is the step before. An EventDoubted says an
+-- earlier event is still endorsed but under investigation, and a DoubtLifted that
+-- it turned out fine; both are EventSpecs a decision emits, registered together
+-- under reserved names, and carry the target's tags as a retraction does, plus a
+-- skilj_doubts tag naming the position. Doubt is a marker: a snapshot's state is
+-- the same with or without one, an event in doubt still counts everywhere, and
+-- a decision that cares reads the doubts and goes by them. A retraction ends a
+-- doubt, with no lift first. Each a typed rejection under the same lock:
+--   doubt_target_not_found    - no event at that position
+--   doubt_of_stance           - the target is a retraction, a doubt or a lift
+--   doubt_target_retracted    - a doubt or a lift of a retracted event
+--   doubt_target_out_of_scope - as retraction_target_out_of_scope
+--   already_doubted           - a doubt is open, including earlier in the batch
+--   no_open_doubt             - a lift with no open doubt
+--   invalid_doubt             - the payload isn't a doubt
+--   retraction_of_doubt       - a retraction of a doubt or a lift; lift it instead
+-- A deployment with doubts refuses CommandType.snapshot() as well: the events
+-- past its stored row would include doubts its fold can't convert.
+--
+-- Hence tags_of_new_event below: derive_tags for every event but these three,
+-- and for them the copied tags. Hence too the exception in invariant
+-- EventTagsMatchDeclaredMappings.
 rule ProcessCommand {
     when:
         CommandAuthorised(
@@ -5999,7 +6025,8 @@ rule SearchFetchedTags {
 }
 
 rule QueryEvents {
-    when: QueryEvents(access_mapping, event_types, tags?, after_sequence?)
+    -- up_to_sequence as on rule FetchEvents (docs/architecture.md §237).
+    when: QueryEvents(access_mapping, event_types, tags?, after_sequence?, up_to_sequence?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
 
@@ -6021,6 +6048,7 @@ rule QueryEvents {
             and (event_types.count = 0 or event_type in event_types)
             and (wanted_tags = null or wanted_tags.any(t => t in tags))
             and sequence > (after_sequence ?? -1)
+            and (up_to_sequence = null or sequence <= up_to_sequence)
 
     -- The ownership check narrows what matched rather than standing beside
     -- it as a requires, which is what makes it a filter: this is a browse
@@ -6157,6 +6185,10 @@ rule CountEvents {
         )
 }
 
+-- Beside what's rendered here, the wire answer says what has been said about
+-- the event since: the position of its retraction, and of its open doubt
+-- (docs/architecture.md §235, §236). Read outside any lock, for tools and an
+-- audit; a decision goes by its own read instead.
 rule InspectEvent {
     when: InspectEvent(access_mapping, event)
     requires: access_mapping.status = active
@@ -9421,10 +9453,12 @@ invariant ConsistencyTagKeysAreDeclared {
 }
 
 invariant EventTagsMatchDeclaredMappings {
-    -- A retraction is the one exception: it carries the tags of the event it
-    -- retracts, whatever its own type maps (see the note above rule
-    -- ProcessCommand, docs/architecture.md §235).
-    for e in Events where e.event_type.name != "EventRetracted":
+    -- Retractions and doubts are the exception: they carry the tags of the
+    -- event they're about, whatever their own type maps (see the note above
+    -- rule ProcessCommand, docs/architecture.md §235, §236).
+    for e in Events where e.event_type.name != "EventRetracted"
+            and e.event_type.name != "EventDoubted"
+            and e.event_type.name != "DoubtLifted":
         for tag in e.tags:
             e.event_type.tag_mappings.any(m => m.key = tag.key)
 }
@@ -9933,7 +9967,7 @@ surface EventFetch {
         event_type.schema_version
 
     provides:
-        FetchEvents(token, event_type, filters, after_sequence?, epoch?)
+        FetchEvents(token, event_type, filters, after_sequence?, up_to_sequence?, epoch?)
         SearchFetchedTags(token, key, prefix?, limit?)
         ConsumeEvents(token, ack_mode?, filters)
         AcknowledgeEvents(token, sequence, epoch?)
@@ -10475,7 +10509,7 @@ surface EventQuery {
         event.origin
 
     provides:
-        QueryEvents(access_mapping, event_types, tags?, after_sequence?)
+        QueryEvents(access_mapping, event_types, tags?, after_sequence?, up_to_sequence?)
         SearchUsedTags(access_mapping, key, prefix?, limit?, selected_type?)
         CountEvents(access_mapping, event_types, tags?)
         InspectEvent(access_mapping, event)

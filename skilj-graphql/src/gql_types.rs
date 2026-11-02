@@ -1100,12 +1100,16 @@ pub fn event_meta_object(n: &Naming) -> Object {
 pub struct InspectedEventData {
     pub event: skilj_core::event_store::Event,
     pub rendered_payload: String,
+    pub stance: skilj_core::retraction::EventStance,
 }
 
 pub fn inspected_event_object(n: &Naming) -> Object {
     gql_object!(InspectedEventData => n.ty("InspectedEvent") {
         object "event": TypeRef::named_nn(n.ty("EventMeta")) => |i| Some(i.event.clone()),
         scalar "renderedPayload": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.rendered_payload.clone()),
+        // docs/architecture.md §235, §236: what has been said about the event.
+        scalar "retractedBy": TypeRef::named(TypeRef::INT) => |i| i.stance.retracted_by.map(Value::from).unwrap_or(Value::Null),
+        scalar "doubtedBy": TypeRef::named(TypeRef::INT) => |i| i.stance.doubted_by.map(Value::from).unwrap_or(Value::Null),
     })
 }
 
