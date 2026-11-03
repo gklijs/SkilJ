@@ -310,6 +310,7 @@ fn event_type_with_sensitive_field() -> EventType {
             subject_field: "user_id".into(),
         }],
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: true,
         system_triggered_allowed: false,
@@ -392,6 +393,7 @@ fn command_type_with_sensitive_field() -> CommandType {
             subject_field: "user_id".into(),
         }],
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         rest_trigger_allowed: false,
     }
 }

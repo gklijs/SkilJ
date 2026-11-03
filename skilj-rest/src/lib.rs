@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod auth;
+pub mod blobs;
 pub mod error;
 pub mod routes;
 

@@ -73,6 +73,7 @@ async fn serve(mock: Mock, with_batch_route: bool) -> (String, Shared) {
 
 fn mapping() -> InboundMapping {
     InboundMapping {
+        blobs: None,
         credential: "id.secret".to_string(),
         action: InboundAction::Trigger {
             command_type: "ShipOrder".to_string(),

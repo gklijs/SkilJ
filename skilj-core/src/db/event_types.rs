@@ -61,6 +61,7 @@ pub(super) struct EventTypeRow {
     pub(super) last_fired_at: Option<DateTime<Utc>>,
     pub(super) event_read_allowed: bool,
     pub(super) private_fields: Json<Vec<PrivateField>>,
+    pub(super) blob_fields: Json<Vec<crate::blob::BlobField>>,
 }
 
 impl EventTypeRow {
@@ -74,6 +75,7 @@ impl EventTypeRow {
             owner_tag_key: self.owner_tag_key,
             sensitive_fields: self.sensitive_fields.0,
             private_fields: self.private_fields.0,
+            blob_fields: self.blob_fields.0,
             external_creation_allowed: self.external_creation_allowed,
             direct_creation_allowed: self.direct_creation_allowed,
             system_triggered_allowed: self.system_triggered_allowed,
@@ -93,7 +95,7 @@ pub(super) const EVENT_TYPE_COLUMNS: &str =
     "name, schema, schema_version, tag_mappings, owner_tag_key, sensitive_fields, \
     external_creation_allowed, direct_creation_allowed, system_triggered_allowed, \
     system_triggered_schedule, missed_occurrence_policy, schedule_position, last_fired_at, \
-    event_read_allowed, private_fields";
+    event_read_allowed, private_fields, blob_fields";
 
 /// Upsert, not insert-only - `RegisterEventType`'s own create-or-update
 /// shape (see `event_store::register_event_type`), though no surface
@@ -114,7 +116,7 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     let schema = schema_ident(&et.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.event_types ({EVENT_TYPE_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
          ON CONFLICT (name) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
             tag_mappings = EXCLUDED.tag_mappings, owner_tag_key = EXCLUDED.owner_tag_key, \
@@ -130,7 +132,8 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
                 THEN EXCLUDED.schedule_position \
                 ELSE {schema}.event_types.schedule_position END, \
             event_read_allowed = EXCLUDED.event_read_allowed, \
-            private_fields = EXCLUDED.private_fields"
+            private_fields = EXCLUDED.private_fields, \
+            blob_fields = EXCLUDED.blob_fields"
     )))
     .bind(&et.name)
     .bind(&et.schema)
@@ -150,6 +153,7 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     .bind(et.last_fired_at)
     .bind(et.event_read_allowed)
     .bind(Json(&et.private_fields))
+    .bind(Json(&et.blob_fields))
     .execute(pool)
     .await?;
     notify_registration_changed(pool).await;
@@ -398,7 +402,7 @@ pub async fn fire_system_event(
     limits
         .apply(projection_dispatcher.payload_limits())
         .check_event(&event)?;
-    let blob_claims = event_blob_claims(projection_dispatcher, &event)?;
+    let blob_claims = event_blob_claims(&event)?;
     check_blob_claims(&mut tx, bounded_context, &blob_claims).await?;
 
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);

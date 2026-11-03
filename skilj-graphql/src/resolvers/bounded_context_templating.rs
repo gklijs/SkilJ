@@ -114,6 +114,7 @@ async fn apply_template_registrations(
             source.owner_tag_key.clone(),
             source.sensitive_fields.clone(),
             source.private_fields.clone(),
+            source.blob_fields.clone(),
             source.external_creation_allowed,
             source.direct_creation_allowed,
             source.system_triggered_allowed,
@@ -150,6 +151,7 @@ async fn apply_template_registrations(
             source.owner_tag_key.clone(),
             source.sensitive_fields.clone(),
             source.private_fields.clone(),
+            source.blob_fields.clone(),
             source.rest_trigger_allowed,
             existing.as_ref(),
         )

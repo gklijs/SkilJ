@@ -184,6 +184,7 @@ pub fn access_event_type(admin: &BoundedContext, kind: AccessEventKind) -> Event
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: false,

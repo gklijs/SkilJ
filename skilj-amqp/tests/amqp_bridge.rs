@@ -577,6 +577,7 @@ fn an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_key()
         };
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -691,6 +692,7 @@ fn an_inbound_record_message_forwards_its_own_correlation_and_causation_properti
         };
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -770,6 +772,7 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_mess
         };
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "command-token".to_string(),
             action: InboundAction::Trigger {
                 command_type: "WithdrawMoney".to_string(),
@@ -840,6 +843,7 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
         mappings.insert(
             address.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1174,6 +1178,7 @@ fn a_message_whose_park_report_fails_is_released_and_parked_on_redelivery() {
         mappings.insert(
             address.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1301,6 +1306,7 @@ fn the_run_loops_stop_when_asked() {
         inbound_mappings.insert(
             address.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1397,6 +1403,7 @@ fn a_non_json_message_is_parked_at_once_with_its_raw_content() {
         mappings.insert(
             address.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1495,6 +1502,7 @@ fn an_undecodable_message_is_rejected_and_does_not_stall_the_receiver() {
         mappings.insert(
             address.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1585,6 +1593,7 @@ fn a_backlog_is_recorded_in_batches_in_order() {
         mappings.insert(
             address.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),

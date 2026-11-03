@@ -102,6 +102,16 @@ pub struct SensitiveSpec {
     pub subject_field: String,
 }
 
+/// The subject of a `blob`-typed field whose bytes are encrypted
+/// (`blobs = [{ field, subject_key, subject_field }]`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobSpec {
+    pub field: String,
+    pub subject_key: String,
+    pub subject_field: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventTypeSpec {
@@ -119,6 +129,9 @@ pub struct EventTypeSpec {
     /// `sensitive_fields()` - encrypted per subject.
     #[serde(default)]
     pub sensitive: Vec<SensitiveSpec>,
+    /// Subjects for its `blob`-typed fields.
+    #[serde(default)]
+    pub blobs: Vec<BlobSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +145,9 @@ pub struct CommandTypeSpec {
     /// See `EventTypeSpec::sensitive`.
     #[serde(default)]
     pub sensitive: Vec<SensitiveSpec>,
+    /// See `EventTypeSpec::blobs`.
+    #[serde(default)]
+    pub blobs: Vec<BlobSpec>,
     #[serde(default)]
     pub rest_trigger_allowed: bool,
     /// `CommandType::consistency_query()` (docs/architecture.md §198), one
@@ -188,6 +204,9 @@ pub enum FieldType {
     String,
     I64,
     Bool,
+    /// A `skilj_core::blob::BlobRef`: declared as a blob field of its type,
+    /// with the subject `blobs` gives it, if any (docs/architecture.md §239).
+    Blob,
 }
 
 /// Rust's keywords (2024 edition, strict and reserved) - a type name may
@@ -343,6 +362,66 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
             "the built-in event type".to_string(),
             &mut problems,
         );
+    }
+
+    let blob_types = spec
+        .event_types
+        .iter()
+        .map(|e| {
+            (
+                "event_type",
+                &e.name,
+                &e.fields,
+                &e.tags,
+                &e.sensitive,
+                &e.blobs,
+            )
+        })
+        .chain(spec.command_types.iter().map(|c| {
+            (
+                "command_type",
+                &c.name,
+                &c.fields,
+                &c.tags,
+                &c.sensitive,
+                &c.blobs,
+            )
+        }));
+    for (kind, name, fields, tags, sensitive, blobs) in blob_types {
+        let is_blob = |field: &str| {
+            fields
+                .iter()
+                .any(|f| f.name == field && f.ty == FieldType::Blob)
+        };
+        for blob in blobs {
+            if !is_blob(&blob.field) {
+                problems.push(format!(
+                    "{kind} {name:?}: blobs names {:?}, which is no field of type blob",
+                    blob.field
+                ));
+            }
+            if !fields.iter().any(|f| f.name == blob.subject_field) {
+                problems.push(format!(
+                    "{kind} {name:?}: blob subject field {:?} is no field of this type",
+                    blob.subject_field
+                ));
+            }
+        }
+        for sensitive in sensitive {
+            if is_blob(&sensitive.field) {
+                problems.push(format!(
+                    "{kind} {name:?}: blob field {:?} can't be sensitive; give it a subject in blobs",
+                    sensitive.field
+                ));
+            }
+        }
+        for (tag_key, field) in tags {
+            if is_blob(field) {
+                problems.push(format!(
+                    "{kind} {name:?}: tag {tag_key:?} can't map blob field {field:?}"
+                ));
+            }
+        }
     }
 
     let types = spec

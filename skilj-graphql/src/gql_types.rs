@@ -332,6 +332,65 @@ pub fn master_key_object(n: &Naming) -> Object {
     })
 }
 
+/// `BlobField` (docs/architecture.md §239).
+pub fn blob_field_object(n: &Naming) -> Object {
+    gql_object!(skilj_core::blob::BlobField => n.ty("BlobField") {
+        scalar "field": TypeRef::named_nn(TypeRef::STRING) => |f| Value::from(f.field.clone()),
+        scalar "subjectKey": TypeRef::named(TypeRef::STRING) => |f| f.subject_key.clone().map_or(Value::Null, Value::from),
+        scalar "subjectField": TypeRef::named(TypeRef::STRING) => |f| f.subject_field.clone().map_or(Value::Null, Value::from),
+    })
+}
+
+/// One reference a rendered payload shows - redaction has already run, so
+/// a private blob field the reader isn't entitled to isn't here.
+#[derive(Clone)]
+pub struct BlobReference {
+    /// The payload field holding it.
+    pub field: String,
+    /// The reference.
+    pub reference: skilj_core::blob::BlobRef,
+}
+
+/// The well-formed references in a rendered payload.
+pub fn blob_references(payload: &str) -> Vec<BlobReference> {
+    skilj_core::blob::find_blob_refs(payload)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|found| {
+            found.reference.ok().map(|reference| BlobReference {
+                field: found.field,
+                reference,
+            })
+        })
+        .collect()
+}
+
+/// `BlobReference`: what a payload says about a blob. Its bytes are at
+/// `GET /v1/blobs/{boundedContext}/{id}`; GraphQL carries no bytes.
+pub fn blob_reference_object(n: &Naming) -> Object {
+    gql_object!(BlobReference => n.ty("BlobReference") {
+        scalar "field": TypeRef::named_nn(TypeRef::STRING) => |b| Value::from(b.field.clone()),
+        scalar "id": TypeRef::named_nn(TypeRef::STRING) => |b| Value::from(b.reference.id.clone()),
+        scalar "sha256": TypeRef::named_nn(TypeRef::STRING) => |b| Value::from(b.reference.sha256.clone()),
+        scalar "size": TypeRef::named_nn(TypeRef::STRING) => |b| Value::from(b.reference.size.to_string()),
+        scalar "mediaType": TypeRef::named_nn(TypeRef::STRING) => |b| Value::from(b.reference.media_type.clone()),
+    })
+}
+
+/// `BlobFieldInput`, the argument of the registration mutations.
+pub fn blob_field_input(n: &Naming) -> InputObject {
+    InputObject::new(n.ty("BlobFieldInput"))
+        .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
+        .field(InputValue::new(
+            "subjectKey",
+            TypeRef::named(TypeRef::STRING),
+        ))
+        .field(InputValue::new(
+            "subjectField",
+            TypeRef::named(TypeRef::STRING),
+        ))
+}
+
 /// A bounded context's payload limits (issue #132, docs/architecture.md
 /// §238): the ones its writes are checked against, and the override a
 /// superadmin stored, if any.
@@ -579,6 +638,7 @@ pub fn event_type_object(n: &Naming) -> Object {
         list "tagMappings": TypeRef::named_nn_list_nn(n.ty("TagMapping")) => |et| et.tag_mappings.clone(),
         scalar "ownerTagKey": TypeRef::named(TypeRef::STRING) => |et| optional_string(et.owner_tag_key.clone()),
         list "sensitiveFields": TypeRef::named_nn_list_nn(n.ty("SensitiveField")) => |et| et.sensitive_fields.clone(),
+        list "blobFields": TypeRef::named_nn_list_nn(n.ty("BlobField")) => |et| et.blob_fields.clone(),
         scalar "externalCreationAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.external_creation_allowed),
         scalar "directCreationAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.direct_creation_allowed),
         scalar "systemTriggeredAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.system_triggered_allowed),
@@ -618,6 +678,7 @@ pub fn command_type_object(n: &Naming) -> Object {
         list "tagMappings": TypeRef::named_nn_list_nn(n.ty("TagMapping")) => |ct| ct.tag_mappings.clone(),
         scalar "ownerTagKey": TypeRef::named(TypeRef::STRING) => |ct| optional_string(ct.owner_tag_key.clone()),
         list "sensitiveFields": TypeRef::named_nn_list_nn(n.ty("SensitiveField")) => |ct| ct.sensitive_fields.clone(),
+        list "blobFields": TypeRef::named_nn_list_nn(n.ty("BlobField")) => |ct| ct.blob_fields.clone(),
         scalar "restTriggerAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |ct| Value::from(ct.rest_trigger_allowed),
         list "privateFields": TypeRef::named_nn_list_nn(n.ty("PrivateField")) => |ct| ct.private_fields.clone(),
     })
@@ -1027,6 +1088,7 @@ pub fn queried_event_object(n: &Naming) -> Object {
     gql_object!((i64, String) => n.ty("QueriedEvent") {
         scalar "sequence": TypeRef::named_nn(TypeRef::INT) => |e| Value::from(e.0),
         scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.1.clone()),
+        list "blobs": TypeRef::named_nn_list_nn(n.ty("BlobReference")) => |e| blob_references(&e.1),
     })
 }
 
@@ -1039,6 +1101,7 @@ pub fn queried_command_object(n: &Naming) -> Object {
         scalar "id": TypeRef::named_nn(TypeRef::STRING) => |c| Value::from(c.0.clone()),
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |c| Value::from(c.1.clone()),
         scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |c| Value::from(c.2.clone()),
+        list "blobs": TypeRef::named_nn_list_nn(n.ty("BlobReference")) => |c| blob_references(&c.2),
     })
 }
 

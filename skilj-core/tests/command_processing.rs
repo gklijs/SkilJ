@@ -68,6 +68,7 @@ fn command_type(
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         rest_trigger_allowed,
     }
 }
@@ -94,6 +95,7 @@ fn event_type() -> EventType {
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: false,

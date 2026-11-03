@@ -215,6 +215,8 @@ pub struct EventType {
     /// gets, and for the same reason. Validated at registration by
     /// `valid_private_fields`.
     pub private_fields: Vec<PrivateField>,
+    /// Fields holding a [`crate::blob::BlobRef`] (docs/architecture.md §239).
+    pub blob_fields: Vec<crate::blob::BlobField>,
     /// Whether external systems may create this event with an external-event
     /// token.
     pub external_creation_allowed: bool,
@@ -292,6 +294,8 @@ pub struct CommandType {
     /// See `EventType.private_fields`'s own doc comment - identical role,
     /// for `Command.payload` instead of `Event.payload`.
     pub private_fields: Vec<PrivateField>,
+    /// Fields holding a [`crate::blob::BlobRef`] (docs/architecture.md §239).
+    pub blob_fields: Vec<crate::blob::BlobField>,
     /// Whether REST command tokens may submit this type.
     pub rest_trigger_allowed: bool,
 }
@@ -1523,6 +1527,17 @@ pub fn valid_sensitive_fields(schema: &str, sensitive_fields: &[SensitiveField])
 /// leaf) and `capability` absent iff `kind = Addressed`; both absent iff
 /// `kind = Own`.
 pub fn valid_private_fields(schema: &str, private_fields: &[PrivateField]) -> bool {
+    valid_private_fields_with_blobs(schema, private_fields, &[])
+}
+
+/// [`valid_private_fields`], where a declared blob field also counts as a
+/// field: it holds a reference, not a leaf, and a private one redacts to
+/// `null` the same way (docs/architecture.md §239).
+fn valid_private_fields_with_blobs(
+    schema: &str,
+    private_fields: &[PrivateField],
+    blob_fields: &[crate::blob::BlobField],
+) -> bool {
     if private_fields.is_empty() {
         return true;
     }
@@ -1531,7 +1546,9 @@ pub fn valid_private_fields(schema: &str, private_fields: &[PrivateField]) -> bo
     };
     let definitions = schema_definitions(schema);
     private_fields.iter().all(|p| {
-        if resolve_field_kind(&properties, definitions.as_ref(), &p.field).is_none() {
+        if resolve_field_kind(&properties, definitions.as_ref(), &p.field).is_none()
+            && !blob_fields.iter().any(|b| b.field == p.field)
+        {
             return false;
         }
         match p.kind {
@@ -2487,6 +2504,17 @@ pub fn try_sensitive_field_subjects(
     Ok(subjects)
 }
 
+/// The subject value `payload` names in `subject_field`, as
+/// `try_sensitive_field_subjects` reads it (docs/architecture.md §239).
+pub fn payload_subject_value(
+    payload: &str,
+    subject_field: &str,
+) -> crate::error::Result<Option<String>> {
+    let parsed: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error: serde_json::Error| Error::PayloadDecodeFailed(error.to_string()))?;
+    Ok(payload_field_value(&parsed, subject_field).and_then(json_scalar_to_string))
+}
+
 /// Pushes `Tag { key, value }` onto `tags` unless an identical tag is
 /// already present - `derive_tags`'s own "Set<Tag>" dedup, kept as a
 /// small helper rather than inlined since it's needed at two call sites
@@ -3098,6 +3126,7 @@ pub fn register_event_type(
     owner_tag_key: Option<String>,
     sensitive_fields: Vec<SensitiveField>,
     private_fields: Vec<PrivateField>,
+    blob_fields: Vec<crate::blob::BlobField>,
     external_creation_allowed: bool,
     direct_creation_allowed: bool,
     system_triggered_allowed: bool,
@@ -3142,8 +3171,17 @@ pub fn register_event_type(
     {
         return Err(crate::secrets::Error::ReservedSubjectKey.into());
     }
-    if !valid_private_fields(&schema, &private_fields) {
+    if !valid_private_fields_with_blobs(&schema, &private_fields, &blob_fields) {
         return Err(Error::InvalidPrivateField.into());
+    }
+    crate::blob::validate_blob_fields(&schema, &blob_fields, &sensitive_fields)?;
+    if let Some(existing) = existing {
+        if !crate::blob::blob_subjects_unchanged(&existing.blob_fields, &blob_fields) {
+            return Err(Error::InvalidBlobField(
+                "a blob field's subject can't change or be removed".to_string(),
+            )
+            .into());
+        }
     }
     // A blind mapping may name a sensitive or private field: its tag is
     // a keyed hash, not the value (docs/architecture.md §205).
@@ -3201,6 +3239,7 @@ pub fn register_event_type(
             owner_tag_key,
             sensitive_fields,
             private_fields,
+            blob_fields,
             external_creation_allowed,
             direct_creation_allowed,
             system_triggered_allowed,
@@ -3240,6 +3279,7 @@ pub fn register_event_type(
         owner_tag_key,
         sensitive_fields,
         private_fields,
+        blob_fields,
         external_creation_allowed,
         direct_creation_allowed,
         system_triggered_allowed,
@@ -3294,6 +3334,7 @@ pub fn register_command_type(
     owner_tag_key: Option<String>,
     sensitive_fields: Vec<SensitiveField>,
     private_fields: Vec<PrivateField>,
+    blob_fields: Vec<crate::blob::BlobField>,
     rest_trigger_allowed: bool,
     existing: Option<&CommandType>,
 ) -> crate::error::Result<CommandTypeRegistration> {
@@ -3327,8 +3368,17 @@ pub fn register_command_type(
     {
         return Err(crate::secrets::Error::ReservedSubjectKey.into());
     }
-    if !valid_private_fields(&schema, &private_fields) {
+    if !valid_private_fields_with_blobs(&schema, &private_fields, &blob_fields) {
         return Err(Error::InvalidPrivateField.into());
+    }
+    crate::blob::validate_blob_fields(&schema, &blob_fields, &sensitive_fields)?;
+    if let Some(existing) = existing {
+        if !crate::blob::blob_subjects_unchanged(&existing.blob_fields, &blob_fields) {
+            return Err(Error::InvalidBlobField(
+                "a blob field's subject can't change or be removed".to_string(),
+            )
+            .into());
+        }
     }
     // A blind mapping may name a sensitive or private field: its tag is
     // a keyed hash, not the value (docs/architecture.md §205).
@@ -3362,6 +3412,7 @@ pub fn register_command_type(
             owner_tag_key,
             sensitive_fields,
             private_fields,
+            blob_fields,
             rest_trigger_allowed,
         }));
     };
@@ -3394,6 +3445,7 @@ pub fn register_command_type(
         owner_tag_key,
         sensitive_fields,
         private_fields,
+        blob_fields,
         rest_trigger_allowed,
     }))
 }

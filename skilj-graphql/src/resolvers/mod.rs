@@ -280,6 +280,48 @@ pub fn parse_sensitive_fields(value: &ValueAccessor) -> async_graphql::Result<Ve
     Ok(fields)
 }
 
+/// Parses an optional `[BlobFieldInput!]` argument (docs/architecture.md
+/// §239); left out means no blob fields.
+pub fn parse_blob_fields(
+    value: Option<ValueAccessor>,
+) -> async_graphql::Result<Vec<skilj_core::blob::BlobField>> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let optional = |obj: &async_graphql::dynamic::ObjectAccessor, name: &str| {
+        obj.get(name)
+            .filter(|v| !v.is_null())
+            .map(|v| v.string().map(str::to_string))
+            .transpose()
+    };
+    let mut fields = Vec::new();
+    for item in value.list()?.iter() {
+        let obj = item.object()?;
+        let field = obj.try_get("field")?.string()?.to_string();
+        fields.push(
+            match (
+                optional(&obj, "subjectKey")?,
+                optional(&obj, "subjectField")?,
+            ) {
+                (None, None) => skilj_core::blob::BlobField::new(field),
+                (subject_key, subject_field) => {
+                    // Half a subject reaches `validate_blob_fields`, which
+                    // refuses it with the reason.
+                    let mut declared = skilj_core::blob::BlobField::with_subject(
+                        field,
+                        subject_key.clone().unwrap_or_default(),
+                        subject_field.clone().unwrap_or_default(),
+                    );
+                    declared.subject_key = subject_key;
+                    declared.subject_field = subject_field;
+                    declared
+                }
+            },
+        );
+    }
+    Ok(fields)
+}
+
 /// Parses a `[PrivateFieldInput!]!` argument into `Vec<PrivateField>` -
 /// shared by `registerEventType`/`registerCommandType`, the same role
 /// `parse_sensitive_fields` plays for `sensitive_fields`.

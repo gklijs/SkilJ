@@ -298,6 +298,12 @@ async fn post_events_external(
     State(state): State<MockSkiljState>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    if body["payload"]["orderId"] == json!("o-too-large") {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "code": "payload_too_large", "message": "too large" })),
+        );
+    }
     {
         let mut remaining = state.fail_external_requests.lock().unwrap();
         if *remaining > 0 {
@@ -715,6 +721,7 @@ fn an_inbound_record_message_carries_its_own_real_partition_and_offset_as_dedupe
         let msg = recv_within(&consumer, Duration::from_secs(15)).await;
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -806,6 +813,7 @@ fn an_inbound_record_message_forwards_its_own_correlation_and_causation_headers(
         let causation_id = header_str(msg.headers(), "Skilj-Causation-Id");
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -880,6 +888,7 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_offs
         let expected_key = format!("{topic}:{}:{}", msg.partition(), msg.offset());
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "command-token".to_string(),
             action: InboundAction::Trigger {
                 command_type: "WithdrawMoney".to_string(),
@@ -957,6 +966,7 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
         mappings.insert(
             topic.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1006,6 +1016,84 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
     });
 }
 
+/// docs/architecture.md §238: a message skilj refuses as too large is moved
+/// past, once and without a retry, and isn't parked: it could never be
+/// stored, so the message after it goes through.
+#[test]
+fn an_inbound_message_too_large_to_store_is_moved_past_and_not_parked() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-in-too-large");
+        create_topic(bootstrap_servers, &topic).await;
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-too-large")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+        for order in ["o-too-large", "o-after"] {
+            producer
+                .send(
+                    FutureRecord::to(&topic)
+                        .payload(&json!({ "orderId": order }).to_string())
+                        .key("k"),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)
+                .unwrap();
+        }
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            topic.clone(),
+            InboundMapping {
+                blobs: None,
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let http = skilj_kafka::http_client();
+        // A policy that would park at once, if this were retried at all.
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(10),
+            1.0,
+            Duration::from_millis(10),
+            1,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mappings, &retry_policy).await;
+        });
+        let mut through = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !mock_state.external_requests.lock().unwrap().is_empty() {
+                through = true;
+                break;
+            }
+        }
+        assert!(through, "the message after the refused one must go through");
+        assert_eq!(
+            mock_state.external_requests.lock().unwrap()[0]["payload"]["orderId"],
+            json!("o-after")
+        );
+        assert!(mock_state.parked_deliveries.lock().unwrap().is_empty());
+    });
+}
+
 /// The `Trigger` counterpart: the parked report carries the
 /// `Idempotency-Key` the failing attempts were sent with, so
 /// `retryParkedDelivery` can redrive under it and dedupe against an
@@ -1050,6 +1138,7 @@ fn a_parked_trigger_message_reports_the_idempotency_key_it_was_sent_with() {
         mappings.insert(
             topic.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "command-token".to_string(),
                 action: InboundAction::Trigger {
                     command_type: "Deposit".to_string(),
@@ -1452,6 +1541,7 @@ fn a_message_whose_park_report_fails_is_never_committed_past() {
         mappings.insert(
             topic.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1555,6 +1645,7 @@ fn a_failing_message_holds_up_only_its_own_partition() {
         mappings.insert(
             topic.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1674,6 +1765,7 @@ fn a_paused_partition_resumes_without_skipping_or_repeating_messages() {
         mappings.insert(
             topic.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1778,6 +1870,7 @@ fn a_message_failing_mid_batch_keeps_its_partitions_order() {
         mappings.insert(
             topic.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),
@@ -1983,6 +2076,7 @@ fn a_non_json_message_is_parked_at_once_with_its_raw_content() {
         mappings.insert(
             topic.clone(),
             InboundMapping {
+                blobs: None,
                 credential: "external-token".to_string(),
                 action: InboundAction::Record {
                     event_type: "OrderPlaced".to_string(),

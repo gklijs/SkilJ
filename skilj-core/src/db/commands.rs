@@ -1461,7 +1461,7 @@ pub(super) async fn finish_accepted_command_in_tx(
     payload_limits.check_command(&result.command, &result.events)?;
     // Every blob reference is to a blob this bounded context holds as
     // referenced, before anything is written (§239).
-    let blob_claims = command_blob_claims(projection_dispatcher, &result.command, &result.events)?;
+    let blob_claims = command_blob_claims(&result.command, &result.events)?;
     check_blob_claims(tx, &bounded_context_name, &blob_claims).await?;
 
     // Command and every one of its triggered events, in the one
@@ -2291,14 +2291,13 @@ pub(super) async fn write_command_batch_as_set(
         // Checked here, refused alone; recorded with the writes below
         // (docs/architecture.md §239). The savepoint first, so a failed
         // read rolls back like a failed write and the batch is replayed.
-        let blob_claims =
-            match command_blob_claims(projection_dispatcher, &result.command, &result.events) {
-                Ok(claims) => claims,
-                Err(e) => {
-                    results.push(Some(Err(e)));
-                    continue;
-                }
-            };
+        let blob_claims = match command_blob_claims(&result.command, &result.events) {
+            Ok(claims) => claims,
+            Err(e) => {
+                results.push(Some(Err(e)));
+                continue;
+            }
+        };
         if !blob_claims.is_empty() {
             savepoint.write(tx, None).await?;
             if let Err(e) =

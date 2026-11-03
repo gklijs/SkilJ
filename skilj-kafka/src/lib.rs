@@ -266,6 +266,13 @@ impl skilj_bridge::BridgeError for BridgeError {
         }
     }
 
+    fn is_too_large(&self) -> bool {
+        match self {
+            BridgeError::SkiljStatus { body, .. } => skilj_bridge::too_large_refusal(body),
+            _ => false,
+        }
+    }
+
     fn is_permanent(&self) -> bool {
         matches!(self, BridgeError::MalformedPayload(_))
     }
@@ -814,23 +821,42 @@ async fn dispatch_with_retry(
     let causation_id = header_str(headers, CAUSATION_ID_HEADER);
 
     let mut retry = skilj_retry::MessageRetry::default();
+    // The message with its blobs uploaded (docs/architecture.md §239), kept
+    // across retries and parked as such.
+    let mut offloaded: Option<Vec<u8>> = None;
     loop {
-        let e = match dispatch_inbound_message(
-            http,
-            skilj_base_url,
-            mapping,
-            topic,
-            partition,
-            offset,
-            payload,
-            correlation_id,
-            causation_id,
-        )
-        .await
-        {
+        let attempt: Result<(), BridgeError> = async {
+            if offloaded.is_none() {
+                offloaded =
+                    skilj_bridge::offload_blob_fields(http, skilj_base_url, mapping, payload)
+                        .await?;
+            }
+            dispatch_inbound_message(
+                http,
+                skilj_base_url,
+                mapping,
+                topic,
+                partition,
+                offset,
+                offloaded.as_deref().unwrap_or(payload),
+                correlation_id,
+                causation_id,
+            )
+            .await
+        }
+        .await;
+        let e = match attempt {
             Ok(()) => return Handled::Commit,
             Err(e) => e,
         };
+        if e.is_too_large() {
+            skilj_bridge::record_oversized_message(
+                "kafka",
+                &format!("{topic}:{partition}:{offset}"),
+                &e.to_string(),
+            );
+            return Handled::Commit;
+        }
         if let BridgeError::Unsupported { what } = &e {
             tracing::error!(
                 topic,
@@ -865,7 +891,7 @@ async fn dispatch_with_retry(
                     "dispatch failed repeatedly - parking and committing so \
                      this message doesn't block progress forever"
                 );
-                let payload_json = parked_payload(payload);
+                let payload_json = parked_payload(offloaded.as_deref().unwrap_or(payload));
                 let partition_key = format!("{topic}:{partition}");
                 let body = inbound_request_body(
                     mapping,

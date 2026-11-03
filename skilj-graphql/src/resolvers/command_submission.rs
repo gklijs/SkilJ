@@ -311,6 +311,7 @@ async fn prepare_command(
             &policy,
             args.idempotency_key.as_deref(),
             state.key_service.as_ref(),
+            state.projection_dispatcher.payload_limits(),
             Utc::now(),
         )
         .await

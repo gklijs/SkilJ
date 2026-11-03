@@ -16,6 +16,26 @@ type BankBatchItemError {
 	message: String!
 }
 
+type BankBlobField {
+	field: String!
+	subjectKey: String
+	subjectField: String
+}
+
+input BankBlobFieldInput @inaccessible {
+	field: String! @inaccessible
+	subjectKey: String @inaccessible
+	subjectField: String @inaccessible
+}
+
+type BankBlobReference {
+	field: String!
+	id: String!
+	sha256: String!
+	size: String!
+	mediaType: String!
+}
+
 type BankBoundedContext @inaccessible {
 	name: String!
 	status: BankBoundedContextStatus!
@@ -116,6 +136,7 @@ type BankCommandType @inaccessible {
 	tagMappings: [BankTagMapping!]!
 	ownerTagKey: String
 	sensitiveFields: [BankSensitiveField!]!
+	blobFields: [BankBlobField!]!
 	restTriggerAllowed: Boolean!
 	privateFields: [BankPrivateField!]!
 	consistencyQuery: [BankQueryItemMapping!]!
@@ -208,6 +229,7 @@ type BankEventType {
 	tagMappings: [BankTagMapping!]!
 	ownerTagKey: String
 	sensitiveFields: [BankSensitiveField!]!
+	blobFields: [BankBlobField!]!
 	externalCreationAllowed: Boolean!
 	directCreationAllowed: Boolean!
 	systemTriggeredAllowed: Boolean!
@@ -391,11 +413,13 @@ type BankQueriedCommand @inaccessible {
 	id: String!
 	createdAt: String!
 	payload: String!
+	blobs: [BankBlobReference!]!
 }
 
 type BankQueriedEvent {
 	sequence: Int!
 	payload: String!
+	blobs: [BankBlobReference!]!
 }
 
 type BankQueryItemMapping @inaccessible {
@@ -519,8 +543,8 @@ type Mutation {
 	bankArchiveBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankDeleteBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankSetPayloadLimits(boundedContext: String!, maxPayloadBytes: Int, warnPayloadBytes: Int): BankPayloadLimits! @inaccessible
-	bankRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: BankMissedOccurrencePolicy): BankEventType! @inaccessible
-	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): BankCommandType! @inaccessible
+	bankRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, blobFields: [BankBlobFieldInput!], sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: BankMissedOccurrencePolicy): BankEventType! @inaccessible
+	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, blobFields: [BankBlobFieldInput!], sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): BankCommandType! @inaccessible
 	bankRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, ownerTagKey: String, requiresCapability: String): BankProjectionRegistrationResult! @inaccessible
 	bankRebuildProjection(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
 	bankDiscardProjectionRebuild(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible

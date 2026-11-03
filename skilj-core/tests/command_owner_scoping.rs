@@ -64,6 +64,7 @@ fn open_ticket() -> CommandType {
         owner_tag_key: Some("company".into()),
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         rest_trigger_allowed: false,
     }
 }
@@ -290,6 +291,7 @@ fn fetch_commands_filters_the_triggered_event_reverse_lookup_by_owner_too() {
             owner_tag_key: None,
             sensitive_fields: Vec::new(),
             private_fields: Vec::new(),
+            blob_fields: Vec::new(),
             external_creation_allowed: false,
             direct_creation_allowed: false,
             system_triggered_allowed: false,
@@ -352,6 +354,7 @@ fn register_command_type_rejects_an_owner_tag_key_naming_an_undeclared_tag_mappi
         Some("company".into()), // never declared as a tag_mappings key
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         false,
         None,
     )
@@ -376,6 +379,7 @@ fn register_command_type_accepts_an_owner_tag_key_naming_a_real_tag_mapping_key(
             blind: false,
         }],
         Some("company".into()),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         false,
@@ -412,6 +416,7 @@ fn register_command_type_allows_clearing_a_previously_set_owner_tag_key() {
             blind: false,
         }],
         None,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         false,

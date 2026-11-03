@@ -574,6 +574,7 @@ fn an_inbound_record_message_carries_its_own_real_stream_and_sequence_as_key() {
         let meta = InboundMessageMeta::from_message(&message).unwrap();
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -641,6 +642,7 @@ fn an_inbound_record_message_forwards_its_own_correlation_and_causation_headers(
         let meta = InboundMessageMeta::from_message(&message).unwrap();
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -699,6 +701,7 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_msg_
         let meta = InboundMessageMeta::from_message(&message).unwrap();
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "command-token".to_string(),
             action: InboundAction::Trigger {
                 command_type: "WithdrawMoney".to_string(),
@@ -749,6 +752,7 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
             .unwrap();
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -1047,6 +1051,7 @@ fn a_message_retried_past_ack_wait_is_not_redelivered_meanwhile() {
             .unwrap();
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -1160,6 +1165,7 @@ fn the_run_loops_stop_when_asked() {
         // The published message waits in the stream; every dispatch of it fails.
         *mock_state.fail_external_requests.lock().unwrap() = 1000;
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -1239,6 +1245,7 @@ fn a_non_json_message_is_parked_at_once_with_its_raw_content() {
             .unwrap();
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -1308,6 +1315,7 @@ fn messages_redelivered_after_a_restart_are_all_created() {
                 .unwrap();
         }
         let mapping = Arc::new(InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),
@@ -1417,6 +1425,7 @@ fn a_backlog_is_recorded_in_batches_in_stream_order() {
         }
 
         let mapping = InboundMapping {
+            blobs: None,
             credential: "external-token".to_string(),
             action: InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),

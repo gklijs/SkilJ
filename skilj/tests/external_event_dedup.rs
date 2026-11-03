@@ -473,6 +473,7 @@ fn the_bridges_batch_client_counts_what_the_external_route_got_done() {
         let router = skilj.rest_router();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let mapping = skilj_bridge::InboundMapping {
+            blobs: None,
             credential,
             action: skilj_bridge::InboundAction::Record {
                 event_type: "OrderPlaced".to_string(),

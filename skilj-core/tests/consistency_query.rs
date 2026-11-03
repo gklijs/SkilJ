@@ -277,6 +277,7 @@ async fn seed(pool: &Pool) -> Helpdesk {
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
         system_triggered_allowed: false,
@@ -302,6 +303,7 @@ async fn seed(pool: &Pool) -> Helpdesk {
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         rest_trigger_allowed: true,
     };
     db::upsert_command_type(pool, &create_ticket).await.unwrap();

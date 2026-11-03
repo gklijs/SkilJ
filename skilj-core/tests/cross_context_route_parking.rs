@@ -279,6 +279,7 @@ async fn seed_order_shipped_event_type(pool: &Pool, bc: &BoundedContext) -> Even
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
         system_triggered_allowed: false,
@@ -302,6 +303,7 @@ async fn seed_stock_reserved_event_type(pool: &Pool, bc: &BoundedContext) -> Eve
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: false,
@@ -329,6 +331,7 @@ async fn seed_command_type(pool: &Pool, bc: &BoundedContext, name: &str) -> Comm
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         rest_trigger_allowed: true,
     };
     db::upsert_command_type(pool, &ct).await.unwrap();

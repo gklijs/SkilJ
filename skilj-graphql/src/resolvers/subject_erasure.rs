@@ -92,6 +92,17 @@ pub fn field(n: &Naming) -> Field {
                 )
                 .await
                 .map_err(to_graphql_error)?;
+                // docs/architecture.md §239: blobs encrypted for the subject
+                // stop being served now; the collection task removes the bytes.
+                skilj_core::db::forget_subject_in_blobs(
+                    &state.pool,
+                    &bounded_context_name,
+                    &subject_key,
+                    &subject_value,
+                    now,
+                )
+                .await
+                .map_err(to_graphql_error)?;
                 skilj_core::db::destroy_encryption_key(
                     &state.pool,
                     &bounded_context_name,

@@ -172,6 +172,32 @@ impl Client {
         }
     }
 
+    /// A blob's bytes (docs/architecture.md §239), from the REST route next
+    /// to this client's GraphQL endpoint, with the same token. `None` when
+    /// the caller may not read it or it doesn't exist: the route doesn't
+    /// tell those apart.
+    pub async fn download_blob(
+        &self,
+        bounded_context: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, ClientError> {
+        let mut url = self.endpoint.clone();
+        url.set_path(&format!("/v1/blobs/{bounded_context}/{id}"));
+        let token = self.token.current().await;
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(ClientError::Http)?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let bytes = response.bytes().await.map_err(ClientError::Http)?;
+        Ok(Some(bytes.to_vec()))
+    }
+
     async fn send(&self, body: &Value, token: &str) -> Result<Value, ClientError> {
         let response = self
             .http

@@ -4,7 +4,7 @@ The workspace has 17 crates. 15 are published to crates.io:
 `skilj-macros`, `skilj-core`, `skilj-graphql`, `skilj-rest`, `skilj`,
 `skilj-codegen`, `skilj-tui`, `skilj-inspector`, `skilj-temporal`,
 `skilj-kafka`, `skilj-amqp`, `skilj-nats`, `skilj-test-fixture`,
-`skilj-retry`, `skilj-bridge`. `skilj-demo` is not (`publish = false` in its
+`skilj-retry`, `skilj-bridge`, `skilj-blob-s3`. `skilj-demo` is not (`publish = false` in its
 `Cargo.toml` - it's a worked example, not a library anyone should
 depend on), and neither is `skilj-test-support` (the workspace's own
 test harness). Other crates reference it only as a path-only
@@ -114,7 +114,7 @@ Derived from the real internal dependency graph:
    `skilj-kafka`/`skilj-amqp`/`skilj-nats` (depend on `skilj-retry` and
    `skilj-bridge`, already published, plus skilj's wire protocol - the same
    posture as `skilj-temporal` otherwise) - independent of each other
-   and of `skilj`
+   and of `skilj`, `skilj-blob-s3` (depends on `skilj-core` only)
 
 Wait for each crate to finish indexing on crates.io
 (`cargo search <crate>` or the crates.io page) before publishing
@@ -140,6 +140,7 @@ cargo publish -p skilj-temporal
 cargo publish -p skilj-kafka
 cargo publish -p skilj-amqp
 cargo publish -p skilj-nats
+cargo publish -p skilj-blob-s3
 ```
 
 `skilj-temporal` no longer needs a system `protoc` binary as of 0.0.5 -

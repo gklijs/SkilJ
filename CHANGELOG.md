@@ -24,16 +24,28 @@ README.md, "Status and stability").
   round trip.
 - Blob references (issue #132, docs/architecture.md §239): a payload
   carries a `BlobRef` (`{"$blob": id, "sha256", "size", "media_type"}`)
-  in place of large bytes. `EventType::blob_fields` and
-  `CommandType::blob_fields` declare where; a `$blob` anywhere else is
-  refused. `BlobStore` is the storage trait and `db::PostgresBlobStore`
-  the built-in backend, in the bounded context's own schema.
-  `db::upload_blob` stores a `pending` blob; an append checks every
-  reference under the write lock - the blob exists, isn't deleted, and
-  size, hash and media type match - refuses it with
-  `blob_reference_invalid` otherwise, records it in `blob_references` and
-  marks the blob `referenced`. `db::read_blob` streams it back, verified.
-  The REST routes, encryption and erasure, and orphan collection follow.
+  in place of large bytes, in fields a type declares with `blob_fields`
+  (registered, a `blobFields` argument on the GraphQL registration
+  mutations, `type = "blob"` in `.skilj.toml`). A `$blob` anywhere else is
+  refused, and an append checks every reference under the write lock.
+  `POST /v1/blobs/{boundedContext}` uploads, for a Role holding the
+  `blob-upload` capability or a writing token whose type declares a blob
+  field. `GET /v1/blobs/{boundedContext}/{id}` downloads, for a caller who
+  can read a referencing record with that field visible, and answers 404
+  otherwise. `BlobField::with_subject` seals the bytes under the subject's
+  data key; `forgetSubject` stops serving them and removes them. Unreferenced
+  blobs are collected after `SkiljBuilder::blob_orphan_grace` (24 hours),
+  except while a parked delivery or pending approval holds them.
+  `db::PostgresBlobStore` is the default store, `SkiljBuilder::blob_store`
+  takes another, and the new crate `skilj-blob-s3` keeps bytes in S3.
+  `SkiljBuilder::max_blob_bytes` defaults to 64 MiB.
+- Bridges: `InboundMapping::blobs` names message fields to upload as blobs.
+  A message refused as too large is logged, counted and moved past, not
+  parked (docs/architecture.md §238).
+- GraphQL: `blobs` on `QueriedEvent` and `QueriedCommand`, `blobFields` on
+  `EventType` and `CommandType`.
+- `skilj-tui` downloads the shown events' blobs with `b`; `skilj-inspector`
+  marks events holding references.
 - Retractions and corrections: `SkiljBuilder::retractions()` (or
   `retractions_owned_by`) registers a built-in `EventRetracted`. A decision
   emits one with `skilj::retraction::retract`, or `corrected` for a retraction
@@ -78,6 +90,9 @@ README.md, "Status and stability").
 
 ### Changed
 
+- `EventType` and `CommandType` have a `blob_fields` field, and
+  `register_event_type`, `register_command_type`, `db::propose_command` and
+  `InboundMapping` a new argument or field (issue #132).
 - Payloads larger than 256 KiB are now refused by default (§238). Raise
   the limit with `SkiljBuilder::payload_limits`, or per bounded context
   with `setPayloadLimits`, if you store larger ones today.

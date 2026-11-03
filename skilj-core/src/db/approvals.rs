@@ -94,6 +94,7 @@ pub async fn propose_command(
     policy: &CommandApprovalPolicy,
     idempotency_key: Option<&str>,
     key_service: Option<&KeyService>,
+    payload_limits: crate::payload_limits::PayloadLimits,
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandProposal> {
     let bounded_context_name = &command_type.bounded_context.name;
@@ -127,6 +128,33 @@ pub async fn propose_command(
         },
     )?;
 
+    // A proposal is stored too, and an approver would only find out at the
+    // end (docs/architecture.md §238, §239). Not under the write lock: the
+    // approval's own submission checks again under it.
+    payload_limits_override(pool, bounded_context_name)
+        .await?
+        .apply(payload_limits)
+        .check(
+            bounded_context_name,
+            crate::payload_limits::PayloadKind::Command,
+            &command_type.name,
+            &protected.payload,
+        )?;
+    let mut blob_claims = Vec::new();
+    for declared in crate::blob::declared_blob_refs(&command_type.blob_fields, &protected.payload)?
+    {
+        blob_claims.push(BlobClaim {
+            event_sequence: None,
+            field: declared.field,
+            reference: declared.reference,
+            subject: declared.subject,
+        });
+    }
+    if !blob_claims.is_empty() {
+        let mut conn = pool.acquire().await?;
+        check_blob_claims(&mut conn, bounded_context_name, &blob_claims).await?;
+    }
+
     let id = crate::shared::try_generate_token_id()?;
     let expires_at = policy
         .deadline_seconds
@@ -154,6 +182,18 @@ pub async fn propose_command(
     .bind(expires_at)
     .fetch_optional(pool)
     .await?;
+
+    if inserted.is_some() {
+        // Held until an approver decides, however long that takes.
+        pin_blobs(
+            pool,
+            bounded_context_name,
+            BlobPinHolder::CommandProposal,
+            &id,
+            &protected.payload,
+        )
+        .await?;
+    }
 
     let proposal_id = match inserted {
         Some((id,)) => id,
@@ -915,6 +955,7 @@ pub async fn propose_if_approval_required(
         &policy,
         Some(idempotency_key),
         key_service,
+        crate::payload_limits::PayloadLimits::default(),
         now,
     )
     .await?;

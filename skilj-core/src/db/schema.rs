@@ -198,6 +198,7 @@ pub(super) async fn provision_bounded_context_schema(
             owner_tag_key TEXT,
             sensitive_fields JSONB NOT NULL DEFAULT '[]',
             private_fields JSONB NOT NULL DEFAULT '[]',
+            blob_fields JSONB NOT NULL DEFAULT '[]',
             external_creation_allowed BOOLEAN NOT NULL,
             direct_creation_allowed BOOLEAN NOT NULL,
             system_triggered_allowed BOOLEAN NOT NULL,
@@ -221,6 +222,7 @@ pub(super) async fn provision_bounded_context_schema(
             owner_tag_key TEXT,
             sensitive_fields JSONB NOT NULL DEFAULT '[]',
             private_fields JSONB NOT NULL DEFAULT '[]',
+            blob_fields JSONB NOT NULL DEFAULT '[]',
             rest_trigger_allowed BOOLEAN NOT NULL
         )"
     )))
@@ -2753,6 +2755,7 @@ pub async fn make_bounded_context_current(
     ensure_encryption_key_provider_columns(pool, &bounded_context.name).await?;
     ensure_payload_limit_columns(pool, &bounded_context.name).await?;
     ensure_blob_tables(pool, &bounded_context.name).await?;
+    ensure_blob_field_columns(pool, &bounded_context.name).await?;
     drop_events_by_tags_index(pool, &bounded_context.name).await?;
     current_bounded_contexts()
         .lock()
@@ -3080,6 +3083,30 @@ pub async fn ensure_private_field_columns(
     Ok(())
 }
 
+/// `event_types.blob_fields`/`command_types.blob_fields`
+/// (docs/architecture.md §239), for a bounded context provisioned before
+/// they existed.
+pub async fn ensure_blob_field_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    for table in ["event_types", "command_types"] {
+        sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+            &schema,
+            table,
+            &["blob_fields"],
+            format!(
+                "ALTER TABLE {schema}.{table} \
+                 ADD COLUMN IF NOT EXISTS blob_fields JSONB NOT NULL DEFAULT '[]'"
+            ),
+        )))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// `projections.requires_capability` (docs/architecture.md §228,
 /// `Projection.requires_capability` in the spec), following
 /// `ensure_private_field_columns`'s own pattern for a bounded context
@@ -3332,6 +3359,7 @@ pub async fn ensure_event_read_token_start_from_column(
 pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::error::Result<()> {
     let schema = schema_ident(name);
     let mut tx = pool.begin().await?;
+    super::blobs::queue_blob_deletions(&mut tx, name, Utc::now()).await?;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&mut *tx)
         .await?;
@@ -3390,6 +3418,7 @@ pub async fn hard_delete_bounded_context_with_trail(
     )))
     .fetch_all(&mut *tx)
     .await?;
+    super::blobs::queue_blob_deletions(&mut tx, name, Utc::now()).await?;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&mut *tx)
         .await?;
