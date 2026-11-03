@@ -544,7 +544,8 @@ value EncryptedPayload {
 -- rather than redacted (see the render_event note above rule
 -- DeliverToSubscriptions for the full three-rule test).
 --
--- A payload field is at most one of the three. private_fields may not
+-- A payload field is at most one of the three (a blob field, see entity Blob,
+-- may also be private, and can't overlap a sensitive one). private_fields may not
 -- overlap tag_mappings, and may not overlap sensitive_fields either, both
 -- refused at registration and for the same leak reason the existing
 -- tag_mappings/sensitive_fields overlap is - see the note above rule
@@ -768,6 +769,10 @@ entity BoundedContext {
     commands: Command with bounded_context = this
     events: Event with bounded_context = this
     blobs: Blob with bounded_context = this
+    -- Override config.max_payload_bytes / warn_payload_bytes; see rule
+    -- SetPayloadLimits. Absent: the deployment's value.
+    max_payload_bytes: Integer?
+    warn_payload_bytes: Integer?
     projections: Projection with bounded_context = this
     subscriptions: Subscription with bounded_context = this
     access_mappings: RoleAccessMapping with bounded_context = this
@@ -2488,6 +2493,9 @@ entity PrivateFieldGrant {
 -- than an arbitrary-length ACL.
 config {
     blob_orphan_grace: Duration = 24.hours
+    max_blob_bytes: Integer = 67108864     -- 64 MiB
+    max_payload_bytes: Integer = 262144    -- 256 KiB
+    warn_payload_bytes: Integer = 65536    -- 64 KiB, logged and stored
     read_cursor_checkout_lease: Duration = 5.minutes
     max_events_per_read: Integer = 1000
     idempotency_key_retention: Duration = 48.hours
@@ -7243,7 +7251,7 @@ rule ApplyTemplateRegistrations {
 
 rule RegisterEventType {
     when: RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
-        sensitive_fields, private_fields, external_creation_allowed, direct_creation_allowed,
+        sensitive_fields, private_fields, blob_fields, external_creation_allowed, direct_creation_allowed,
         system_triggered_allowed, event_read_allowed, system_triggered_schedule?,
         missed_occurrence_policy?, owner_tag_key?)
     requires: access_mapping.status = active
@@ -7263,6 +7271,10 @@ rule RegisterEventType {
     -- empty set and is checked vacuously, rather than leaving "declared
     -- nothing" and "said nothing" as two different registrations.
     requires: valid_private_fields(schema, private_fields)
+    -- docs/architecture.md §239. Refuses an empty or duplicate field, one
+    -- not in the schema, half a subject, and any overlap with a sensitive
+    -- field, nested either way.
+    requires: valid_blob_fields(schema, blob_fields, sensitive_fields)
 
     -- valid_owner_tag_key(tag_mappings, owner_tag_key) holds when
     -- owner_tag_key is null - the type declares no owner dimension, which
@@ -7375,6 +7387,7 @@ rule RegisterEventType {
                 owner_tag_key: owner_tag_key,
                 sensitive_fields: sensitive_fields,
                 private_fields: private_fields,
+                blob_fields: blob_fields,
                 external_creation_allowed: external_creation_allowed,
                 direct_creation_allowed: direct_creation_allowed,
                 system_triggered_allowed: system_triggered_allowed,
@@ -7388,7 +7401,7 @@ rule RegisterEventType {
 
 rule RegisterCommandType {
     when: RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
-        sensitive_fields, private_fields, rest_trigger_allowed, owner_tag_key?)
+        sensitive_fields, private_fields, blob_fields, rest_trigger_allowed, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
@@ -7407,6 +7420,10 @@ rule RegisterCommandType {
     -- restated here. Required rather than optional for the same reason
     -- sensitive_fields is.
     requires: valid_private_fields(schema, private_fields)
+    -- docs/architecture.md §239. Refuses an empty or duplicate field, one
+    -- not in the schema, half a subject, and any overlap with a sensitive
+    -- field, nested either way.
+    requires: valid_blob_fields(schema, blob_fields, sensitive_fields)
 
     -- The very same valid_owner_tag_key RegisterEventType applies, reused
     -- unchanged rather than mirrored: it asks a question about a
@@ -7486,6 +7503,7 @@ rule RegisterCommandType {
                 owner_tag_key: owner_tag_key,
                 sensitive_fields: sensitive_fields,
                 private_fields: private_fields,
+                blob_fields: blob_fields,
                 rest_trigger_allowed: rest_trigger_allowed
             )
 }
@@ -7878,7 +7896,7 @@ rule DiscardProjectionRebuild {
 
 rule ReconcileEventTypeAtStartup {
     when: ReconcileEventTypeAtStartup(application_version?, access_mapping, bounded_context, name,
-        schema, tag_mappings, sensitive_fields, private_fields, external_creation_allowed,
+        schema, tag_mappings, sensitive_fields, private_fields, blob_fields, external_creation_allowed,
         direct_creation_allowed, system_triggered_allowed, event_read_allowed,
         system_triggered_schedule?, missed_occurrence_policy?, owner_tag_key?)
     requires: access_mapping.status = active
@@ -7941,6 +7959,7 @@ rule ReconcileEventTypeAtStartup {
                 tag_mappings: tag_mappings,
                 sensitive_fields: merged_sensitive_fields,
                 private_fields: merged_private_fields,
+                blob_fields: blob_fields,
                 external_creation_allowed: external_creation_allowed,
                 direct_creation_allowed: direct_creation_allowed,
                 system_triggered_allowed: system_triggered_allowed,
@@ -7959,7 +7978,7 @@ rule ReconcileEventTypeAtStartup {
 
 rule ReconcileCommandTypeAtStartup {
     when: ReconcileCommandTypeAtStartup(application_version?, access_mapping, bounded_context, name,
-        schema, tag_mappings, sensitive_fields, private_fields, rest_trigger_allowed, owner_tag_key?)
+        schema, tag_mappings, sensitive_fields, private_fields, blob_fields, rest_trigger_allowed, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
@@ -8009,6 +8028,7 @@ rule ReconcileCommandTypeAtStartup {
                 tag_mappings: tag_mappings,
                 sensitive_fields: merged_sensitive_fields,
                 private_fields: merged_private_fields,
+                blob_fields: blob_fields,
                 rest_trigger_allowed: rest_trigger_allowed,
                 owner_tag_key: merged_owner_tag_key
             )
@@ -11376,12 +11396,12 @@ surface TypeRegistration {
 
     provides:
         RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
-            sensitive_fields, private_fields, external_creation_allowed, direct_creation_allowed,
+            sensitive_fields, private_fields, blob_fields, external_creation_allowed, direct_creation_allowed,
             system_triggered_allowed, event_read_allowed, system_triggered_schedule?,
             missed_occurrence_policy?, owner_tag_key?)
             when bounded_context.status = active
         RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
-            sensitive_fields, private_fields, rest_trigger_allowed, owner_tag_key?)
+            sensitive_fields, private_fields, blob_fields, rest_trigger_allowed, owner_tag_key?)
             when bounded_context.status = active
         RegisterProjection(access_mapping, bounded_context, name, schema,
             consumed_event_types, sync, requires_capability?, owner_tag_key?, segments?, segment_key?)
@@ -12373,13 +12393,32 @@ entity Blob {
 }
 
 -- Who may upload is a capability on a grant, or a writing token whose type
--- declares a blob field. Who may read is whoever can read a record
--- referencing it with that field visible; everyone else is told it doesn't
--- exist. Neither is modelled further here: the second is the same rendering
--- every read already performs.
+-- declares a blob field; a surface can't say "either", so it stays a black box.
+-- Who may read is whoever can read a record referencing it with that field
+-- visible, the same rendering every read already performs, and an event read
+-- token never decrypts; everyone else is told it doesn't exist.
+surface BlobTransfer {
+    facing caller: BlobClient
+    context bounded_context: BoundedContext
+
+    provides:
+        UploadBlob(caller, bounded_context, sha256, size, media_type, subject_key?, subject_value?)
+        ReadBlob(caller, blob)
+
+    @guarantee RefusalLooksLikeAbsence
+        -- A blob the caller may not read is answered as one that doesn't
+        -- exist, so an id says nothing to someone who can't read it.
+}
+
+actor BlobClient {
+    identified_by: Role where status = active
+}
+
 rule UploadBlob {
-    when: UploadBlob(bounded_context, sha256, size, media_type, subject_key?, subject_value?)
+    when: UploadBlob(caller, bounded_context, sha256, size, media_type, subject_key?, subject_value?)
+    requires: may_upload_blob(caller, bounded_context, subject_key)
     requires: bounded_context.status = active
+    requires: size <= config.max_blob_bytes
     ensures:
         Blob.created(
             bounded_context: bounded_context,
@@ -12394,14 +12433,42 @@ rule UploadBlob {
         )
 }
 
+rule ReadBlob {
+    when: ReadBlob(caller, blob)
+    requires: blob.status != deleted
+    requires: may_read_blob(caller, blob)
+    ensures: BlobServed(blob)
+}
+
 rule ReferenceBlob {
     when: ReferenceBlob(blob)
     requires: blob.status != deleted
     ensures: blob.status = referenced
 }
 
+-- A parked delivery or pending proposal replays its stored request later,
+-- without whoever uploaded, so it holds the blobs it names. The holder's row
+-- and its pins are written in one transaction: a stored holder always has its
+-- blobs, and a failure stores neither. Forgetting a subject ignores pins.
+rule PinBlob {
+    when: PinBlob(blob)
+    requires: blob.status != deleted
+    ensures:
+        blob.pins = blob.pins + 1
+        blob.grace_from = now
+}
+
+-- A holder ending gives its blob a fresh grace period: it may have waited far
+-- longer than that already.
+rule ReleaseBlobPin {
+    when: ReleaseBlobPin(blob)
+    requires: blob.pins > 0
+    ensures:
+        blob.pins = blob.pins - 1
+        blob.grace_from = now
+}
+
 -- Past its grace period, a blob nothing references or holds is an orphan.
--- A holder ending gives its blob a fresh grace period (grace_from = now).
 rule CollectBlobs {
     when: CollectBlobs(blob)
     requires: blob.status = uploaded
@@ -12409,3 +12476,27 @@ rule CollectBlobs {
     requires: blob.grace_from + config.blob_orphan_grace <= now
     ensures: blob.status = deleted
 }
+
+surface PayloadLimitsAdmin {
+    facing caller: Superadmin
+    context bounded_context: BoundedContext
+
+    provides:
+        SetPayloadLimits(caller, bounded_context, max_payload_bytes?, warn_payload_bytes?)
+}
+
+-- Superadmin-only, like adding and deleting a bounded context: the limit
+-- protects every reader and the instances serving the context, not one
+-- owner's data (docs/architecture.md §238). Read under the write lock.
+rule SetPayloadLimits {
+    when: SetPayloadLimits(caller, bounded_context, max_payload_bytes?, warn_payload_bytes?)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    ensures:
+        bounded_context.max_payload_bytes = max_payload_bytes
+        bounded_context.warn_payload_bytes = warn_payload_bytes
+}
+
+-- A bridge's inbound message refused as too large is not parked: skilj will
+-- never store it, and parking exists to retry what may yet succeed. The bridge
+-- logs its identifier, counts it and moves past it, outside this specification.

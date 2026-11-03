@@ -129,7 +129,8 @@ system, `extracted/usr/include/x86_64-linux-gnu`.
 
 `skilj-kafka`, `skilj-amqp`, `skilj-nats`, and `skilj-temporal`'s real-
 broker tests (`skilj-kafka/tests/`, `skilj-amqp/tests/`,
-`skilj-nats/tests/`, `skilj-temporal/tests/`) each need a reachable Docker
+`skilj-nats/tests/`, `skilj-temporal/tests/`), and `skilj-blob-s3`'s S3Mock
+test, each need a reachable Docker
 daemon (`testcontainers-modules` or `testcontainers` spinning up real,
 ephemeral Kafka/Artemis/NATS containers, and `skilj-temporal` downloads a
 small ephemeral Temporal server binary on first run, cached under
@@ -229,6 +230,13 @@ far as a test exercises them, and some aren't checked at all
   value appears in no stored tag, query or payload, that racing claims
   accept one, and that erasure removes the hash from the database and
   from the event cache.
+- **Blobs** (§239): `skilj/tests/blob_lifecycle.rs` checks who may upload and
+  download, that the store holds no plaintext of a blob with a subject and
+  that `forgetSubject` removes it, that a cut-off or wrong blob ends a
+  download in an error, and that collection spares what a parked delivery
+  or pending approval holds. The race between collection and a new pin has
+  no test of its own; a failed pin storing nothing does. Real AWS S3 is
+  verified by nothing: `skilj-blob-s3` runs against S3Mock.
 - **The template**: `scripts/check-template.sh` generates it, builds it
   with and without its `local` feature, and runs the README's quickstart:
   the server starts its own embedded Postgres, a deposit is accepted, a

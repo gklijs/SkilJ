@@ -14,7 +14,8 @@ description: >
   wire contract itself, skilj-tui usage, or the cross-instance/inspector
   internals - those are skilj's own implementation, not the plugin API
   this skill covers. A uniqueness rule (an email address registered once)
-  is the `skilj-uniqueness` skill.
+  is the `skilj-uniqueness` skill; a file, document or anything else too
+  large for a payload is the `skilj-large-payloads` skill.
 ---
 
 # skilj
@@ -48,6 +49,11 @@ when the value is personal data, a blind tag (`BlindTag`,
 `TagMapping::blind`) so it is only ever stored as a keyed hash. Use the
 `skilj-uniqueness` skill for that; don't tag a sensitive field plainly or
 hash it by hand.
+
+**A document, image or other large value** doesn't go in a payload, which
+is refused above 256 KiB by default. Use the `skilj-large-payloads` skill: a
+blob field holds a reference to the bytes. A type's `blob_fields()` is
+declared next to `sensitive_fields()`.
 
 There is a fourth plugin type, `Snapshot` - an optional accelerator for
 `decide()` against a large per-entity history, its own trait with its

@@ -437,8 +437,8 @@ pub async fn migrate_parked_deliveries_dedup_and_unique_index(
 /// that actually exists afterward, real either way (the fresh `id` this
 /// generated, or the winning row's own from an earlier insert).
 #[allow(clippy::too_many_arguments)]
-pub async fn insert_parked_delivery(
-    pool: &Pool,
+pub async fn insert_parked_delivery<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     bounded_context: &str,
     source: &str,
     kind: ParkedDeliveryKind,
@@ -479,9 +479,58 @@ pub async fn insert_parked_delivery(
     .bind(attempt_count)
     .bind(first_failed_at)
     .bind(last_failed_at)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(row.into())
+}
+
+/// [`insert_parked_delivery`] for a request a retry will replay here, without
+/// whoever uploaded its blobs (docs/architecture.md §239): holds them from
+/// collection, in one transaction with the row, so a stored delivery always
+/// has its blobs and a failure stores neither.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_parked_delivery_holding_blobs(
+    pool: &Pool,
+    bounded_context: &str,
+    source: &str,
+    kind: ParkedDeliveryKind,
+    identifier: &str,
+    access_token_id: Option<&str>,
+    request_json: &serde_json::Value,
+    error: &str,
+    attempt_count: i32,
+    first_failed_at: DateTime<Utc>,
+    last_failed_at: DateTime<Utc>,
+) -> crate::error::Result<ParkedDelivery> {
+    let ids = referenced_blob_ids(&request_json.to_string())?;
+    let mut tx = pool.begin().await?;
+    hold_blobs_for_pin(&mut tx, bounded_context, &ids, last_failed_at).await?;
+    let delivery = insert_parked_delivery(
+        &mut *tx,
+        bounded_context,
+        source,
+        kind,
+        identifier,
+        access_token_id,
+        None,
+        None,
+        request_json,
+        error,
+        attempt_count,
+        first_failed_at,
+        last_failed_at,
+    )
+    .await?;
+    pin_held_blobs(
+        &mut tx,
+        bounded_context,
+        BlobPinHolder::ParkedDelivery,
+        &delivery.id,
+        &ids,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(delivery)
 }
 
 /// Every parked delivery in `bounded_context`, in page order (see

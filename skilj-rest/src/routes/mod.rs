@@ -1955,31 +1955,20 @@ async fn post_parked_deliveries(
         request["idempotencyKey"] = serde_json::Value::String(idempotency_key);
     }
 
-    let delivery = db::insert_parked_delivery(
+    // A retry replays this request here, without the bridge that uploaded
+    // its blobs (docs/architecture.md §239).
+    let delivery = db::insert_parked_delivery_holding_blobs(
         &state.pool,
         &bounded_context_name,
         &body.source,
         kind,
         &body.identifier,
         Some(&access_token_id),
-        None,
-        None,
         &request,
         &body.error,
         body.attempt_count,
         body.first_failed_at,
         Utc::now(),
-    )
-    .await?;
-    // A retry replays this request here, without the bridge that uploaded
-    // its blobs, so collection has to pass over them until the row is gone
-    // (docs/architecture.md §239).
-    db::pin_blobs(
-        &state.pool,
-        &bounded_context_name,
-        db::BlobPinHolder::ParkedDelivery,
-        &delivery.id,
-        &request.to_string(),
     )
     .await?;
 

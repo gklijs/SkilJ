@@ -311,7 +311,9 @@ fn encrypting_stream<'a>(
 }
 
 /// Plaintext from a stream of a blob's stored frames. Each frame's tag is
-/// checked before any of it is served.
+/// checked before any of it is served, and the last frame isn't served until
+/// `inner` has ended cleanly: that end is where a verifying stream reports a
+/// wrong hash or size, and nothing may follow the last frame.
 fn decrypting_stream(
     inner: ByteStream<'static>,
     data_key: DataKey,
@@ -321,7 +323,8 @@ fn decrypting_stream(
     let frame = crate::encryption::BLOB_FRAME_PLAINTEXT + crate::encryption::BLOB_FRAME_OVERHEAD;
     let frames = crate::encryption::blob_frame_count(stored_size);
     futures_util::stream::unfold(
-        (inner, Vec::<u8>::new(), 0_u64, false),
+        // `Some(inner)` until it has ended: it must not be polled after that.
+        (Some(inner), Vec::<u8>::new(), 0_u64, false),
         move |(mut inner, mut buffer, index, done)| {
             let data_key = data_key.clone();
             let blob_id = blob_id.clone();
@@ -329,19 +332,29 @@ fn decrypting_stream(
                 if done || index >= frames {
                     return None;
                 }
-                while buffer.len() < frame {
-                    match inner.next().await {
+                let last = index + 1 == frames;
+                // For the last frame, read on to the end of the stream.
+                while last || buffer.len() < frame {
+                    let Some(stream) = inner.as_mut() else {
+                        break;
+                    };
+                    match stream.next().await {
                         Some(Ok(chunk)) => buffer.extend_from_slice(&chunk),
-                        Some(Err(e)) => return Some((Err(e), (inner, Vec::new(), index, true))),
-                        None => break,
+                        Some(Err(e)) => return Some((Err(e), (None, Vec::new(), index, true))),
+                        None => inner = None,
                     }
                 }
                 let rest = buffer.split_off(buffer.len().min(frame));
-                let last = index + 1 == frames;
+                if last && !rest.is_empty() {
+                    let trailing = std::io::Error::other(format!(
+                        "blob {blob_id} has bytes after its last frame"
+                    ));
+                    return Some((Err(trailing), (None, Vec::new(), index, true)));
+                }
                 match crate::encryption::open_blob_frame(&data_key, &blob_id, index, last, &buffer)
                 {
                     Ok(plain) => Some((Ok(plain), (inner, rest, index + 1, false))),
-                    Err(e) => Some((Err(std::io::Error::other(e)), (inner, rest, index, true))),
+                    Err(e) => Some((Err(std::io::Error::other(e)), (None, rest, index, true))),
                 }
             }
         },
@@ -745,8 +758,7 @@ pub async fn blob_references(
 /// Who holds a pending blob past its grace period: a parked delivery or a
 /// pending approval whose stored request will be replayed later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BlobPinHolder {
+pub(super) enum BlobPinHolder {
     /// A parked delivery's stored request, by the row's id.
     ParkedDelivery,
     /// A command proposal's payload, by its id.
@@ -762,24 +774,57 @@ impl BlobPinHolder {
     }
 }
 
-/// Pins every blob `document` references for `holder_id`, so collection
-/// passes over it however long the holder waits: its replay would
-/// otherwise fail once the blob was collected. Nothing to do, and no
-/// query, when the document references none. A reference to a blob this
-/// bounded context doesn't have pins nothing; the replay refuses it.
-pub async fn pin_blobs(
-    pool: &Pool,
+/// The ids of the blobs `document` references. Nothing to pin, and no query
+/// for one, when it references none.
+pub(super) fn referenced_blob_ids(document: &str) -> crate::error::Result<Vec<String>> {
+    let found = crate::blob::find_blob_refs(document)
+        .map_err(|e| crate::event_store::Error::PayloadDecodeFailed(e.to_string()))?;
+    Ok(found
+        .into_iter()
+        .filter_map(|found| found.reference.ok().map(|r| r.id))
+        .collect())
+}
+
+/// The first half of pinning, before the holder's row is written: locks the
+/// blobs in id order, so two holders of the same blobs can't deadlock, and
+/// restarts a pending one's grace period. Writing the row is what stops
+/// collection: its `FOR UPDATE SKIP LOCKED` passes over a row locked here,
+/// and one that got past its snapshot before this commits re-checks
+/// `grace_from` and no longer qualifies. A pin alone wouldn't: collection's
+/// snapshot can predate it.
+pub(super) async fn hold_blobs_for_pin(
+    tx: &mut Transaction<'_, Postgres>,
+    bounded_context: &str,
+    ids: &[String],
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "WITH held AS (SELECT id FROM {schema}.blobs WHERE id = ANY($1) ORDER BY id FOR UPDATE) \
+         UPDATE {schema}.blobs b SET grace_from = $2 FROM held \
+         WHERE b.id = held.id AND b.state = 'pending'"
+    )))
+    .bind(ids)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The second half, once the holder's row is written: in the same
+/// transaction, so there is never a holder without its pin, or the reverse.
+/// A reference to a blob this bounded context doesn't have pins nothing;
+/// the replay refuses it.
+pub(super) async fn pin_held_blobs(
+    tx: &mut Transaction<'_, Postgres>,
     bounded_context: &str,
     holder: BlobPinHolder,
     holder_id: &str,
-    document: &str,
+    ids: &[String],
 ) -> crate::error::Result<()> {
-    let found = crate::blob::find_blob_refs(document)
-        .map_err(|e| crate::event_store::Error::PayloadDecodeFailed(e.to_string()))?;
-    let ids: Vec<String> = found
-        .into_iter()
-        .filter_map(|found| found.reference.ok().map(|r| r.id))
-        .collect();
     if ids.is_empty() {
         return Ok(());
     }
@@ -789,10 +834,10 @@ pub async fn pin_blobs(
          SELECT id, $2, $3 FROM {schema}.blobs WHERE id = ANY($1) \
          ON CONFLICT DO NOTHING"
     )))
-    .bind(&ids)
+    .bind(ids)
     .bind(holder.as_str())
     .bind(holder_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }

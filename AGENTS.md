@@ -28,6 +28,7 @@ CONTRIBUTING.md's "What the tests do and don't verify" lists which guarantees ho
 Some integration tests require external services:
 - **Postgres** — `skilj-core`, `skilj`, `skilj-inspector` and `skilj-demo` integration tests use `DATABASE_URL` when it is set, and otherwise fall back to `postgresql_embedded`. Set `DATABASE_URL` to a real Postgres to avoid embedded-server issues. `DATABASE_URL` supplies the server, not the database: every test binary drops and recreates a named database of its own on it (docs/architecture.md §167), so the role needs `CREATEDB`.
 - **Kafka** (`skilj-kafka`), **AMQP** (`skilj-amqp`), **NATS** (`skilj-nats`) — these tests use `testcontainers-modules` and need a reachable Docker daemon. They skip gracefully if Docker is unavailable, except in CI, where any skip fails the build (docs/architecture.md §223).
+- **S3** (`skilj-blob-s3`) — one test runs against an S3Mock container and needs a reachable Docker daemon, like the brokers; the other uses `object_store`'s in-memory backend.
 - **Temporal** (`skilj-temporal`) — downloads Temporal's test server from temporal.download on first run and skips if it can't. Where that host is blocked, set `SKILJ_TEMPORAL_TEST_SERVER` to a `temporal-test-server` binary; the Java SDK's GitHub releases publish it (`temporal-test-server_<version>_linux_amd64.tar.gz`).
 
 ## Lint
@@ -84,7 +85,7 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 11. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 12. `scripts/check-spec.sh` — `allium check` on `specs/skilj.allium`: fails on an error, or on more warnings than the script's `MAX_WARNINGS` (a ratchet; lower it when a warning is fixed)
 13. `cargo machete` — no unused dependency; one kept on purpose goes in the crate's `[package.metadata.cargo-machete] ignored` with its reason
-14. `cargo semver-checks` on the library crates against their latest release, pull requests only. Blocking: a breaking change fails it until the minor version is bumped in the same diff
+14. `cargo semver-checks` on the library crates against their latest release, pull requests only. Blocking: a breaking change fails it until the minor version is bumped in the same diff. A crate not yet on crates.io has no baseline and fails the whole job, so it goes in the step's `--exclude` until its first release (`skilj-blob-s3` for now)
 15. `cargo llvm-cov` — on pushes to `main` and manual workflow dispatch, line coverage of the full test run, in the job summary and as an lcov artifact. Informational (`continue-on-error`), no threshold
 16. `cargo mutants` — weekly (`.github/workflows/mutants.yml`), on the access trail and the `*_with_trail` writers against the `access_trail` tests. Surviving mutants are listed in the job summary. Informational
 17. `scripts/check-template-docker.sh` — builds `templates/skilj-template`'s Dockerfile against this workspace and starts the image (its own job, needs Docker)
