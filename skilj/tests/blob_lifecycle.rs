@@ -14,14 +14,15 @@ use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use skilj::{EventType, IdpConfig, SigningAlgorithm, Skilj};
+use skilj::{CommandType, EventType, IdpConfig, SigningAlgorithm, Skilj};
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::blob::{BlobField, BlobRef};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool, PostgresBlobStore};
 use skilj_core::encryption::{InMemoryKeyProvider, KeyService};
-use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
-use skilj_core::shared::{generate_token_id, generate_token_secret, PrivateField};
+use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
+use skilj_core::plugin::BoundedContextEvent;
+use skilj_core::shared::{generate_token_id, generate_token_secret, CommandDecision, PrivateField};
 use tower::ServiceExt;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -84,6 +85,58 @@ impl EventType for FiledForCustomer {
             "customer",
             "customer_id",
         )]
+    }
+}
+
+/// What a bridge's messages become: `body` always a reference, `note` free.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct InboundPayload {
+    customer_id: String,
+    body: BlobRef,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+struct Inbound;
+impl EventType for Inbound {
+    type Payload = InboundPayload;
+    const NAME: &'static str = "Inbound";
+    fn external_creation_allowed() -> bool {
+        true
+    }
+    fn event_read_allowed() -> bool {
+        true
+    }
+    fn blob_fields() -> Vec<BlobField> {
+        vec![BlobField::new("body")]
+    }
+}
+
+enum NoEvents {}
+
+impl BoundedContextEvent for NoEvents {
+    fn try_from_event(_event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        None
+    }
+}
+
+/// Needs an approval, so its payload is stored as a proposal first.
+struct ApprovedFiling;
+impl CommandType for ApprovedFiling {
+    type Payload = FiledPayload;
+    type Event = NoEvents;
+    const NAME: &'static str = "ApprovedFiling";
+    fn rest_trigger_allowed() -> bool {
+        true
+    }
+    fn requires_approval() -> bool {
+        true
+    }
+    fn blob_fields() -> Vec<BlobField> {
+        vec![BlobField::new("document")]
+    }
+    fn decide(_payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted { events: Vec::new() }
     }
 }
 
@@ -322,6 +375,108 @@ impl Setup {
         (status, body.to_vec())
     }
 
+    async fn graphql(
+        &self,
+        jwt: &str,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> serde_json::Value {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/graphql")
+            .header("authorization", format!("Bearer {jwt}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "query": query, "variables": variables }).to_string(),
+            ))
+            .unwrap();
+        let router = self.skilj.graphql_router().await.unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The real REST surface on a real port, for a bridge's own HTTP client.
+    async fn serve(&self) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = self.skilj.rest_router();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        url
+    }
+
+    async fn external_token(&self, event_type: &str) -> String {
+        let event_type = db::get_event_type(&self.pool, &self.bc, event_type)
+            .await
+            .unwrap()
+            .unwrap();
+        let token = access_control::create_external_event_token(
+            &self.mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            now(),
+        )
+        .unwrap();
+        db::insert_external_event_token(&self.pool, &token)
+            .await
+            .unwrap();
+        format!("{}.{}", token.id, token.secret)
+    }
+
+    async fn command_token(&self, command_type: &str) -> String {
+        let command_type = db::get_command_type(&self.pool, &self.bc, command_type)
+            .await
+            .unwrap()
+            .unwrap();
+        let token = access_control::create_command_token(
+            &self.mapping,
+            &command_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            now(),
+        )
+        .unwrap();
+        db::insert_command_token(&self.pool, &token).await.unwrap();
+        format!("{}.{}", token.id, token.secret)
+    }
+
+    async fn trigger(&self, credential: &str, payload: serde_json::Value) -> (StatusCode, Vec<u8>) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/commands/trigger")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "payload": payload }).to_string()))
+            .unwrap();
+        self.send(request).await
+    }
+
+    async fn state(&self, id: &str) -> &'static str {
+        db::get_blob(&self.pool, &self.bc, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+            .unwrap()
+            .as_str()
+    }
+
+    async fn collect_at(&self, at: chrono::DateTime<Utc>) -> db::CollectedBlobs {
+        db::collect_blobs(
+            &self.pool,
+            &store(self),
+            &self.bc,
+            at - chrono::Duration::hours(24),
+            at,
+            100,
+        )
+        .await
+        .unwrap()
+    }
+
     async fn stored_bytes(&self, storage_key: &str) -> Option<Vec<u8>> {
         let row: Option<(Vec<u8>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT bytes FROM \"bc_{}\".blob_bytes WHERE storage_key = $1",
@@ -389,6 +544,8 @@ async fn setup_with(idp: Option<IdpConfig>) -> Setup {
         .event_type::<FiledPrivately>()
         .event_type::<FiledForCustomer>()
         .event_type::<Scoped>()
+        .event_type::<Inbound>()
+        .command_type::<ApprovedFiling>()
         .reconciliation_role(external_subject)
         .build()
         .await
@@ -948,5 +1105,436 @@ fn a_deleted_bounded_context_leaves_its_blobs_queued_for_the_store() {
                 .await
                 .unwrap();
         assert_eq!(queued, Vec::new());
+    });
+}
+
+fn idp(jwks_url: &str) -> IdpConfig {
+    IdpConfig::new(
+        jwks_url.parse().unwrap(),
+        TEST_ISSUER,
+        TEST_AUDIENCE,
+        SigningAlgorithm::Rs256,
+    )
+}
+
+#[test]
+fn blob_fields_registered_over_graphql_declare_and_read_back() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup_with(Some(idp(&serve_jwks().await))).await;
+        let jwt = sign_jwt(&setup.mapping.role.external_subject);
+        const REGISTER: &str = "\
+            mutation($bc: String!, $blobFields: [BlobFieldInput!]) { \
+                registerEventType(boundedContext: $bc, name: \"Scanned\", \
+                    schema: \"{\\\"properties\\\":{\\\"id\\\":{\\\"type\\\":\\\"string\\\"},\\\"scan\\\":{\\\"type\\\":\\\"object\\\"}}}\", \
+                    tagMappings: [], sensitiveFields: [], privateFields: [], blobFields: $blobFields, \
+                    externalCreationAllowed: false, directCreationAllowed: true, \
+                    systemTriggeredAllowed: false, eventReadAllowed: true) { \
+                    blobFields { field subjectKey subjectField } \
+                } \
+            }";
+        let scan = json!({"field": "scan", "subjectKey": "customer", "subjectField": "id"});
+        let response = setup
+            .graphql(&jwt, REGISTER, json!({"bc": setup.bc, "blobFields": [scan]}))
+            .await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(
+            response["data"]["registerEventType"]["blobFields"][0],
+            json!({"field": "scan", "subjectKey": "customer", "subjectField": "id"})
+        );
+        let stored = db::get_event_type(&setup.pool, &setup.bc, "Scanned")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.blob_fields,
+            vec![BlobField::with_subject("scan", "customer", "id")]
+        );
+
+        // Dropping the subject would store new bytes in plaintext.
+        let response = setup
+            .graphql(&jwt, REGISTER, json!({"bc": setup.bc, "blobFields": [{"field": "scan"}]}))
+            .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "invalid_blob_field",
+            "{response}"
+        );
+        // A field the schema doesn't have, and half a subject.
+        for bad in [
+            json!({"field": "missing"}),
+            json!({"field": "scan", "subjectKey": "customer"}),
+        ] {
+            let response = setup
+                .graphql(&jwt, REGISTER, json!({"bc": setup.bc, "blobFields": [bad]}))
+                .await;
+            assert_eq!(
+                response["errors"][0]["extensions"]["code"],
+                "invalid_blob_field",
+                "{response}"
+            );
+        }
+    });
+}
+
+#[test]
+fn the_blobs_of_a_read_are_listed_unless_redacted() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup_with(Some(idp(&serve_jwks().await))).await;
+        let jwt = sign_jwt(&setup.mapping.role.external_subject);
+        const QUERY: &str = "query($bc: String!, $types: [String!]!) { \
+            queryEvents(boundedContext: $bc, eventTypes: $types) { \
+                blobs { field id sha256 size mediaType } \
+            } }";
+        let writer = setup.writer("Filed").await;
+        let (_, body) = setup.upload(&writer, "", vec![1, 2, 3]).await;
+        let plain = reference(&body);
+        assert_eq!(setup.file(&writer, "c1", &plain).await, StatusCode::CREATED);
+        let response = setup
+            .graphql(&jwt, QUERY, json!({"bc": setup.bc, "types": ["Filed"]}))
+            .await;
+        assert_eq!(
+            response["data"]["queryEvents"][0]["blobs"][0],
+            json!({
+                "field": "document",
+                "id": plain.id,
+                "sha256": plain.sha256,
+                "size": "3",
+                "mediaType": "application/pdf",
+            }),
+            "{response}"
+        );
+
+        let writer = setup.writer("FiledPrivately").await;
+        let (_, body) = setup.upload(&writer, "", vec![4]).await;
+        let private = reference(&body);
+        assert_eq!(
+            setup.file(&writer, "c1", &private).await,
+            StatusCode::CREATED
+        );
+        let response = setup
+            .graphql(
+                &jwt,
+                QUERY,
+                json!({"bc": setup.bc, "types": ["FiledPrivately"]}),
+            )
+            .await;
+        assert_eq!(
+            response["data"]["queryEvents"][0]["blobs"],
+            json!([]),
+            "{response}"
+        );
+    });
+}
+
+#[test]
+fn forget_subject_over_graphql_reaches_the_subjects_blobs_only() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup_with(Some(idp(&serve_jwks().await))).await;
+        let writer = setup.writer("FiledForCustomer").await;
+        let mut references = Vec::new();
+        for customer in ["c1", "c2"] {
+            let (status, body) = setup
+                .upload(
+                    &writer,
+                    &format!("?subjectKey=customer&subjectValue={customer}"),
+                    vec![6; 100],
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED);
+            let reference = reference(&body);
+            assert_eq!(setup.file(&writer, customer, &reference).await, StatusCode::CREATED);
+            references.push(reference);
+        }
+        let record = db::get_blob(&setup.pool, &setup.bc, &references[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        // The subject itself may read its blob, up to the moment it's forgotten.
+        let subject_jwt = {
+            sqlx::query("UPDATE roles SET external_subject = 'c1' WHERE id = $1")
+                .bind(&setup.mapping.role.id)
+                .execute(&setup.pool)
+                .await
+                .unwrap();
+            sign_jwt("c1")
+        };
+        let (status, served) = setup.download(&subject_jwt, &references[0].id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(served, vec![6; 100]);
+
+        let response = setup
+            .graphql(
+                &subject_jwt,
+                "mutation($bc: String!) { \
+                    forgetSubject(boundedContext: $bc, subjectKey: \"customer\", subjectValue: \"c1\") { status } \
+                }",
+                json!({"bc": setup.bc}),
+            )
+            .await;
+        assert!(response.get("errors").is_none(), "{response}");
+
+        assert_eq!(setup.state(&references[0].id).await, "deleted");
+        assert_eq!(setup.state(&references[1].id).await, "referenced");
+        assert_eq!(
+            setup.download(&subject_jwt, &references[0].id).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert!(setup.stored_bytes(&record.storage_key).await.is_some());
+        assert_eq!(setup.collect_at(now()).await.bytes_removed, 1);
+        assert!(setup.stored_bytes(&record.storage_key).await.is_none());
+    });
+}
+
+#[test]
+fn a_proposal_is_refused_when_too_large_or_undeclared_and_pins_its_blob() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup().await;
+        let proposals = || {
+            let (pool, bc) = (setup.pool.clone(), setup.bc.clone());
+            async move {
+                let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT count(*) FROM \"bc_{bc}\".command_proposals"
+                )))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                count
+            }
+        };
+        let writer = setup.writer("Filed").await;
+        let (_, body) = setup.upload(&writer, "", vec![1]).await;
+        let held = reference(&body);
+        let token = setup.command_token("ApprovedFiling").await;
+
+        // A reference to nothing this bounded context has.
+        let mut unknown = held.clone();
+        unknown.id = "no-such-blob".to_string();
+        let (status, body) = setup
+            .trigger(&token, json!({"customer_id": "c1", "document": unknown}))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(proposals().await, 0);
+
+        // Past the limit.
+        db::set_payload_limits(
+            &setup.pool,
+            &setup.bc,
+            db::PayloadLimitsOverride {
+                max_payload_bytes: Some(32),
+                warn_payload_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (status, _) = setup
+            .trigger(&token, json!({"customer_id": "c1", "document": held}))
+            .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(proposals().await, 0);
+        db::set_payload_limits(&setup.pool, &setup.bc, db::PayloadLimitsOverride::default())
+            .await
+            .unwrap();
+
+        // Stored as a proposal: held past the grace period while it waits.
+        let (status, body) = setup
+            .trigger(&token, json!({"customer_id": "c1", "document": held}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(proposals().await, 1);
+        let later = now() + chrono::Duration::hours(25);
+        assert_eq!(setup.collect_at(later).await.orphans, 0);
+        assert_eq!(setup.state(&held.id).await, "pending");
+
+        // Decided: a fresh grace period, then collected.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"bc_{}\".command_proposals SET status = 'rejected'",
+            setup.bc
+        )))
+        .execute(&setup.pool)
+        .await
+        .unwrap();
+        assert_eq!(setup.collect_at(later).await.orphans, 0);
+        let much_later = later + chrono::Duration::hours(25);
+        assert_eq!(setup.collect_at(much_later).await.orphans, 1);
+        assert_eq!(setup.state(&held.id).await, "deleted");
+    });
+}
+
+fn inbound_mapping(credential: &str, bc: &str, field: &str) -> skilj_bridge::InboundMapping {
+    skilj_bridge::InboundMapping {
+        blobs: Some(skilj_bridge::InboundBlobs {
+            bounded_context: bc.to_string(),
+            fields: vec![skilj_bridge::InboundBlobField {
+                field: field.to_string(),
+                media_type: "text/plain".to_string(),
+                subject: None,
+            }],
+        }),
+        credential: credential.to_string(),
+        action: skilj_bridge::InboundAction::Record {
+            event_type: "Inbound".to_string(),
+        },
+    }
+}
+
+#[test]
+fn a_bridge_against_a_real_skilj_uploads_marked_fields_and_only_those_are_spared_the_limit() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup().await;
+        let url = setup.serve().await;
+        let credential = setup.external_token("Inbound").await;
+        let mapping = inbound_mapping(&credential, &setup.bc, "body");
+        let http = reqwest::Client::new();
+        let post = |payload: serde_json::Value, sequence: i64| {
+            let (http, url, mapping) = (http.clone(), url.clone(), &mapping);
+            async move {
+                skilj_bridge::post_inbound(
+                    &http,
+                    &url,
+                    mapping,
+                    &json!({
+                        "payload": payload,
+                        "sourceContent": "test",
+                        "dedupe": {"partitionKey": "t:0", "sequence": sequence},
+                    }),
+                    None,
+                )
+                .await
+            }
+        };
+
+        // A value far over the payload limit fits, once it is a blob.
+        let large = "x".repeat(1024 * 1024);
+        let message = json!({"customer_id": "c1", "body": large}).to_string();
+        let offloaded =
+            skilj_bridge::offload_blob_fields(&http, &url, &mapping, message.as_bytes())
+                .await
+                .unwrap()
+                .expect("the marked field was replaced");
+        let payload: serde_json::Value = serde_json::from_slice(&offloaded).unwrap();
+        post(payload.clone(), 1).await.unwrap();
+        let id = payload["body"]["$blob"].as_str().unwrap();
+        assert_eq!(setup.state(id).await, "referenced");
+        let reader = setup.reader("Inbound", None).await;
+        let (status, served) = setup.download(&reader, id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(served, large.as_bytes());
+
+        // Over the limit in a field that isn't marked: refused as too large.
+        let message = json!({"customer_id": "c1", "body": "y", "note": large}).to_string();
+        let offloaded =
+            skilj_bridge::offload_blob_fields(&http, &url, &mapping, message.as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&offloaded).unwrap();
+        match post(payload, 2).await {
+            Err(skilj_bridge::SkiljError::SkiljStatus { status, body }) => {
+                assert_eq!(status, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+                assert!(skilj_bridge::too_large_refusal(&body), "{body}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // A marked field the type doesn't declare: not a size problem, so it parks.
+        let wrong = inbound_mapping(&credential, &setup.bc, "note");
+        let message = json!({"customer_id": "c1", "body": null, "note": "z"}).to_string();
+        let offloaded = skilj_bridge::offload_blob_fields(&http, &url, &wrong, message.as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&offloaded).unwrap();
+        match post(payload, 3).await {
+            Err(skilj_bridge::SkiljError::SkiljStatus { body, .. }) => {
+                assert!(!skilj_bridge::too_large_refusal(&body), "{body}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn a_parked_message_keeps_its_blob_past_the_grace_period_and_its_retry_succeeds() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup_with(Some(idp(&serve_jwks().await))).await;
+        let url = setup.serve().await;
+        let credential = setup.external_token("Inbound").await;
+        let mapping = inbound_mapping(&credential, &setup.bc, "body");
+        let http = reqwest::Client::new();
+
+        let offloaded = skilj_bridge::offload_blob_fields(
+            &http,
+            &url,
+            &mapping,
+            json!({"customer_id": "c1", "body": "the bytes"})
+                .to_string()
+                .as_bytes(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&offloaded).unwrap();
+        let id = payload["body"]["$blob"].as_str().unwrap().to_string();
+        skilj_bridge::report_parked_delivery(
+            &http,
+            &url,
+            &mapping,
+            "kafka-inbound",
+            "t:0:1",
+            &json!({"payload": payload, "sourceContent": "test"}),
+            None,
+            "refused",
+            3,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        // Long past its grace period, the parked row still holds it.
+        let later = now() + chrono::Duration::days(30);
+        assert_eq!(setup.collect_at(later).await.orphans, 0);
+        assert_eq!(setup.state(&id).await, "pending");
+
+        // So the retry, which replays inside skilj, finds it.
+        let parked = db::list_parked_deliveries(&setup.pool, &setup.bc)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        let jwt = sign_jwt(&setup.mapping.role.external_subject);
+        let response = setup
+            .graphql(
+                &jwt,
+                "mutation($bc: String!, $id: String!) { \
+                    retryParkedDelivery(boundedContext: $bc, id: $id) { id } \
+                }",
+                json!({"bc": setup.bc, "id": parked[0].id}),
+            )
+            .await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(setup.state(&id).await, "referenced");
+        assert_eq!(setup.collect_at(later).await.orphans, 0);
     });
 }

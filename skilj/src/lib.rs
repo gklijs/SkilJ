@@ -4536,7 +4536,12 @@ impl SkiljBuilder {
                 .min(BLOB_COLLECTION_INTERVAL)
                 .max(std::time::Duration::from_secs(1));
             background.spawn("blob_collection", move |mut stop| async move {
+                // Not at startup: every instance would sweep at once, for
+                // work that is never urgent.
                 loop {
+                    if stop.sleep(interval).await {
+                        return;
+                    }
                     let start = std::time::Instant::now();
                     blob_collection_tick(&pool, store.as_ref(), grace)
                         .instrument(tracing::info_span!("blob_collection_tick"))
@@ -4545,9 +4550,6 @@ impl SkiljBuilder {
                         start.elapsed().as_secs_f64(),
                         &[KeyValue::new("task", "blob_collection")],
                     );
-                    if stop.sleep(interval).await {
-                        return;
-                    }
                 }
             });
         }

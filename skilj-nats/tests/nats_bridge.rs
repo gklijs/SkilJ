@@ -246,6 +246,12 @@ async fn post_events_external(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    if body["payload"]["orderId"] == json!("o-too-large") {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "code": "payload_too_large", "message": "too large" })),
+        );
+    }
     {
         let mut remaining = state.fail_external_requests.lock().unwrap();
         if *remaining > 0 {
@@ -796,6 +802,65 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
             0,
             "every attempt failed, so a real event must never have been created"
         );
+    });
+}
+
+/// docs/architecture.md §238: a message skilj refuses as too large is moved
+/// past, without a retry, and isn't parked, so the next one goes through.
+#[test]
+fn an_inbound_message_too_large_to_store_is_moved_past_and_not_parked() {
+    runtime().block_on(async {
+        let Some(url) = test_nats().await else {
+            return;
+        };
+        let stream_name = unique_name("ORDERSLARGE");
+        let jetstream = jetstream_with_stream(url, &stream_name).await;
+        let consumer = pull_consumer(&jetstream, &stream_name).await;
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        for order in ["o-too-large", "o-after"] {
+            jetstream
+                .publish(
+                    format!("{stream_name}.in"),
+                    json!({ "orderId": order }).to_string().into(),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        let mapping = InboundMapping {
+            blobs: None,
+            credential: "external-token".to_string(),
+            action: InboundAction::Record {
+                event_type: "OrderPlaced".to_string(),
+            },
+        };
+        let http = skilj_nats::http_client();
+        // A policy that would park at once, if this were retried at all.
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(10),
+            1.0,
+            Duration::from_millis(10),
+            1,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mapping, &retry_policy).await;
+        });
+        let mut through = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !mock_state.external_requests.lock().unwrap().is_empty() {
+                through = true;
+                break;
+            }
+        }
+        assert!(through, "the message after the refused one must go through");
+        assert_eq!(
+            mock_state.external_requests.lock().unwrap()[0]["payload"]["orderId"],
+            json!("o-after")
+        );
+        assert!(mock_state.parked_deliveries.lock().unwrap().is_empty());
     });
 }
 

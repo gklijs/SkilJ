@@ -952,3 +952,75 @@ fn create_bounded_context_from_template_carries_scope_onto_the_initial_grant() {
         );
     });
 }
+
+/// docs/architecture.md §239: a blob field is registered like a sensitive
+/// one, so a tenant stamped from a template has it too.
+#[test]
+fn a_templates_blob_fields_are_copied_to_its_tenants() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+        let jwks_url = serve_jwks().await;
+
+        let template_name = unique_name("rtpl");
+        let template_bc = insert_bounded_context(&pool, &template_name).await;
+        let (admin_role, admin_jwt) = insert_role(&pool, false, "Template Admin").await;
+        grant(&pool, &admin_role, &template_bc, AccessLevel::Admin).await;
+        let (_superadmin, superadmin_jwt) = insert_role(&pool, true, "Superadmin").await;
+        let (tenant_role, _tenant_jwt) = insert_role(&pool, false, "Tenant Operator").await;
+
+        let (skilj, _report) = Skilj::builder(database_url)
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+
+        let response = graphql_request(
+            &router,
+            &admin_jwt,
+            "mutation($bc: String!) { \
+                registerEventType(boundedContext: $bc, name: \"BlobFixtureEvent\", \
+                    schema: \"{\\\"properties\\\":{\\\"id\\\":{\\\"type\\\":\\\"string\\\"},\\\"doc\\\":{\\\"type\\\":\\\"object\\\"}}}\", \
+                    tagMappings: [], sensitiveFields: [], privateFields: [], \
+                    blobFields: [{field: \"doc\", subjectKey: \"customer\", subjectField: \"id\"}], \
+                    externalCreationAllowed: true, directCreationAllowed: true, \
+                    systemTriggeredAllowed: false, eventReadAllowed: true) { name } \
+            }",
+            json!({ "bc": template_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+
+        let tenant_name = unique_name("btnt");
+        let response = graphql_request(
+            &router,
+            &superadmin_jwt,
+            CREATE_FROM_TEMPLATE_MUTATION,
+            json!({
+                "template": template_name,
+                "name": tenant_name,
+                "roleId": tenant_role.id,
+                "level": "ADMIN",
+            }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+
+        let copied = skilj_core::db::get_event_type(&pool, &tenant_name, "BlobFixtureEvent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            copied.blob_fields,
+            vec![skilj_core::blob::BlobField::with_subject("doc", "customer", "id")]
+        );
+    });
+}

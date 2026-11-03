@@ -223,7 +223,9 @@ jobs:
       # skilj-inspector), and a new crate is skipped until it has a
       # release to compare with. skilj-kafka is why this job installs
       # cmake: building its baseline compiles librdkafka.
-      - run: cargo semver-checks --workspace
+      # skilj-blob-s3 isn't on crates.io yet, so it has no baseline to compare
+      # with. Drop the exclude once 0.3.0 is published.
+      - run: cargo semver-checks --workspace --exclude skilj-blob-s3
 
   machete:
     runs-on: ubuntu-24.04

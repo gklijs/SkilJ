@@ -216,6 +216,8 @@ struct MockSkiljState {
     /// "the target keeps failing" trigger `an_inbound_message_parks_after_exhausting_retries`
     /// needs.
     fail_external_requests: Arc<Mutex<usize>>,
+    /// How many `POST /v1/blobs/{boundedContext}` this mock received.
+    blob_uploads: Arc<Mutex<usize>>,
     /// Same idea, for `POST /v1/events/consume/ack` -
     /// `an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap`'s
     /// own deterministic trigger.
@@ -322,6 +324,14 @@ async fn post_events_external(
     (
         StatusCode::CREATED,
         Json(json!({ "sequence": 1, "redelivered": false })),
+    )
+}
+
+async fn post_blob(State(state): State<MockSkiljState>) -> (StatusCode, Json<Value>) {
+    *state.blob_uploads.lock().unwrap() += 1;
+    (
+        StatusCode::CREATED,
+        Json(json!({ "$blob": "b1", "sha256": "ab", "size": 1, "media_type": "text/plain" })),
     )
 }
 
@@ -469,6 +479,7 @@ async fn serve_mock_skilj(state: MockSkiljState) -> String {
         .route("/v1/events/consume", get(get_events_consume))
         .route("/v1/events/consume/ack", post(post_events_consume_ack))
         .route("/v1/events/external", post(post_events_external))
+        .route("/v1/blobs/{bounded_context}", post(post_blob))
         .route("/v1/commands/trigger", post(post_commands_trigger))
         .route(
             "/v1/events/external/batch",
@@ -1013,6 +1024,91 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
             0,
             "every attempt failed, so a real event must never have been created"
         );
+    });
+}
+
+/// docs/architecture.md §239: a message's marked fields are uploaded once,
+/// however many attempts it takes, and it parks holding the reference,
+/// since `retryParkedDelivery` replays the request without the bridge.
+#[test]
+fn a_parked_message_holds_the_reference_its_one_upload_answered() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-in-blobs");
+        create_topic(bootstrap_servers, &topic).await;
+        let mock_state = MockSkiljState::default();
+        *mock_state.fail_external_requests.lock().unwrap() = 2;
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-blobs")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+        producer
+            .send(
+                FutureRecord::to(&topic)
+                    .payload(r#"{"orderId":"o-blob","document":"the bytes"}"#)
+                    .key("k"),
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            topic.clone(),
+            InboundMapping {
+                blobs: Some(skilj_bridge::InboundBlobs {
+                    bounded_context: "orders".to_string(),
+                    fields: vec![skilj_bridge::InboundBlobField {
+                        field: "document".to_string(),
+                        media_type: "text/plain".to_string(),
+                        subject: None,
+                    }],
+                }),
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let http = skilj_kafka::http_client();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(10),
+            1.0,
+            Duration::from_millis(10),
+            2,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mappings, &retry_policy).await;
+        });
+        let mut parked = None;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(p) = mock_state.parked_deliveries.lock().unwrap().first() {
+                parked = Some(p.clone());
+                break;
+            }
+        }
+        let parked = parked.expect("a parked delivery within the timeout");
+        assert_eq!(parked["attemptCount"], json!(2));
+        assert_eq!(
+            parked["request"]["payload"]["document"]["$blob"],
+            json!("b1")
+        );
+        assert_eq!(parked["request"]["payload"]["orderId"], json!("o-blob"));
+        assert_eq!(*mock_state.blob_uploads.lock().unwrap(), 1);
     });
 }
 
