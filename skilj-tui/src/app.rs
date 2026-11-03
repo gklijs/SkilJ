@@ -73,6 +73,8 @@ pub enum AppEvent {
     LiveEvent(Result<Value, ClientError>),
     /// `true` when this is a next page (`n`) to append, not a fresh query.
     QueryEventsResult(Result<Value, ClientError>, bool),
+    /// What `b` did: a line for the status bar.
+    BlobsDownloaded(String),
     /// What `inspectEvent` said about a batch of the shown events.
     QueryEventsStanceResult(Result<Value, ClientError>),
     QueryEventsTypesResult(Result<Value, ClientError>),
@@ -325,6 +327,9 @@ impl App {
             AppEvent::LiveEvent(Err(e)) => {
                 self.live_connected = false;
                 self.status = Some(format!("live events: {e}"));
+            }
+            AppEvent::BlobsDownloaded(status) => {
+                self.status = Some(status);
             }
             AppEvent::QueryEventsResult(result, append) => {
                 self.query_events.query_loading = false;
@@ -600,6 +605,7 @@ impl App {
             KeyCode::Enter => self.submit_query_events(),
             KeyCode::Char('n') => self.next_query_events_page(),
             KeyCode::Char('s') => self.fetch_event_stances(),
+            KeyCode::Char('b') => self.download_shown_blobs(),
             _ => {}
         }
     }
@@ -681,6 +687,39 @@ impl App {
                 .request(&document, serde_json::json!({ "bc": bounded_context }))
                 .await;
             let _ = tx.send(AppEvent::QueryEventsStanceResult(result));
+        });
+    }
+
+    /// Downloads every blob the shown events reference into the working
+    /// directory, as `<id>` (docs/architecture.md §239).
+    fn download_shown_blobs(&mut self) {
+        let ids = blob_ids(&self.query_events.results);
+        if ids.is_empty() {
+            self.status = Some("no blobs in the shown events".to_string());
+            return;
+        }
+        self.status = Some(format!("downloading {} blob(s)...", ids.len()));
+        let client = self.client.clone();
+        let tx = self.events_tx.clone();
+        let bounded_context = self.bounded_context.clone();
+        tokio::spawn(async move {
+            let (mut saved, mut refused) = (0, 0);
+            let mut failure = None;
+            for id in &ids {
+                match client.download_blob(&bounded_context, id).await {
+                    Ok(Some(bytes)) => match tokio::fs::write(id, bytes).await {
+                        Ok(()) => saved += 1,
+                        Err(e) => failure = Some(e.to_string()),
+                    },
+                    Ok(None) => refused += 1,
+                    Err(e) => failure = Some(e.to_string()),
+                }
+            }
+            let status = match failure {
+                Some(e) => format!("{saved} blob(s) saved, {refused} not readable, failed: {e}"),
+                None => format!("{saved} blob(s) saved, {refused} not readable"),
+            };
+            let _ = tx.send(AppEvent::BlobsDownloaded(status));
         });
     }
 
@@ -1084,5 +1123,58 @@ impl App {
                 .await;
             let _ = tx.send(AppEvent::ParkedDeliveryActionResult(result));
         });
+    }
+}
+
+/// Every distinct blob id the rows' payloads reference. An id comes from a
+/// server's payload and becomes a file name, so only a plain one counts.
+fn blob_ids(rows: &[Value]) -> Vec<String> {
+    fn walk(value: &Value, ids: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => match map.get("$blob").and_then(Value::as_str) {
+                Some(id) => {
+                    let plain = !id.is_empty()
+                        && id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                    if plain && !ids.iter().any(|known| known == id) {
+                        ids.push(id.to_string());
+                    }
+                }
+                None => map.values().for_each(|value| walk(value, ids)),
+            },
+            Value::Array(items) => items.iter().for_each(|value| walk(value, ids)),
+            _ => {}
+        }
+    }
+    let mut ids = Vec::new();
+    for row in rows {
+        let payload = row
+            .get("payload")
+            .and_then(Value::as_str)
+            .and_then(|payload| serde_json::from_str::<Value>(payload).ok());
+        if let Some(payload) = payload {
+            walk(&payload, &mut ids);
+        }
+    }
+    ids
+}
+
+#[cfg(test)]
+mod blob_tests {
+    use super::*;
+
+    #[test]
+    fn blob_ids_are_distinct_and_never_a_path() {
+        let reference = |id: &str| serde_json::json!({"$blob": id, "sha256": "a", "size": 1, "media_type": "t"});
+        let rows = vec![
+            serde_json::json!({"payload": serde_json::json!({"a": reference("x-1")}).to_string()}),
+            serde_json::json!({"payload": serde_json::json!({
+                "a": reference("x-1"),
+                "b": reference("../../etc/passwd"),
+            }).to_string()}),
+            serde_json::json!({"payload": "not json"}),
+        ];
+        assert_eq!(blob_ids(&rows), vec!["x-1".to_string()]);
     }
 }

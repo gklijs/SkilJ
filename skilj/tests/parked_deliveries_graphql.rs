@@ -268,6 +268,7 @@ async fn setup_with(
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: false,
         system_triggered_allowed: false,
@@ -540,6 +541,7 @@ fn retrying_a_delivery_whose_target_bounded_context_was_hard_deleted_errors_grac
             owner_tag_key: None,
             sensitive_fields: Vec::new(),
             private_fields: Vec::new(),
+            blob_fields: Vec::new(),
             rest_trigger_allowed: false,
         };
         db::upsert_command_type(&pool, &command_type).await.unwrap();

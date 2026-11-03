@@ -5,7 +5,8 @@
 //! bounded context doesn't have, or with another hash, size or media type,
 //! or in a field the type doesn't declare, is refused and nothing is
 //! written; a command and the event its `decide()` returns can both carry
-//! references; and `build()` refuses a blob field that is also sensitive.
+//! references; and `build()` refuses a blob field overlapping a sensitive
+//! one. `blob_lifecycle.rs` covers the REST routes, encryption and erasure.
 //! Same `DATABASE_URL`-then-embedded-Postgres-then-skip harness as
 //! `payload_validation.rs`.
 
@@ -270,6 +271,7 @@ async fn upload(setup: &Setup, bytes: &[u8]) -> BlobRef {
         "application/pdf",
         futures_util::stream::iter(chunks).boxed(),
         DEFAULT_MAX_BLOB_BYTES,
+        None,
         test_now(),
     )
     .await
@@ -334,10 +336,11 @@ fn an_uploaded_blob_reads_back_byte_for_byte_and_its_reference_is_recorded() {
         assert_eq!(state(&setup, &reference.id).await, Some(BlobState::Pending));
 
         let store = PostgresBlobStore::new(setup.pool.clone());
-        let (served, stream) = db::read_blob(&setup.pool, &store, &setup.bc_name, &reference.id)
-            .await
-            .unwrap()
-            .unwrap();
+        let (served, stream) =
+            db::read_blob(&setup.pool, &store, &setup.bc_name, &reference.id, None)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(served, reference);
         let read: Vec<u8> = stream
             .map(|chunk| chunk.unwrap())
@@ -497,6 +500,7 @@ fn an_upload_past_the_blob_limit_is_refused_and_leaves_nothing_behind() {
             "application/octet-stream",
             futures_util::stream::iter(vec![Ok(vec![0u8; 64])]).boxed(),
             16,
+            None,
             test_now(),
         )
         .await

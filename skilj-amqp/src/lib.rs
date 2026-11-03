@@ -232,6 +232,13 @@ impl skilj_bridge::BridgeError for BridgeError {
         }
     }
 
+    fn is_too_large(&self) -> bool {
+        match self {
+            BridgeError::SkiljStatus { body, .. } => skilj_bridge::too_large_refusal(body),
+            _ => false,
+        }
+    }
+
     fn is_permanent(&self) -> bool {
         matches!(self, BridgeError::MalformedPayload(_))
     }
@@ -969,8 +976,27 @@ async fn handle_one<S: std::future::Future<Output = ()>>(
 ) -> One {
     let payload = delivery.body().0.as_ref();
     let mut retry = skilj_retry::MessageRetry::default();
+    // The message with its blobs uploaded (docs/architecture.md §239), kept
+    // across retries and parked as such.
+    let mut offloaded: Option<Vec<u8>> = None;
     loop {
-        let e = match dispatch_inbound_message(http, skilj_base_url, mapping, meta, payload).await {
+        let attempt: Result<(), BridgeError> = async {
+            if offloaded.is_none() {
+                offloaded =
+                    skilj_bridge::offload_blob_fields(http, skilj_base_url, mapping, payload)
+                        .await?;
+            }
+            dispatch_inbound_message(
+                http,
+                skilj_base_url,
+                mapping,
+                meta,
+                offloaded.as_deref().unwrap_or(payload),
+            )
+            .await
+        }
+        .await;
+        let e = match attempt {
             Ok(()) => {
                 if let Err(e) = receiver.accept(delivery).await {
                     tracing::error!("accepting an AMQP delivery failed: {e}");
@@ -979,6 +1005,17 @@ async fn handle_one<S: std::future::Future<Output = ()>>(
             }
             Err(e) => e,
         };
+        if e.is_too_large() {
+            skilj_bridge::record_oversized_message(
+                "amqp",
+                &message_identifier(meta),
+                &e.to_string(),
+            );
+            if let Err(e) = receiver.accept(delivery).await {
+                tracing::error!("accepting an AMQP delivery failed: {e}");
+            }
+            return One::Handled;
+        }
         if let BridgeError::Unsupported { what } = &e {
             tracing::error!(
                 address,
@@ -1012,7 +1049,7 @@ async fn handle_one<S: std::future::Future<Output = ()>>(
                     "dispatch failed repeatedly - parking and accepting so this \
                      message doesn't block redelivery forever"
                 );
-                let payload_json = parked_payload(payload);
+                let payload_json = parked_payload(offloaded.as_deref().unwrap_or(payload));
                 let body = inbound_request_body(mapping, meta, &payload_json);
                 let identifier = message_identifier(meta);
                 let idempotency_key = inbound_idempotency_key(mapping, meta);

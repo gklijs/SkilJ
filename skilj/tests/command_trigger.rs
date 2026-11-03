@@ -1483,6 +1483,7 @@ fn the_bridges_batch_client_counts_what_the_trigger_route_got_done() {
         let (skilj, credential, pool, bc_name, _, _) = setup().await;
         let url = serve_rest(&skilj).await;
         let mapping = skilj_bridge::InboundMapping {
+            blobs: None,
             credential,
             action: skilj_bridge::InboundAction::Trigger {
                 command_type: "WithdrawMoney".to_string(),

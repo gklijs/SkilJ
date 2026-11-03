@@ -86,6 +86,17 @@ pub async fn load_bounded_context_data(
     })
 }
 
+/// What the event list shows next to an event whose payload references
+/// blobs (docs/architecture.md §239). The bytes are the REST route's to
+/// serve, under its access checks; the inspector reads metadata only.
+pub fn blob_marker(payload: &str) -> String {
+    match skilj_core::blob::find_blob_refs(payload).map_or(0, |found| found.len()) {
+        0 => String::new(),
+        1 => " [1 blob]".to_string(),
+        count => format!(" [{count} blobs]"),
+    }
+}
+
 /// What the event list shows next to an event something was said about: a
 /// retraction ends a doubt, so never both.
 pub fn stance_marker(stance: &skilj_core::retraction::EventStance) -> String {
@@ -104,6 +115,11 @@ mod tests {
     #[test]
     fn the_marker_says_what_was_said() {
         let mut stance = EventStance::default();
+        assert_eq!(blob_marker(r#"{"a":1}"#), "");
+        assert_eq!(
+            blob_marker(r#"{"a":{"$blob":"x"},"b":{"$blob":"y"}}"#),
+            " [2 blobs]"
+        );
         assert_eq!(stance_marker(&stance), "");
         stance.doubted_by = Some(8);
         assert_eq!(stance_marker(&stance), " [in doubt by #8]");

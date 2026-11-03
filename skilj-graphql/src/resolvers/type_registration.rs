@@ -19,8 +19,8 @@
 //! lookup's luck.
 
 use super::{
-    not_found, parse_missed_occurrence_policy, parse_private_fields, parse_sensitive_fields,
-    parse_tag_mappings, require_admin_mapping,
+    not_found, parse_blob_fields, parse_missed_occurrence_policy, parse_private_fields,
+    parse_sensitive_fields, parse_tag_mappings, require_admin_mapping,
 };
 use crate::error::to_graphql_error;
 use crate::gql_types::{ProjectionRegistrationResult, ProjectionWithRebuild};
@@ -59,6 +59,7 @@ pub fn register_event_type_field(n: &Naming) -> Field {
                     .transpose()?;
                 let sensitive_fields =
                     parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
+                let blob_fields = parse_blob_fields(ctx.args.get("blobFields"))?;
                 let private_fields = parse_private_fields(&ctx.args.try_get("privateFields")?)?;
                 let external_creation_allowed =
                     ctx.args.try_get("externalCreationAllowed")?.boolean()?;
@@ -101,6 +102,7 @@ pub fn register_event_type_field(n: &Naming) -> Field {
                     owner_tag_key,
                     sensitive_fields,
                     private_fields,
+                    blob_fields,
                     external_creation_allowed,
                     direct_creation_allowed,
                     system_triggered_allowed,
@@ -137,6 +139,10 @@ pub fn register_event_type_field(n: &Naming) -> Field {
     .argument(InputValue::new(
         "ownerTagKey",
         TypeRef::named(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "blobFields",
+        TypeRef::named_nn_list(n.ty("BlobFieldInput")),
     ))
     .argument(InputValue::new(
         "sensitiveFields",
@@ -200,6 +206,7 @@ pub fn register_command_type_field(n: &Naming) -> Field {
                     .transpose()?;
                 let sensitive_fields =
                     parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
+                let blob_fields = parse_blob_fields(ctx.args.get("blobFields"))?;
                 let private_fields = parse_private_fields(&ctx.args.try_get("privateFields")?)?;
                 let rest_trigger_allowed = ctx.args.try_get("restTriggerAllowed")?.boolean()?;
                 // issue #98. Omitted leaves any stored policy
@@ -252,6 +259,7 @@ pub fn register_command_type_field(n: &Naming) -> Field {
                     owner_tag_key,
                     sensitive_fields,
                     private_fields,
+                    blob_fields,
                     rest_trigger_allowed,
                     existing.as_ref(),
                 )
@@ -311,6 +319,10 @@ pub fn register_command_type_field(n: &Naming) -> Field {
     .argument(InputValue::new(
         "ownerTagKey",
         TypeRef::named(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "blobFields",
+        TypeRef::named_nn_list(n.ty("BlobFieldInput")),
     ))
     .argument(InputValue::new(
         "sensitiveFields",

@@ -767,6 +767,7 @@ entity BoundedContext {
     command_types: CommandType with bounded_context = this
     commands: Command with bounded_context = this
     events: Event with bounded_context = this
+    blobs: Blob with bounded_context = this
     projections: Projection with bounded_context = this
     subscriptions: Subscription with bounded_context = this
     access_mappings: RoleAccessMapping with bounded_context = this
@@ -1030,6 +1031,7 @@ entity CommandType {
     -- to tell historical ones apart the way Command.encryption_keys does
     -- for sensitivity, and nothing that needs to be.
     private_fields: Set<PrivateField>
+    blob_fields: Set<BlobField>            -- see entity Blob
 
     -- Opt-in, mirroring EventType.external_creation_allowed: submitting
     -- this command over GraphQL with a write-level RoleAccessMapping is
@@ -1248,6 +1250,7 @@ entity EventType {
     -- written, so there is no Event.encryption_keys equivalent to tell
     -- historical events apart, and none is needed.
     private_fields: Set<PrivateField>
+    blob_fields: Set<BlobField>            -- see entity Blob
 
     -- Command-triggered origin is always permitted; the other three
     -- origins require explicit opt-in per event type.
@@ -2484,6 +2487,7 @@ entity PrivateFieldGrant {
 -- CapabilitiesAreWellFormed), so a grant stays a bounded named set rather
 -- than an arbitrary-length ACL.
 config {
+    blob_orphan_grace: Duration = 24.hours
     read_cursor_checkout_lease: Duration = 5.minutes
     max_events_per_read: Integer = 1000
     idempotency_key_retention: Duration = 48.hours
@@ -8839,6 +8843,10 @@ rule ForgetSubject {
     ensures:
         key.status = destroyed
         key.destroyed_at = now
+        -- docs/architecture.md §239: nothing serves the subject's blobs from
+        -- now on, and CollectBlobs removes their bytes from the store.
+        for blob in key.bounded_context.blobs where subject_key = key.subject_key and subject_value = key.subject_value:
+            blob.status = deleted
         -- docs/architecture.md §205: a blind tag erased with its subject
         -- leaves the subject's events and commands, so the value is free
         -- and no hash of it is left. without_key is a black box: the set
@@ -12329,3 +12337,75 @@ open question "Supergraph-side authorisation - should the description also tell 
 -- schema_is_backwards_compatible notes above the rules). Lists of nested
 -- objects and any second level of nesting remain excluded, but as a
 -- decided cap with stated reasoning rather than an unresolved question.
+
+-- ---------------------------------------------------------------------------
+-- Blobs: the claim check (docs/architecture.md §239)
+-- ---------------------------------------------------------------------------
+--
+-- A payload never carries large bytes; it carries a reference. Upload first,
+-- append second. Every append, on every write path, checks each reference in
+-- its payload under the bounded context's write lock: the field is a declared
+-- blob field, the blob exists in this bounded context, it isn't deleted, and
+-- its size, hash, media type and subject match. Anything else refuses the
+-- write with blob_reference_invalid, and a payload over the limit with
+-- payload_too_large (§238); neither takes a sequence number. These checks are
+-- stated here once rather than repeated in each append rule.
+
+value BlobField {
+    field: String
+    subject_key: String?                   -- set together with subject_field,
+    subject_field: String?                 -- or the bytes aren't encrypted
+}
+
+entity Blob {
+    bounded_context: BoundedContext
+    sha256: String                         -- of the stored bytes: sealed frames
+                                            -- for a blob with a subject, so it
+                                            -- says nothing once the key is gone
+    size: Integer
+    media_type: String
+    subject_key: String?
+    subject_value: String?
+    status: uploaded | referenced | deleted   -- `uploaded` is stored as 'pending'
+    pins: Integer                          -- parked deliveries and pending
+                                            -- proposals that will replay it
+    grace_from: Timestamp
+}
+
+-- Who may upload is a capability on a grant, or a writing token whose type
+-- declares a blob field. Who may read is whoever can read a record
+-- referencing it with that field visible; everyone else is told it doesn't
+-- exist. Neither is modelled further here: the second is the same rendering
+-- every read already performs.
+rule UploadBlob {
+    when: UploadBlob(bounded_context, sha256, size, media_type, subject_key?, subject_value?)
+    requires: bounded_context.status = active
+    ensures:
+        Blob.created(
+            bounded_context: bounded_context,
+            sha256: sha256,
+            size: size,
+            media_type: media_type,
+            subject_key: subject_key,
+            subject_value: subject_value,
+            status: uploaded,
+            pins: 0,
+            grace_from: now
+        )
+}
+
+rule ReferenceBlob {
+    when: ReferenceBlob(blob)
+    requires: blob.status != deleted
+    ensures: blob.status = referenced
+}
+
+-- Past its grace period, a blob nothing references or holds is an orphan.
+-- A holder ending gives its blob a fresh grace period (grace_from = now).
+rule CollectBlobs {
+    when: CollectBlobs(blob)
+    requires: blob.status = uploaded
+    requires: blob.pins = 0
+    requires: blob.grace_from + config.blob_orphan_grace <= now
+    ensures: blob.status = deleted
+}

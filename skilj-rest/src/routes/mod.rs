@@ -1755,6 +1755,7 @@ async fn propose_unless_key_used(
         policy,
         idempotency_key,
         state.key_service.as_ref(),
+        state.projection_dispatcher.payload_limits(),
         Utc::now(),
     )
     .await?;
@@ -1968,6 +1969,17 @@ async fn post_parked_deliveries(
         body.attempt_count,
         body.first_failed_at,
         Utc::now(),
+    )
+    .await?;
+    // A retry replays this request here, without the bridge that uploaded
+    // its blobs, so collection has to pass over them until the row is gone
+    // (docs/architecture.md §239).
+    db::pin_blobs(
+        &state.pool,
+        &bounded_context_name,
+        db::BlobPinHolder::ParkedDelivery,
+        &delivery.id,
+        &request.to_string(),
     )
     .await?;
 

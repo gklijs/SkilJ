@@ -128,6 +128,7 @@ async fn seed(pool: &Pool) -> BoundedContext {
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
         system_triggered_allowed: false,

@@ -16,6 +16,26 @@ type LedgerBatchItemError {
 	message: String!
 }
 
+type LedgerBlobField {
+	field: String!
+	subjectKey: String
+	subjectField: String
+}
+
+input LedgerBlobFieldInput @inaccessible {
+	field: String! @inaccessible
+	subjectKey: String @inaccessible
+	subjectField: String @inaccessible
+}
+
+type LedgerBlobReference {
+	field: String!
+	id: String!
+	sha256: String!
+	size: String!
+	mediaType: String!
+}
+
 type LedgerBoundedContext @inaccessible {
 	name: String!
 	status: LedgerBoundedContextStatus!
@@ -116,6 +136,7 @@ type LedgerCommandType @inaccessible {
 	tagMappings: [LedgerTagMapping!]!
 	ownerTagKey: String
 	sensitiveFields: [LedgerSensitiveField!]!
+	blobFields: [LedgerBlobField!]!
 	restTriggerAllowed: Boolean!
 	privateFields: [LedgerPrivateField!]!
 	consistencyQuery: [LedgerQueryItemMapping!]!
@@ -208,6 +229,7 @@ type LedgerEventType {
 	tagMappings: [LedgerTagMapping!]!
 	ownerTagKey: String
 	sensitiveFields: [LedgerSensitiveField!]!
+	blobFields: [LedgerBlobField!]!
 	externalCreationAllowed: Boolean!
 	directCreationAllowed: Boolean!
 	systemTriggeredAllowed: Boolean!
@@ -391,11 +413,13 @@ type LedgerQueriedCommand @inaccessible {
 	id: String!
 	createdAt: String!
 	payload: String!
+	blobs: [LedgerBlobReference!]!
 }
 
 type LedgerQueriedEvent {
 	sequence: Int!
 	payload: String!
+	blobs: [LedgerBlobReference!]!
 }
 
 type LedgerQueryItemMapping @inaccessible {
@@ -519,8 +543,8 @@ type Mutation {
 	ledgerArchiveBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerDeleteBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerSetPayloadLimits(boundedContext: String!, maxPayloadBytes: Int, warnPayloadBytes: Int): LedgerPayloadLimits! @inaccessible
-	ledgerRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: LedgerMissedOccurrencePolicy): LedgerEventType! @inaccessible
-	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): LedgerCommandType! @inaccessible
+	ledgerRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, blobFields: [LedgerBlobFieldInput!], sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: LedgerMissedOccurrencePolicy): LedgerEventType! @inaccessible
+	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, blobFields: [LedgerBlobFieldInput!], sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): LedgerCommandType! @inaccessible
 	ledgerRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!, ownerTagKey: String, requiresCapability: String): LedgerProjectionRegistrationResult! @inaccessible
 	ledgerRebuildProjection(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
 	ledgerDiscardProjectionRebuild(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible

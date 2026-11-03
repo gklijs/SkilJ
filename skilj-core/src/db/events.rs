@@ -2631,7 +2631,7 @@ pub async fn create_and_insert_external_event(
     // As stored, after encryption (docs/architecture.md §238). A
     // redelivery above was answered before this: it was stored once.
     payload_limits.check_event(&event)?;
-    let blob_claims = event_blob_claims(projection_dispatcher, &event)?;
+    let blob_claims = event_blob_claims(&event)?;
     check_blob_claims(&mut tx, &bounded_context_name, &blob_claims).await?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
     // Fetched only now - after `next_sequence` above already took this
@@ -2949,7 +2949,7 @@ pub(super) async fn insert_external_event_in_tx(
     // Refused alone: the savepoint takes the sequence number back
     // (docs/architecture.md §238, §239).
     payload_limits.check_event(&event)?;
-    let blob_claims = event_blob_claims(projection_dispatcher, &event)?;
+    let blob_claims = event_blob_claims(&event)?;
     let schema_name = &adapter.event_type.bounded_context.name;
     check_blob_claims(tx, schema_name, &blob_claims).await?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, resolved);
@@ -3050,7 +3050,7 @@ pub async fn create_and_insert_direct_event(
     limits
         .apply(projection_dispatcher.payload_limits())
         .check_event(&event)?;
-    let blob_claims = event_blob_claims(projection_dispatcher, &event)?;
+    let blob_claims = event_blob_claims(&event)?;
     check_blob_claims(&mut tx, &bounded_context_name, &blob_claims).await?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
     // Fetched only now - after `next_sequence` above already took this

@@ -81,6 +81,12 @@ pub enum RestError {
     /// or `"manual"`) - distinct from a library-level `Error`, which
     /// always comes from a rule that *did* run.
     InvalidRequest(String),
+    /// A verified Role whose grant in this bounded context doesn't hold the
+    /// `blob-upload` capability (403).
+    UploadNotAllowed,
+    /// No such blob, or none this caller may read: the same answer, so a
+    /// blob id says nothing to someone who can't read it (404).
+    BlobNotFound,
     /// `CommandTrigger`'s own `Arc<dyn CommandDispatcher>` had nothing
     /// registered for this `(bounded_context, command_type)` pair - see
     /// `CommandDispatcher::dispatch`'s own doc comment for why that's
@@ -325,6 +331,16 @@ impl RestError {
                 StatusCode::UNAUTHORIZED,
                 "unrecognised_credential".to_string(),
                 "no AccessToken matches this credential".to_string(),
+            ),
+            RestError::UploadNotAllowed => (
+                StatusCode::FORBIDDEN,
+                "blob_upload_not_allowed".to_string(),
+                "this grant doesn't hold the blob-upload capability".to_string(),
+            ),
+            RestError::BlobNotFound => (
+                StatusCode::NOT_FOUND,
+                "blob_not_found".to_string(),
+                "no such blob".to_string(),
             ),
             RestError::WrongTokenVariant => (
                 StatusCode::FORBIDDEN,

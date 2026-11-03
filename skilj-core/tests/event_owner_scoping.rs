@@ -67,6 +67,7 @@ fn ticket_opened() -> EventType {
         owner_tag_key: Some("company".into()),
         sensitive_fields: Vec::new(),
         private_fields: Vec::new(),
+        blob_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
         system_triggered_allowed: false,

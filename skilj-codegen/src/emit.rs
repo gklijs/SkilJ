@@ -7,8 +7,8 @@
 //! statements in scope.
 
 use crate::spec::{
-    BlindTagSpec, BoundedContextSpec, CommandTypeSpec, ErasureSpec, EventTypeSpec, FieldSpec,
-    FieldType, QueryItemSpec, SensitiveSpec,
+    BlindTagSpec, BlobSpec, BoundedContextSpec, CommandTypeSpec, ErasureSpec, EventTypeSpec,
+    FieldSpec, FieldType, QueryItemSpec, SensitiveSpec,
 };
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -92,6 +92,7 @@ fn field_type_tokens(ty: FieldType) -> TokenStream {
         FieldType::String => quote! { String },
         FieldType::I64 => quote! { i64 },
         FieldType::Bool => quote! { bool },
+        FieldType::Blob => quote! { ::skilj_core::blob::BlobRef },
     }
 }
 
@@ -230,6 +231,32 @@ fn sensitive_fields_fn(sensitive: &[SensitiveSpec]) -> Option<TokenStream> {
     })
 }
 
+/// `None` when no field is `blob`-typed - the trait's own default.
+fn blob_fields_fn(fields: &[FieldSpec], blobs: &[BlobSpec]) -> Option<TokenStream> {
+    let entries: Vec<TokenStream> = fields
+        .iter()
+        .filter(|f| f.ty == FieldType::Blob)
+        .map(|f| {
+            let field = &f.name;
+            match blobs.iter().find(|b| b.field == f.name) {
+                Some(blob) => {
+                    let (subject_key, subject_field) = (&blob.subject_key, &blob.subject_field);
+                    quote! { ::skilj_core::blob::BlobField::with_subject(#field, #subject_key, #subject_field) }
+                }
+                None => quote! { ::skilj_core::blob::BlobField::new(#field) },
+            }
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(quote! {
+        fn blob_fields() -> Vec<::skilj_core::blob::BlobField> {
+            Vec::from([#(#entries),*])
+        }
+    })
+}
+
 /// A `[[blind_tag]]`: its marker type and `BlindTag` impl
 /// (docs/architecture.md §205). `spec::validate` has refused a
 /// `with_subject` erasure without a subject and a normalizer that is
@@ -284,6 +311,7 @@ fn emit_event_type(event: &EventTypeSpec, blind: &BlindKeys) -> TokenStream {
     let name_lit = &event.name;
     let tag_fn = tag_mappings_fn(&event.tags, blind);
     let sensitive_fn = sensitive_fields_fn(&event.sensitive);
+    let blob_fn = blob_fields_fn(&event.fields, &event.blobs);
 
     quote! {
         #payload_tokens
@@ -296,6 +324,7 @@ fn emit_event_type(event: &EventTypeSpec, blind: &BlindKeys) -> TokenStream {
             const NAME: &'static str = #name_lit;
             #tag_fn
             #sensitive_fn
+            #blob_fn
         }
     }
 }
@@ -318,6 +347,7 @@ fn emit_command_type(
     let name_lit = &command.name;
     let tag_fn = tag_mappings_fn(&command.tags, blind);
     let sensitive_fn = sensitive_fields_fn(&command.sensitive);
+    let blob_fn = blob_fields_fn(&command.fields, &command.blobs);
     let query_fn = consistency_query_fn(
         &command.query,
         command.reads_nothing,
@@ -349,6 +379,7 @@ fn emit_command_type(
             const NAME: &'static str = #name_lit;
             #tag_fn
             #sensitive_fn
+            #blob_fn
             #query_fn
             #rest_fn
             fn decide(
@@ -444,6 +475,41 @@ fn snake_case_to_pascal_case(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod blob_tests {
+    use super::*;
+
+    #[test]
+    fn only_blob_typed_fields_are_declared_with_their_subject() {
+        let fields: Vec<FieldSpec> = vec![
+            FieldSpec {
+                name: "id".to_string(),
+                ty: FieldType::String,
+            },
+            FieldSpec {
+                name: "doc".to_string(),
+                ty: FieldType::Blob,
+            },
+            FieldSpec {
+                name: "scan".to_string(),
+                ty: FieldType::Blob,
+            },
+        ];
+        let blobs = vec![BlobSpec {
+            field: "scan".to_string(),
+            subject_key: "customer".to_string(),
+            subject_field: "id".to_string(),
+        }];
+        let emitted = blob_fields_fn(&fields, &blobs).unwrap().to_string();
+        assert!(emitted.contains("BlobField :: new (\"doc\")"), "{emitted}");
+        assert!(
+            emitted.contains("BlobField :: with_subject (\"scan\" , \"customer\" , \"id\")"),
+            "{emitted}"
+        );
+        assert!(blob_fields_fn(&fields[..1], &[]).is_none());
+    }
 }
 
 #[cfg(test)]

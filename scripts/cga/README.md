@@ -69,6 +69,16 @@ unchanged. This baseline update accepts additional analyzed code, not a reductio
 in potential panics. Database and Unicode edge tests complement the analysis;
 they do not establish panic freedom.
 
+The issue #132 large-payload change also re-records it after review: 407 new
+identities, 86 gone, mostly in the new `db/blobs.rs` and `blob.rs` and in the
+checks added to the append paths. They are SQLx calls, formatting, cleanup,
+allocation and serde derives, plus the poison-tolerant lock of the payload
+warning throttle; the change adds no `unwrap`, `expect` or indexing outside
+tests. Moved code and closure line numbers account for the ones gone. The
+skipped generic target multiset, tool and configuration are unchanged; the
+dependency snapshot grows with `object_store` in `skilj-blob-s3`. This accepts
+additional analyzed code, not a reduction in potential panics.
+
 `baseline.json` records a multiset of `(file, diagnostic, normalized source
 span)`, rather than just a maximum count. Line numbers and indentation
 are excluded: moving code does not create findings. A new finding cannot

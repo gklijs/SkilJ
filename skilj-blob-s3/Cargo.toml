@@ -1,0 +1,21 @@
+[package]
+name = "skilj-blob-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "A skilj blob store on S3 or any S3-compatible object store, so large payloads' bytes live outside Postgres."
+keywords = ["s3", "object-store", "event-sourcing", "skilj"]
+categories = ["database"]
+
+[dependencies]
+skilj-core.workspace = true
+futures-util.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+object_store = { version = "0.14.2", features = ["aws"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+testcontainers-modules = "0.15"

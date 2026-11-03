@@ -14,6 +14,7 @@ pub(super) struct CommandTypeRow {
     pub(super) sensitive_fields: Json<Vec<SensitiveField>>,
     pub(super) rest_trigger_allowed: bool,
     pub(super) private_fields: Json<Vec<PrivateField>>,
+    pub(super) blob_fields: Json<Vec<crate::blob::BlobField>>,
 }
 
 impl CommandTypeRow {
@@ -27,6 +28,7 @@ impl CommandTypeRow {
             owner_tag_key: self.owner_tag_key,
             sensitive_fields: self.sensitive_fields.0,
             private_fields: self.private_fields.0,
+            blob_fields: self.blob_fields.0,
             rest_trigger_allowed: self.rest_trigger_allowed,
         }
     }
@@ -34,7 +36,7 @@ impl CommandTypeRow {
 
 pub(super) const COMMAND_TYPE_COLUMNS: &str =
     "name, schema, schema_version, tag_mappings, owner_tag_key, \
-    sensitive_fields, rest_trigger_allowed, private_fields";
+    sensitive_fields, rest_trigger_allowed, private_fields, blob_fields";
 
 /// See `upsert_event_type` above - same shape and reasoning.
 #[tracing::instrument(skip_all)]
@@ -43,13 +45,14 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
     let schema = schema_ident(&ct.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.command_types ({COMMAND_TYPE_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
          ON CONFLICT (name) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
             tag_mappings = EXCLUDED.tag_mappings, owner_tag_key = EXCLUDED.owner_tag_key, \
             sensitive_fields = EXCLUDED.sensitive_fields, \
             rest_trigger_allowed = EXCLUDED.rest_trigger_allowed, \
-            private_fields = EXCLUDED.private_fields"
+            private_fields = EXCLUDED.private_fields, \
+            blob_fields = EXCLUDED.blob_fields"
     )))
     .bind(&ct.name)
     .bind(&ct.schema)
@@ -59,6 +62,7 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
     .bind(Json(&ct.sensitive_fields))
     .bind(ct.rest_trigger_allowed)
     .bind(Json(&ct.private_fields))
+    .bind(Json(&ct.blob_fields))
     .execute(pool)
     .await?;
     notify_registration_changed(pool).await;

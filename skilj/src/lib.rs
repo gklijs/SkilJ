@@ -233,6 +233,13 @@ const IDEMPOTENCY_KEY_STARTUP_GRACE: std::time::Duration = std::time::Duration::
 /// batch comes back short.
 const IDEMPOTENCY_KEY_CLEANUP_BATCH: i64 = 10_000;
 
+/// How often the blob collection task runs at most (docs/architecture.md
+/// §239); erased bytes outlive their subject's `forgetSubject` by about this.
+const BLOB_COLLECTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Blobs one collection pass handles per bounded context.
+const BLOB_COLLECTION_BATCH: i64 = 500;
+
 /// [`SkiljBuilder::deadline_retention`]'s default: 30 days.
 pub const DEFAULT_DEADLINE_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(30 * 24 * 60 * 60);
@@ -414,9 +421,10 @@ pub struct Skilj {
     /// `SkiljBuilder::payload_limits` (docs/architecture.md §238), handed
     /// to every write path through `projection_dispatcher()`.
     payload_limits: skilj_core::payload_limits::PayloadLimits,
-    /// Declared blob fields, handed out the same way (§239).
-    event_blob_fields: BlobFieldsByType,
-    command_blob_fields: BlobFieldsByType,
+    /// `SkiljBuilder::blob_store` (docs/architecture.md §239).
+    blob_store: Arc<dyn skilj_core::blob::BlobStore>,
+    /// `SkiljBuilder::max_blob_bytes`.
+    max_blob_bytes: u64,
     /// `Arc`-wrapped for the identical reason `command_types`/`projections`
     /// are - `event_dispatcher()` hands out a cheap `Arc<dyn
     /// EventDispatcher>`, and the background scheduler task spawned in
@@ -683,9 +691,6 @@ struct ProjectionDispatcherImpl {
     template_cache: skilj_core::template_cache::TemplateCache,
     /// `SkiljBuilder::payload_limits` (docs/architecture.md §238).
     payload_limits: skilj_core::payload_limits::PayloadLimits,
-    /// Declared blob fields (docs/architecture.md §239).
-    event_blob_fields: BlobFieldsByType,
-    command_blob_fields: BlobFieldsByType,
 }
 
 impl ProjectionDispatcherImpl {
@@ -762,34 +767,6 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
 
     fn payload_limits(&self) -> skilj_core::payload_limits::PayloadLimits {
         self.payload_limits
-    }
-
-    fn event_blob_fields(
-        &self,
-        bounded_context: &str,
-        event_type: &str,
-    ) -> Vec<skilj_core::blob::BlobField> {
-        let bounded_context = self
-            .template_cache
-            .effective_bounded_context(bounded_context);
-        self.event_blob_fields
-            .get(&(bounded_context, event_type.to_string()))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn command_blob_fields(
-        &self,
-        bounded_context: &str,
-        command_type: &str,
-    ) -> Vec<skilj_core::blob::BlobField> {
-        let bounded_context = self
-            .template_cache
-            .effective_bounded_context(bounded_context);
-        self.command_blob_fields
-            .get(&(bounded_context, command_type.to_string()))
-            .cloned()
-            .unwrap_or_default()
     }
 
     fn subject_key(&self, bounded_context: &str, projection_name: &str) -> Option<&'static str> {
@@ -1113,6 +1090,9 @@ impl Skilj {
                 skilj_core::slow_command::DEFAULT_SLOW_DECIDE_WARNING,
             ),
             payload_limits: skilj_core::payload_limits::PayloadLimits::default(),
+            blob_store: None,
+            max_blob_bytes: skilj_core::blob::DEFAULT_MAX_BLOB_BYTES,
+            blob_orphan_grace: skilj_core::blob::DEFAULT_ORPHAN_GRACE,
             application_version: None,
         }
     }
@@ -1149,8 +1129,6 @@ impl Skilj {
             projections: self.projections.clone(),
             template_cache: self.template_cache.clone(),
             payload_limits: self.payload_limits,
-            event_blob_fields: self.event_blob_fields.clone(),
-            command_blob_fields: self.command_blob_fields.clone(),
         })
     }
 
@@ -1217,6 +1195,16 @@ impl Skilj {
             self.max_events_per_read,
             self.command_batcher.clone(),
         )
+        .merge(skilj_rest::blobs::router(skilj_rest::blobs::BlobRoutes {
+            pool: self.pool.clone(),
+            store: self.blob_store.clone(),
+            max_blob_bytes: self.max_blob_bytes,
+            key_service: self.key_service.clone(),
+            identity: self
+                .identity_provider
+                .as_ref()
+                .map(|idp| (idp.config.clone(), idp.cache.clone())),
+        }))
     }
 
     /// `skilj-graphql`'s single unified schema, mounted onto a fresh
@@ -1851,6 +1839,22 @@ fn keep_stored_protections(
     (sensitive, private, owner_tag_key, added)
 }
 
+/// This process's blob fields plus any stored one with a subject it doesn't
+/// declare. Startup never weakens a protection (docs/architecture.md §102):
+/// dropping it would store new bytes in plaintext.
+fn keep_stored_blob_subjects(
+    ours: &[skilj_core::blob::BlobField],
+    stored: Option<&[skilj_core::blob::BlobField]>,
+) -> Vec<skilj_core::blob::BlobField> {
+    let mut kept = ours.to_vec();
+    for field in stored.unwrap_or_default() {
+        if field.subject_key.is_some() && !kept.iter().any(|f| f.field == field.field) {
+            kept.push(field.clone());
+        }
+    }
+    kept
+}
+
 /// The startup registration side of `SkiljBuilder::application_version`
 /// (docs/architecture.md §104).
 struct RegistrationVersion {
@@ -2078,44 +2082,20 @@ struct RegisteredCommandType {
     decide_from_snapshot: DecideFromSnapshotFn,
 }
 
-/// What `build()` refuses about blob fields (docs/architecture.md §239):
-/// an empty field, one declared twice by a type, or one also declared
-/// sensitive - until blobs are encrypted under the subject's key, the
-/// reference would be encrypted and its bytes would not.
-fn validate_blob_fields(
+/// Says which type a refused blob field declaration belongs to.
+fn invalid_blob_declaration(
     kind: &str,
     bounded_context: &str,
     name: &str,
-    blob_fields: &[skilj_core::blob::BlobField],
-    sensitive_fields: &[skilj_core::shared::SensitiveField],
-) -> Result<(), skilj_core::Error> {
-    let refuse = |why: String| {
-        Err(skilj_core::event_store::Error::InvalidBlobField(format!(
-            "{kind} {name:?} in bounded context {bounded_context:?}: {why}"
-        ))
-        .into())
-    };
-    let mut seen = std::collections::HashSet::new();
-    for blob in blob_fields {
-        if blob.field.is_empty() {
-            return refuse("a blob field names no field".to_string());
-        }
-        if !seen.insert(blob.field.as_str()) {
-            return refuse(format!("blob field {:?} is declared twice", blob.field));
-        }
-        if sensitive_fields.iter().any(|s| s.field == blob.field) {
-            return refuse(format!(
-                "{:?} is declared both a blob field and a sensitive field",
-                blob.field
-            ));
-        }
-    }
-    Ok(())
+    error: skilj_core::Error,
+) -> skilj_core::Error {
+    use skilj_core::error::SkiljRejection;
+    skilj_core::event_store::Error::InvalidBlobField(format!(
+        "{kind} {name:?} in bounded context {bounded_context:?}: {}",
+        error.message()
+    ))
+    .into()
 }
-
-/// Each registered type's blob fields, by `(bounded context, type name)`,
-/// for `ProjectionDispatcher::event_blob_fields`/`command_blob_fields`.
-type BlobFieldsByType = Arc<HashMap<(String, String), Vec<skilj_core::blob::BlobField>>>;
 
 /// What `build()` refuses about blind tags (docs/architecture.md §205): a
 /// declared `BlindTag` without a `blind_index_key`; a type mapping a key
@@ -3053,6 +3033,9 @@ pub struct SkiljBuilder {
     slow_command_read_warning: Option<std::time::Duration>,
     slow_command_decide_warning: Option<std::time::Duration>,
     payload_limits: skilj_core::payload_limits::PayloadLimits,
+    blob_store: Option<Arc<dyn skilj_core::blob::BlobStore>>,
+    max_blob_bytes: u64,
+    blob_orphan_grace: std::time::Duration,
     application_version: Option<u64>,
 }
 
@@ -3719,6 +3702,32 @@ impl SkiljBuilder {
         self
     }
 
+    /// Where blob bytes are kept (docs/architecture.md §239). Defaults to
+    /// [`skilj_core::db::PostgresBlobStore`], a table in each bounded
+    /// context's own schema; `skilj-blob-s3` keeps them in an object store.
+    pub fn blob_store(mut self, store: Arc<dyn skilj_core::blob::BlobStore>) -> Self {
+        self.blob_store = Some(store);
+        self
+    }
+
+    /// The most bytes one blob may hold. Defaults to
+    /// [`skilj_core::blob::DEFAULT_MAX_BLOB_BYTES`], 64 MiB. The Postgres
+    /// backend holds an upload in memory while it stores it, and `bytea`
+    /// stops at 1 GB, so go higher only with another store.
+    pub fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
+        self.max_blob_bytes = max_blob_bytes;
+        self
+    }
+
+    /// How long an uploaded blob nothing references survives. Defaults to
+    /// [`skilj_core::blob::DEFAULT_ORPHAN_GRACE`], 24 hours. A blob a parked
+    /// delivery or a pending approval holds waits for that to end, then
+    /// gets this long again.
+    pub fn blob_orphan_grace(mut self, grace: std::time::Duration) -> Self {
+        self.blob_orphan_grace = grace;
+        self
+    }
+
     /// Never delete resolved deadlines: each bounded context's `deadlines`
     /// table keeps one row per deadline ever scheduled.
     pub fn keep_resolved_deadlines_forever(mut self) -> Self {
@@ -3822,31 +3831,13 @@ impl SkiljBuilder {
         )?;
         // docs/architecture.md §239.
         for ((bc, name), t) in &self.event_types {
-            validate_blob_fields("event type", bc, name, &t.blob_fields, &t.sensitive_fields)?;
+            skilj_core::blob::validate_blob_fields(&t.schema, &t.blob_fields, &t.sensitive_fields)
+                .map_err(|e| invalid_blob_declaration("event type", bc, name, e))?;
         }
         for ((bc, name), t) in &self.command_types {
-            validate_blob_fields(
-                "command type",
-                bc,
-                name,
-                &t.blob_fields,
-                &t.sensitive_fields,
-            )?;
+            skilj_core::blob::validate_blob_fields(&t.schema, &t.blob_fields, &t.sensitive_fields)
+                .map_err(|e| invalid_blob_declaration("command type", bc, name, e))?;
         }
-        let event_blob_fields: BlobFieldsByType = Arc::new(
-            self.event_types
-                .iter()
-                .filter(|(_, t)| !t.blob_fields.is_empty())
-                .map(|(key, t)| (key.clone(), t.blob_fields.clone()))
-                .collect(),
-        );
-        let command_blob_fields: BlobFieldsByType = Arc::new(
-            self.command_types
-                .iter()
-                .filter(|(_, t)| !t.blob_fields.is_empty())
-                .map(|(key, t)| (key.clone(), t.blob_fields.clone()))
-                .collect(),
-        );
         // docs/architecture.md §194.
         let graphql_naming = match &self.graphql_federation {
             Some(options) => options.naming().map_err(skilj_core::Error::configuration)?,
@@ -4280,8 +4271,6 @@ impl SkiljBuilder {
                 projections: projections.clone(),
                 template_cache: template_cache.clone(),
                 payload_limits,
-                event_blob_fields: event_blob_fields.clone(),
-                command_blob_fields: command_blob_fields.clone(),
             };
             reconcile_projections(
                 &pool,
@@ -4337,8 +4326,6 @@ impl SkiljBuilder {
                     projections: projections.clone(),
                     template_cache: template_cache.clone(),
                     payload_limits,
-                    event_blob_fields: event_blob_fields.clone(),
-                    command_blob_fields: command_blob_fields.clone(),
                 }),
                 snapshot_dispatcher: Arc::new(SnapshotDispatcherImpl {
                     snapshots: snapshots.clone(),
@@ -4363,7 +4350,13 @@ impl SkiljBuilder {
         }
 
         let background = Background::new();
+        let blob_store = self.blob_store.clone().unwrap_or_else(|| {
+            Arc::new(skilj_core::db::PostgresBlobStore::new(pool.clone()))
+                as Arc<dyn skilj_core::blob::BlobStore>
+        });
         let skilj = Skilj {
+            blob_store,
+            max_blob_bytes: self.max_blob_bytes,
             pool,
             command_types,
             projections,
@@ -4387,8 +4380,6 @@ impl SkiljBuilder {
             command_batcher,
             blind_index,
             payload_limits,
-            event_blob_fields,
-            command_blob_fields,
             background: background.clone(),
         };
 
@@ -4533,6 +4524,34 @@ impl SkiljBuilder {
 
         // docs/architecture.md §163: resolved-deadline retention. No
         // startup grace: nothing retries under a resolved deadline.
+        // docs/architecture.md §239: orphaned blobs, the bytes of deleted
+        // ones and of deleted bounded contexts.
+        {
+            let pool = skilj.pool.clone();
+            let store = skilj.blob_store.clone();
+            let grace =
+                chrono::Duration::from_std(self.blob_orphan_grace).unwrap_or(chrono::Duration::MAX);
+            let interval = self
+                .blob_orphan_grace
+                .min(BLOB_COLLECTION_INTERVAL)
+                .max(std::time::Duration::from_secs(1));
+            background.spawn("blob_collection", move |mut stop| async move {
+                loop {
+                    let start = std::time::Instant::now();
+                    blob_collection_tick(&pool, store.as_ref(), grace)
+                        .instrument(tracing::info_span!("blob_collection_tick"))
+                        .await;
+                    BACKGROUND_TASK_TICK_DURATION.record(
+                        start.elapsed().as_secs_f64(),
+                        &[KeyValue::new("task", "blob_collection")],
+                    );
+                    if stop.sleep(interval).await {
+                        return;
+                    }
+                }
+            });
+        }
+
         if let Some(retention) = self.deadline_retention {
             let retention_pool = skilj.pool.clone();
             let cleanup_interval = retention
@@ -5290,6 +5309,53 @@ impl RetentionTarget {
 /// One pass of a retention task: in every bounded context, delete what
 /// `target` names recorded (or resolved) more than `retention` ago, a
 /// bounded batch at a time.
+/// One pass of [`skilj_core::db::collect_blobs`] over every bounded context,
+/// then of what deleted ones left behind.
+async fn blob_collection_tick(
+    pool: &Pool,
+    store: &dyn skilj_core::blob::BlobStore,
+    grace: chrono::Duration,
+) {
+    let now = chrono::Utc::now();
+    let cutoff = now
+        .checked_sub_signed(grace)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+    let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
+        Ok(bcs) => bcs,
+        Err(e) => {
+            tracing::warn!(error = %e, "blob collection failed to list bounded contexts");
+            return;
+        }
+    };
+    stream::iter(&bounded_contexts)
+        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
+            contain_panic("blob_collection", bc.name.clone(), async move {
+                if let Err(e) = skilj_core::db::collect_blobs(
+                    pool,
+                    store,
+                    &bc.name,
+                    cutoff,
+                    now,
+                    BLOB_COLLECTION_BATCH,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        bounded_context = %bc.name,
+                        error = %e,
+                        "blob collection failed"
+                    );
+                }
+            })
+        })
+        .await;
+    if let Err(e) =
+        skilj_core::db::collect_deleted_contexts(pool, store, BLOB_COLLECTION_BATCH).await
+    {
+        tracing::warn!(error = %e, "removing a deleted bounded context's blobs failed");
+    }
+}
+
 async fn retention_tick(pool: &Pool, target: RetentionTarget, retention: chrono::Duration) {
     let task = target.task();
     let cutoff = chrono::Utc::now()
@@ -5797,6 +5863,10 @@ async fn reconcile_event_types(
                 false,
             ),
         };
+        let blob_fields = keep_stored_blob_subjects(
+            &registered.blob_fields,
+            existing.as_ref().map(|e| e.blob_fields.as_slice()),
+        );
         let register = |existing: Option<&skilj_core::event_store::EventType>| {
             skilj_core::event_store::register_event_type(
                 &mapping,
@@ -5807,6 +5877,7 @@ async fn reconcile_event_types(
                 owner_tag_key.clone(),
                 sensitive_fields.clone(),
                 private_fields.clone(),
+                blob_fields.clone(),
                 registered.external_creation_allowed,
                 registered.direct_creation_allowed,
                 registered.system_triggered_allowed,
@@ -5833,6 +5904,7 @@ async fn reconcile_event_types(
                     stored.owner_tag_key.clone(),
                     stored.sensitive_fields.clone(),
                     stored.private_fields.clone(),
+                    stored.blob_fields.clone(),
                     stored.external_creation_allowed,
                     stored.direct_creation_allowed,
                     stored.system_triggered_allowed,
@@ -5928,6 +6000,10 @@ async fn reconcile_command_types(
                 false,
             ),
         };
+        let blob_fields = keep_stored_blob_subjects(
+            &registered.blob_fields,
+            existing.as_ref().map(|e| e.blob_fields.as_slice()),
+        );
         let register = |existing: Option<&skilj_core::event_store::CommandType>| {
             skilj_core::event_store::register_command_type(
                 &mapping,
@@ -5938,6 +6014,7 @@ async fn reconcile_command_types(
                 owner_tag_key.clone(),
                 sensitive_fields.clone(),
                 private_fields.clone(),
+                blob_fields.clone(),
                 registered.rest_trigger_allowed,
                 existing,
             )
@@ -5956,6 +6033,7 @@ async fn reconcile_command_types(
                     stored.owner_tag_key.clone(),
                     stored.sensitive_fields.clone(),
                     stored.private_fields.clone(),
+                    stored.blob_fields.clone(),
                     stored.rest_trigger_allowed,
                     Some(ours.command_type()),
                 )

@@ -17,12 +17,13 @@ path = "src/lib.rs"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["query"] }
 thiserror.workspace = true
 sha2.workspace = true
 chrono.workspace = true
 skilj-retry.workspace = true
 tracing.workspace = true
+opentelemetry.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]

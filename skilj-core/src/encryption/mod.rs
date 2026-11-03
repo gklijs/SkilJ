@@ -344,6 +344,97 @@ pub fn try_encrypt_leaf(data_key: &DataKey, plaintext: &str) -> Result<String, E
     Ok(crate::base64::encode(&combined))
 }
 
+/// How many plaintext bytes one encrypted blob frame holds
+/// (docs/architecture.md §239).
+pub const BLOB_FRAME_PLAINTEXT: usize = 64 * 1024;
+
+/// What a frame adds to its plaintext: its nonce and tag.
+pub const BLOB_FRAME_OVERHEAD: usize = NONCE_LEN + 16;
+
+/// What binds a frame to its place: the blob's id, the frame's index and
+/// whether it is the last, so frames can't be moved between blobs,
+/// reordered, or cut off at a frame boundary.
+fn blob_frame_aad(blob_id: &str, index: u64, last: bool) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(blob_id.len() + 9);
+    aad.extend_from_slice(&index.to_be_bytes());
+    aad.push(u8::from(last));
+    aad.extend_from_slice(blob_id.as_bytes());
+    aad
+}
+
+/// Seals one frame of a blob: nonce, then ciphertext and tag.
+pub fn seal_blob_frame(
+    data_key: &DataKey,
+    blob_id: &str,
+    index: u64,
+    last: bool,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let nonce_bytes = random_bytes::<NONCE_LEN>()?;
+    let unbound = UnboundKey::new(&AES_256_GCM, &data_key.0).map_err(|_| Error::DecryptFailed)?;
+    let key = LessSafeKey::new(unbound);
+    let mut sealed = plaintext.to_vec();
+    key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce_bytes),
+        Aad::from(blob_frame_aad(blob_id, index, last)),
+        &mut sealed,
+    )
+    .map_err(|_| Error::DecryptFailed)?;
+    let mut frame = Vec::with_capacity(NONCE_LEN + sealed.len());
+    frame.extend_from_slice(&nonce_bytes);
+    frame.extend_from_slice(&sealed);
+    Ok(frame)
+}
+
+/// Opens what [`seal_blob_frame`] sealed, refusing a frame that isn't this
+/// blob's frame at this place.
+pub fn open_blob_frame(
+    data_key: &DataKey,
+    blob_id: &str,
+    index: u64,
+    last: bool,
+    frame: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if frame.len() < BLOB_FRAME_OVERHEAD {
+        return Err(Error::DecryptFailed);
+    }
+    let (nonce_bytes, ciphertext) = frame.split_at(NONCE_LEN);
+    let nonce_bytes: [u8; NONCE_LEN] = nonce_bytes.try_into().map_err(|_| Error::DecryptFailed)?;
+    let unbound = UnboundKey::new(&AES_256_GCM, &data_key.0).map_err(|_| Error::DecryptFailed)?;
+    let key = LessSafeKey::new(unbound);
+    let mut in_out = ciphertext.to_vec();
+    let len = key
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::from(blob_frame_aad(blob_id, index, last)),
+            &mut in_out,
+        )
+        .map_err(|_| Error::DecryptFailed)?
+        .len();
+    in_out.truncate(len);
+    Ok(in_out)
+}
+
+/// How many bytes `plaintext_size` bytes take once framed. An empty blob
+/// is one empty frame.
+pub fn blob_stored_size(plaintext_size: u64) -> u64 {
+    let frames = plaintext_size.div_ceil(BLOB_FRAME_PLAINTEXT as u64).max(1);
+    plaintext_size.saturating_add(frames.saturating_mul(BLOB_FRAME_OVERHEAD as u64))
+}
+
+/// How many frames `stored_size` stored bytes hold.
+pub fn blob_frame_count(stored_size: u64) -> u64 {
+    stored_size
+        .div_ceil((BLOB_FRAME_PLAINTEXT + BLOB_FRAME_OVERHEAD) as u64)
+        .max(1)
+}
+
+/// Inverts [`blob_stored_size`].
+pub fn blob_plaintext_size(stored_size: u64) -> u64 {
+    stored_size
+        .saturating_sub(blob_frame_count(stored_size).saturating_mul(BLOB_FRAME_OVERHEAD as u64))
+}
+
 /// Inverts `encrypt_leaf`.
 pub fn decrypt_leaf(data_key: &DataKey, ciphertext_b64: &str) -> Result<String, Error> {
     let combined = crate::base64::decode(ciphertext_b64).ok_or(Error::DecryptFailed)?;

@@ -158,6 +158,10 @@ pub trait BridgeError: std::error::Error + Send + Sync + 'static {
     /// Whether no retry can change the outcome (e.g. a payload that isn't
     /// JSON) - such failures are parked at once.
     fn is_permanent(&self) -> bool;
+
+    /// Whether skilj refused the message as too large
+    /// ([`too_large_refusal`]): not retried and not parked.
+    fn is_too_large(&self) -> bool;
 }
 
 /// Whether a skilj error response `body` carries one of
@@ -240,6 +244,172 @@ pub struct InboundMapping {
     /// `ExternalEventToken` for `Record`, `CommandToken` for `Trigger`.
     pub credential: String,
     pub action: InboundAction,
+    /// The message's fields to store as blobs (docs/architecture.md §239),
+    /// `None` for none. Everything else stays in the payload, and a payload
+    /// still over the limit is refused like any other.
+    pub blobs: Option<InboundBlobs>,
+}
+
+/// Which of a mapping's message fields become blobs.
+pub struct InboundBlobs {
+    /// The bounded context they are uploaded to: the mapping's type's.
+    pub bounded_context: String,
+    /// The fields. The type must declare each as a blob field.
+    pub fields: Vec<InboundBlobField>,
+}
+
+/// One message field stored as a blob. Its value is always uploaded,
+/// whatever its size, so the stored field has one shape: a `BlobRef`.
+pub struct InboundBlobField {
+    /// The field, dotted for a nested one. A list has each element uploaded.
+    pub field: String,
+    /// The media type its bytes are stored under.
+    pub media_type: String,
+    /// `(subject_key, subject_field)` for a blob encrypted under a
+    /// subject's key, as the type's `BlobField` declares it: `subject_field`
+    /// names the message field holding the subject's identifier.
+    pub subject: Option<(String, String)>,
+}
+
+/// Bytes of one value: a string as its UTF-8, anything else as its JSON.
+fn blob_bytes(value: &serde_json::Value) -> Vec<u8> {
+    match value {
+        serde_json::Value::String(text) => text.clone().into_bytes(),
+        other => other.to_string().into_bytes(),
+    }
+}
+
+/// The value at dotted `path`, for reading the subject.
+fn value_at<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.')
+        .try_fold(root, |value, part| value.get(part))
+}
+
+/// Uploads one value and answers its reference as a JSON value.
+async fn upload_blob(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    bounded_context: &str,
+    field: &InboundBlobField,
+    subject_value: Option<&str>,
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, SkiljError> {
+    let mut request = http
+        .post(format!("{skilj_base_url}/v1/blobs/{bounded_context}"))
+        .bearer_auth(&mapping.credential)
+        .header(reqwest::header::CONTENT_TYPE, field.media_type.as_str())
+        .body(blob_bytes(value));
+    if let (Some((subject_key, _)), Some(subject_value)) = (&field.subject, subject_value) {
+        request = request.query(&[
+            ("subjectKey", subject_key.as_str()),
+            ("subjectValue", subject_value),
+        ]);
+    }
+    let response = require_success(request.send().await?).await?;
+    Ok(response.json().await?)
+}
+
+/// `payload` with every field of `mapping.blobs` uploaded and replaced by
+/// its reference, or `None` when there is nothing to replace: no such
+/// fields, or a message that isn't JSON, which goes on to be refused as
+/// that. A bridge keeps what this answers across retries, so a retry
+/// doesn't upload again, and parks it, because `retryParkedDelivery`
+/// replays the stored request without the bridge.
+pub async fn offload_blob_fields(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    payload: &[u8],
+) -> Result<Option<Vec<u8>>, SkiljError> {
+    let Some(blobs) = &mapping.blobs else {
+        return Ok(None);
+    };
+    let Ok(mut message) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return Ok(None);
+    };
+    let mut replaced = false;
+    for field in &blobs.fields {
+        let subject_value = field.subject.as_ref().and_then(|(_, subject_field)| {
+            value_at(&message, subject_field).map(|value| match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+        });
+        let mut parts = field.field.split('.').peekable();
+        let mut target = Some(&mut message);
+        while let Some(part) = parts.next() {
+            target = target.and_then(|value| value.get_mut(part));
+            if parts.peek().is_none() {
+                break;
+            }
+        }
+        let Some(target) = target.filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if let serde_json::Value::Array(items) = target {
+            for item in items.iter_mut() {
+                *item = upload_blob(
+                    http,
+                    skilj_base_url,
+                    mapping,
+                    &blobs.bounded_context,
+                    field,
+                    subject_value.as_deref(),
+                    item,
+                )
+                .await?;
+            }
+        } else {
+            *target = upload_blob(
+                http,
+                skilj_base_url,
+                mapping,
+                &blobs.bounded_context,
+                field,
+                subject_value.as_deref(),
+                target,
+            )
+            .await?;
+        }
+        replaced = true;
+    }
+    if !replaced {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_vec(&message).unwrap_or_default()))
+}
+
+/// Whether a skilj error response `body` says this message can't ever be
+/// stored: too large for a payload or a blob. Such a message isn't parked:
+/// parking exists to retry what may yet succeed, and storing it there would
+/// only move what the limit keeps out. The bridge calls
+/// [`record_oversized_message`] and moves past it.
+pub fn too_large_refusal(body: &str) -> bool {
+    error_code(body).is_some_and(|code| code == "payload_too_large" || code == "blob_too_large")
+}
+
+/// Logs and counts a message refused as too large that the bridge is moving
+/// past. Its identifier is what finds it again in the broker.
+pub fn record_oversized_message(source: &str, identifier: &str, error: &str) {
+    static COUNTER: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+        std::sync::LazyLock::new(|| {
+            opentelemetry::global::meter("skilj-bridge")
+                .u64_counter("skilj.bridge.oversized_messages")
+                .with_description("Inbound messages refused as too large and moved past")
+                .build()
+        });
+    COUNTER.add(
+        1,
+        &[opentelemetry::KeyValue::new("source", source.to_string())],
+    );
+    tracing::warn!(
+        source,
+        identifier,
+        error,
+        "a message is too large to store - moving past it, not parking it \
+         (docs/architecture.md §238): resend it from the broker if the limit is raised"
+    );
 }
 
 /// Which skilj call a mapped address's messages become. Neither variant's
@@ -462,6 +632,11 @@ pub async fn post_inbound_batch(
     batcher: &InboundBatcher,
     items: &[InboundItem<'_>],
 ) -> usize {
+    // Each message uploads its blobs first and keeps them across retries,
+    // which is the one-at-a-time path.
+    if mapping.blobs.is_some() {
+        return 0;
+    }
     let (url, list) = match &mapping.action {
         InboundAction::Record { .. } => ("/v1/events/external/batch", "events"),
         InboundAction::Trigger { .. } => ("/v1/commands/trigger/batch", "commands"),
@@ -1195,6 +1370,10 @@ mod tests {
 
         fn is_permanent(&self) -> bool {
             matches!(self, TestBridgeError::Broker(_))
+        }
+
+        fn is_too_large(&self) -> bool {
+            matches!(self, TestBridgeError::SkiljStatus { body, .. } if too_large_refusal(body))
         }
     }
 
