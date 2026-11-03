@@ -130,7 +130,8 @@ pub async fn propose_command(
 
     // A proposal is stored too, and an approver would only find out at the
     // end (docs/architecture.md §238, §239). Not under the write lock: the
-    // approval's own submission checks again under it.
+    // approval's own submission checks again under it, against the blobs
+    // this holds from collection below.
     payload_limits_override(pool, bounded_context_name)
         .await?
         .apply(payload_limits)
@@ -150,10 +151,17 @@ pub async fn propose_command(
             subject: declared.subject,
         });
     }
-    if !blob_claims.is_empty() {
-        let mut conn = pool.acquire().await?;
-        check_blob_claims(&mut conn, bounded_context_name, &blob_claims).await?;
-    }
+    let blob_ids: Vec<String> = blob_claims
+        .iter()
+        .map(|claim| claim.reference.id.clone())
+        .collect();
+    // The check, the proposal and its pins in one transaction: a proposal
+    // that exists can always be approved as far as its blobs go. Held first,
+    // so two proposals of one blob queue rather than deadlock on upgrading
+    // the check's shared lock.
+    let mut tx = pool.begin().await?;
+    hold_blobs_for_pin(&mut tx, bounded_context_name, &blob_ids, now).await?;
+    check_blob_claims(&mut tx, bounded_context_name, &blob_claims).await?;
 
     let id = crate::shared::try_generate_token_id()?;
     let expires_at = policy
@@ -180,20 +188,21 @@ pub async fn propose_command(
     .bind(&authorised.causation_id)
     .bind(idempotency_key)
     .bind(expires_at)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if inserted.is_some() {
         // Held until an approver decides, however long that takes.
-        pin_blobs(
-            pool,
+        pin_held_blobs(
+            &mut tx,
             bounded_context_name,
             BlobPinHolder::CommandProposal,
             &id,
-            &protected.payload,
+            &blob_ids,
         )
         .await?;
     }
+    tx.commit().await?;
 
     let proposal_id = match inserted {
         Some((id,)) => id,

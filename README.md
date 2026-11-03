@@ -54,6 +54,10 @@ What you get in one library on one Postgres database, without running a separate
   subscriptions.
 - **Personal data handling built in:** sensitive fields are encrypted per subject, and
   `forgetSubject` makes them unreadable. Blind tags check uniqueness without storing the value.
+- **Large payloads without a side channel:** a payload has a size limit, and a document goes in a
+  blob the payload references. skilj checks the reference, applies the event's access rules to the
+  download, and erases the bytes with the subject, in Postgres or S3
+  ([guide](docs/large-payloads.md)).
 - **Corrections without losing history:** a command can retract an earlier event, and the store
   copies its tags onto the retraction, so a corrected unique value is freed even when it's a blind
   tag. Snapshots leave retracted events out; projections take the contribution out themselves.
@@ -198,6 +202,7 @@ Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/arc
 | [`skilj-kafka`](skilj-kafka) | Optional: a bridge between skilj's own event stream and Kafka, both directions - produce mapped events to a topic, consume a topic into `ExternalEventIngestion`/`CommandTrigger`. See [`docs/architecture.md` §40](docs/architecture.md#skilj-kafka-bridge). |
 | [`skilj-amqp`](skilj-amqp) | Optional: `skilj-kafka`'s own sibling for any AMQP 1.0 broker - Solace PubSub+, Azure Service Bus, ActiveMQ Artemis. See [`docs/architecture.md` §41](docs/architecture.md#skilj-amqp-bridge). |
 | [`skilj-nats`](skilj-nats) | Optional: a third bridge sibling, for NATS JetStream. See [`docs/architecture.md` §42](docs/architecture.md#skilj-nats-bridge). |
+| [`skilj-blob-s3`](skilj-blob-s3) | Optional: keeps blob bytes in S3 or anything S3-compatible instead of Postgres. See [`docs/large-payloads.md`](docs/large-payloads.md). |
 | [`skilj-test-fixture`](skilj-test-fixture) | Optional dev-dependency: a given/when/then test harness for your own `CommandType::decide()`/`Projection::project()` - no database, no HTTP. See [`docs/architecture.md` §45](docs/architecture.md#given-when-then-test-fixture). |
 | [`skilj-retry`](skilj-retry) | Internal: the backoff/attempt-cap policy `skilj-core`'s routes and the broker bridges share. A dependency, not used directly. |
 | [`skilj-macros`](skilj-macros) | Internal proc-macros, re-exported through `skilj-core`/`skilj` (not uniformly - each macro picks whichever crate it applies to) - you won't normally add this directly. |

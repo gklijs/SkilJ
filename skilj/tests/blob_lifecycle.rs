@@ -986,29 +986,18 @@ fn collection_takes_orphans_and_spares_what_is_referenced_or_pinned() {
             setup.file(&writer, "c1", referenced).await,
             StatusCode::CREATED
         );
-        let parked = db::insert_parked_delivery(
+        let parked = db::insert_parked_delivery_holding_blobs(
             &setup.pool,
             &setup.bc,
             "kafka:test",
             db::ParkedDeliveryKind::ExternalEvent,
             "t:0:1",
             Some("token"),
-            None,
-            None,
-            &serde_json::json!({"payload": {"document": pinned}}),
+            &json!({"payload": {"document": pinned}}),
             "refused",
             1,
             now(),
             now(),
-        )
-        .await
-        .unwrap();
-        db::pin_blobs(
-            &setup.pool,
-            &setup.bc,
-            db::BlobPinHolder::ParkedDelivery,
-            &parked.id,
-            &serde_json::json!({"document": pinned}).to_string(),
         )
         .await
         .unwrap();
@@ -1536,5 +1525,199 @@ fn a_parked_message_keeps_its_blob_past_the_grace_period_and_its_retry_succeeds(
         assert!(response.get("errors").is_none(), "{response}");
         assert_eq!(setup.state(&id).await, "referenced");
         assert_eq!(setup.collect_at(later).await.orphans, 0);
+    });
+}
+
+/// Uploads a blob with a subject that fills its frames exactly, so reading
+/// the last frame doesn't happen to run into the end of the stream.
+async fn sealed_exact_frames(setup: &Setup) -> BlobRef {
+    let writer = setup.writer("FiledForCustomer").await;
+    let (status, body) = setup
+        .upload(
+            &writer,
+            "?subjectKey=customer&subjectValue=c7",
+            vec![8; 2 * skilj_core::encryption::BLOB_FRAME_PLAINTEXT],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    reference(&body)
+}
+
+/// Every chunk of a blob's download, and whether any was an error.
+async fn read_to_the_end(setup: &Setup, id: &str) -> (usize, bool) {
+    let (_, mut stream) = db::read_blob(
+        &setup.pool,
+        &store(setup),
+        &setup.bc,
+        id,
+        Some(&key_service()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (mut bytes, mut failed) = (0, false);
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => bytes += chunk.len(),
+            Err(_) => failed = true,
+        }
+    }
+    (bytes, failed)
+}
+
+#[test]
+fn an_encrypted_download_checks_the_hash_even_when_frames_end_exactly() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup().await;
+        let reference = sealed_exact_frames(&setup).await;
+        assert_eq!(
+            read_to_the_end(&setup, &reference.id).await,
+            (2 * skilj_core::encryption::BLOB_FRAME_PLAINTEXT, false)
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"bc_{}\".blobs SET sha256 = 'not-the-hash'",
+            setup.bc
+        )))
+        .execute(&setup.pool)
+        .await
+        .unwrap();
+        assert!(read_to_the_end(&setup, &reference.id).await.1);
+    });
+}
+
+#[test]
+fn an_encrypted_download_refuses_bytes_after_its_last_frame() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup().await;
+        let reference = sealed_exact_frames(&setup).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"bc_{}\".blob_bytes SET bytes = bytes || '\\x00'::bytea",
+            setup.bc
+        )))
+        .execute(&setup.pool)
+        .await
+        .unwrap();
+        assert!(read_to_the_end(&setup, &reference.id).await.1);
+    });
+}
+
+/// A failure writing the pin: what is left must be nothing, and a retry
+/// must end up with both the holder and its pin.
+async fn fail_pins(setup: &Setup) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION \"bc_{bc}\".refuse_pin() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'no pins'; END $$; \
+         CREATE TRIGGER refuse_pin BEFORE INSERT ON \"bc_{bc}\".blob_pins \
+         FOR EACH ROW EXECUTE FUNCTION \"bc_{bc}\".refuse_pin()",
+        bc = setup.bc
+    )))
+    .execute(&setup.pool)
+    .await
+    .unwrap();
+}
+
+async fn allow_pins(setup: &Setup) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER refuse_pin ON \"bc_{}\".blob_pins",
+        setup.bc
+    )))
+    .execute(&setup.pool)
+    .await
+    .unwrap();
+}
+
+async fn count_rows(setup: &Setup, table: &str) -> i64 {
+    let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"bc_{}\".{table}",
+        setup.bc
+    )))
+    .fetch_one(&setup.pool)
+    .await
+    .unwrap();
+    count
+}
+
+#[test]
+fn a_proposal_that_cannot_pin_its_blob_is_not_stored() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup().await;
+        let writer = setup.writer("Filed").await;
+        let (_, body) = setup.upload(&writer, "", vec![1]).await;
+        let held = reference(&body);
+        let token = setup.command_token("ApprovedFiling").await;
+        let payload = json!({"customer_id": "c1", "document": held});
+
+        fail_pins(&setup).await;
+        let (status, _) = setup.trigger(&token, payload.clone()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(count_rows(&setup, "command_proposals").await, 0);
+
+        allow_pins(&setup).await;
+        let (status, _) = setup.trigger(&token, payload).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(count_rows(&setup, "command_proposals").await, 1);
+        assert_eq!(count_rows(&setup, "blob_pins").await, 1);
+    });
+}
+
+#[test]
+fn a_parked_delivery_that_cannot_pin_its_blob_is_not_stored() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let setup = setup().await;
+        let url = setup.serve().await;
+        let credential = setup.external_token("Inbound").await;
+        let mapping = inbound_mapping(&credential, &setup.bc, "body");
+        let http = reqwest::Client::new();
+        let offloaded = skilj_bridge::offload_blob_fields(
+            &http,
+            &url,
+            &mapping,
+            json!({"customer_id": "c1", "body": "x"})
+                .to_string()
+                .as_bytes(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&offloaded).unwrap();
+        let report = || {
+            let (http, url, mapping, payload) = (&http, &url, &mapping, &payload);
+            async move {
+                skilj_bridge::report_parked_delivery(
+                    http,
+                    url,
+                    mapping,
+                    "kafka-inbound",
+                    "t:0:1",
+                    &json!({"payload": payload, "sourceContent": "test"}),
+                    None,
+                    "refused",
+                    3,
+                    now(),
+                )
+                .await
+            }
+        };
+
+        fail_pins(&setup).await;
+        assert!(report().await.is_err());
+        assert_eq!(count_rows(&setup, "parked_deliveries").await, 0);
+
+        allow_pins(&setup).await;
+        report().await.unwrap();
+        assert_eq!(count_rows(&setup, "parked_deliveries").await, 1);
+        assert_eq!(count_rows(&setup, "blob_pins").await, 1);
     });
 }

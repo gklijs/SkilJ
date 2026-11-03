@@ -136,6 +136,14 @@ sensitive field. That's how a command checks an email address is unique
 without the address being stored in the clear - see the
 `skilj-uniqueness` skill and docs/architecture.md §205.
 
+## `blob_fields` - a field holding a reference to large bytes
+
+`fn blob_fields() -> Vec<BlobField>`, on the same field a `BlobRef` typed
+payload field has. A `$blob` value in any other field is refused. It can't
+overlap a sensitive field: for personal data, use
+`BlobField::with_subject(field, subject_key, subject_field)`. See the
+`skilj-large-payloads` skill and docs/architecture.md §239.
+
 ## `field`/`subject_field` shape rule (applies to `TagMapping` too)
 
 Both are a `FieldPath` (a plain `String`) naming either:

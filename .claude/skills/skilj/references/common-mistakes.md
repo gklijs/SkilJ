@@ -41,6 +41,10 @@ another type, made blind while a registered type maps it plainly, or a
 `BlindTag::NORMALIZER_VERSION` other than the stored one. The
 `skilj-uniqueness` skill's error table has the fixes.
 
+**`InvalidBlobField`** - a blob field that's empty, declared twice, not in
+the schema, has half a subject, overlaps a sensitive field, or changes or
+drops an existing subject. See the `skilj-large-payloads` skill.
+
 **`SchemaIncompatible`** - re-registering an existing type with a schema
 change that would break an existing reader: a field removed, an existing
 field tightened from optional to required, or a field's type changed.

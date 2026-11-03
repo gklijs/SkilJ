@@ -103,5 +103,16 @@ async fn the_contract_holds_against_an_s3_compatible_server() {
             .build()
             .unwrap(),
     );
+    // Its log line can come before its port answers on a loaded machine.
+    let mut answered = false;
+    for _ in 0..120 {
+        let listed: Vec<_> = inner.list(None).collect().await;
+        if listed.iter().all(Result::is_ok) {
+            answered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(answered, "S3Mock never answered");
     exercise(S3BlobStore::new(inner.clone(), "tenant"), inner).await;
 }

@@ -331,6 +331,11 @@ flowchart TD
 Notes:
 
 - REST reads fail closed on private fields (§31).
+- A blob's bytes follow the same rules (§239). `GET /v1/blobs/{boundedContext}/{id}` serves a
+  caller who can read a record referencing the blob with that field visible, decided by rendering
+  the record as above, and answers everyone else 404. A blob with a subject also needs what a
+  sensitive field needs; an event read token never decrypts, so it can't have one. Uploading needs
+  the `blob-upload` capability on a Role's grant, or a writing token whose type declares a blob field.
 - Parked requests and a rejection's `matchingEvents` are masked by the same rules (§118, §119).
 - Private fields are redacted in a read, not in stored projection or snapshot state; §177
   documents what a snapshot keeps.
