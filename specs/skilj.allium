@@ -809,11 +809,17 @@ entity ContextCreator {
     kind: SuperadminCreator | SystemCreator
 }
 
-variant SuperadminCreator : ContextCreator {
+-- Layout note for the checker: a variant's opening brace goes on its own
+-- line. allium-cli 3.5.3 (and 3.6.1) parses `variant V : Base {` on one line
+-- as a join lookup `Base{...}`, so the variant's fields were never seen as
+-- fields, and the types they name never counted as referenced.
+variant SuperadminCreator : ContextCreator
+{
     role: Role                  -- the superadmin Role that called AddBoundedContext
 }
 
-variant SystemCreator : ContextCreator {
+variant SystemCreator : ContextCreator
+{
     -- No variant-specific fields, exactly as SystemTriggered has none:
     -- SkilJ is the creator, so there is no Role to point at. Exactly one
     -- instance exists - the `skilj` default - and it creates exactly one
@@ -1347,7 +1353,8 @@ entity AccessToken {
     }
 }
 
-variant ExternalEventToken : AccessToken {
+variant ExternalEventToken : AccessToken
+{
     -- Held by an out-of-core adapter (e.g. a Kafka client, which needs OS
     -- facilities the core deliberately avoids) to authenticate against
     -- ExternalEventIngestion and fail independently if its own
@@ -1374,7 +1381,8 @@ variant ExternalEventToken : AccessToken {
     scope: String?
 }
 
-variant DirectCreationToken : AccessToken {
+variant DirectCreationToken : AccessToken
+{
     event_type: EventType
 
     -- Exactly ExternalEventToken.scope above, on the same terms and with
@@ -1384,7 +1392,8 @@ variant DirectCreationToken : AccessToken {
     scope: String?
 }
 
-variant CommandToken : AccessToken {
+variant CommandToken : AccessToken
+{
     -- Held by an AI or otherwise automated caller that triggers a command
     -- over REST rather than over GraphQL. The command itself is processed
     -- exactly as a GraphQL-submitted one (see ProcessCommand); only the
@@ -1403,7 +1412,8 @@ variant CommandToken : AccessToken {
     scope: String?
 }
 
-variant EventReadToken : AccessToken {
+variant EventReadToken : AccessToken
+{
     -- Held by a remote workflow that fetches events of one type to drive
     -- itself. Read-only: it authorises no writing of any kind.
     event_type: EventType
@@ -1933,11 +1943,13 @@ entity Event {
     origin: CommandTriggered | ExternalTriggered | DirectlyCreated | SystemTriggered | SkiljRecorded
 }
 
-variant CommandTriggered : Event {
+variant CommandTriggered : Event
+{
     command: Command
 }
 
-variant ExternalTriggered : Event {
+variant ExternalTriggered : Event
+{
     -- Both fields below are fully opaque, adapter-defined blobs. SkilJ
     -- persists verbatim whatever the adapter sends and imposes no schema
     -- of its own on them, validates nothing about them and interprets
@@ -1977,17 +1989,20 @@ variant ExternalTriggered : Event {
     -- metadata.client_id holds the id of the ExternalEventToken used to submit this event
 }
 
-variant DirectlyCreated : Event {
+variant DirectlyCreated : Event
+{
     -- metadata.client_id holds the id of the DirectCreationToken used to create this event
 }
 
-variant SystemTriggered : Event {
+variant SystemTriggered : Event
+{
     -- No variant-specific fields: the scheduler is the originator, so
     -- there is no external token or command to point back at. See
     -- SystemTriggeredClientIdIsSystem for the client_id constraint.
 }
 
-variant SkiljRecorded : Event {
+variant SkiljRecorded : Event
+{
     -- A fact the library records about its own state, in the admin
     -- context, as part of the change it describes (rule RecordAccessEvent).
     -- No variant-specific fields. Not SystemTriggered, which is the
@@ -2297,7 +2312,8 @@ entity Subscription {
     kind: AllEventsSubscription | EventTypeSubscription | ProjectionSubscription
 }
 
-variant AllEventsSubscription : Subscription {
+variant AllEventsSubscription : Subscription
+{
     event_types: Set<EventType>    -- restricts delivery to these event types; empty means every
                                     -- event type in the bounded context, the same "empty means
                                     -- unfiltered" convention as EventTypeSubscription.filters.
@@ -2309,7 +2325,8 @@ variant AllEventsSubscription : Subscription {
                                     -- EventTypeSubscription per type of interest instead.
 }
 
-variant EventTypeSubscription : Subscription {
+variant EventTypeSubscription : Subscription
+{
     event_type: EventType
     filters: List<Filter>
 }
@@ -2321,7 +2338,8 @@ variant EventTypeSubscription : Subscription {
 -- row for every key, and each later push is the row after an event touched
 -- it. Access is re-checked on every push exactly as EventSubscription's
 -- is, and private fields are redacted exactly as ProjectionQuery's are.
-variant ProjectionSubscription : Subscription {
+variant ProjectionSubscription : Subscription
+{
     projection: Projection
 }
 
@@ -2596,7 +2614,9 @@ default SystemCreator skilj = { }
 -- protect_sensitive_fields(type, payload), used in the same three rules
 -- and, for the command's own payload, in ProcessCommand, follows a
 -- similar pattern: it get-or-creates the EncryptionKey for each subject
--- a sensitive field in type.sensitive_fields references (each key
+-- a sensitive field in type.sensitive_fields references, raising
+-- EncryptionKeyNeeded for a subject with no active key, which rule
+-- ProvisionEncryptionKey answers (each key
 -- provisioned exactly once - the get-or-create is genuinely idempotent,
 -- protected by the schema's own partial unique index over the active
 -- key for a bounded_context, subject_key and subject_value, so two
@@ -8932,6 +8952,33 @@ rule ListMasterKeys {
     ensures: MasterKeysListed(keys: MasterKeys)
 }
 
+-- The create half of protect_sensitive_fields' get-or-create. The data key is
+-- new random key material, wrapped by the provider under the context's own
+-- master key if it has one and the default key otherwise, at that key's
+-- latest version; the plaintext data key never reaches storage. A subject
+-- whose key was destroyed gets a new key here, never the old one back.
+rule ProvisionEncryptionKey {
+    when: EncryptionKeyNeeded(bounded_context, subject_key, subject_value)
+    requires: not exists EncryptionKey{
+        bounded_context: bounded_context,
+        subject_key: subject_key,
+        subject_value: subject_value,
+        status: active
+    }
+    let master_key = bounded_context.master_key ?? default_master_key()
+    ensures:
+        EncryptionKey.created(
+            bounded_context: bounded_context,
+            subject_key: subject_key,
+            subject_value: subject_value,
+            wrapped_data_key: wrap_new_data_key(master_key),
+            master_key: master_key,
+            master_key_version: master_key.version,
+            status: active,
+            created_at: now
+        )
+}
+
 rule RegisterMasterKey {
     when: RegisterMasterKey(caller, provider, key_name, bounded_context?)
     requires: caller.status = active
@@ -11672,7 +11719,7 @@ surface TokenRevocation {
         else: token.event_type.bounded_context
 
     provides:
-        RevokeToken(access_mapping, token)
+        RevokeToken(access_mapping, token: AccessToken)
             when token_scope = access_mapping.bounded_context
 
     @guarantee GrantScopedToBoundedContext
@@ -11688,11 +11735,11 @@ surface TokenRevocation {
 
 surface BoundedContextArchival {
     facing access_mapping: AdminAccess
-    context bounded_context: BoundedContext
-        where this = access_mapping.bounded_context and status = active
 
     provides:
-        ArchiveBoundedContext(access_mapping, bounded_context)
+        ArchiveBoundedContext(access_mapping, bounded_context: BoundedContext)
+            when bounded_context = access_mapping.bounded_context
+                and bounded_context.status = active
 
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises archiving its own
@@ -11727,11 +11774,11 @@ surface BoundedContextDeletion {
 
 surface SubjectErasure {
     facing access_mapping: AdminAccess
-    context key: EncryptionKey
-        where bounded_context = access_mapping.bounded_context and status = active
 
     provides:
-        ForgetSubject(access_mapping, key)
+        ForgetSubject(access_mapping, key: EncryptionKey)
+            when key.bounded_context = access_mapping.bounded_context
+                and key.status = active
 
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises forgetting subjects within
@@ -11991,9 +12038,9 @@ surface AccessManagement {
 
     provides:
         CreateRole(caller, name, superadmin, external_subject)
-        RevokeRole(caller, role)
+        RevokeRole(caller, role: Role)
         GrantRoleAccessMapping(caller, role, bounded_context, level, can_read_sensitive, scope?)
-        RevokeRoleAccessMapping(caller, access_mapping)
+        RevokeRoleAccessMapping(caller, access_mapping: RoleAccessMapping)
         GrantCapabilityAsSuperadmin(caller, target, capability)
         RevokeCapabilityAsSuperadmin(caller, target, capability)
         SetDelegableCapabilities(caller, target, delegable)
@@ -12127,7 +12174,7 @@ surface PrivateFieldGrantManagement {
     provides:
         GrantPrivateFieldAccessForEvent(access_mapping, grantee, event?, field?)
         GrantPrivateFieldAccessForCommand(access_mapping, grantee, command?, field?)
-        RevokePrivateFieldAccess(access_mapping, grant)
+        RevokePrivateFieldAccess(access_mapping, grant: PrivateFieldGrant)
         ListPrivateFieldGrants(access_mapping, grantor?, after_grant_id?)
 
     @guarantee SharingIsSelfServiceAndRevocationIsTheGrantorsAlone

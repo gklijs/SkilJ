@@ -203,7 +203,9 @@ README.md, "Status and stability").
   tokens, the blob lifecycle names what triggers each step and gains the
   byte removal step, `SetPayloadLimits` refuses negative limits as the code
   does, and listing proposals, parked deliveries and master keys has rules
-  of its own.
+  of its own. Encryption key provisioning is a rule
+  (`ProvisionEncryptionKey`), and `allium check` warnings are down from 14
+  to 3, the checker's own blind spots (`scripts/check-spec.sh` says which).
 - Spec: an idempotency key is scoped to the submitting caller
   (`client_id`) as well as the bounded context and command type, matching
   `ProcessCommand`; the contradictory "not to the submitting Role"
