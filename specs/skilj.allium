@@ -446,9 +446,9 @@ value CommandDecision {
     -- discriminator would misrepresent it considerably more than this flat
     -- shape understates it. The pairing is therefore an obligation on
     -- decide(), written down here and unchecked, in the same register as
-    -- the rest of that plugin contract - see rule ProcessCommand, where
-    -- decide() is deliberately a prose contract rather than a formally
-    -- specified interface.
+    -- the rest of that plugin contract - see contract CommandDecider just
+    -- below, and rule ProcessCommand. decide()'s behaviour stays prose: the
+    -- contract gives it a signature, not a formal specification.
     --
     -- An implementation is free to model this as a real two-case sum, with
     -- the rejection fields mandatory and non-optional in the rejection
@@ -456,6 +456,26 @@ value CommandDecision {
     -- faithful refinement of what is written here - it can represent
     -- every well-formed decision and no malformed one - not a divergence
     -- from it.
+}
+
+-- The two sides of a decision. A command type's own code implements
+-- decide() and returns a CommandDecision; the library takes that decision and
+-- turns it into the stored command and events, or into a rejection:
+-- skilj-core's process_command takes the decision as an argument.
+contract CommandDecider {
+    decide: (command_type: CommandType, payload: String, matching_events: List<Event>, now: Timestamp) -> CommandDecision
+
+    @invariant WellFormedDecision
+        -- Every decision has one of the two shapes described on
+        -- value CommandDecision.
+}
+
+contract DecisionProcessing {
+    process_command: (command_type: CommandType, payload: String, decision: CommandDecision) -> CommandOutcome
+
+    @invariant NothingAppendedOnRejection
+        -- A rejected decision appends nothing, and its rejection_reason and
+        -- rejection_kind reach the caller unchanged.
 }
 
 -- What one command submission answers with, whichever track it came in
@@ -515,6 +535,22 @@ value EncryptedPayload {
                                           -- string value replaced by string ciphertext
     encryption_keys: Set<EncryptionKey>  -- the EncryptionKeys used, one per distinct
                                           -- subject a sensitive field referenced
+}
+
+-- The two directions of field encryption, both black boxes to the rules (see
+-- the protect_sensitive_fields note above the rules). The rules write
+-- protect_sensitive_fields(type, payload) for the fields that type declares.
+-- skilj-core's reveal_sensitive_fields takes the protected payload's string
+-- and a key lookup rather than this value, which is the same information:
+-- encryption_keys names the keys that lookup finds.
+contract SensitiveFieldProtection {
+    protect_sensitive_fields: (sensitive_fields: Set<SensitiveField>, payload: String) -> EncryptedPayload
+    reveal_sensitive_fields: (sensitive_fields: Set<SensitiveField>, protected: EncryptedPayload) -> String
+
+    @invariant RevealUndoesProtect
+        -- Revealing a protected payload gives back the original, while every
+        -- key it used is active. With a destroyed key it fails instead:
+        -- that is what ForgetSubject relies on.
 }
 
 -- The third field-level protection mechanism, and deliberately the
@@ -4940,8 +4976,9 @@ rule ProcessCommand {
     -- owes in each case, and why that pairing is an obligation on decide()
     -- rather than something the value type itself can enforce.
     --
-    -- Resolved: that plugin boundary stays a prose contract here, not a
-    -- formally specified interface. Whether the implementation expresses
+    -- Resolved: that plugin boundary's behaviour stays prose here, not a
+    -- formally specified interface; contract CommandDecider gives it a
+    -- signature and nothing more. Whether the implementation expresses
     -- decide() as a Rust trait each bounded context implements, as a
     -- closure registered per command type, or as something else again, is
     -- a language and tooling concern this spec deliberately does not reach
@@ -8160,6 +8197,14 @@ rule StampRegistration {
 -- REST credential is itself a GraphQL admin operation - the REST track
 -- never issues its own credentials.
 
+-- Every token starts active, whichever variant it is. One rule on the base
+-- entity's creation says so, rather than each minting rule below repeating
+-- it; revocation is the only other status change.
+rule AccessTokenStartsActive {
+    when: token: AccessToken.created
+    ensures: token.status = active
+}
+
 rule CreateExternalEventToken {
     when: CreateExternalEventToken(access_mapping, event_type, scope?)
     requires: access_mapping.status = active
@@ -8184,7 +8229,6 @@ rule CreateExternalEventToken {
             event_type: event_type,
             secret: generate_token_secret(),
             scope: minted_scope,
-            status: active,
             created_at: now
         )
 }
@@ -8210,7 +8254,6 @@ rule CreateDirectCreationToken {
             event_type: event_type,
             secret: generate_token_secret(),
             scope: minted_scope,
-            status: active,
             created_at: now
         )
 }
@@ -8236,7 +8279,6 @@ rule CreateCommandToken {
             command_type: command_type,
             secret: generate_token_secret(),
             scope: minted_scope,
-            status: active,
             created_at: now
         )
 }
@@ -8326,7 +8368,6 @@ rule CreateEventReadToken {
             start_from: resolved_start_from,
             start_at_sequence: start_at_sequence,
             start_at_time: start_at_time,
-            status: active,
             created_at: now
         )
 }
@@ -9887,6 +9928,28 @@ actor Superadmin {
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
+
+-- The code-to-code boundaries of the plugin API; see their contracts above.
+surface CommandPlugin {
+    facing plugin: CommandType
+
+    exposes:
+        plugin.name
+
+    contracts:
+        demands CommandDecider
+        fulfils DecisionProcessing
+}
+
+surface SensitivePayloads {
+    facing owner: BoundedContext
+
+    exposes:
+        owner.name
+
+    contracts:
+        fulfils SensitiveFieldProtection
+}
 
 -- REST token presentation, written once here and pointed at from each of
 -- the four REST surfaces below (ExternalEventIngestion,

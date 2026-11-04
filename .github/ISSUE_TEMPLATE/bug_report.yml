@@ -33,7 +33,7 @@ body:
     id: crates
     attributes:
       label: Crate(s) and version(s)
-      placeholder: skilj 0.2.0, skilj-kafka 0.2.0
+      placeholder: skilj 0.3.0, skilj-kafka 0.3.0
     validations:
       required: true
   - type: input

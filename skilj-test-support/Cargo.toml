@@ -9,6 +9,6 @@ description = "Shared Postgres provisioning for skilj's own integration tests. N
 publish = false
 
 [dependencies]
-postgresql_embedded = "0.21.0"
+postgresql_embedded = "0.22"
 sqlx.workspace = true
 tokio.workspace = true
