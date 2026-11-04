@@ -1,6 +1,6 @@
 # Releasing
 
-The workspace has 17 crates. 15 are published to crates.io:
+The workspace has 18 crates. 16 are published to crates.io:
 `skilj-macros`, `skilj-core`, `skilj-graphql`, `skilj-rest`, `skilj`,
 `skilj-codegen`, `skilj-tui`, `skilj-inspector`, `skilj-temporal`,
 `skilj-kafka`, `skilj-amqp`, `skilj-nats`, `skilj-test-fixture`,
@@ -18,16 +18,19 @@ Every crate uses `version.workspace = true`, pulling its version from
 therefore:
 
 1. Bump `[workspace.package] version`.
-2. Update the matching `version = "..."` in each of the 9 internal
+2. Update the matching `version = "..."` in each of the 10 internal
    `[workspace.dependencies]` path entries (`skilj-core`,
    `skilj-graphql`, `skilj-macros`, `skilj-rest`, `skilj`,
-   `skilj-codegen`, `skilj-test-fixture`, `skilj-retry`, `skilj-bridge` - these are the
-   only crates any other workspace member depends on via a
-   `workspace = true` reference (the `[dev-dependencies]` of `skilj-demo`
-   and `skilj` are `skilj-test-fixture`'s dependents); `skilj-tui`/`skilj-inspector`
-   have no internal dependents and need no such entry).
+   `skilj-codegen`, `skilj-test-fixture`, `skilj-retry`, `skilj-bridge`,
+   `skilj-blob-s3`). The first nine are the only crates any other
+   workspace member depends on via a `workspace = true` reference (the
+   `[dev-dependencies]` of `skilj-demo` and `skilj` are
+   `skilj-test-fixture`'s dependents); `skilj-blob-s3` has an entry but no
+   dependent yet, so its version string still has to match.
+   `skilj-tui`/`skilj-inspector` have no internal dependents and need no
+   such entry.
 
-Not 15 separate per-crate edits - one field plus 9 matching version
+Not 16 separate per-crate edits - one field plus 10 matching version
 strings (`skilj-temporal`/`skilj-kafka`/`skilj-amqp`/`skilj-nats` have
 no internal dependents either - `skilj-retry` is a dependency of
 `skilj-core`/`skilj-bridge`/`skilj-kafka`/`skilj-amqp`/`skilj-nats`, and
@@ -167,6 +170,9 @@ root available; wherever the publish actually runs needs this too,
 ## After publishing
 
 - Tag the release: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+- The first release of a crate (`skilj-blob-s3` in 0.3.0) gives
+  `cargo semver-checks` a baseline: drop it from the `--exclude` list of
+  the semver step in `.github/workflows/ci.yml`.
 - Run `scripts/check-template.sh --published` - it generates the
   template and builds it against what crates.io now serves (step 4 of
   "Version sync" already pointed it at the new version). 0.0.8 shipped

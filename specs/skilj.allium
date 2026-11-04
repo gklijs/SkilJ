@@ -5300,6 +5300,22 @@ rule RejectCommand {
         -- allowed, even where self-approval is not.
 }
 
+-- Paged like ParkedDeliveries (docs/architecture.md §218): at most
+-- config.max_events_per_read per call, oldest first by (proposed_at, id),
+-- continued from a deletion-safe cursor rather than a row. page_after is that
+-- black box.
+rule ListCommandProposals {
+    when: ListCommandProposals(access_mapping, command_type?, status?, after?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: command_type = null or command_type?.bounded_context = access_mapping.bounded_context
+    let matched =
+        CommandProposals where bounded_context = access_mapping.bounded_context
+            and (command_type = null or this.command_type = command_type)
+            and (status = null or this.status = status)
+    ensures: CommandProposalsListed(proposals: page_after(matched, after, config.max_events_per_read))
+}
+
 rule ExpireCommandProposals {
     when: ApprovalDeadlinesPassed()
     ensures:
@@ -5539,6 +5555,18 @@ rule RouteCrossContext {
             causation_id: source_event.id
         )
         route.cursor = source_event.sequence
+}
+
+-- Paged the same way (docs/architecture.md §86): bounded, in a stable order,
+-- from a deletion-safe cursor.
+rule ListParkedDeliveries {
+    when: ListParkedDeliveries(access_mapping, kind?, after?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    let matched =
+        ParkedDeliveries where bounded_context = access_mapping.bounded_context
+            and (kind = null or this.kind = kind)
+    ensures: ParkedDeliveriesListed(deliveries: page_after(matched, after, config.max_events_per_read))
 }
 
 rule ParkDelivery {
@@ -8864,7 +8892,8 @@ rule ForgetSubject {
         key.status = destroyed
         key.destroyed_at = now
         -- docs/architecture.md §239: nothing serves the subject's blobs from
-        -- now on, and CollectBlobs removes their bytes from the store.
+        -- now on, pins or not, and RemoveBlobBytes removes their bytes from
+        -- the store.
         for blob in key.bounded_context.blobs where subject_key = key.subject_key and subject_value = key.subject_value:
             blob.status = deleted
         -- docs/architecture.md §205: a blind tag erased with its subject
@@ -8894,6 +8923,15 @@ rule ForgetSubject {
 -- until retirement. A context's own key can be deleted after no data key
 -- uses it; that erases the context's sensitive data cryptographically,
 -- including in backups, because the provider holds the only copy.
+-- Names, versions and lifecycle only: no key material ever leaves the
+-- provider (see surface EncryptionKeyAdmin).
+rule ListMasterKeys {
+    when: ListMasterKeys(caller)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    ensures: MasterKeysListed(keys: MasterKeys)
+}
+
 rule RegisterMasterKey {
     when: RegisterMasterKey(caller, provider, key_name, bounded_context?)
     requires: caller.status = active
@@ -9073,7 +9111,8 @@ rule GrantPrivateFieldAccessForEvent {
         or is_default_private_reader(event, access_mapping)
 
     -- Naming a field narrows the check to that field: its type must declare
-    -- it private and the grantor must be its own default reader. With no
+    -- it private (or the grant is refused with private_field_not_declared)
+    -- and the grantor must be its own default reader. With no
     -- record there is no type to check a name against, so only an empty
     -- name is refused here; the rest is re-derived at every read.
     requires:
@@ -10181,15 +10220,15 @@ surface ProjectionQuery {
 
     provides:
         QueryProjection(access_mapping, projection, key?, wait_for_sequence?)
-        SubscribeProjectionUpdates(access_mapping, projection)
+        CreateProjectionSubscription(access_mapping, projection)
 
     @guarantee ProjectionUpdatesFollowTheQuery
-        -- SubscribeProjectionUpdates pushes the same current state
+        -- A projection subscription pushes the same current state
         -- QueryProjection would answer with, under the same grant, owner
-        -- scope and private-field redaction (see rule
-        -- CreateProjectionSubscription). It is current state on each
-        -- change, not an event feed: a lagged connection refetches and
-        -- carries on rather than reporting a gap.
+        -- scope and private-field redaction (see rules
+        -- CreateProjectionSubscription and DeliverProjectionUpdates). It
+        -- is current state on each change, not an event feed: a lagged
+        -- connection refetches and carries on rather than reporting a gap.
 
     @guarantee GrantScopedToBoundedContext
         -- A grant only authorises querying projections belonging to its
@@ -12370,6 +12409,22 @@ open question "Supergraph-side authorisation - should the description also tell 
 -- write with blob_reference_invalid, and a payload over the limit with
 -- payload_too_large (§238); neither takes a sequence number. These checks are
 -- stated here once rather than repeated in each append rule.
+--
+-- The lifecycle below is driven from outside these rules, the same way the
+-- scheduler drives deadlines:
+--   ReferenceBlob     - each reference a committed append stored, in the
+--                       append's own transaction
+--   PinBlob           - each blob a parked delivery or pending proposal names,
+--                       in the transaction that stores the holder
+--   ReleaseBlobPin    - a holder found gone (retried, discarded, resolved) by
+--                       a collection pass
+--   CollectBlobs      - each pending blob a collection pass finds
+--   RemoveBlobBytes   - each deleted blob a collection pass finds, whatever
+--                       made it deleted: CollectBlobs or ForgetSubject
+-- A collection pass runs once a minute per instance (more often only when
+-- blob_orphan_grace is shorter), never at startup. Deleting a bounded context
+-- queues its blobs' bytes in the same transaction that drops it, and the same
+-- pass removes them from a store outside Postgres.
 
 value BlobField {
     field: String
@@ -12392,11 +12447,14 @@ entity Blob {
     grace_from: Timestamp
 }
 
--- Who may upload is a capability on a grant, or a writing token whose type
--- declares a blob field; a surface can't say "either", so it stays a black box.
--- Who may read is whoever can read a record referencing it with that field
--- visible, the same rendering every read already performs, and an event read
--- token never decrypts; everyone else is told it doesn't exist.
+-- Who may upload is a Role whose grant holds the blob-upload capability, or a
+-- writing token (direct creation, external event or command) whose type
+-- declares a blob field for the subject named; may_upload_blob is that black
+-- box. Who may read is whoever can read a record referencing it with that
+-- field visible, the same rendering every read already performs, and an event
+-- read token never decrypts; everyone else is told it doesn't exist. A Role
+-- and a token are different callers, so each has its own surface below; the
+-- two provide the same actions and share the rules.
 surface BlobTransfer {
     facing caller: BlobClient
     context bounded_context: BoundedContext
@@ -12414,8 +12472,25 @@ actor BlobClient {
     identified_by: Role where status = active
 }
 
+-- The REST track's half: the token is the whole of the permission model, as
+-- on surface EventFetch.
+surface TokenBlobTransfer {
+    facing token: AccessToken
+    context bounded_context: BoundedContext
+
+    provides:
+        UploadBlob(token, bounded_context, sha256, size, media_type, subject_key?, subject_value?)
+        ReadBlob(token, blob)
+
+    @guarantee TokenRefusalLooksLikeAbsence
+        -- As on BlobTransfer: a blob the token may not read is answered as
+        -- one that doesn't exist.
+}
+
 rule UploadBlob {
     when: UploadBlob(caller, bounded_context, sha256, size, media_type, subject_key?, subject_value?)
+    -- A Role without the capability is refused with blob_upload_not_allowed,
+    -- and a blob over config.max_blob_bytes with blob_too_large.
     requires: may_upload_blob(caller, bounded_context, subject_key)
     requires: bounded_context.status = active
     requires: size <= config.max_blob_bytes
@@ -12477,6 +12552,14 @@ rule CollectBlobs {
     ensures: blob.status = deleted
 }
 
+-- Deleted is final: a deleted blob is never served or accepted again, and its
+-- bytes go from the blob store. A failure leaves the blob to try again.
+rule RemoveBlobBytes {
+    when: RemoveBlobBytes(blob)
+    requires: blob.status = deleted
+    ensures: BlobBytesRemoved(blob)
+}
+
 surface PayloadLimitsAdmin {
     facing caller: Superadmin
     context bounded_context: BoundedContext
@@ -12492,6 +12575,10 @@ rule SetPayloadLimits {
     when: SetPayloadLimits(caller, bounded_context, max_payload_bytes?, warn_payload_bytes?)
     requires: caller.status = active
     requires: caller.superadmin = true
+    -- A negative limit is refused with invalid_payload_limit; null clears
+    -- that half of the override, back to config.
+    requires: max_payload_bytes = null or max_payload_bytes >= 0
+    requires: warn_payload_bytes = null or warn_payload_bytes >= 0
     ensures:
         bounded_context.max_payload_bytes = max_payload_bytes
         bounded_context.warn_payload_bytes = warn_payload_bytes
