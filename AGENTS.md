@@ -85,7 +85,7 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 11. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 12. `scripts/check-spec.sh` — `allium check` on `specs/skilj.allium`: fails on an error, or on more warnings than the script's `MAX_WARNINGS` (a ratchet; lower it when a warning is fixed)
 13. `cargo machete` — no unused dependency; one kept on purpose goes in the crate's `[package.metadata.cargo-machete] ignored` with its reason
-14. `cargo semver-checks` on the library crates against their latest release, pull requests only. Blocking: a breaking change fails it until the minor version is bumped in the same diff. A crate not yet on crates.io has no baseline and fails the whole job, so it goes in the step's `--exclude` until its first release (`skilj-blob-s3` for now)
+14. `cargo semver-checks` on the library crates against their latest release, pull requests only. Blocking: a breaking change fails it until the minor version is bumped in the same diff. A crate not yet on crates.io has no baseline and fails the whole job, so it goes in the step's `--exclude` until its first release
 15. `cargo llvm-cov` — on pushes to `main` and manual workflow dispatch, line coverage of the full test run, in the job summary and as an lcov artifact. Informational (`continue-on-error`), no threshold
 16. `cargo mutants` — weekly (`.github/workflows/mutants.yml`), on the access trail and the `*_with_trail` writers against the `access_trail` tests. Surviving mutants are listed in the job summary. Informational
 17. `scripts/check-template-docker.sh` — builds `templates/skilj-template`'s Dockerfile against this workspace and starts the image (its own job, needs Docker)
