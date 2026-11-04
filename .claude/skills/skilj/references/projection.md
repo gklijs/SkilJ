@@ -14,6 +14,10 @@ pub trait Projection {
     fn consumed_event_types() -> Vec<&'static str>; // no default - must be declared
     fn sync() -> bool { false }
     fn keys(_event: &Self::Event) -> Vec<String> { vec![String::new()] }
+    const OWNER_TAG_KEY: Option<&'static str> = None;
+    const SUBJECT_KEY: Option<&'static str> = None;          // see below
+    const LIVE_FOLD_COMPATIBLE: bool = false;                // see below
+    const REQUIRES_CAPABILITY: Option<&'static str> = None;
 
     fn project(state: &mut Self::State, event: &Self::Event, key: &str);
 }
@@ -110,6 +114,37 @@ disturbs what it's already serving, whichever `sync` setting - a change
 that can't honestly be applied to already-folded content is staged,
 waiting for an explicit `RebuildProjection` call, never triggered
 automatically by a deploy.
+
+## Sensitive state: `SUBJECT_KEY`
+
+A projection folding a sensitive field keeps it as stored ciphertext:
+`project()` never sees plaintext. On read, the state is decrypted only
+when the projection declares which subject namespace its instance key
+belongs to:
+
+```rust
+impl Projection for CustomerProfile {
+    const SUBJECT_KEY: Option<&'static str> = Some("customer");
+    fn keys(event: &Self::Event) -> Vec<String> { /* the customer_id */ }
+    // ...
+}
+```
+
+The instance key is then the subject value, and only that subject's key
+in the `"customer"` namespace decrypts it; an equal value in another
+namespace never does. Without `SUBJECT_KEY`, the state stays encrypted
+for every reader, sensitive readers included, and a forgotten subject's
+state stays encrypted either way. Projections that decrypted for a
+sensitive reader before 0.3 need this declared to keep doing so.
+
+## Rebuilds: `LIVE_FOLD_COMPATIBLE`
+
+While a rebuild is staged or building, live folding into the current
+state pauses, and a `sync()` projection refuses writes with
+`live_fold_paused` until the rebuild is promoted. Declare
+`const LIVE_FOLD_COMPATIBLE: bool = true;` only when the new fold keeps
+the live state's schema and meaning, so it may go on updating the live
+generation meanwhile.
 
 ## Restricting who may read a projection: `REQUIRES_CAPABILITY`
 

@@ -10,6 +10,28 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Upgrading from 0.2
+
+- **PostgreSQL 15 or later is required** (docs/architecture.md §232): the
+  tag dictionary uses `UNIQUE NULLS NOT DISTINCT`.
+- **Plan a maintenance window for large histories.** The first start on
+  0.3 interns every bounded context's event tags: it locks event writes
+  while it backfills `event_tag_values` and `event_tag_refs` from the
+  existing events, then replaces the `event_tags` table with a
+  compatibility view. Reads go on meanwhile, and a restart repeats it
+  safely (§232).
+- **Projections holding sensitive data stay encrypted unless they declare
+  `Projection::SUBJECT_KEY`.** 0.2 decrypted a projection's state for a
+  sensitive reader; 0.3 decrypts only with keys from the declared subject
+  namespace, so declare it on every projection that should keep doing so
+  (§231).
+- **A staged or building rebuild now pauses live folding** unless the
+  projection declares `Projection::LIVE_FOLD_COMPATIBLE`. A synchronous
+  projection paused this way refuses writes with `live_fold_paused` until
+  the rebuild is promoted, so declare it where the new fold keeps the old
+  state's schema and meaning (§231).
+- Payloads larger than 256 KiB are refused by default; see Changed below.
+
 ### Added
 
 - Payload size limits (issue #132, docs/architecture.md §238):
@@ -87,6 +109,24 @@ README.md, "Status and stability").
   `private_field_not_declared`. Omitted, it covers every field, as far as
   the Security entry below allows. The `field` column is added at startup
   (issue #155, docs/architecture.md §233).
+- Used-tag discovery (issue #158, docs/architecture.md §232): GraphQL
+  `searchUsedTags(boundedContext, key, prefix, limit, eventTypeName)`, for an
+  admin mapping, and REST `GET /v1/events/tags?key=&prefix=&limit=`, for an
+  event read token and its own event type, answer the distinct values under
+  a tag key that visible events carry, by literal prefix. At most 100 (20
+  by default, and never more than `max_events_per_read`), within the
+  caller's owner scope; a null value only for an empty prefix. Rust:
+  `db::search_used_tags`.
+- `Projection::SUBJECT_KEY` names the subject namespace whose keys decrypt
+  a projection's state, and `Projection::LIVE_FOLD_COMPATIBLE` lets live
+  folding continue while a rebuild is staged (docs/architecture.md §231).
+- A projection's `OWNER_TAG_KEY` is now registered, as
+  `projections::Projection::owner_tag_key`, and shown on `TypeRegistration`
+  and `CapabilityOverview`. Changing it reconciles without a rebuild
+  (§231).
+- `CommandDispatcher::key_service()`, defaulted to `None`, gives the
+  command engine the key service it decrypts history with. The facade wires
+  it; a custom dispatcher overrides it (§231).
 
 ### Changed
 
@@ -99,6 +139,25 @@ README.md, "Status and stability").
 - **Breaking:** `PrivateFieldGrant` has a new public `field`, and
   `grant_private_field_access_for_event` and `_for_command` a new `field`
   parameter; pass `None` for today's behaviour.
+- **Breaking:** the registered `projections::Projection` struct has a new
+  public `owner_tag_key` field, so building one by hand needs it (§231).
+- `decide()` receives the selected history decrypted, whatever the
+  submitting caller may read; the incoming command was already plaintext.
+  Folds, the event cache and a rejection's matching events still hold
+  ciphertext. When a selected sensitive value can't be decrypted because
+  its subject was forgotten, the command is rejected with
+  `sensitive_history_unavailable`, blind-index uniqueness checks included
+  (§231).
+- A command's default consistency matching leaves out tags with no value.
+  They are still stored and an explicit query still selects them; a command
+  whose default tags are all null reads no history (§231).
+- Event subscriptions catch up on any span of missed history in pages of
+  `max_events_per_read`, rechecking grants and field permissions per page,
+  and a client can reconnect with its last processed sequence (§231).
+- Event tags are interned in a per-context dictionary (`event_tag_values`,
+  `event_tag_refs`); `event_tags` remains as a view (§232).
+- `skilj-core`'s `db` module is split into submodules by responsibility;
+  the public `db::` paths are unchanged (§231).
 - `skilj-kafka` no longer needs a system libcurl: its `ssl` and
   `ssl-vendored` features, one of them the default, build curl from source
   for the header librdkafka includes, and link it statically. With
@@ -134,7 +193,17 @@ README.md, "Status and stability").
 
 - Inserting a private-field grant for a nonexistent command returns
   `row_not_found` instead of panicking, for raw and access-trail writes.
-
+- Malformed payloads, invalid read-token state, lease overflow and a
+  failure of the secure random source return errors instead of panicking;
+  rendering a malformed payload fails closed, a poisoned cache recovers,
+  and an error building the Vault client is returned. A pinned Call Graph
+  Analyzer check guards `skilj-core` against new panic paths in CI.
+- Spec: the projection subscription a surface offers and the rule that
+  creates it now share one name, the blob upload actor covers writing
+  tokens, the blob lifecycle names what triggers each step and gains the
+  byte removal step, `SetPayloadLimits` refuses negative limits as the code
+  does, and listing proposals, parked deliveries and master keys has rules
+  of its own.
 - Spec: an idempotency key is scoped to the submitting caller
   (`client_id`) as well as the bounded context and command type, matching
   `ProcessCommand`; the contradictory "not to the submitting Role"

@@ -148,7 +148,7 @@ To add `skilj` to an existing project instead:
 
 ```toml
 [dependencies]
-skilj = "0.2"
+skilj = "0.3"
 ```
 
 [`skilj-demo`](skilj-demo) in this repository is a larger worked example (two bounded contexts:
@@ -173,9 +173,9 @@ Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/arc
   production; there is no tool to go back to an older schema.
 - **Minimum supported Rust version: 1.95**, checked in CI. Raising it is a minor-release change.
 - **Which crates the promise covers.** `skilj`, `skilj-core`, `skilj-rest`, `skilj-codegen`,
-  `skilj-test-fixture` and the bridges (`skilj-kafka`, `skilj-amqp`, `skilj-nats`,
-  `skilj-temporal`). `skilj-tui` and `skilj-inspector` are tools: their command line is
-  covered, their Rust API is not. `skilj-graphql`, `skilj-macros`, `skilj-retry` and
+  `skilj-test-fixture`, `skilj-blob-s3` and the bridges (`skilj-kafka`, `skilj-amqp`,
+  `skilj-nats`, `skilj-temporal`). `skilj-tui` and `skilj-inspector` are tools: their command
+  line is covered, their Rust API is not. `skilj-graphql`, `skilj-macros`, `skilj-retry` and
   `skilj-bridge` are internal, published because other crates need them: a patch release never
   breaks them either, but they may change in any minor release without migration notes. The
   GraphQL contract itself is covered, like REST's; use `skilj-graphql` and the macros through
@@ -216,6 +216,12 @@ Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/arc
   sections assume you've read the earlier ones.
 - [`docs/authorization.md`](docs/authorization.md) - diagrams of the authorization flows: JWT and
   token authentication, grants, scopes, capabilities, field-level protection and the access trail.
+- [`docs/large-payloads.md`](docs/large-payloads.md) - payload size limits, and blobs for the
+  bytes that don't belong in a payload.
+- [`docs/disjoint-consistency-boundaries.md`](docs/disjoint-consistency-boundaries.md) and
+  [`docs/dcb158-postgres-experiment.md`](docs/dcb158-postgres-experiment.md) - the investigation
+  into running commands with disjoint consistency boundaries concurrently, and the measurements
+  behind interned tags (docs/architecture.md §232).
 - [`docs/performance.md`](docs/performance.md) - what limits command throughput, measured
   numbers, and the batching knobs.
 - [`docs/rest-event-reading.md`](docs/rest-event-reading.md) - the three ways to consume the REST

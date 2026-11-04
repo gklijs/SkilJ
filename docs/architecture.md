@@ -239,6 +239,16 @@ listed separately here; see that section itself for its own structure.
 - [227. Ordered batch submission for commands and external events](#batch-submission)
 - [228. Capabilities replace the `Role.name` team gate (issue #17)](#capabilities)
 - [229. The access trail: who held what, as events in the admin context](#access-trail)
+- [230. Master keys in a key provider, per bounded context, rotated in place](#master-key-providers)
+- [231. Decisions from the spec rebuild review (issue #148)](#spec-rebuild-review)
+- [232. Interned event tags and used-tag discovery (issue #158)](#interned-tags)
+- [233. A private-field grant may name one field (issue #155)](#per-field-grants)
+- [234. skilj-kafka builds without a system libcurl](#kafka-without-libcurl)
+- [235. Retractions and corrections (issue #133)](#retractions)
+- [236. Doubt (issue #133)](#doubt)
+- [237. As-of reads](#as-of-reads)
+- [238. Payload size limits (issue #132)](#payload-limits)
+- [239. Blob references (issue #132)](#blob-references)
 
 ---
 
@@ -13165,6 +13175,7 @@ Tests: `skilj/tests/projection_query.rs` (`capability_mutations_and_reads_end_to
 Tests: `skilj-core/tests/access_trail.rs` (private-field grants: a grant and a repeated revoke recorded by the grantee with the grantor as actor, a failed insert leaves one event, the payload names the record and nothing personal, the fold ignores them; the fold: unknown before the trail, a capability held between its grant and revoke, level, scope and delegable as of an instant, a revoked grant holding nothing, a baseline as the starting point; the writers: grant and revoke leave events with the system origin and both tags, capability changes record only when they apply, a revoked grant records nothing, a role revoked ends each grant with its own event, the admin log stays gapless across eight writers; the baseline: once, once under four concurrent instances, not for a revoked grant; the eight types registered with creation closed), and `skilj/tests/graphql_business_surfaces.rs` (the private-field mutations leave both events).
 
 
+<a id="master-key-providers"></a>
 ## 230. Master keys in a key provider, per bounded context, rotated in place
 
 Asked in the 0.2.0 release review whether the master key could be rotated, the answer was no: `SkiljBuilder::encryption_master_key` took one raw `[u8; 32]`, every data key was sealed under it in the process, and nothing recorded which key wrapped what. A first attempt (PR #129) added previous keys and a fingerprint per data key, rotated by restarting an instance with the reconciliation role. The user judged that too heavy for a routine rotation - monthly, say - and set the requirements: the key must not sit in the process; rotating must be easy; afterwards the old key must not be usable; local use needs something easy too. They chose Vault/OpenBao Transit first, rotation both by request and on a schedule, retirement after a grace period, and a key file skilj manages for local use. Asked about alternatives, they rejected a middle layer of per-context keys held in the process (it would put keys back in memory and make a master rotation no longer a leak response) and chose instead per-context keys *at the provider*: a shared default key, and a superadmin can give a bounded context a key of its own, deleted after the grace period once nothing uses it.
@@ -13216,6 +13227,7 @@ Every instance runs it, so no restart, deploy or reconciliation role is involved
 **Tests.** `skilj/tests/master_key_rotation.rs`, against an in-process imitation of Transit (versioned ciphertexts, batch rewrap, `min_decryption_version`, key creation, deletion only once allowed, token checks): the Vault provider on its own; a requested rotation end to end with the key file and with Vault - adopted on first start, rewrapped in every context, the old version kept through the grace period, a destroyed key left destroyed, old ciphertext still opening, then a leak rotation retiring at once; a scheduled rotation; a rotation made at the provider directly; legacy data keys refused without their key, or with the wrong one naming the context despite a corrupt newest row, then moved; another provider's data keys refusing startup; a context given its own key - moved, rotated without touching the default key, read by an instance that never used the key, and the key deleted at the provider after the context is; a key a superadmin brought, refused when missing, let go of but not deleted; 250 data keys with one corrupt one - one event across both batches, the corrupt one marked once, and the rotation retiring regardless; a data key wrapped under an old version after the rewrap, holding up the retirement until it is rewrapped; the GraphQL surface, including a misspelt and an empty context refused; a key not retired while a context moving off it still has data keys under it; one bad ciphertext in a Vault batch marked while the rest are rewrapped; a slow provider not holding pool connections (fails before the change); a brought key followed but never rotated or retired by skilj; asking to create a key that exists claiming nothing; a key file recreated at its path refusing startup, a marked data key cleared by a read and another tried again by the next rotation; a due deletion refused, and started over, while a data key is wrapped by the key; a deletion waiting for a provisioning that holds the key's row and then finding its data key; another Vault with a key at the same path refusing startup, the key checked once across three contexts, and an unreachable Vault not stopping the start; zero intervals refused. The tests cap each instance's pool at four connections, as the other suites do: sixteen tests starting instances together otherwise exhaust a default Postgres's hundred. `skilj/tests/vault_transit_container.rs` runs the provider and the lifecycle against real Vault 1.17 and OpenBao 2.1.0 in containers - each refusal's status, a batch with failed items, `min_decryption_version`, creating, deleting, a token without the right, and a leak rotation and a tenant key's deletion end to end - and skips without Docker, which fails CI. `encryption::provider` unit tests cover the keyrings and the key file, `encryption::trail`'s the events' schemas and tags.
 
 
+<a id="spec-rebuild-review"></a>
 ## 231. Decisions from the spec rebuild review (issue #148)
 
 Default command consistency matching excludes tags with no value. Such tags
@@ -13280,6 +13292,7 @@ A compiled fold whose schema differs from the live registration also pauses
 without a compatibility declaration. Discarding a staged rebuild therefore
 cannot accidentally resume an incompatible fold against the old state.
 
+<a id="interned-tags"></a>
 ## 232. Interned event tags and used-tag discovery (issue #158)
 
 PostgreSQL 15 or later is required. Each context stores exact `(tag_key,
@@ -13312,6 +13325,7 @@ storage. Integrated throughput has not shown a general improvement. See
 and the restricted UUID/WAL prototype. That prototype is not the production
 append path; neither distributed routing nor a linger setting is introduced.
 
+<a id="per-field-grants"></a>
 ## 233. A private-field grant may name one field (issue #155)
 
 §31's grants were record-wide on purpose, and issue #136 kept them so when it made the default entitlement per field. So a record with an `own` note, a message addressed to the customer and an `own` field meant for a colleague couldn't be shared field by field. `PrivateFieldGrant.field` names the one field a grant shares, by its `PrivateField.field` path; null is every field the grant reaches. The column is nullable and added at startup by `ensure_private_field_grants_table`. `grantPrivateFieldAccessForEvent` and `grantPrivateFieldAccessForCommand` take an optional `field`, `PrivateFieldGrant` returns it, and `PrivateFieldAccessGranted` records it.
@@ -13331,6 +13345,7 @@ append path; neither distributed routing nor a linger setting is introduced.
 
 Whether a named field is declared private is therefore a check on making a grant and not an invariant over grants, which is why the spec has it as a `requires` and not the invariant the issue suggested: a later registration can stop declaring a field a grant names, and a blanket grant can name one not declared yet. A field that is no longer private isn't redacted at all, so such a grant needs no handling.
 
+<a id="kafka-without-libcurl"></a>
 ## 234. skilj-kafka builds without a system libcurl
 
 Every build needed `curl/curl.h`, and §40 worked around it, with `libcurl4-openssl-dev` in CI and `CPATH` without root. §40 called the include unconditional. The cause is narrower: `packaging/cmake/config.h.in` has `#cmakedefine01 WITH_OAUTHBEARER_OIDC`, which always defines it, to 0 or 1, and `rdkafka_conf.c` tests it with `#ifdef`. rdkafka 0.39 / rdkafka-sys 4.10 (librdkafka 2.12.1) is the latest release, so upgrading doesn't help yet. librdkafka changed the test to `#if` in v2.15.0 (its issue #5204); once an rdkafka-sys release carries that, `curl-static` and §40's recipe can both go.
@@ -13339,6 +13354,7 @@ skilj-kafka's `ssl` and `ssl-vendored` features now add rdkafka's `curl-static`,
 
 It can't be unconditional: curl-sys's default features turn on OpenSSL, and rdkafka-sys doesn't turn them off, so `default-features = false` would stop being the build with no OpenSSL (issue #124). That build still needs the header on the system, and is the one case left for §40's recipe (CONTRIBUTING.md).
 
+<a id="retractions"></a>
 ## 235. Retractions and corrections (issue #133)
 
 Correcting data means appending, since events and tags are immutable. That is easy to get wrong when the corrected value is a tag a consistency query depends on, the classic case being a unique email address (§205). The issue proposed a `…Corrected { from, to }` event mapping both fields to one tag key, with decision models folding `to == X` as taken and `from == X` as released. Its later comment, drawing on the handbook *Uit betrouwbare bron*, proposed instead that a correction is a withdrawal plus a new claim in one consequence. This builds the second. The first is workable while a subject's key lives, since `decide()` gets decrypted history (§231), but a fold then has to normalize and compare values itself to learn which of the event's two tags the queried value was, the old value has to be supplied and right, and the `from` mapping can still be forgotten, the silent failure the issue set out to remove. A retraction needs none of that: the old tags come from the store, and the fold goes by tags and positions alone.
@@ -13391,6 +13407,7 @@ A snapshot refolded by catch-up or by a command's own read costs what a `VERSION
 
 Nothing from the issue is left to build: doubt is §236, as-of reads §237.
 
+<a id="doubt"></a>
 ## 236. Doubt (issue #133)
 
 The issue's comment, drawing on *Uit betrouwbare bron*, separates a retraction from doubt: still endorsed, but not certain, for instance under investigation. Doubt is usually an intermediate step, ending in a lift or a correction. The choices below were the user's.
@@ -13407,6 +13424,7 @@ The issue's comment, drawing on *Uit betrouwbare bron*, separates a retraction f
 
 **`.skilj.toml`.** `doubts = true` registers both. A `retractable` command's query item names them to read them.
 
+<a id="as-of-reads"></a>
 ## 237. As-of reads
 
 "As known at T" is a fold up to a sequence, since the store is append-only, as the issue's comment on bitemporality says. Two small additions make it usable. Both go by sequence, the user's choice over also looking up a time: a sequence is exact and is what the epoch check (§176) protects, and recorded time isn't tied strictly to sequence order, so a time would need a defined rule and probably an index.
@@ -13417,6 +13435,7 @@ The issue's comment, drawing on *Uit betrouwbare bron*, separates a retraction f
 
 Valid time stays out of scope, per the same comment: projections are current-state, and an occurrence time is a domain field (§235).
 
+<a id="payload-limits"></a>
 ## 238. Payload size limits (issue #132)
 
 Event and command payloads are stored inline, and nothing stopped one from carrying a document. A large payload costs in several places: every consistency query and replay that matches it reads it whole, the event cache counts events rather than bytes, and the bridges publish an event as one message, where Kafka's default limit is 1 MB. GraphQL already capped a request at 2 MiB (`GraphqlLimits::max_request_body_bytes`); REST and the brokers had nothing.
@@ -13433,6 +13452,7 @@ Event and command payloads are stored inline, and nothing stopped one from carry
 
 **Why on `ProjectionDispatcher`.** The builder's value reaches skilj-core through `ProjectionDispatcher::payload_limits`, a defaulted method, because that dispatcher is the one collaborator every write path already takes; a new parameter on each public write function would have been a breaking change for nothing.
 
+<a id="blob-references"></a>
 ## 239. Blob references (issue #132)
 
 A limit alone sends large data to a side channel the user invents, and that is where it goes wrong: a blob next to the event in plaintext survives `forgetSubject` and context deletion, a mutable URL breaks immutability, writing the event before the blob leaves it pointing at nothing, and private fields and grants don't apply to a URL. So skilj owns the claim check and its guarantees, without growing into a storage product: one built-in backend and a trait.
