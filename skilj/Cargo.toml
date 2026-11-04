@@ -50,7 +50,7 @@ opentelemetry.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
 # issue #100: only with the `local` feature.
-postgresql_embedded = { version = "0.21.0", optional = true }
+postgresql_embedded = { version = "0.22", optional = true }
 
 [dev-dependencies]
 skilj-test-fixture.workspace = true

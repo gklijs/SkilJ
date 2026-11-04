@@ -1,24 +1,13 @@
 #!/usr/bin/env bash
 # Validates specs/skilj.allium with `allium check` (cargo install allium-cli).
 #
-# `allium check` exits 1 on any warning, and the spec carries some that are
-# understood and accepted. So this fails on what the checker calls an error,
-# and on more warnings than MAX_WARNINGS: a ratchet. A change that fixes a
-# warning lowers the number here; one that adds a warning has to either fix
-# it or raise the number in the same diff, where a reviewer sees it.
-#
-# The three accepted ones are the checker's blind spots, not the spec's
-# (allium-cli 3.5.3, unchanged in 3.6.1):
-# - CommandDecision and EncryptedPayload "not referenced": they are what the
-#   black boxes decide() and protect_sensitive_fields() return, and the
-#   checker has no way to give a function a result type that it counts (a
-#   contract signature's `-> Type` is dropped).
-# - AccessToken's `active` "never assigned": every token is created as one
-#   of its variants (`CommandToken.created(status: active, ...)`), and the
-#   checker doesn't credit a variant's creation to its base entity.
+# `allium check` exits 1 on any warning. This fails on what the checker calls
+# an error, and on more warnings than MAX_WARNINGS: a ratchet, now at zero. A
+# change that adds a warning has to fix it, or raise the number in the same
+# diff with its reason, where a reviewer sees it.
 set -euo pipefail
 
-MAX_WARNINGS=3
+MAX_WARNINGS=0
 
 cd "$(dirname "$0")/.."
 

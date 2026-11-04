@@ -10,6 +10,8 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-04
+
 ### Upgrading from 0.2
 
 - **PostgreSQL 15 or later is required** (docs/architecture.md §232): the
@@ -31,6 +33,13 @@ README.md, "Status and stability").
   the rebuild is promoted, so declare it where the new fold keeps the old
   state's schema and meaning (§231).
 - Payloads larger than 256 KiB are refused by default; see Changed below.
+- **Private-field grants reach less, including ones already made.** A grant
+  opens a field only while its grantor is that field's own default reader
+  and an active Role, so sharing both fields of a mixed record now takes a
+  grant from each party; see Security below (§233).
+- **A sensitive field with a value but no usable `subject_field` is now
+  refused** with `sensitive_field_without_subject`, where 0.2 stored it in
+  plaintext; see Security below.
 
 ### Added
 
@@ -138,9 +147,14 @@ README.md, "Status and stability").
   with `setPayloadLimits`, if you store larger ones today.
 - **Breaking:** `PrivateFieldGrant` has a new public `field`, and
   `grant_private_field_access_for_event` and `_for_command` a new `field`
-  parameter; pass `None` for today's behaviour.
+  parameter; `None` covers every field, as far as the Security entry below
+  allows.
 - **Breaking:** the registered `projections::Projection` struct has a new
   public `owner_tag_key` field, so building one by hand needs it (§231).
+- **Breaking:** `skilj-codegen`'s `BoundedContextSpec` has new public
+  `retractions` and `doubts` fields, and `EventTypeSpec` and `CommandTypeSpec`
+  a `blobs` field (`CommandTypeSpec` also `retractable`), so building one by
+  hand needs them. Parsing a `.skilj.toml` is unaffected.
 - `decide()` receives the selected history decrypted, whatever the
   submitting caller may read; the incoming command was already plaintext.
   Folds, the event cache and a rejection's matching events still hold
@@ -158,6 +172,10 @@ README.md, "Status and stability").
   `event_tag_refs`); `event_tags` remains as a view (§232).
 - `skilj-core`'s `db` module is split into submodules by responsibility;
   the public `db::` paths are unchanged (§231).
+- Dependencies: `async-nats` 0.50 -> 0.51, `jsonschema` 0.58 -> 0.60,
+  `postgresql_embedded` 0.21 -> 0.22, `sha2` 0.10 -> 0.11. `skilj::local`'s
+  error type wraps `postgresql_embedded::Error`, so a caller matching on it
+  sees the new crate's type.
 - `skilj-kafka` no longer needs a system libcurl: its `ssl` and
   `ssl-vendored` features, one of them the default, build curl from source
   for the header librdkafka includes, and link it statically. With
@@ -204,8 +222,9 @@ README.md, "Status and stability").
   byte removal step, `SetPayloadLimits` refuses negative limits as the code
   does, and listing proposals, parked deliveries and master keys has rules
   of its own. Encryption key provisioning is a rule
-  (`ProvisionEncryptionKey`), and `allium check` warnings are down from 14
-  to 3, the checker's own blind spots (`scripts/check-spec.sh` says which).
+  (`ProvisionEncryptionKey`), `decide()`, `process_command` and field
+  encryption have contracts, every token starts active through one rule, and
+  `allium check` warnings are down from 14 to 0.
 - Spec: an idempotency key is scoped to the submitting caller
   (`client_id`) as well as the bounded context and command type, matching
   `ProcessCommand`; the contradictory "not to the submitting Role"
@@ -2441,7 +2460,8 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://github.com/gklijs/SkilJ/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/gklijs/SkilJ/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/gklijs/SkilJ/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gklijs/SkilJ/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/gklijs/SkilJ/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/gklijs/SkilJ/compare/v0.0.10...v0.1.0
