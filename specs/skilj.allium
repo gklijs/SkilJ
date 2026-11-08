@@ -1984,44 +1984,26 @@ variant CommandTriggered : Event
     command: Command
 }
 
+-- protected_source_content(event_type, content) returns "[redacted]" if
+-- sensitive_fields or private_fields is nonempty, or any blob_field has
+-- a subject_key; otherwise it returns content. Metadata is unaffected.
 variant ExternalTriggered : Event
 {
-    -- Both fields below are fully opaque, adapter-defined blobs. SkilJ
-    -- persists verbatim whatever the adapter sends and imposes no schema
-    -- of its own on them, validates nothing about them and interprets
-    -- nothing inside them - a black box in exactly the same register as
-    -- EventType.schema, CommandType.schema and Projection.schema, and as
-    -- the encryption scheme and JWT signature verification.
+    -- Raw source messages have no independent field or subject policy.
+    -- For an event type with private fields, sensitive fields, or blobs
+    -- encrypted for a subject, SkilJ discards source_content and stores
+    -- "[redacted]". This also applies to historical rows on upgrade and
+    -- when a type gains protection; removing protection never restores it.
+    -- The guard is not opt-in: an adapter cannot bypass payload policy by
+    -- placing the original message in provenance instead.
     --
-    -- Resolved deliberately, and out of scope by design: SkilJ models no
-    -- "source type" concept anywhere - not here, not on
-    -- ExternalEventToken, nowhere - so there is no per-source-type shape
-    -- variance at this level. An adapter or consuming application that
-    -- wants a different shape per source encodes that convention inside
-    -- the blob itself (a source_type key within the JSON, say); SkilJ
-    -- neither tracks nor enforces it. Note also that these two fields sit
-    -- outside payload, so protect_sensitive_fields and derive_tags never
-    -- touch them (see CreateExternalEvent).
-    --
-    -- Adapters must therefore not put sensitive data into either field:
-    -- plaintext here survives crypto-shredding, since only the payload
-    -- fields named in EventType.sensitive_fields are encrypted under a
-    -- subject's key and only those are reachable by ForgetSubject. That is
-    -- a documented obligation on the adapter, in the same trust register as
-    -- declaring sensitive_fields before sensitive data flows - the adapter
-    -- is out-of-core code the same deploying team controls (see
-    -- ExternalEventToken), not untrusted end-user input. Opacity is the
-    -- point, so RegisterEventType has nothing to inspect here the way it
-    -- can rule out a TagMapping/SensitiveField overlap structurally.
-    -- Encrypting the whole blob under the event's encryption_keys was
-    -- rejected: an un-parsed blob declares no subject for an EncryptionKey
-    -- to be scoped to, so ForgetSubject could not shred it either. A
-    -- per-EventType opt-out refusing to persist source_content at all was
-    -- rejected as machinery that prevents nothing on any type not setting
-    -- it.
-    source_content: String                 -- source-specific payload, e.g. a raw JSON blob
-    source_context: String?                -- source-specific provenance data, e.g. a Kafka
-                                            -- topic/partition/offset or a webhook's headers
+    -- source_context is retained as non-confidential provenance metadata.
+    -- Adapters must not put secrets or personal data in that field (or in
+    -- unprotected payload fields). No arbitrary metadata format can infer
+    -- its own sensitivity. Use topic/partition/offset or a safe source id,
+    -- rather than request headers or a copy of the original message.
+    source_content: String                 -- raw message for unprotected types; otherwise "[redacted]"
+    source_context: String?                -- non-confidential source metadata
     -- metadata.client_id holds the id of the ExternalEventToken used to submit this event
 }
 
@@ -3308,7 +3290,7 @@ rule CreateExternalEvent {
                 sequence: next_sequence(event_type.bounded_context),
                 tags: tags,
                 encryption_keys: protected.encryption_keys,
-                source_content: source_content,
+                source_content: protected_source_content(event_type, source_content),
                 source_context: source_context
             )
 }
@@ -7341,6 +7323,8 @@ rule RegisterEventType {
         missed_occurrence_policy?, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
+    -- Schema/rebuild changes affect every owner, so scoped admins cannot make them.
+    requires: access_mapping.scope = null
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
     requires: valid_type_name(name)
@@ -7489,6 +7473,8 @@ rule RegisterCommandType {
         sensitive_fields, private_fields, blob_fields, rest_trigger_allowed, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
+    -- Schema/rebuild changes affect every owner, so scoped admins cannot make them.
+    requires: access_mapping.scope = null
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
     requires: valid_type_name(name)
@@ -7703,6 +7689,8 @@ rule RegisterProjection {
         consumed_event_types, sync, requires_capability?, owner_tag_key?, segments?, segment_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
+    -- Schema/rebuild changes affect every owner, so scoped admins cannot make them.
+    requires: access_mapping.scope = null
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
     requires: valid_type_name(name)
@@ -7898,6 +7886,8 @@ rule RebuildProjection {
     when: RebuildProjection(access_mapping, projection)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
+    -- Schema/rebuild changes affect every owner, so scoped admins cannot make them.
+    requires: access_mapping.scope = null
     requires: access_mapping.bounded_context = projection.bounded_context
 
     let staged = ProjectionRebuild{projection: projection, status: pending}
@@ -7952,6 +7942,8 @@ rule DiscardProjectionRebuild {
     when: DiscardProjectionRebuild(access_mapping, projection)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
+    -- Schema/rebuild changes affect every owner, so scoped admins cannot make them.
+    requires: access_mapping.scope = null
     requires: access_mapping.bounded_context = projection.bounded_context
 
     let staged = ProjectionRebuild{projection: projection, status: pending}
@@ -7986,6 +7978,7 @@ rule ReconcileEventTypeAtStartup {
         system_triggered_schedule?, missed_occurrence_policy?, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
+    requires: access_mapping.scope = null
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
 
@@ -8066,6 +8059,7 @@ rule ReconcileCommandTypeAtStartup {
         schema, tag_mappings, sensitive_fields, private_fields, blob_fields, rest_trigger_allowed, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
+    requires: access_mapping.scope = null
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
 
@@ -8130,6 +8124,7 @@ rule ReconcileProjectionAtStartup {
         schema, consumed_event_types, sync, requires_capability?, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
+    requires: access_mapping.scope = null
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
 

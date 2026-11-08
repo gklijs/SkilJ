@@ -322,6 +322,7 @@ pub fn service_schema(sdl: std::sync::Arc<String>) -> Schema {
         .register(query)
         .limit_depth(SERVICE_MAX_DEPTH)
         .limit_complexity(SERVICE_MAX_COMPLEXITY)
+        .extension(crate::limits::ExpensiveFieldBudget { max: 0 })
         .finish()
         .expect("a fixed two-type schema")
 }

@@ -129,6 +129,10 @@ impl Projection for SyncAccountBalance {
 
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip - see this file's own doc comment ---
 
+// Every builder below caps its pool at two connections: these tests run
+// concurrently and each live instance has background workers, so default
+// ten-connection pools together can exhaust Postgres's connection limit.
+
 /// Unlike `skilj-core/tests/persistence.rs`'s `TestDb`, this one keeps
 /// the raw connection URL string too - `Skilj::builder(database_url)`
 /// connects for itself, so tests need to hand it a URL, not a
@@ -246,6 +250,7 @@ fn reconciliation_registers_every_type_with_admin_access() {
         let (bc_name, external_subject) = seed_admin_context(&pool).await;
 
         let (_skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDeposited>()
             .command_type::<WithdrawMoney>()
@@ -325,6 +330,7 @@ fn reconciliation_skips_bounded_contexts_with_no_admin_access() {
         db::insert_bounded_context(&pool, &bc).await.unwrap();
 
         let (_skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDeposited>()
             .reconciliation_role(external_subject)
@@ -355,6 +361,7 @@ fn omitting_reconciliation_role_skips_reconciliation_entirely() {
         let (bc_name, _external_subject) = seed_admin_context(&pool).await;
 
         let (_skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDeposited>()
             .build()
@@ -382,6 +389,7 @@ fn reconciliation_is_idempotent_across_repeated_builds() {
 
         for _ in 0..2 {
             let (_skilj, report) = Skilj::builder(database_url.clone())
+                .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
                 .bounded_context(bc_name.clone())
                 .event_type::<MoneyDeposited>()
                 .reconciliation_role(external_subject.clone())
@@ -462,6 +470,7 @@ fn reconciliation_folds_pre_existing_history_into_a_first_time_sync_projection()
         // all - so nothing here folds anything, but a real event is
         // committed for it below regardless.
         let (skilj, report) = Skilj::builder(database_url.clone())
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDeposited>()
             .reconciliation_role(external_subject.clone())
@@ -506,6 +515,7 @@ fn reconciliation_folds_pre_existing_history_into_a_first_time_sync_projection()
         // Second deploy: the sync projection is added now, into a
         // bounded context that already has both events committed above.
         let (_skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDeposited>()
             .projection::<SyncAccountBalance>()
@@ -984,5 +994,45 @@ fn a_versioned_startup_adds_the_column_to_an_older_bounded_context() {
             .unwrap(),
             Some(5)
         );
+    });
+}
+
+#[test]
+fn reconciliation_skips_owner_scoped_admin_grants() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc, subject) = seed_admin_context(&pool).await;
+        sqlx::query(
+            "UPDATE role_access_mappings SET scope = 'tenant-a' WHERE bounded_context = $1",
+        )
+        .bind(&bc)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (_skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<WithdrawMoney>()
+            .projection::<AccountBalance>()
+            .reconciliation_role(subject)
+            .build()
+            .await
+            .unwrap();
+        assert!(report.registered.is_empty());
+        assert_eq!(
+            report.skipped_no_access.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([
+                format!("{bc}/MoneyDeposited"),
+                format!("{bc}/WithdrawMoney"),
+                format!("{bc}/AccountBalance"),
+            ])
+        );
+        assert!(db::get_event_type(&pool, &bc, "MoneyDeposited")
+            .await
+            .unwrap()
+            .is_none());
     });
 }

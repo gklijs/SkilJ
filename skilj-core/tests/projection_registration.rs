@@ -1103,3 +1103,38 @@ fn private_fields_consumed_names_every_private_field_by_event_type() {
         ]
     );
 }
+
+#[test]
+fn scoped_admin_cannot_change_or_rebuild_shared_projection_definitions() {
+    let mut mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    mapping.scope = Some("tenant-a".into());
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let projection = existing_projection(vec![], false);
+    let staged = pending_rebuild(projection.clone());
+    let err = projections::register_projection(
+        &mapping,
+        &bc,
+        projection.name.clone(),
+        base_schema(),
+        vec![],
+        false,
+        None,
+        Some(&projection),
+        None,
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "unscoped_admin_required");
+    assert_eq!(
+        projections::rebuild_projection(&mapping, &projection, Some(&staged))
+            .unwrap_err()
+            .code(),
+        "unscoped_admin_required"
+    );
+    assert_eq!(
+        projections::discard_projection_rebuild(&mapping, &projection, Some(&staged))
+            .unwrap_err()
+            .code(),
+        "unscoped_admin_required"
+    );
+}

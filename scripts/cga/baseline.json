@@ -766,6 +766,12 @@
     {
       "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to associated function `std::time::Instant::now` which can panic",
+      "source": "keys.fetched_at = Some(std::time::Instant::now());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/access_control/mod.rs",
+      "message": "call to associated function `std::time::Instant::now` which can panic",
       "source": "let now = std::time::Instant::now();",
       "count": 1
     },
@@ -791,7 +797,7 @@
       "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to drop of `reqwest::Error` which can panic",
       "source": ".map_err(|e| Error::JwksFetchFailed(e.to_string()))?",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
@@ -808,7 +814,7 @@
     {
       "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to drop of `std::option::Option<jsonwebtoken::DecodingKey>` which can panic",
-      "source": "keys.insert(kid, decoding_key);",
+      "source": "keys.keys.insert(kid, decoding_key);",
       "count": 1
     },
     {
@@ -843,7 +849,7 @@
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to drop of `tokio::sync::RwLockReadGuard<'_, std::collections::HashMap<std::string::String, jsonwebtoken::DecodingKey>>` which can panic",
+      "message": "call to drop of `tokio::sync::RwLockReadGuard<'_, access_control::CachedSigningKeys>` which can panic",
       "source": "}",
       "count": 2
     },
@@ -855,7 +861,7 @@
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/access_control/mod.rs:1000:5: 1000:82}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/access_control/mod.rs:1046:5: 1046:82}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(jwks_endpoint = %self.jwks_endpoint))]",
       "count": 1
     },
@@ -873,19 +879,13 @@
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to drop of `{async fn body of tokio::sync::RwLock<std::collections::HashMap<std::string::String, jsonwebtoken::DecodingKey>>::read()}` which can panic",
-      "source": "Ok(self.keys.read().await.get(kid).cloned())",
-      "count": 1
+      "message": "call to drop of `{async fn body of tokio::sync::RwLock<access_control::CachedSigningKeys>::read()}` which can panic",
+      "source": "let cached = self.keys.read().await;",
+      "count": 3
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to drop of `{async fn body of tokio::sync::RwLock<std::collections::HashMap<std::string::String, jsonwebtoken::DecodingKey>>::read()}` which can panic",
-      "source": "if let Some(key) = self.keys.read().await.get(kid) {",
-      "count": 2
-    },
-    {
-      "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to drop of `{async fn body of tokio::sync::RwLock<std::collections::HashMap<std::string::String, jsonwebtoken::DecodingKey>>::write()}` which can panic",
+      "message": "call to drop of `{async fn body of tokio::sync::RwLock<access_control::CachedSigningKeys>::write()}` which can panic",
       "source": "let mut keys = self.keys.write().await;",
       "count": 1
     },
@@ -939,6 +939,12 @@
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
+      "message": "call to method `core::bool::<impl bool>::then` which can panic",
+      "source": "Ok(cached .fresh(self.max_age) .then(|| cached.keys.get(kid).cloned())",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to method `core::f64::<impl f64>::clamp` which can panic",
       "source": "+ std::time::Duration::from_secs(exp.clamp(0.0, u32::MAX as f64) as u64)",
       "count": 1
@@ -981,6 +987,12 @@
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
+      "message": "call to method `reqwest::Response::error_for_status` which can panic",
+      "source": "let jwks: jsonwebtoken::jwk::JwkSet = self .client .get(self.jwks_endpoint.clone()) .timeout(self.fetch_timeout) .send() .await .map_err(|e| Error::JwksFetchFailed(e.to_string()))? .error_for_status()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to method `serde_json::Map::<std::string::String, serde_json::Value>::get` which can panic",
       "source": "let exp = token_data .claims .get(\"exp\")",
       "count": 1
@@ -994,25 +1006,19 @@
     {
       "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to method `std::collections::HashMap::<K, V, S, A>::clear` which can panic",
-      "source": "keys.clear();",
+      "source": "keys.keys.clear();",
       "count": 1
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to method `std::collections::HashMap::<K, V, S, A>::get` which can panic",
-      "source": "Ok(self.keys.read().await.get(kid).cloned())",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to method `std::collections::HashMap::<K, V, S, A>::get` which can panic",
-      "source": "if let Some(key) = self.keys.read().await.get(kid) {",
+      "source": "if let Some(key) = cached.keys.get(kid) {",
       "count": 2
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to method `std::collections::HashMap::<K, V, S, A>::insert` which can panic",
-      "source": "keys.insert(kid, decoding_key);",
+      "source": "keys.keys.insert(kid, decoding_key);",
       "count": 1
     },
     {
@@ -1055,12 +1061,6 @@
       "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to method `std::fmt::Formatter::<'a>::debug_tuple_field1_finish` which can panic",
       "source": "#[derive(Debug, thiserror::Error)]",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to method `std::option::Option::<&T>::cloned` which can panic",
-      "source": "Ok(self.keys.read().await.get(kid).cloned())",
       "count": 1
     },
     {
@@ -20237,12 +20237,18 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": ".bind(format!(\"bc_{bounded_context}\"))",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": ".bind(format!(\"skilj_blind_tags:{schema}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": ".bind(format!(\"source_content_protection:{bounded_context}\"))",
       "count": 1
     },
     {
@@ -20260,7 +20266,19 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "DROP TRIGGER IF EXISTS protect_existing_external_sources ON {schema}.event_types;\"",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "FROM {schema}.blind_tags ORDER BY tag_key\"",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "FROM {schema}.event_types et WHERE e.event_type_name = et.name \\",
       "count": 1
     },
     {
@@ -20543,12 +20561,24 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `sqlx::RawSql` which can panic",
       "source": ".execute(&mut **tx)",
-      "count": 1
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `sqlx::RawSql` which can panic",
+      "source": ".execute(&mut *tx)",
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".bind(format!(\"skilj_blind_tags:{schema}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".bind(format!(\"source_content_protection:{bounded_context}\"))",
       "count": 1
     },
     {
@@ -20591,7 +20621,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".execute(&mut *tx)",
-      "count": 22
+      "count": 24
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -20643,6 +20673,12 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `sqlx::query::QueryScalar<'_, sqlx::Postgres, i64, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".bind(format!(\"bc_{bounded_context}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `std::array::IntoIter<&str, 2>` which can panic",
       "source": "}",
       "count": 1
@@ -20661,6 +20697,12 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error>> + std::marker::Send>>` which can panic",
+      "source": "let mut tx = conn.begin().await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": ");",
       "count": 1
@@ -20675,7 +20717,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 37
+      "count": 39
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -20735,54 +20777,66 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `tracing::Span` which can panic",
       "source": "}",
-      "count": 22
+      "count": 23
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1253:1: 1253:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1256:1: 1256:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1368:1: 1368:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1371:1: 1371:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1632:1: 1632:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1635:1: 1635:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2010:1: 2010:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2013:1: 2013:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2039:1: 2039:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2042:1: 2042:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2089:1: 2089:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2092:1: 2092:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2179:1: 2179:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2182:1: 2182:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2686:1: 2686:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2689:1: 2689:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3523:1: 3523:33}>` which can panic",
+      "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `{async block@sqlx::Pool<sqlx::Postgres>::acquire::{closure#0}}` which can panic",
+      "source": "let mut conn = pool.acquire().await?;",
       "count": 1
     },
     {
@@ -20795,7 +20849,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::RawSql::execute<'_, &mut sqlx::PgConnection, sqlx::Postgres>()}` which can panic",
       "source": ".await?;",
-      "count": 3
+      "count": 6
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -20807,13 +20861,13 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::commit()}` which can panic",
       "source": "tx.commit().await?;",
-      "count": 8
+      "count": 9
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 71
+      "count": 73
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -20931,6 +20985,12 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, i64, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query_as` which can panic",
       "source": "let (in_use,): (bool,) = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT EXISTS (SELECT 1 FROM {schema}.event_types t, \\ jsonb_array_elements(t.tag_mappings) m \\ WHERE m->>'key' = $1 AND NOT coalesce((m->>'blind')::boolean, false)) \\ OR EXISTS (SELECT 1 FROM {schema}.command_types t, \\ jsonb_array_elements(t.tag_mappings) m \\ WHERE m->>'key' = $1 AND NOT coalesce((m->>'blind')::boolean, false))\" )))",
       "count": 1
@@ -21040,6 +21100,12 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "Ok(sqlx::query_scalar::<_, i64>( \"SELECT count(*) FROM pg_trigger t \\ JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace \\ WHERE n.nspname = $1 AND NOT t.tgisinternal AND \\ ((c.relname = 'events' AND t.tgname = 'protect_external_source') OR \\ (c.relname = 'event_types' AND t.tgname = 'protect_existing_external_sources'))\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
       "source": "let already_migrated: bool = sqlx::query_scalar( \"SELECT EXISTS ( SELECT 1 FROM information_schema.key_column_usage WHERE table_schema = $1 AND table_name = 'idempotency_keys' AND constraint_name = 'idempotency_keys_pkey' AND column_name = 'client_id' )\", )",
       "count": 1
     },
@@ -21090,6 +21156,12 @@
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(\"SELECT pg_advisory_xact_lock(hashtext($1)::bigint)\")",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(\"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))\")",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -21688,6 +21760,12 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.events e SET origin_source_content = '[redacted]' \\ FROM {schema}.event_types et WHERE e.event_type_name = et.name \\ AND e.origin_kind = 'external_triggered' AND {protected} \\ AND e.origin_source_content IS DISTINCT FROM '[redacted]'\" )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.projections SET owner_tag_key = $1 WHERE name = $2\" )))",
       "count": 1
     },
@@ -21759,6 +21837,12 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
+      "message": "call to method `<&'c mut sqlx::pool::PoolConnection<DB> as sqlx::Acquire<'c>>::begin` which can panic",
+      "source": "let mut tx = conn.begin().await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
       "source": "bounded_context: bounded_context.to_string(),",
       "count": 1
@@ -21773,13 +21857,13 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": ".execute(&mut **tx)",
-      "count": 43
+      "count": 44
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": ".execute(&mut *tx)",
-      "count": 22
+      "count": 26
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -21874,6 +21958,12 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "if !source_content_protection_installed(&mut tx, bounded_context).await? {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "if !update_private_field_grant(&mut *tx, revoked).await? {",
       "count": 1
     },
@@ -21881,6 +21971,12 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "insert_private_field_grant_row(&mut *tx, grant, command_id).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to method `<sqlx::pool::PoolConnection<DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "if source_content_protection_installed(&mut conn, bounded_context).await? {",
       "count": 1
     },
     {
@@ -22037,6 +22133,12 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "sqlx::query(\"SELECT pg_advisory_xact_lock(hashtext($1)::bigint)\") .bind(format!(\"skilj_blind_tags:{schema}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query(\"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))\") .bind(format!(\"source_content_protection:{bounded_context}\"))",
       "count": 1
     },
     {
@@ -22367,6 +22469,12 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "sqlx::query_as::<_, RoleRow>(sqlx::AssertSqlSafe(format!( \"SELECT {ROLE_COLUMNS} FROM roles WHERE id = ANY($1)\" ))) .bind(&role_ids)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "Ok(sqlx::query_scalar::<_, i64>( \"SELECT count(*) FROM pg_trigger t \\ JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace \\ WHERE n.nspname = $1 AND NOT t.tgisinternal AND \\ ((c.relname = 'events' AND t.tgname = 'protect_external_source') OR \\ (c.relname = 'event_types' AND t.tgname = 'protect_existing_external_sources'))\", ) .bind(format!(\"bc_{bounded_context}\"))",
       "count": 1
     },
     {
@@ -24857,7 +24965,7 @@
       "file": "skilj-core/src/event_store/mod.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 9
+      "count": 10
     },
     {
       "file": "skilj-core/src/event_store/mod.rs",
@@ -25013,6 +25121,12 @@
       "file": "skilj-core/src/event_store/mod.rs",
       "message": "call to function `event_store::private_field_default_reader` which can panic",
       "source": "private_field_default_reader(record, field, &access_mapping.role)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/event_store/mod.rs",
+      "message": "call to function `event_store::protect_source_content` which can panic",
+      "source": "source_content: protect_source_content(event_type, source_content),",
       "count": 1
     },
     {
@@ -25187,6 +25301,12 @@
       "file": "skilj-core/src/event_store/mod.rs",
       "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
       "source": "tags.iter() .any(|tag| tag.key == owner_tag_key && tag.value.as_deref() == Some(scope))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/event_store/mod.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "|| event_type .blob_fields .iter() .any(|field| field.subject_key.is_some())",
       "count": 1
     },
     {

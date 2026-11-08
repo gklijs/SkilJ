@@ -48,6 +48,11 @@ pub fn register_event_type_field(n: &Naming) -> Field {
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
                 let access_mapping =
                     require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                if access_mapping.scope.is_some() {
+                    return Err(to_graphql_error(
+                        skilj_core::access_control::Error::UnscopedAdminRequired,
+                    ));
+                }
                 let name = ctx.args.try_get("name")?.string()?.to_string();
                 let schema = ctx.args.try_get("schema")?.string()?.to_string();
                 let tag_mappings = parse_tag_mappings(&ctx.args.try_get("tagMappings")?)?;
@@ -195,6 +200,11 @@ pub fn register_command_type_field(n: &Naming) -> Field {
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
                 let access_mapping =
                     require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                if access_mapping.scope.is_some() {
+                    return Err(to_graphql_error(
+                        skilj_core::access_control::Error::UnscopedAdminRequired,
+                    ));
+                }
                 let name = ctx.args.try_get("name")?.string()?.to_string();
                 let schema = ctx.args.try_get("schema")?.string()?.to_string();
                 let tag_mappings = parse_tag_mappings(&ctx.args.try_get("tagMappings")?)?;
@@ -366,6 +376,11 @@ pub fn register_projection_field(n: &Naming) -> Field {
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
                 let access_mapping =
                     require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                if access_mapping.scope.is_some() {
+                    return Err(to_graphql_error(
+                        skilj_core::access_control::Error::UnscopedAdminRequired,
+                    ));
+                }
                 let name = ctx.args.try_get("name")?.string()?.to_string();
                 let schema = ctx.args.try_get("schema")?.string()?.to_string();
                 let sync = ctx.args.try_get("sync")?.boolean()?;
@@ -561,6 +576,11 @@ pub fn rebuild_projection_field(n: &Naming) -> Field {
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
                 let access_mapping =
                     require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                if access_mapping.scope.is_some() {
+                    return Err(to_graphql_error(
+                        skilj_core::access_control::Error::UnscopedAdminRequired,
+                    ));
+                }
                 let name = ctx.args.try_get("name")?.string()?.to_string();
 
                 let projection =
@@ -617,6 +637,11 @@ pub fn discard_projection_rebuild_field(n: &Naming) -> Field {
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
                 let access_mapping =
                     require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                if access_mapping.scope.is_some() {
+                    return Err(to_graphql_error(
+                        skilj_core::access_control::Error::UnscopedAdminRequired,
+                    ));
+                }
                 let name = ctx.args.try_get("name")?.string()?.to_string();
 
                 let projection =

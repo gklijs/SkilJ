@@ -1319,7 +1319,12 @@ task to manage the lifecycle of. Paired with a minimum time between
 refetches (on the order of a few seconds) so a caller can't cheaply force
 repeated JWKS fetches by presenting JWTs with garbage `kid` values.
 The refetch is single-flight: misses that arrive while one is in flight
-wait for it rather than hitting the rate limit (see §65).
+wait for it rather than hitting the rate limit (see §65). Key sets also expire
+after five minutes, including known-key cache hits. The next lookup must refresh
+successfully: expired keys are never served during an IdP outage or while a failed
+refresh is throttled. Removing a compromised key from JWKS therefore reaches a
+running instance within that maximum age; `JwksCache::with_max_age` can override
+it for callers constructing their own cache.
 
 **Crate: `jsonwebtoken`**, not a full OIDC-discovery crate like
 `openidconnect`. Skilj only needs signature verification against a known
@@ -13486,3 +13491,56 @@ A limit alone sends large data to a side channel the user invents, and that is w
 **Tools.** `skilj-tui` downloads the shown events' blobs with `b` on the query tab, `skilj-inspector` marks events holding references (it reads metadata only, never bytes), and `skilj-codegen` has `type = "blob"`.
 
 **Not built.** A per-token upload quota; `Range` requests; a `downloadPath` in GraphQL (above).
+
+
+<a id="security-audit-fixes"></a>
+## 240. Security audit fixes: query work, key expiry, schema authority and provenance
+
+The 2026-11-08 audit's four reproductions are recorded in
+[`security-audit-2026-11-08.md`](security-audit-2026-11-08.md).
+
+**GraphQL work.** The expensive-field extension now checks the syntax tree in
+`prepare_request`, before async-graphql's recursive fragment traversal. An
+iterative expansion permits at most 10,000 selection visits across all operations
+and fragment definitions, including ordinary scalar leaves, unused operations and
+unused fragments. A depth bound rejects cycles and long chains. This protects
+HTTP, subscriptions and the federation service schema. The ordinary depth,
+complexity and expensive-field limits still apply. A timeout alone cannot interrupt
+synchronous traversal on a runtime worker.
+
+**Signing-key removal.** A JWKS set expires after five minutes even on known-key
+hits. Lookups refresh it single-flight; expired keys fail closed during outages or
+refresh throttling. Unknown-key throttling and the ten-second fetch timeout remain.
+A removed key therefore cannot verify new requests indefinitely on a warm instance.
+Existing authenticated WebSockets retain their existing JWT-expiration lifecycle;
+this change does not proactively disconnect them when an IdP key is removed.
+
+**Schema authority.** Registering event, command and projection types, and starting
+or discarding projection rebuilds, require an active **unscoped** Admin grant.
+Changing a shared definition can remove an owner dimension or field policy, so an
+owner-scoped admin may no longer perform these operations. Both core rules and
+GraphQL enforce this. Startup reconciliation skips scoped grants as insufficient
+schema authority. Other context-wide admin powers still require the trust model
+described in `authorization.md`; this does not make a shared context suitable for
+mutually hostile tenant administrators.
+
+**Source messages.** An event type with private fields, sensitive fields or
+subject-encrypted blobs stores `[redacted]` for external `sourceContent`.
+`sourceContext`, timestamps, caller id, correlation/causation ids, tags and sequence
+remain available; the event payload retains its existing protection and replay
+behavior. An unprotected event type still retains raw source content. The choice
+favors field protection and erasure over retaining duplicate input for debugging.
+Use protected payload reads when debugging confidential events. `sourceContext`
+must contain non-confidential source identifiers, never raw messages or credentials.
+
+New contexts install database guards. Existing contexts install them and scrub
+raw protected source content before warming the event cache, once per context in
+one transaction. A declaration gaining protection scrubs its existing rows in the
+same transaction as the policy change. Insert/update guards consult the current
+declaration under a shared row lock, covering older writers during a rolling
+deploy. Inspection also masks legacy/cached provenance before returning it. The
+cleanup permanently removes raw provenance from the live database, but does not
+rewrite existing backups, WAL archives or exported messages; their retention and
+access controls remain operational responsibilities. The first upgrade and a
+policy change may update many history rows and need time/space for the resulting
+WAL. Event payloads and metadata are not rewritten.

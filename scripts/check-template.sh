@@ -108,9 +108,6 @@ fi
 cargo build --bin server
 port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
 log="$work/server.log"
-env -u DATABASE_URL PORT="$port" SKILJ_LOCAL_DATA_DIR="$work/postgres" \
-    "$CARGO_TARGET_DIR/debug/server" >"$log" 2>&1 &
-server_pid=$!
 
 fail() {
     echo "check-template: $*" >&2
@@ -119,12 +116,30 @@ fail() {
     exit 1
 }
 
-# Long enough for the first run's Postgres download and initdb.
-for _ in $(seq 1 300); do
-    # shellcheck disable=SC2016 # Match the literal variable in printed commands.
-    grep -q '^  curl .*\$WITHDRAW' "$log" && break
-    kill -0 "$server_pid" 2>/dev/null || fail "the server exited before it was ready"
-    sleep 1
+# Retry only a failed embedded-Postgres download's HTTP 5xx response.
+# Application, initialization and quickstart failures must still fail immediately.
+for attempt in 1 2 3; do
+    env -u DATABASE_URL PORT="$port" SKILJ_LOCAL_DATA_DIR="$work/postgres" \
+        "$CARGO_TARGET_DIR/debug/server" >"$log" 2>&1 &
+    server_pid=$!
+    # Long enough for the first run's Postgres download and initdb.
+    for _ in $(seq 1 300); do
+        # shellcheck disable=SC2016 # Match the literal variable in printed commands.
+        grep -q '^  curl .*\$WITHDRAW' "$log" && break
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            wait "$server_pid" || true
+            server_pid=
+            break
+        fi
+        sleep 1
+    done
+    [[ -n "$server_pid" ]] && break
+    if [[ $attempt -eq 3 ]] || ! grep -Eq '^error: local Postgres: HTTP status server error \(5[0-9]{2} ' "$log"; then
+        fail "the server exited before it was ready"
+    fi
+    cat "$log" >&2
+    echo "check-template: retrying Postgres download (attempt $((attempt + 1))/3)" >&2
+    sleep 2
 done
 # shellcheck disable=SC2016 # Match the literal variable in printed commands.
 grep -q '^  curl .*\$WITHDRAW' "$log" || fail "the server didn't print its try-it commands within 300s"

@@ -1607,3 +1607,51 @@ fn register_command_type_rejects_a_sensitive_field_in_the_secrets_namespace() {
         skilj_core::secrets::Error::ReservedSubjectKey.code()
     );
 }
+
+#[test]
+fn scoped_admin_cannot_remove_record_security_by_reregistering_types() {
+    let mut mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    mapping.scope = Some("tenant-a".into());
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let existing = EventType {
+        owner_tag_key: Some("currency".into()),
+        ..existing_event_type(schema_v1(), vec![tag_mapping("currency", "currency")])
+    };
+    let err = event_store::register_event_type(
+        &mapping,
+        &bc,
+        existing.name.clone(),
+        existing.schema.clone(),
+        existing.tag_mappings.clone(),
+        None,
+        vec![],
+        vec![],
+        vec![],
+        false,
+        false,
+        false,
+        None,
+        None,
+        false,
+        Some(&existing),
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "unscoped_admin_required");
+    let existing = existing_command_type(schema_v1(), vec![]);
+    let err = event_store::register_command_type(
+        &mapping,
+        &bc,
+        existing.name.clone(),
+        existing.schema.clone(),
+        vec![],
+        None,
+        vec![],
+        vec![],
+        vec![],
+        false,
+        Some(&existing),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "unscoped_admin_required");
+}

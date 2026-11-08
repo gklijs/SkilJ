@@ -25,6 +25,10 @@ function fixture(t) {
 printf '%s\\n' "$*" >> "$CAPTURE"
 printf '%s\\n' "target=$CARGO_TARGET_DIR" >> "$CAPTURE"
 printf '%s\\n' "\${FAKE_TEST_OUTPUT:-tests passed}"
+if [[ "$*" == 'build --bin server' && -n "\${FAKE_SERVER:-}" ]]; then
+  mkdir -p "$CARGO_TARGET_DIR/debug"
+  cp "$FAKE_SERVER" "$CARGO_TARGET_DIR/debug/server"
+fi
 if [[ " $* " == *" --doc "* ]]; then exit "\${FAKE_DOC_STATUS:-0}"; fi
 exit "\${FAKE_TEST_STATUS:-0}"
 `, { mode: 0o755 });
@@ -136,3 +140,40 @@ esac
   for (const name of ['template-check', 'skilj', 'skilj-core', 'skilj-graphql', 'skilj-rest']) assert.ok(names.includes(name), name);
   assert.ok(!names.includes('skilj-kafka') && !names.includes('skilj-temporal'));
 });
+
+for (const [label, failures, message, expectedAttempts, status] of [
+  ['recovers from an HTTP 504 download failure', 1, 'local Postgres: HTTP status server error (504 Gateway Timeout) for url (https://github.com/test)', 2, 0],
+  ['stops after three HTTP 504 download failures', 3, 'local Postgres: HTTP status server error (504 Gateway Timeout) for url (https://github.com/test)', 3, 1],
+  ['does not retry an application failure', 1, 'registration rejected', 1, 1],
+  ['does not retry an HTTP 404 download failure', 1, 'local Postgres: HTTP status client error (404 Not Found) for url (https://github.com/test)', 1, 1],
+]) {
+  test(`template startup ${label}`, t => {
+    const { dir, env } = fixture(t);
+    const attempts = join(dir, 'attempts');
+    const server = join(dir, 'server');
+    writeFileSync(server, `#!/usr/bin/env node
+const fs = require('node:fs');
+const count = Number(fs.existsSync(process.env.ATTEMPTS) ? fs.readFileSync(process.env.ATTEMPTS, 'utf8') : 0) + 1;
+fs.writeFileSync(process.env.ATTEMPTS, String(count));
+if (count <= Number(process.env.FAILURES)) {
+  console.error('error: ' + process.env.FAILURE_MESSAGE);
+  process.exit(1);
+}
+process.on('SIGINT', () => process.exit(0));
+console.log('export DEPOSIT=deposit WITHDRAW=withdraw');
+console.log('  curl $DEPOSIT');
+console.log('  curl $WITHDRAW');
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+    writeFileSync(join(dir, 'bin', 'curl'), `#!/usr/bin/env bash
+if [[ "$1" == deposit ]]; then echo '{"accepted":true}'; else echo '{"rejectionKind":"insufficient_funds"}'; fi
+`, { mode: 0o755 });
+    const result = run('check-template.sh', [], {
+      ...env, FAKE_SERVER: server, ATTEMPTS: attempts, FAILURES: String(failures), FAILURE_MESSAGE: message,
+    });
+    assert.equal(result.status, status, result.stdout + result.stderr);
+    assert.equal(Number(readFileSync(attempts, 'utf8')), expectedAttempts);
+    if (status === 0) assert.match(result.stdout, /quickstart ran: deposit accepted, overdraft rejected/);
+    else assert.match(result.stderr, /the server exited before it was ready/);
+  });
+}
