@@ -1211,3 +1211,89 @@ fn a_command_for_another_bounded_context_fails_alone() {
             .is_empty());
     });
 }
+
+#[test]
+fn prepared_commands_recheck_conflicts_and_idempotency_after_a_delayed_submission() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+        let batcher = CommandBatcher::new();
+        let dispatcher: Arc<dyn CommandDispatcher> = Arc::new(ShipOrderDispatcher);
+        let projections: Arc<dyn ProjectionDispatcher> = Arc::new(NoopProjectionDispatcher);
+        let cache = EventCache::new(1000);
+        let broadcaster = EventBroadcaster::new(64);
+        let now = test_now();
+        let item = |key: Option<&str>| skilj_core::command_batcher::CommandBatchItem {
+            command_type: ct.clone(),
+            payload: r#"{"order_id":"A"}"#.into(),
+            client_id: "client-1".into(),
+            correlation_id: Some("prepared-correlation".into()),
+            causation_id: Some("prepared-cause".into()),
+            idempotency_key: key.map(str::to_owned),
+        };
+        // Every optimistic decision sees empty history. None is queued yet.
+        let mut prepared = Vec::new();
+        for key in [Some("once"), Some("once"), None] {
+            let command = batcher
+                .prepare_command(
+                    &pool,
+                    dispatcher.as_ref(),
+                    &NoSnapshots,
+                    &cache,
+                    item(key),
+                    None,
+                    now,
+                )
+                .await
+                .unwrap();
+            prepared.push(command);
+        }
+        assert!(db::list_events_for_bounded_context(&pool, &bc.name).await.unwrap().is_empty());
+        let mut outcomes = Vec::new();
+        for command in prepared {
+            let outcome = batcher
+                .submit_prepared(
+                    &pool, &dispatcher, &projections, &broadcaster, &cache, None, command,
+                )
+                .await
+                .unwrap();
+            outcomes.push(outcome);
+        }
+        let SubmitCommandOutcome::Accepted { command, events } = &outcomes[0] else {
+            panic!("first preparation should commit");
+        };
+        assert_eq!(command.metadata.created_at, now);
+        assert_eq!(command.metadata.correlation_id.as_deref(), Some("prepared-correlation"));
+        assert_eq!(command.metadata.causation_id.as_deref(), Some("prepared-cause"));
+        let sequences: Vec<_> = events.iter().map(|event| event.sequence).collect();
+        assert!(matches!(&outcomes[1], SubmitCommandOutcome::Deduplicated { triggered_event_sequences } if *triggered_event_sequences == sequences));
+        let SubmitCommandOutcome::Rejected { kind, matching_events, .. } = &outcomes[2] else {
+            panic!("stale optimistic acceptance must be re-decided");
+        };
+        assert_eq!(kind, "already_shipped");
+        assert_eq!(matching_events.len(), 1);
+        assert_eq!(matching_events[0].sequence, sequences[0]);
+        assert_eq!(db::list_events_for_bounded_context(&pool, &bc.name).await.unwrap().len(), 1);
+
+        // This preparation starts with nonempty rejection history and owns it
+        // until submission, rather than reconstructing it from borrowed slices.
+        let rejected = batcher
+            .prepare_command(
+                &pool, dispatcher.as_ref(), &NoSnapshots, &cache, item(None), None, now,
+            )
+            .await
+            .unwrap();
+        let outcome = batcher
+            .submit_prepared(
+                &pool, &dispatcher, &projections, &broadcaster, &cache, None, rejected,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome,
+            SubmitCommandOutcome::Rejected { matching_events, .. } if matching_events.len() == 1));
+    });
+}

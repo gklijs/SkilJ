@@ -109,6 +109,19 @@ pub struct CommandBatchItem {
     pub idempotency_key: Option<String>,
 }
 
+/// An optimistic command ready to join a batch queue.
+///
+/// Created by [`CommandBatcher::prepare_command`] and consumed by
+/// [`CommandBatcher::submit_prepared`]. Owns its ciphertext histories and
+/// snapshot states; moving it into the queue does not copy those records.
+/// It is neither a committed result nor evidence that the locked checks
+/// may be skipped. Submit with the same pool, dispatchers and key service
+/// used for preparation. Authorisation remains the caller's responsibility.
+#[must_use = "a prepared command must be submitted to persist its decision"]
+pub struct PreparedCommand {
+    command: BatchedCommand,
+}
+
 /// One command, sitting in a per-bounded-context queue - see this
 /// module's own doc comment. Every entry is answered through its `reply`
 /// sender, the leader's own included: since a caller can queue several
@@ -337,6 +350,106 @@ impl CommandBatcher {
         await_reply(reply).await
     }
 
+    /// Resolve and warm one already authorised command before queueing it.
+    ///
+    /// Histories and snapshot states move from the resolver into the result.
+    /// `now` is retained for both optimistic and locked decisions. No command
+    /// is persisted until [`submit_prepared`](Self::submit_prepared) is called;
+    /// key warm-up may provision encryption keys, as in `decide_and_submit`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_command(
+        &self,
+        pool: &Pool,
+        dispatcher: &dyn CommandDispatcher,
+        snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+        event_cache: &EventCache,
+        item: CommandBatchItem,
+        key_service: Option<&KeyService>,
+        now: DateTime<Utc>,
+    ) -> Result<PreparedCommand> {
+        let resolved = crate::db::resolve_command_submission(
+            pool,
+            dispatcher,
+            snapshot_dispatcher,
+            event_cache,
+            &item.command_type,
+            &item.payload,
+            &crate::plugin::DecisionContext::at(now),
+        )
+        .await?;
+        self.slow.note_resolved(&item.command_type, &resolved);
+        let (event_types_by_name, keys) = crate::db::warm_up_event_types_and_encryption_keys(
+            pool,
+            &item.command_type.bounded_context.name,
+            &item.command_type,
+            &item.payload,
+            &resolved.decision,
+            key_service,
+        )
+        .await?;
+        Ok(PreparedCommand {
+            command: BatchedCommand {
+                command_type: item.command_type,
+                payload: item.payload,
+                client_id: item.client_id,
+                correlation_id: item.correlation_id,
+                causation_id: item.causation_id,
+                bounded_context_events: resolved.bounded_context_events,
+                covered_through: Some(resolved.covered_through),
+                consistency_tags: resolved.consistency_tags,
+                matching_events: resolved.matching_events,
+                initial_decision: resolved.decision,
+                now,
+                snapshot: resolved
+                    .snapshot_context
+                    .map(|snapshot| OwnedSnapshotContext {
+                        state_json: snapshot.state_json,
+                        as_of_sequence: snapshot.as_of_sequence,
+                    }),
+                snapshot_states: resolved.snapshot_states,
+                idempotency_key: item.idempotency_key,
+                event_types_by_name,
+                resolved: keys,
+            },
+        })
+    }
+
+    /// Consume a prepared command and await its durable, locked outcome.
+    ///
+    /// The context is taken from the opaque value. Conflict redispatch,
+    /// current policy/key checks and failed set-write replay still run.
+    /// Unlike [`decide_and_submit`](Self::decide_and_submit), this low-level
+    /// method returns errors requiring a fresh optimistic read to the caller;
+    /// use [`crate::db::back_to_the_read`] to identify them and prepare again.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_prepared(
+        &self,
+        pool: &Pool,
+        dispatcher: &Arc<dyn CommandDispatcher>,
+        projection_dispatcher: &Arc<dyn ProjectionDispatcher>,
+        broadcaster: &EventBroadcaster,
+        event_cache: &EventCache,
+        key_service: Option<&KeyService>,
+        prepared: PreparedCommand,
+    ) -> Result<SubmitCommandOutcome> {
+        let bounded_context = prepared.command.command_type.bounded_context.name.clone();
+        let reply = self
+            .enqueue(
+                pool,
+                dispatcher,
+                projection_dispatcher,
+                broadcaster,
+                event_cache,
+                key_service,
+                &bounded_context,
+                vec![prepared.command],
+            )
+            .await
+            .pop()
+            .expect("one command queued, one reply");
+        await_reply(reply).await
+    }
+
     /// A command as it waits in the queue. The pre-lock warm-up is done
     /// here - fully in parallel across every concurrently-submitting
     /// caller, before any of them join the shared queue - rather than by
@@ -517,43 +630,17 @@ impl CommandBatcher {
                 if item.command_type.bounded_context.name != bounded_context_name {
                     return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
                 }
-                let now = Utc::now();
-                let resolved = crate::db::resolve_command_submission(
+                self.prepare_command(
                     pool,
                     dispatcher.as_ref(),
                     snapshot_dispatcher,
                     event_cache,
-                    &item.command_type,
-                    &item.payload,
-                    &crate::plugin::DecisionContext::at(now),
-                )
-                .await?;
-                self.slow.note_resolved(&item.command_type, &resolved);
-                Self::prepare(
-                    pool,
-                    &item.command_type,
-                    &item.payload,
-                    &item.client_id,
-                    item.correlation_id.as_deref(),
-                    item.causation_id.as_deref(),
-                    &resolved.bounded_context_events,
-                    &resolved.consistency_tags,
-                    &resolved.matching_events,
-                    resolved.decision,
+                    item,
                     key_service,
-                    now,
-                    resolved
-                        .snapshot_context
-                        .as_ref()
-                        .map(|ctx| SnapshotContext {
-                            state_json: &ctx.state_json,
-                            as_of_sequence: ctx.as_of_sequence,
-                        }),
-                    &resolved.snapshot_states,
-                    item.idempotency_key.as_deref(),
-                    Some(resolved.covered_through),
+                    Utc::now(),
                 )
                 .await
+                .map(|prepared| prepared.command)
             })
             .buffered(PREPARE_CONCURRENCY)
             .collect()
@@ -674,45 +761,32 @@ impl CommandBatcher {
         now: DateTime<Utc>,
         idempotency_key: Option<&str>,
     ) -> Result<SubmitCommandOutcome> {
-        let resolved = crate::db::resolve_command_submission(
-            pool,
-            dispatcher.as_ref(),
-            snapshot_dispatcher,
-            event_cache,
-            command_type,
-            payload,
-            &crate::plugin::DecisionContext::at(now),
-        )
-        .await?;
-        self.slow.note_resolved(command_type, &resolved);
-
-        self.submit(
+        let prepared = self
+            .prepare_command(
+                pool,
+                dispatcher.as_ref(),
+                snapshot_dispatcher,
+                event_cache,
+                CommandBatchItem {
+                    command_type: command_type.clone(),
+                    payload: payload.to_owned(),
+                    client_id: client_id.to_owned(),
+                    correlation_id: correlation_id.map(str::to_owned),
+                    causation_id: causation_id.map(str::to_owned),
+                    idempotency_key: idempotency_key.map(str::to_owned),
+                },
+                key_service,
+                now,
+            )
+            .await?;
+        self.submit_prepared(
             pool,
             dispatcher,
             projection_dispatcher,
             broadcaster,
             event_cache,
-            command_type,
-            payload,
-            client_id,
-            correlation_id,
-            causation_id,
-            &resolved.bounded_context_events,
-            &resolved.consistency_tags,
-            &resolved.matching_events,
-            resolved.decision,
             key_service,
-            now,
-            resolved
-                .snapshot_context
-                .as_ref()
-                .map(|ctx| SnapshotContext {
-                    state_json: &ctx.state_json,
-                    as_of_sequence: ctx.as_of_sequence,
-                }),
-            &resolved.snapshot_states,
-            idempotency_key,
-            Some(resolved.covered_through),
+            prepared,
         )
         .await
     }
