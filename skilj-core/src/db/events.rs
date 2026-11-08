@@ -548,6 +548,23 @@ pub async fn list_events_for_bounded_context_from_limited(
     after_sequence: i64,
     limit: i64,
 ) -> crate::error::Result<Vec<Event>> {
+    list_events_for_bounded_context_from_limited_up_to(
+        pool,
+        bounded_context,
+        after_sequence,
+        limit,
+        None,
+    )
+    .await
+}
+
+async fn list_events_for_bounded_context_from_limited_up_to(
+    pool: &Pool,
+    bounded_context: &str,
+    after_sequence: i64,
+    limit: i64,
+    up_to: Option<i64>,
+) -> crate::error::Result<Vec<Event>> {
     let bc = require_bounded_context(pool, bounded_context).await?;
 
     let schema = schema_ident(bounded_context);
@@ -556,10 +573,11 @@ pub async fn list_events_for_bounded_context_from_limited(
          metadata_client_id, metadata_created_at, metadata_correlation_id, \
          metadata_causation_id, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events \
-         WHERE sequence > $1 ORDER BY sequence LIMIT $2"
+         WHERE sequence > $1 AND ($3::bigint IS NULL OR sequence <= $3) ORDER BY sequence LIMIT $2"
     )))
     .bind(after_sequence)
     .bind(limit)
+    .bind(up_to)
     .fetch_all(pool)
     .await?;
 
@@ -1570,14 +1588,17 @@ pub(super) async fn list_events_cached_limited(
     limit: i64,
 ) -> crate::error::Result<Vec<Event>> {
     match cache
-        .try_events_after(pool, bounded_context, after_sequence)
+        .try_events_bounded(
+            pool,
+            bounded_context,
+            after_sequence,
+            None,
+            usize::try_from(limit).unwrap_or(usize::MAX),
+            |e| e.event_type.name == event_type_name,
+        )
         .await?
     {
-        Some(events) => Ok(events
-            .into_iter()
-            .filter(|e| e.event_type.name == event_type_name)
-            .take(usize::try_from(limit).unwrap_or(usize::MAX))
-            .collect()),
+        Some((events, _)) => Ok(events),
         None => {
             list_events_from_limited(
                 pool,
@@ -1622,6 +1643,25 @@ pub async fn list_events_from_limited(
     after_sequence: i64,
     limit: i64,
 ) -> crate::error::Result<Vec<Event>> {
+    list_events_from_limited_up_to(
+        pool,
+        bounded_context,
+        event_type_name,
+        after_sequence,
+        limit,
+        None,
+    )
+    .await
+}
+
+async fn list_events_from_limited_up_to(
+    pool: &Pool,
+    bounded_context: &str,
+    event_type_name: &str,
+    after_sequence: i64,
+    limit: i64,
+    up_to: Option<i64>,
+) -> crate::error::Result<Vec<Event>> {
     let bc = require_bounded_context(pool, bounded_context).await?;
     let et = require_event_type(pool, bounded_context, event_type_name).await?;
 
@@ -1631,11 +1671,12 @@ pub async fn list_events_from_limited(
          metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \
          origin_kind, origin_source_content, origin_source_context, \
          origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \
-         ORDER BY sequence LIMIT $3"
+         AND ($4::bigint IS NULL OR sequence <= $4) ORDER BY sequence LIMIT $3"
     )))
     .bind(event_type_name)
     .bind(after_sequence)
     .bind(limit)
+    .bind(up_to)
     .fetch_all(pool)
     .await?;
 
@@ -1682,7 +1723,31 @@ pub async fn for_each_event_chunk(
     cache: &crate::event_cache::EventCache,
     bounded_context: &str,
     event_type_name: Option<&str>,
+    after_sequence: i64,
+    chunk_size: usize,
+    visit: impl FnMut(&[Event]) -> crate::error::Result<bool>,
+) -> crate::error::Result<()> {
+    for_each_event_chunk_up_to(
+        pool,
+        cache,
+        bounded_context,
+        event_type_name,
+        after_sequence,
+        None,
+        chunk_size,
+        visit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn for_each_event_chunk_up_to(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    event_type_name: Option<&str>,
     mut after_sequence: i64,
+    up_to: Option<i64>,
     chunk_size: usize,
     mut visit: impl FnMut(&[Event]) -> crate::error::Result<bool>,
 ) -> crate::error::Result<()> {
@@ -1690,32 +1755,40 @@ pub async fn for_each_event_chunk(
     let limit = i64::try_from(chunk_size).unwrap_or(i64::MAX);
     loop {
         let chunk = match cache
-            .try_events_after(pool, bounded_context, after_sequence)
+            .try_events_bounded(
+                pool,
+                bounded_context,
+                after_sequence,
+                up_to,
+                chunk_size,
+                |e| event_type_name.is_none_or(|name| e.event_type.name == name),
+            )
             .await?
         {
-            Some(events) => {
-                // The window is complete from `after_sequence` on, so a
-                // short type-filtered result here is the real end.
-                let chunk: Vec<Event> = events
-                    .into_iter()
-                    .filter(|e| event_type_name.is_none_or(|name| e.event_type.name == name))
-                    .take(chunk_size)
-                    .collect();
-                let exhausted = chunk.len() < chunk_size;
-                (chunk, exhausted)
+            Some((events, _)) => {
+                let exhausted = events.len() < chunk_size;
+                (events, exhausted)
             }
             None => {
                 let chunk = match event_type_name {
                     Some(name) => {
-                        list_events_from_limited(pool, bounded_context, name, after_sequence, limit)
-                            .await?
+                        list_events_from_limited_up_to(
+                            pool,
+                            bounded_context,
+                            name,
+                            after_sequence,
+                            limit,
+                            up_to,
+                        )
+                        .await?
                     }
                     None => {
-                        list_events_for_bounded_context_from_limited(
+                        list_events_for_bounded_context_from_limited_up_to(
                             pool,
                             bounded_context,
                             after_sequence,
                             limit,
+                            up_to,
                         )
                         .await?
                     }
@@ -1810,12 +1883,13 @@ pub async fn collect_scanned_event_page(
 ) -> crate::error::Result<ScannedEventPage> {
     let mut page = Vec::new();
     let mut scanned_through = None;
-    for_each_event_chunk(
+    for_each_event_chunk_up_to(
         pool,
         cache,
         bounded_context,
         event_type_name,
         after_sequence,
+        up_to,
         max_events,
         |chunk| {
             let wanted = chunk_up_to(chunk, up_to);

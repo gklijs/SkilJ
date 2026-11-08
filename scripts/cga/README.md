@@ -121,3 +121,19 @@ unchanged. Postgres regressions verify the actual guards, concurrent upgrade
 cleanup, stale writers and metadata retention; JWT regressions verify removed
 keys and outage behavior. This is an explicit review of the analysis growth,
 not a panic-count reduction.
+
+Issue #171's bounded cache pages review and re-record the baseline with 20
+added identities (20 occurrences) and 18 removed identities (18 occurrences);
+one existing bounded-context drop identity falls from four occurrences to three.
+The two SQL queries now bind an optional upper sequence bound; their changed
+query strings replace existing query/bind identities and add the extra bind.
+The cache's existing `partition_point`/`range` operations move into a selection
+helper, with their bounds still computed from the same guarded deque. The
+bounded iterator changes allocation/collection and event-vector drop paths;
+tracing's embedded async-block line numbers also change identities. Sampled
+backtraces lead to standard-library allocation/unsafe-precondition assertions
+and SQLx/drop paths. These remain potential panics; this is not a claim of
+panic freedom. No production `unwrap`, `expect`, unchecked indexing or unsafe
+code is added. Tool/configuration, dependency snapshot and the skipped generic
+target multiset are unchanged. Postgres parity tests and an append/erasure
+interleaving exercise the changed read path.
