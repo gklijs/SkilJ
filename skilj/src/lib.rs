@@ -3762,6 +3762,35 @@ impl SkiljBuilder {
     /// so start from [`default_pool_options`] to keep that, or from
     /// `PgPoolOptions::new()` to have every connection pinged as it is
     /// taken (docs/architecture.md §196).
+    ///
+    /// Large queries and projection states can grow SQLx's retained client
+    /// buffers on each connection. Pool width therefore multiplies application
+    /// memory as well as database resources. See docs/performance.md's
+    /// "Client connection buffers" for measurements and reclamation tradeoffs.
+    /// An opt-in idle-time experiment can use SQLx's hook:
+    ///
+    /// ```
+    /// use sqlx::Connection;
+    /// use std::time::Duration;
+    ///
+    /// let options = skilj::default_pool_options()
+    ///     .max_connections(10)
+    ///     .before_acquire(|connection, metadata| Box::pin(async move {
+    ///         if metadata.idle_for >= Duration::from_secs(60) {
+    ///             connection.shrink_buffers();
+    ///         }
+    ///         Ok(true)
+    ///     }));
+    /// let builder = skilj::Skilj::builder("postgres://localhost/skilj")
+    ///     .pool_options(options);
+    /// ```
+    ///
+    /// This runs on the next acquisition, not on a timer during idleness.
+    /// Background polling can keep every connection below the idle threshold.
+    /// The threshold is illustrative; frequent shrinking may cause allocator
+    /// churn. This does not close sockets or clear prepared statements, and
+    /// does not guarantee that RSS falls. Configure any other `before_acquire`
+    /// behavior in the same callback: setting another hook replaces this one.
     pub fn pool_options(mut self, options: PgPoolOptions) -> Self {
         self.pool_options = Some(options);
         self

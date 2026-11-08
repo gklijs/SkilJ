@@ -10,6 +10,13 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Documentation
+
+- Explain SQLx client-buffer retention, its per-connection memory cost, and
+  opt-in pool hooks in the performance guide and `SkiljBuilder::pool_options`.
+  Add a SQLx-only two-cycle allocation/RSS and latency probe; pool defaults
+  remain unchanged.
+
 ## [0.3.0] - 2026-11-04
 
 ### Upgrading from 0.2

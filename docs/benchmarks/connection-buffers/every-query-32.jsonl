@@ -1,0 +1,12 @@
+{"backend_pids":[1412,1413,1414,1415,1416,1417,1418,1419,1420,1421,1422,1423,1424,1425,1426,1427,1428,1429,1430,1431,1432,1433,1434,1435,1436,1438,1437,1439,1440,1441,1410,1411],"connections":32,"idle_seconds":5,"passes":8,"payload_bytes":2097152,"policy":"every-query","postgres":"PostgreSQL 17.11 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit"}
+{"cycle":0,"live_requested_bytes":2781320,"rss_kib":9580,"stage":"warm_pool"}
+{"cycle":1,"load_seconds_including_boundary":0.788033301,"p95_ms":161.955233,"p99_ms":193.706424,"queries_per_second":324.8593678403446,"requested_bytes_during_load":3376004085,"successful_queries":256}
+{"cycle":1,"live_requested_bytes":69645288,"rss_kib":77596,"stage":"after_load_and_policy"}
+{"cycle":1,"live_requested_bytes":2798056,"rss_kib":10340,"stage":"after_small_queries"}
+{"cycle":1,"live_requested_bytes":2798056,"rss_kib":10340,"stage":"idle"}
+{"cycle":2,"load_seconds_including_boundary":0.818873913,"p95_ms":129.510917,"p99_ms":151.832705,"queries_per_second":312.6244418534798,"requested_bytes_during_load":3299327974,"successful_queries":256}
+{"cycle":2,"live_requested_bytes":69645288,"rss_kib":77564,"stage":"after_load_and_policy"}
+{"cycle":2,"live_requested_bytes":2798056,"rss_kib":10340,"stage":"after_small_queries"}
+{"cycle":2,"live_requested_bytes":2798056,"rss_kib":10340,"stage":"idle"}
+{"connections_opened":32,"cycles":2,"replacements":0}
+{"cycle":2,"live_requested_bytes":2146652,"rss_kib":9992,"stage":"pool_closed"}
