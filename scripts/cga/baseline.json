@@ -459,6 +459,12 @@
     },
     {
       "file": "<rust>/library/alloc/src/vec/mod.rs",
+      "message": "call to associated function `<std::vec::Vec<T> as std::vec::spec_from_iter::SpecFromIter<T, I>>::from_iter` which can panic",
+      "source": "<Self as SpecFromIter<T, I::IntoIter>>::from_iter(iter.into_iter())",
+      "count": 1
+    },
+    {
+      "file": "<rust>/library/alloc/src/vec/mod.rs",
       "message": "call to drop of `std::vec::Vec<u8>` which can panic",
       "source": "}",
       "count": 1
@@ -11321,7 +11327,7 @@
       "file": "skilj-core/src/db/events.rs",
       "message": "call to drop of `event_store::BoundedContext` which can panic",
       "source": "}",
-      "count": 4
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/events.rs",
@@ -11367,8 +11373,8 @@
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `std::iter::Filter<std::vec::IntoIter<event_store::Event>, {closure@skilj-core/src/db/events.rs:1578:21: 1578:24}>` which can panic",
-      "source": ".take(usize::try_from(limit).unwrap_or(usize::MAX))",
+      "message": "call to drop of `std::collections::HashMap<std::string::String, event_store::EventType>` which can panic",
+      "source": "}",
       "count": 1
     },
     {
@@ -11589,19 +11595,19 @@
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:1237:1: 1237:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:1255:1: 1255:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:1421:1: 1421:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:1439:1: 1439:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:1478:1: 1478:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:1496:1: 1496:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -11613,19 +11619,19 @@
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:1947:1: 1947:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2021:1: 2021:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2006:1: 2006:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2080:1: 2080:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2156:1: 2156:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2230:1: 2230:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -11944,7 +11950,7 @@
     {
       "file": "skilj-core/src/db/events.rs",
       "message": "call to function `sqlx::query_as` which can panic",
-      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \\ metadata_client_id, metadata_created_at, metadata_correlation_id, \\ metadata_causation_id, tags, origin_kind, origin_source_content, \\ origin_source_context, origin_command_id FROM {schema}.events \\ WHERE sequence > $1 ORDER BY sequence LIMIT $2\" )))",
+      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \\ metadata_client_id, metadata_created_at, metadata_correlation_id, \\ metadata_causation_id, tags, origin_kind, origin_source_content, \\ origin_source_context, origin_command_id FROM {schema}.events \\ WHERE sequence > $1 AND ($3::bigint IS NULL OR sequence <= $3) ORDER BY sequence LIMIT $2\" )))",
       "count": 1
     },
     {
@@ -11956,7 +11962,7 @@
     {
       "file": "skilj-core/src/db/events.rs",
       "message": "call to function `sqlx::query_as` which can panic",
-      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \\ origin_kind, origin_source_content, origin_source_context, \\ origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \\ ORDER BY sequence LIMIT $3\" )))",
+      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \\ origin_kind, origin_source_content, origin_source_context, \\ origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \\ AND ($4::bigint IS NULL OR sequence <= $4) ORDER BY sequence LIMIT $3\" )))",
       "count": 1
     },
     {
@@ -12760,13 +12766,19 @@
     {
       "file": "skilj-core/src/db/events.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \\ metadata_client_id, metadata_created_at, metadata_correlation_id, \\ metadata_causation_id, tags, origin_kind, origin_source_content, \\ origin_source_context, origin_command_id FROM {schema}.events \\ WHERE sequence > $1 ORDER BY sequence LIMIT $2\" ))) .bind(after_sequence)",
+      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \\ metadata_client_id, metadata_created_at, metadata_correlation_id, \\ metadata_causation_id, tags, origin_kind, origin_source_content, \\ origin_source_context, origin_command_id FROM {schema}.events \\ WHERE sequence > $1 AND ($3::bigint IS NULL OR sequence <= $3) ORDER BY sequence LIMIT $2\" ))) .bind(after_sequence)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/events.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \\ metadata_client_id, metadata_created_at, metadata_correlation_id, \\ metadata_causation_id, tags, origin_kind, origin_source_content, \\ origin_source_context, origin_command_id FROM {schema}.events \\ WHERE sequence > $1 ORDER BY sequence LIMIT $2\" ))) .bind(after_sequence) .bind(limit)",
+      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \\ metadata_client_id, metadata_created_at, metadata_correlation_id, \\ metadata_causation_id, tags, origin_kind, origin_source_content, \\ origin_source_context, origin_command_id FROM {schema}.events \\ WHERE sequence > $1 AND ($3::bigint IS NULL OR sequence <= $3) ORDER BY sequence LIMIT $2\" ))) .bind(after_sequence) .bind(limit)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/events.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \\ metadata_client_id, metadata_created_at, metadata_correlation_id, \\ metadata_causation_id, tags, origin_kind, origin_source_content, \\ origin_source_context, origin_command_id FROM {schema}.events \\ WHERE sequence > $1 AND ($3::bigint IS NULL OR sequence <= $3) ORDER BY sequence LIMIT $2\" ))) .bind(after_sequence) .bind(limit) .bind(up_to)",
       "count": 1
     },
     {
@@ -12778,19 +12790,25 @@
     {
       "file": "skilj-core/src/db/events.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \\ origin_kind, origin_source_content, origin_source_context, \\ origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \\ ORDER BY sequence LIMIT $3\" ))) .bind(event_type_name)",
+      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \\ origin_kind, origin_source_content, origin_source_context, \\ origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \\ AND ($4::bigint IS NULL OR sequence <= $4) ORDER BY sequence LIMIT $3\" ))) .bind(event_type_name)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/events.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \\ origin_kind, origin_source_content, origin_source_context, \\ origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \\ ORDER BY sequence LIMIT $3\" ))) .bind(event_type_name) .bind(after_sequence)",
+      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \\ origin_kind, origin_source_content, origin_source_context, \\ origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \\ AND ($4::bigint IS NULL OR sequence <= $4) ORDER BY sequence LIMIT $3\" ))) .bind(event_type_name) .bind(after_sequence)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/events.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \\ origin_kind, origin_source_content, origin_source_context, \\ origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \\ ORDER BY sequence LIMIT $3\" ))) .bind(event_type_name) .bind(after_sequence) .bind(limit)",
+      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \\ origin_kind, origin_source_content, origin_source_context, \\ origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \\ AND ($4::bigint IS NULL OR sequence <= $4) ORDER BY sequence LIMIT $3\" ))) .bind(event_type_name) .bind(after_sequence) .bind(limit)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/events.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \\ origin_kind, origin_source_content, origin_source_context, \\ origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \\ AND ($4::bigint IS NULL OR sequence <= $4) ORDER BY sequence LIMIT $3\" ))) .bind(event_type_name) .bind(after_sequence) .bind(limit) .bind(up_to)",
       "count": 1
     },
     {
@@ -24586,7 +24604,7 @@
     {
       "file": "skilj-core/src/event_cache.rs",
       "message": "call to drop of `std::vec::Vec<event_store::Event>` which can panic",
-      "source": ")))",
+      "source": "))),",
       "count": 1
     },
     {
@@ -24784,13 +24802,13 @@
     {
       "file": "skilj-core/src/event_cache.rs",
       "message": "call to method `std::collections::VecDeque::<T, A>::partition_point` which can panic",
-      "source": "let from = window .events .partition_point(|e| e.sequence <= after_sequence);",
+      "source": "let from = self .events .partition_point(|e| e.sequence <= after_sequence);",
       "count": 1
     },
     {
       "file": "skilj-core/src/event_cache.rs",
       "message": "call to method `std::collections::VecDeque::<T, A>::range` which can panic",
-      "source": "window .events .range(from..)",
+      "source": "self.events .range(from..)",
       "count": 1
     },
     {
@@ -24815,12 +24833,6 @@
       "file": "skilj-core/src/event_cache.rs",
       "message": "call to method `std::iter::Iterator::collect` which can panic",
       "source": "event_types: event_types .into_iter() .map(|et| (et.name.clone(), et)) .collect(),",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/event_cache.rs",
-      "message": "call to method `std::iter::Iterator::collect` which can panic",
-      "source": "window .events .range(from..) .filter(|e| keep(e)) .map(|e| window.serve(e)) .collect(),",
       "count": 1
     },
     {

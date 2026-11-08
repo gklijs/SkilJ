@@ -935,3 +935,243 @@ fn a_tag_read_after_a_position_is_served_by_a_window_that_holds_it() {
         assert_eq!(read(-1).await, None, "needs the whole history");
     });
 }
+
+/// Cache hits, evicted windows and disabled caches must produce the same
+/// chunks/pages, including the empty visit after an exactly full final chunk.
+#[test]
+fn bounded_chunks_and_as_of_pages_match_postgres() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let other = EventType {
+            name: "Other".into(),
+            ..et.clone()
+        };
+        db::upsert_event_type(&pool, &other).await.unwrap();
+        let mut events = Vec::new();
+        for n in 0..12 {
+            events.push(
+                insert_event_bypassing_cache(&pool, &bc, if n % 4 == 0 { &et } else { &other })
+                    .await,
+            );
+        }
+        for capacity in [0, 3, 100] {
+            let cache = EventCache::new(capacity);
+            cache.warm(&pool, &bc.name).await.unwrap();
+            for name in [None, Some(et.name.as_str()), Some(other.name.as_str())] {
+                for after in [-1, events[8].sequence, events[11].sequence] {
+                    let expected: Vec<_> = events
+                        .iter()
+                        .filter(|e| {
+                            e.sequence > after && name.is_none_or(|n| e.event_type.name == n)
+                        })
+                        .cloned()
+                        .collect();
+                    for size in [1, 3, 4, 100] {
+                        let mut actual = Vec::new();
+                        let mut sizes = Vec::new();
+                        db::for_each_event_chunk(
+                            &pool,
+                            &cache,
+                            &bc.name,
+                            name,
+                            after,
+                            size,
+                            |chunk| {
+                                assert!(
+                                    sizes.len() <= events.len() + 1,
+                                    "pagination must terminate"
+                                );
+                                sizes.push(chunk.len());
+                                actual.extend_from_slice(chunk);
+                                Ok(true)
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(actual, expected);
+                        assert_eq!(sizes.last().copied(), Some(expected.len() % size));
+                        for up_to in [
+                            Some(-1),
+                            Some(events[5].sequence),
+                            Some(events[8].sequence),
+                            None,
+                        ] {
+                            let mut scanned = None;
+                            let selected: Vec<_> = expected
+                                .iter()
+                                .filter(|e| up_to.is_none_or(|end| e.sequence <= end))
+                                .collect();
+                            // Select only the last event: exercise repeated chunks
+                            // discarded by the authorization/filter callback.
+                            let target = events[11].sequence;
+                            let page = db::collect_scanned_event_page(
+                                &pool,
+                                &cache,
+                                &bc.name,
+                                name,
+                                after,
+                                up_to,
+                                size,
+                                |chunk, room| {
+                                    scanned = chunk.last().map(|e| e.sequence).or(scanned);
+                                    Ok(chunk
+                                        .iter()
+                                        .filter(|e| e.sequence == target)
+                                        .take(room)
+                                        .cloned()
+                                        .collect())
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            assert_eq!(
+                                page.events,
+                                selected
+                                    .iter()
+                                    .filter(|e| e.sequence == target)
+                                    .map(|e| (*e).clone())
+                                    .collect::<Vec<_>>()
+                            );
+                            assert_eq!(page.scanned_through, selected.last().map(|e| e.sequence));
+                            assert_eq!(page.scanned_through, scanned);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn first_bounded_page(pool: &Pool, cache: &EventCache, bc: &BoundedContext) -> Vec<Event> {
+    db::collect_event_page(pool, cache, &bc.name, None, -1, None, 1, |chunk, room| {
+        Ok(chunk.iter().take(room).cloned().collect())
+    })
+    .await
+    .unwrap()
+}
+
+#[test]
+fn bounded_pages_refresh_policy_appends_and_recreated_tables() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let mut et = seed_event_type(&pool, &bc).await;
+        let cache = EventCache::new(100);
+        cache.warm(&pool, &bc.name).await.unwrap();
+        assert!(first_bounded_page(&pool, &cache, &bc).await.is_empty());
+        // Another writer commits without publishing to this cache.
+        insert_event_bypassing_cache(&pool, &bc, &et).await;
+        assert_eq!(first_bounded_page(&pool, &cache, &bc).await.len(), 1);
+        et.owner_tag_key = Some("customer".into());
+        et.private_fields = vec![PrivateField {
+            field: "note".into(),
+            kind: PrivateFieldKind::Own,
+            capability: None,
+            addressee_field: None,
+        }];
+        db::upsert_event_type(&pool, &et).await.unwrap();
+        let cached = first_bounded_page(&pool, &cache, &bc).await;
+        assert_eq!(cached[0].event_type, et);
+        assert_eq!(
+            cached,
+            first_bounded_page(&pool, &EventCache::new(0), &bc).await
+        );
+        db::hard_delete_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+        assert!(first_bounded_page(&pool, &cache, &bc).await.is_empty());
+        let et = seed_event_type(&pool, &bc).await;
+        let new = insert_event_bypassing_cache(&pool, &bc, &et).await;
+        assert_eq!(first_bounded_page(&pool, &cache, &bc).await, vec![new]);
+    });
+}
+
+/// Erasure between chunks must invalidate the remaining cached records. A
+/// second writer appends while erasing, so the next chunk must also freshen
+/// the log tail. The first chunk is already observed and cannot be recalled.
+#[test]
+fn bounded_walk_freshens_after_concurrent_append_and_blind_tag_erasure() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        db::register_blind_tag(
+            &pool,
+            &bc.name,
+            &skilj_core::blind::BlindTagDeclaration {
+                tag_key: "email_hash".into(),
+                normalizer_version: 1,
+                erasure: skilj_core::blind::Erasure::WithSubject {
+                    subject_key: "customer".into(),
+                    subject_tag: "account".into(),
+                },
+                key_fingerprint: None,
+                key_generation: 0,
+            },
+            test_now(),
+        )
+        .await
+        .unwrap();
+        let tags = vec![
+            account("a"),
+            Tag {
+                key: "email_hash".into(),
+                value: Some("hash".into()),
+            },
+        ];
+        for _ in 0..3 {
+            insert_tagged_event_bypassing_cache(&pool, &bc, &et, tags.clone()).await;
+        }
+        let cache = EventCache::new(100);
+        cache.warm(&pool, &bc.name).await.unwrap();
+        let (go, start) = tokio::sync::oneshot::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let writer_pool = pool.clone();
+        let writer_bc = bc.clone();
+        let writer = tokio::spawn(async move {
+            start.await.unwrap();
+            insert_tagged_event_bypassing_cache(&writer_pool, &writer_bc, &et, tags).await;
+            assert_eq!(
+                db::forget_subject_in_blind_tags(&writer_pool, &writer_bc.name, "customer", "a")
+                    .await
+                    .unwrap(),
+                4
+            );
+            done.send(()).unwrap();
+        });
+        let mut go = Some(go);
+        let mut seen = Vec::new();
+        db::for_each_event_chunk(&pool, &cache, &bc.name, None, -1, 1, |chunk| {
+            for event in chunk {
+                if seen.is_empty() {
+                    assert!(event.tags.iter().any(|t| t.key == "email_hash"));
+                } else {
+                    assert!(event.tags.iter().all(|t| t.key != "email_hash"));
+                }
+                seen.push(event.sequence);
+            }
+            if let Some(go) = go.take() {
+                go.send(()).unwrap();
+                finished
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .unwrap();
+            }
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        writer.await.unwrap();
+        assert_eq!(seen.len(), 4);
+        let uncached = first_bounded_page(&pool, &EventCache::new(0), &bc).await;
+        assert_eq!(first_bounded_page(&pool, &cache, &bc).await, uncached);
+    });
+}

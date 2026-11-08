@@ -167,6 +167,27 @@ impl ContextWindow {
         }
     }
 
+    /// Select borrowed records before materializing any owned event. A short
+    /// result is complete through the upper bound (or the window's end).
+    fn select(
+        &self,
+        after_sequence: i64,
+        up_to: Option<i64>,
+        limit: usize,
+        keep: impl Fn(&Event) -> bool,
+    ) -> Vec<Event> {
+        let from = self
+            .events
+            .partition_point(|e| e.sequence <= after_sequence);
+        self.events
+            .range(from..)
+            .take_while(|e| up_to.is_none_or(|end| e.sequence <= end))
+            .filter(|e| keep(e))
+            .take(limit)
+            .map(|e| self.serve(e))
+            .collect()
+    }
+
     fn highest_known_sequence(&self) -> Option<i64> {
         self.events.back().map(|e| e.sequence)
     }
@@ -469,6 +490,30 @@ impl EventCache {
         after_sequence: i64,
         keep: impl Fn(&Event) -> bool,
     ) -> crate::error::Result<Option<(Vec<Event>, i64)>> {
+        self.try_events_bounded(
+            pool,
+            bounded_context,
+            after_sequence,
+            None,
+            usize::MAX,
+            keep,
+        )
+        .await
+    }
+
+    /// A coverage miss is `None`; `Some` contains at most `limit` matching
+    /// events, complete when short. Freshness, incarnation and registration
+    /// checks are identical to the unbounded read. Filtering and both bounds
+    /// precede `serve`, including its current-registration copies.
+    pub(crate) async fn try_events_bounded(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+        after_sequence: i64,
+        up_to: Option<i64>,
+        limit: usize,
+        keep: impl Fn(&Event) -> bool,
+    ) -> crate::error::Result<Option<(Vec<Event>, i64)>> {
         if self.is_disabled() {
             return Ok(None);
         }
@@ -482,20 +527,10 @@ impl EventCache {
         };
         match window.covers_from() {
             None => Ok(Some((Vec::new(), -1))), // freshened, still empty - see above
-            Some(covers_from) if after_sequence >= covers_from - 1 => {
-                let from = window
-                    .events
-                    .partition_point(|e| e.sequence <= after_sequence);
-                Ok(Some((
-                    window
-                        .events
-                        .range(from..)
-                        .filter(|e| keep(e))
-                        .map(|e| window.serve(e))
-                        .collect(),
-                    window.highest_known_sequence().unwrap_or(-1),
-                )))
-            }
+            Some(covers_from) if after_sequence >= covers_from - 1 => Ok(Some((
+                window.select(after_sequence, up_to, limit, keep),
+                window.highest_known_sequence().unwrap_or(-1),
+            ))),
             Some(_) => Ok(None), // after_sequence reaches further back than this window can prove
         }
     }
