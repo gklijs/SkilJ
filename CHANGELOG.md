@@ -10,6 +10,14 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Changed
+
+- Command batch preparation moves resolved histories and snapshot states into
+  the queue instead of deep-copying them (issue #172, ownership stage).
+  `CommandBatcher::prepare_command` returns an opaque `PreparedCommand` consumed
+  by `submit_prepared`; the existing borrowed `submit` API remains available.
+  Conflict checks and failed set-write replay are unchanged.
+
 ### Documentation
 
 - Explain SQLx client-buffer retention, its per-connection memory cost, and

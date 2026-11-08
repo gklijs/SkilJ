@@ -91,6 +91,11 @@ Validate allocation scaling with 0/100/10,000 history events, large schemas,
 multi-event command origins, rejection, conflicts, sensitive history and set
 write fallback. Compare durable throughput and lock time, not only clone cost.
 
+The [ownership stage of #172](benchmarks/performance-review-2026-11-08/prepared-commands.md)
+now moves resolver histories and snapshot states into an opaque prepared value,
+retaining the borrowed submission API. Selection sharing and typed input reuse
+remain separate work; the original probe results are not throughput results.
+
 ## 3. Select/count in the database; separate event and inspection models
 
 [`count_events_field`](../skilj-graphql/src/resolvers/event_query.rs) walks
