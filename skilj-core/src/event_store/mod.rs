@@ -417,7 +417,9 @@ pub enum EventOrigin {
     },
     /// Created by an external system, over REST or a broker bridge.
     ExternalTriggered {
-        /// The source's own message, e.g. a raw JSON blob.
+        /// The source's message for an unprotected type. Types declaring
+        /// private/sensitive fields or subject-encrypted blobs store
+        /// `[redacted]` instead; provenance metadata stays available.
         source_content: String,
         /// Where it came from, e.g. a Kafka topic, partition and offset.
         source_context: Option<String>,
@@ -3142,6 +3144,10 @@ pub fn register_event_type(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
+    // Schema and rebuild changes affect every owner in the context.
+    if access_mapping.scope.is_some() {
+        return Err(crate::access_control::Error::UnscopedAdminRequired.into());
+    }
     if !access_mapping.bounded_context.same_as(bounded_context) {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
@@ -3343,6 +3349,10 @@ pub fn register_command_type(
     }
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
+    }
+    // Schema and rebuild changes affect every owner in the context.
+    if access_mapping.scope.is_some() {
+        return Err(crate::access_control::Error::UnscopedAdminRequired.into());
     }
     if !access_mapping.bounded_context.same_as(bounded_context) {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
@@ -3737,6 +3747,9 @@ pub fn inspect_event(
     // renders it (docs/architecture.md §120) - it used to go out as
     // stored, private fields in plaintext.
     let mut shown = event.clone();
+    if let EventOrigin::ExternalTriggered { source_content, .. } = &mut shown.origin {
+        *source_content = protect_source_content(&event.event_type, std::mem::take(source_content));
+    }
     if let EventOrigin::CommandTriggered { command } = &mut shown.origin {
         command.payload = render_command(
             command,
@@ -4689,6 +4702,22 @@ fn check_event_creation(
     Ok(tags)
 }
 
+/// Raw source messages have no independently declared field policy.
+/// Never retain a duplicate that can bypass payload protection/erasure.
+pub(crate) fn protect_source_content(event_type: &EventType, content: String) -> String {
+    if !event_type.sensitive_fields.is_empty()
+        || !event_type.private_fields.is_empty()
+        || event_type
+            .blob_fields
+            .iter()
+            .any(|field| field.subject_key.is_some())
+    {
+        "[redacted]".to_string()
+    } else {
+        content
+    }
+}
+
 /// See `rule CreateExternalEvent`. `next_sequence` is the value the
 /// caller's own `next_sequence(bounded_context)` already allocated under
 /// its Postgres row lock (see the note above the rules) - not this
@@ -4741,7 +4770,7 @@ pub fn create_external_event(
         tags,
         encryption_keys: protected.encryption_keys,
         origin: EventOrigin::ExternalTriggered {
-            source_content,
+            source_content: protect_source_content(event_type, source_content),
             source_context,
         },
     })

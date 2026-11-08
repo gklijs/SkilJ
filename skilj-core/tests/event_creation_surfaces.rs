@@ -715,3 +715,110 @@ fn create_direct_event_rejects_a_payload_naming_no_owner_at_all_when_scoped() {
 // missing-implementation one. Real end-to-end coverage exists in
 // `skilj/tests/payload_validation.rs` and
 // `skilj/tests/event_creation_atomicity.rs`.
+
+#[test]
+fn protected_external_events_discard_raw_content_but_keep_metadata() {
+    use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
+    use skilj_core::shared::{PrivateField, PrivateFieldKind, SensitiveField};
+    let mut et = event_type(true, false);
+    et.schema =
+        r#"{"type":"object","properties":{"email":{"type":"string"},"user_id":{"type":"string"}}}"#
+            .into();
+    let payload = r#"{"email":"private@example.com","user_id":"42"}"#;
+    let master = skilj_core::encryption::EncryptionMasterKey::from_bytes([7; 32]);
+    let (data_key, _, _) = skilj_core::encryption::generate_and_wrap_data_key(&master);
+    for sensitive in [false, true] {
+        et.private_fields.clear();
+        et.sensitive_fields.clear();
+        if sensitive {
+            et.sensitive_fields.push(SensitiveField {
+                field: "email".into(),
+                subject_key: "user".into(),
+                subject_field: "user_id".into(),
+            });
+        } else {
+            et.private_fields.push(PrivateField {
+                field: "email".into(),
+                kind: PrivateFieldKind::Own,
+                capability: None,
+                addressee_field: None,
+            });
+        }
+        let token = external_token(TokenStatus::Active, et.clone());
+        let key = event_store::EncryptionKey {
+            bounded_context: et.bounded_context.clone(),
+            subject_key: "user".into(),
+            subject_value: "42".into(),
+            status: event_store::EncryptionKeyStatus::Active,
+            created_at: timestamp(0),
+            destroyed_at: None,
+        };
+        let mut event = event_store::create_external_event(
+            &token,
+            payload.into(),
+            payload.into(),
+            Some("topic/0/144".into()),
+            Some("correlation".into()),
+            Some("cause".into()),
+            7,
+            timestamp(500),
+            |_, _| (key.clone(), data_key.clone()),
+            &Default::default(),
+        )
+        .unwrap();
+        match &event.origin {
+            EventOrigin::ExternalTriggered {
+                source_content,
+                source_context,
+            } => {
+                assert_eq!(source_content, "[redacted]");
+                assert_eq!(source_context.as_deref(), Some("topic/0/144"));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            event.metadata.correlation_id.as_deref(),
+            Some("correlation")
+        );
+        assert_eq!(event.metadata.causation_id.as_deref(), Some("cause"));
+        assert_eq!(event.metadata.created_at, timestamp(500));
+        assert_eq!(event.sequence, 7);
+        // Defense for a cached or legacy row created before cleanup.
+        event.origin = EventOrigin::ExternalTriggered {
+            source_content: payload.into(),
+            source_context: Some("topic/0/144".into()),
+        };
+        let mapping = RoleAccessMapping {
+            role: Role {
+                id: "other".into(),
+                external_subject: "other".into(),
+                name: "Admin".into(),
+                superadmin: false,
+                status: RoleStatus::Active,
+                created_at: timestamp(0),
+                revoked_at: None,
+            },
+            bounded_context: et.bounded_context.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
+            status: RoleStatus::Active,
+            created_at: timestamp(0),
+            revoked_at: None,
+        };
+        let inspected = event_store::inspect_event(&mapping, &event, |_, _| None, &[]).unwrap();
+        assert!(!inspected.rendered_payload.contains("private@example.com"));
+        match inspected.event.origin {
+            EventOrigin::ExternalTriggered {
+                source_content,
+                source_context,
+            } => {
+                assert_eq!(source_content, "[redacted]");
+                assert_eq!(source_context.as_deref(), Some("topic/0/144"));
+            }
+            _ => unreachable!(),
+        }
+    }
+}

@@ -3340,3 +3340,43 @@ fn projection_subject_key_does_not_decrypt_other_namespaces_with_the_same_value(
         );
     });
 }
+
+#[test]
+fn external_source_protection_scrubs_history_and_guards_legacy_writers() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else { return; };
+        let bc = seed_bounded_context(&pool).await;
+        let mut et = seed_event_type(&pool, &bc).await;
+        let event = sample_event(&bc, &et, 0, "adapter");
+        db::insert_event(&pool, &event, None).await.unwrap();
+        et.private_fields.push(skilj_core::shared::PrivateField {
+            field:"amount".into(),kind:skilj_core::shared::PrivateFieldKind::Own,capability:None,addressee_field:None,
+        });
+        db::upsert_event_type(&pool, &et).await.unwrap();
+        let schema = format!("\"bc_{}\"",bc.name.replace('"',"\"\""));
+        let raw = || sqlx::query_scalar::<_,String>(sqlx::AssertSqlSafe(format!("SELECT origin_source_content FROM {schema}.events WHERE sequence = 0")));
+        assert_eq!(raw().fetch_one(&pool).await.unwrap(),"[redacted]");
+        let loaded = db::get_event_by_sequence(&pool,&bc.name,0).await.unwrap().unwrap();
+        assert_eq!(loaded.payload,event.payload); assert_eq!(loaded.metadata,event.metadata);
+        assert!(matches!(loaded.origin,EventOrigin::ExternalTriggered {source_context:Some(ref source),..} if source=="adapter-1"));
+        // A stale instance still sends an unprotected declaration and raw
+        // source. The database uses the current declaration instead.
+        db::insert_event(&pool, &sample_event(&bc,&event.event_type,1,"adapter"),None).await.unwrap();
+        let stored: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT origin_source_content FROM {schema}.events WHERE sequence = 1"))).fetch_one(&pool).await.unwrap();
+        assert_eq!(stored,"[redacted]");
+        // Simulate a pre-upgrade context, then migrate it concurrently.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER protect_external_source ON {schema}.events; DROP TRIGGER protect_existing_external_sources ON {schema}.event_types; UPDATE {schema}.events SET origin_source_content='legacy plaintext';"
+        ))).execute(&pool).await.unwrap();
+        for result in futures_util::future::join_all((0..4).map(|_|db::ensure_source_content_protection(&pool,&bc.name))).await { result.unwrap(); }
+        assert_eq!(raw().fetch_one(&pool).await.unwrap(),"[redacted]");
+        db::ensure_source_content_protection(&pool,&bc.name).await.unwrap();
+        // Removing a protection never restores discarded raw content.
+        et.private_fields.clear();db::upsert_event_type(&pool,&et).await.unwrap();
+        assert_eq!(raw().fetch_one(&pool).await.unwrap(),"[redacted]");
+        let plain = seed_event_type(&pool,&bc).await;
+        let plain_event=sample_event(&bc,&plain,2,"adapter");
+        db::insert_event(&pool,&plain_event,None).await.unwrap();
+        assert_eq!(db::get_event_by_sequence(&pool,&bc.name,2).await.unwrap().unwrap(),plain_event);
+    });
+}

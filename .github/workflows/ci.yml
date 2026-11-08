@@ -188,7 +188,12 @@ jobs:
       # RustSec advisories, licenses, banned crates and sources, per
       # deny.toml. A pinned release binary rather than `cargo install`,
       # which would compile cargo-deny itself on every run.
-      - run: curl -sSfL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+      - name: Download cargo-deny
+        run: |
+          curl --retry 4 --retry-delay 2 --retry-max-time 120 -sSfL \
+            https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz \
+            -o /tmp/cargo-deny.tar.gz
+          tar xzf /tmp/cargo-deny.tar.gz -C /tmp
       - run: /tmp/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny check
 
   semver:

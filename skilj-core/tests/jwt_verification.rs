@@ -533,3 +533,49 @@ fn concurrent_cold_cache_lookups_all_succeed_off_one_refetch() {
         assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
     });
 }
+
+/// Known keys must be revalidated too: removing a compromised key at
+/// the IdP must stop tokens signed with it on already-running instances.
+#[test]
+fn expired_cached_keys_refresh_and_fail_closed() {
+    runtime().block_on(async {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let mode = Arc::new(AtomicUsize::new(0));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route("/jwks.json", axum::routing::get({
+            let mode = mode.clone(); let fetches = fetches.clone();
+            move || { let mode = mode.clone(); let fetches = fetches.clone(); async move {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                let value = match mode.load(Ordering::SeqCst) {
+                    0 => json!({"keys": [{"kty":"RSA", "use":"sig", "alg":"RS256", "kid":TEST_KID, "n":TEST_MODULUS_N, "e":TEST_EXPONENT_E}]}),
+                    1 => json!({"keys": []}),
+                    _ => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"keys":[]}))),
+                };
+                (axum::http::StatusCode::OK, axum::Json(value))
+            }}
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = idp_config(&format!("http://{}/jwks.json", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let removed_cache = JwksCache::new(config.jwks_endpoint.clone()).with_max_age(std::time::Duration::from_secs(5));
+        let outage_cache = JwksCache::new(config.jwks_endpoint.clone()).with_max_age(std::time::Duration::from_secs(5));
+        let jwt = sign_jwt("sub", "user-123", TEST_KID, TEST_ISSUER, TEST_PRIVATE_KEY_PEM, false);
+        for cache in [&removed_cache, &outage_cache] {
+            verify_jwt(&jwt, &config, cache).await.unwrap();
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(std::time::Duration::from_millis(5100)).await;
+        mode.store(1, Ordering::SeqCst);
+        // Concurrent expiry checks share one refresh and never return
+        // the key removed by that successful refresh.
+        for result in futures_util::future::join_all((0..8).map(|_| verify_jwt(&jwt, &config, &removed_cache))).await {
+            assert_eq!(result.unwrap_err().code(), "unknown_signing_key");
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 3);
+        mode.store(2, Ordering::SeqCst);
+        assert_eq!(verify_jwt(&jwt, &config, &outage_cache).await.unwrap_err().code(), "jwks_fetch_failed");
+        assert_eq!(verify_jwt(&jwt, &config, &outage_cache).await.unwrap_err().code(), "unknown_signing_key");
+        assert_eq!(fetches.load(Ordering::SeqCst), 4);
+        server.abort();
+    });
+}

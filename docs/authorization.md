@@ -193,8 +193,10 @@ The rules, in short:
 - **Level** is `Read`, `Write` or `Admin`, each including the one before.
 - **Scope** on a grant confines it to one owner's records wherever a projection declares an owner
   tag, for admin grants too (§23). A scoped admin can only mint or revoke tokens within its own
-  scope (§92). Other admin surfaces (type registration, parked deliveries, `forgetSubject`) stay
-  bounded-context-wide; a tenant that needs a fully confined admin gets its own bounded context.
+  scope (§92). Type registration and projection rebuild changes require an **unscoped** Admin
+  grant: otherwise an admin could remove the owner dimension or private-field protections.
+  Parked deliveries and `forgetSubject` remain bounded-context-wide; a tenant that needs a
+  fully confined admin gets its own bounded context.
 - **A refused projection looks like a missing one.** A caller without the capability gets the
   same answer, and the same absent type in its per-caller GraphQL schema, as for a name that does
   not exist (§138, §228).

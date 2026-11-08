@@ -5,9 +5,11 @@
 //! one paged field hundreds of times - each alias getting its own full
 //! `max_events_per_read` page.
 
-use async_graphql::extensions::{Extension, ExtensionContext, ExtensionFactory, NextParseQuery};
+use async_graphql::extensions::{
+    Extension, ExtensionContext, ExtensionFactory, NextPrepareRequest,
+};
 use async_graphql::parser::types::{ExecutableDocument, Selection, SelectionSet};
-use async_graphql::{ServerError, ServerResult, Variables};
+use async_graphql::{Request, ServerError, ServerResult};
 use std::sync::Arc;
 
 /// `skilj::SkiljBuilder::graphql_limits`. The defaults fit every query
@@ -75,8 +77,14 @@ pub const EXPENSIVE_FIELDS: &[&str] = &[
     "commandProposals",
 ];
 
-/// Refuses an operation selecting more than `max` [`EXPENSIVE_FIELDS`].
-/// Checked on the parsed document, before validation and execution.
+/// A hard bound on fragment-expanded work before async-graphql's own
+/// recursive depth and validation passes. This includes ordinary fields,
+/// fragment spreads and every operation, even operations not selected.
+const MAX_EXPANDED_SELECTIONS: usize = 10_000;
+const MAX_RECURSIVE_DEPTH: usize = 32;
+
+/// Checks document work and expensive fields before the dependency's
+/// recursive parse/validation passes. Installed on every served schema.
 pub(crate) struct ExpensiveFieldBudget {
     pub(crate) max: usize,
 }
@@ -93,76 +101,90 @@ struct ExpensiveFieldBudgetExtension {
 
 #[async_graphql::async_trait::async_trait]
 impl Extension for ExpensiveFieldBudgetExtension {
-    async fn parse_query(
+    async fn prepare_request(
         &self,
         ctx: &ExtensionContext<'_>,
-        query: &str,
-        variables: &Variables,
-        next: NextParseQuery<'_>,
-    ) -> ServerResult<ExecutableDocument> {
-        let document = next.run(ctx, query, variables).await?;
-        // Only one operation executes, so the most expensive one decides.
-        let worst = document
-            .operations
-            .iter()
-            .map(|(_, op)| count_expensive(&document, &op.node.selection_set.node, &mut Vec::new()))
-            .max()
-            .unwrap_or(0);
-        if worst > self.max {
-            let mut error = ServerError::new(
-                format!(
-                    "this query selects {worst} of {EXPENSIVE_FIELDS:?} (aliases and fragments \
-                     included); at most {} are allowed per request",
+        mut request: Request,
+        next: NextPrepareRequest<'_>,
+    ) -> ServerResult<Request> {
+        // parsed_query parses and caches the syntax tree without running
+        // async-graphql's recursive fragment traversal. parse_query hooks
+        // are too late: NextParseQuery already performs that traversal.
+        let document = request.parsed_query()?;
+        let mut remaining = MAX_EXPANDED_SELECTIONS;
+        for (_, operation) in document.operations.iter() {
+            let count =
+                count_expensive(document, &operation.node.selection_set.node, &mut remaining)?;
+            if count > self.max {
+                return Err(budget_error("query_too_expensive", format!(
+                    "this query selects {count} expensive fields; at most {} are allowed per request",
                     self.max
-                ),
-                None,
-            );
-            error.extensions = Some({
-                let mut extensions = async_graphql::ErrorExtensionValues::default();
-                extensions.set("code", "query_too_expensive");
-                extensions
-            });
-            return Err(error);
+                )));
+            }
         }
-        Ok(document)
+        // Validation also visits definitions that no operation selects.
+        for fragment in document.fragments.values() {
+            count_expensive(document, &fragment.node.selection_set.node, &mut remaining)?;
+        }
+        next.run(ctx, request).await
     }
 }
 
-/// Counts [`EXPENSIVE_FIELDS`] selections under `selection_set`,
-/// expanding fragment spreads. `expanding` holds the fragments currently
-/// being expanded: this runs before validation, which is what would
-/// otherwise reject a fragment cycle, so a cycle is simply not followed.
-fn count_expensive<'a>(
-    document: &'a ExecutableDocument,
-    selection_set: &'a SelectionSet,
-    expanding: &mut Vec<&'a str>,
-) -> usize {
-    selection_set
-        .items
-        .iter()
-        .map(|selection| match &selection.node {
-            Selection::Field(field) => {
-                usize::from(EXPENSIVE_FIELDS.contains(&field.node.name.node.as_str()))
-                    + count_expensive(document, &field.node.selection_set.node, expanding)
-            }
-            Selection::InlineFragment(fragment) => {
-                count_expensive(document, &fragment.node.selection_set.node, expanding)
-            }
-            Selection::FragmentSpread(spread) => {
-                let name = spread.node.fragment_name.node.as_str();
-                match document.fragments.get(name) {
-                    Some(fragment) if !expanding.contains(&name) => {
-                        expanding.push(name);
-                        let count =
-                            count_expensive(document, &fragment.node.selection_set.node, expanding);
-                        expanding.pop();
-                        count
+fn budget_error(code: &str, message: String) -> ServerError {
+    let mut error = ServerError::new(message, None);
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", code);
+    error.extensions = Some(extensions);
+    error
+}
+
+/// An iterative, bounded expansion: at most MAX_EXPANDED_SELECTIONS
+/// selections are visited across the entire document. The depth bound
+/// rejects cycles and long fragment chains without recursive Rust calls.
+/// Limiting all selections, including zero-cost leaves, is essential.
+fn count_expensive(
+    document: &ExecutableDocument,
+    selection_set: &SelectionSet,
+    remaining: &mut usize,
+) -> ServerResult<usize> {
+    let mut count = 0;
+    let mut stack = vec![(selection_set, 0)];
+    while let Some((set, depth)) = stack.pop() {
+        if depth > MAX_RECURSIVE_DEPTH {
+            return Err(budget_error(
+                "query_too_complex",
+                "query fragment depth exceeds the document budget".into(),
+            ));
+        }
+        for selection in &set.items {
+            *remaining = remaining.checked_sub(1).ok_or_else(|| {
+                budget_error(
+                    "query_too_complex",
+                    "query fragment expansion exceeds the document budget".into(),
+                )
+            })?;
+            match &selection.node {
+                Selection::Field(field) => {
+                    count += usize::from(EXPENSIVE_FIELDS.contains(&field.node.name.node.as_str()));
+                    if !field.node.selection_set.node.items.is_empty() {
+                        stack.push((&field.node.selection_set.node, depth + 1));
                     }
-                    _ => 0,
+                }
+                Selection::InlineFragment(fragment) => {
+                    stack.push((&fragment.node.selection_set.node, depth + 1));
+                }
+                Selection::FragmentSpread(spread) => {
+                    if let Some(fragment) = document
+                        .fragments
+                        .get(spread.node.fragment_name.node.as_str())
+                    {
+                        stack.push((&fragment.node.selection_set.node, depth + 1));
+                    }
                 }
             }
-        })
-        .sum()
+        }
+    }
+    Ok(count)
 }
 
 /// One websocket connection's count of running subscriptions - inserted
@@ -254,7 +276,10 @@ mod tests {
         document
             .operations
             .iter()
-            .map(|(_, op)| count_expensive(&document, &op.node.selection_set.node, &mut Vec::new()))
+            .map(|(_, op)| {
+                let mut remaining = MAX_EXPANDED_SELECTIONS;
+                count_expensive(&document, &op.node.selection_set.node, &mut remaining).unwrap()
+            })
             .max()
             .unwrap_or(0)
     }
@@ -280,13 +305,113 @@ mod tests {
         );
     }
 
-    /// Runs before validation, which is what rejects fragment cycles - so
-    /// the walk itself must not follow one forever.
     #[test]
-    fn a_fragment_cycle_is_not_followed() {
+    fn cycles_fail_closed_with_bounded_work() {
+        let document = async_graphql::parser::parse_query(
+            "{ ...A } fragment A on Query { ...B } fragment B on Query { ...A }",
+        )
+        .unwrap();
+        let operation = document.operations.iter().next().unwrap().1;
+        let mut remaining = MAX_EXPANDED_SELECTIONS;
+        assert!(count_expensive(
+            &document,
+            &operation.node.selection_set.node,
+            &mut remaining
+        )
+        .is_err());
+    }
+
+    fn fragment_bomb(leaf: &str) -> String {
+        let mut query = "{ ...F0 }\n".to_string();
+        for i in 0..20 {
+            query.push_str(&format!("fragment F{i} on Query {{ "));
+            if i == 19 {
+                query.push_str(leaf);
+            } else {
+                for _ in 0..6 {
+                    query.push_str(&format!("...F{} ", i + 1));
+                }
+            }
+            query.push_str(" }\n");
+        }
+        query
+    }
+
+    #[tokio::test]
+    async fn fragment_bombs_are_refused_before_dependency_traversal() {
+        use async_graphql::dynamic::{
+            Field, FieldFuture, FieldValue, Object, Schema, Subscription, SubscriptionField,
+            SubscriptionFieldFuture, TypeRef,
+        };
+        let query = Object::new("Query").field(Field::new(
+            "ok",
+            TypeRef::named_nn(TypeRef::STRING),
+            |_| FieldFuture::new(async { Ok(Some(FieldValue::value("ok"))) }),
+        ));
+        let subscription = Subscription::new("Subscription").field(SubscriptionField::new(
+            "ok",
+            TypeRef::named_nn(TypeRef::STRING),
+            |_| {
+                SubscriptionFieldFuture::new(async {
+                    Ok(async_graphql::futures_util::stream::empty::<
+                        async_graphql::Result<FieldValue<'static>>,
+                    >())
+                })
+            },
+        ));
+        let schema = Schema::build("Query", None, Some("Subscription"))
+            .register(query)
+            .register(subscription)
+            .limit_depth(24)
+            .limit_complexity(2000)
+            .extension(ExpensiveFieldBudget { max: 10 })
+            .finish()
+            .unwrap();
+        // A regular scalar, an expensive field, an unknown field, an
+        // unselected operation and the subscription execution path.
+        for leaf in ["ok", "queryEvents", "unknown"] {
+            let query = fragment_bomb(leaf);
+            let response = schema.execute(&query).await;
+            assert_eq!(
+                response.errors[0].extensions.as_ref().unwrap().get("code"),
+                Some(&async_graphql::Value::from("query_too_complex"))
+            );
+            let query = query.replacen("{ ...F0 }", "query Safe { ok } query Bomb { ...F0 }", 1);
+            let response = schema
+                .execute(Request::new(query).operation_name("Safe"))
+                .await;
+            assert_eq!(
+                response.errors[0].extensions.as_ref().unwrap().get("code"),
+                Some(&async_graphql::Value::from("query_too_complex"))
+            );
+        }
+        let unused = fragment_bomb("ok").replacen("{ ...F0 }", "{ ok }", 1);
+        let response = schema.execute(unused).await;
         assert_eq!(
-            worst("{ ...A } fragment A on Query { countEvents ...B } fragment B on Query { ...A }"),
-            1
+            response.errors[0].extensions.as_ref().unwrap().get("code"),
+            Some(&async_graphql::Value::from("query_too_complex"))
         );
+        let service =
+            crate::federation::service_schema(Arc::new("type Query { ok: String }".into()));
+        let response = service.execute(fragment_bomb("__typename")).await;
+        assert_eq!(
+            response.errors[0].extensions.as_ref().unwrap().get("code"),
+            Some(&async_graphql::Value::from("query_too_complex"))
+        );
+        use async_graphql::futures_util::StreamExt;
+        let response = schema
+            .execute_stream(
+                fragment_bomb("ok")
+                    .replacen("{ ...F0 }", "subscription { ...F0 }", 1)
+                    .replace("on Query", "on Subscription"),
+            )
+            .next()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.errors[0].extensions.as_ref().unwrap().get("code"),
+            Some(&async_graphql::Value::from("query_too_complex"))
+        );
+        assert!(schema.execute("{ ok }").await.errors.is_empty());
     }
 }

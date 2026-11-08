@@ -103,3 +103,21 @@ revision, target, nightly, patch hash, and config hash are recorded to
 make such baseline changes explicit. Update pins and review a fresh run
 together. Remove the generic-dispatch workaround once upstream resolves
 it; do not interpret fewer findings caused by skipped code as a fix.
+
+
+The 2026-11-08 security fixes review and re-record the baseline after adding
+bounded JWKS expiry and database guards for protected external provenance.
+The reviewed delta has 51 added finding identities (64 occurrences) and 19
+removed identities (22 occurrences). The additions are in
+`access_control/mod.rs`, `db/schema.rs` and `event_store/mod.rs`: clock access,
+HTTP status/error handling, key-cache lock/map operations, SQLx query creation,
+binding, transaction and cleanup paths, formatting, and source-content string
+cleanup/iteration. Tracing closure locations and changed cache guard types also
+change existing identities. These remain recorded as potential panics; this
+update does not claim the dependency paths cannot panic. The source changes add
+no production `unwrap`, `expect`, unchecked indexing or unsafe block. All skipped
+generic targets, analyzer pins/configuration and dependency snapshot remain
+unchanged. Postgres regressions verify the actual guards, concurrent upgrade
+cleanup, stale writers and metadata retention; JWT regressions verify removed
+keys and outage behavior. This is an explicit review of the analysis growth,
+not a panic-count reduction.

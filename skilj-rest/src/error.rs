@@ -124,7 +124,8 @@ fn status_for(err: &CoreError) -> StatusCode {
         CoreError::AccessControl(e) => match e {
             AccessControlError::TokenNotActive => StatusCode::FORBIDDEN,
             AccessControlError::GrantNotActive => StatusCode::FORBIDDEN,
-            AccessControlError::InsufficientAccessLevel => StatusCode::FORBIDDEN,
+            AccessControlError::InsufficientAccessLevel
+            | AccessControlError::UnscopedAdminRequired => StatusCode::FORBIDDEN,
             AccessControlError::GrantBoundedContextMismatch => StatusCode::FORBIDDEN,
             // Cross-tenant write fix (docs/architecture.md's own write-up
             // of these passes): newly reachable over REST by this pass -

@@ -593,6 +593,9 @@ pub(super) async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(source_content_protection_ddl(&schema)))
+        .execute(&mut **tx)
+        .await?;
     // No index on `tags`: tag reads go through `event_tags` (§198, §210).
     // §19's GIN index on it, `events_by_tags`, is dropped from bounded
     // contexts provisioned before (`drop_events_by_tags_index`).
@@ -2756,6 +2759,8 @@ pub async fn make_bounded_context_current(
     ensure_payload_limit_columns(pool, &bounded_context.name).await?;
     ensure_blob_tables(pool, &bounded_context.name).await?;
     ensure_blob_field_columns(pool, &bounded_context.name).await?;
+    ensure_private_field_columns(pool, &bounded_context.name).await?;
+    ensure_source_content_protection(pool, &bounded_context.name).await?;
     drop_events_by_tags_index(pool, &bounded_context.name).await?;
     current_bounded_contexts()
         .lock()
@@ -3444,5 +3449,113 @@ pub async fn hard_delete_bounded_context_with_trail(
     }
     tx.commit().await?;
     notify_registration_changed(pool).await;
+    Ok(())
+}
+
+/// SQL predicate shared by the insert guard, policy-change guard and
+/// one-time cleanup. Subject-encrypted blobs protect source bytes too.
+fn protected_source_type(alias: &str) -> String {
+    format!(
+        "({alias}.sensitive_fields <> '[]'::jsonb OR {alias}.private_fields <> '[]'::jsonb \
+        OR EXISTS (SELECT 1 FROM jsonb_array_elements({alias}.blob_fields) AS f \
+                   WHERE f->>'subject_key' IS NOT NULL))"
+    )
+}
+
+fn source_content_protection_ddl(schema: &str) -> String {
+    let stored_protected = protected_source_type("et");
+    let new_protected = protected_source_type("NEW");
+    let old_protected = protected_source_type("OLD");
+    format!(
+        r#"
+        CREATE OR REPLACE FUNCTION {schema}.protect_external_source() RETURNS trigger
+        LANGUAGE plpgsql AS $body$
+        DECLARE protected boolean;
+        BEGIN
+            SELECT {stored_protected} INTO protected FROM {schema}.event_types et
+                WHERE et.name = NEW.event_type_name FOR SHARE;
+            IF protected THEN NEW.origin_source_content := '[redacted]'; END IF;
+            RETURN NEW;
+        END $body$;
+        CREATE TRIGGER protect_external_source BEFORE INSERT OR UPDATE ON {schema}.events
+            FOR EACH ROW WHEN (NEW.origin_kind = 'external_triggered'
+                AND NEW.origin_source_content IS DISTINCT FROM '[redacted]')
+            EXECUTE FUNCTION {schema}.protect_external_source();
+        CREATE OR REPLACE FUNCTION {schema}.protect_existing_external_sources() RETURNS trigger
+        LANGUAGE plpgsql AS $body$
+        BEGIN
+            IF TG_OP <> 'UPDATE' THEN RETURN NEW; END IF;
+            IF {new_protected} AND NOT {old_protected} THEN
+                UPDATE {schema}.events SET origin_source_content = '[redacted]'
+                    WHERE event_type_name = NEW.name AND origin_kind = 'external_triggered'
+                      AND origin_source_content IS DISTINCT FROM '[redacted]';
+            END IF;
+            RETURN NEW;
+        END $body$;
+        CREATE TRIGGER protect_existing_external_sources AFTER INSERT OR UPDATE ON {schema}.event_types
+            FOR EACH ROW EXECUTE FUNCTION {schema}.protect_existing_external_sources();
+    "#
+    )
+}
+
+async fn source_content_protection_installed(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+) -> crate::error::Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pg_trigger t \
+         JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND NOT t.tgisinternal AND \
+         ((c.relname = 'events' AND t.tgname = 'protect_external_source') OR \
+          (c.relname = 'event_types' AND t.tgname = 'protect_existing_external_sources'))",
+    )
+    .bind(format!("bc_{bounded_context}"))
+    .fetch_one(conn)
+    .await?
+        == 2)
+}
+
+/// Installs provenance guards and permanently scrubs raw external source
+/// content for protected event types. Payloads and provenance metadata are
+/// unchanged. Runs once per bounded context, atomically with its guards;
+/// subsequent calls only check the catalog. The guards also protect
+/// writes from older instances and types acquiring protection later.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_source_content_protection(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let mut conn = pool.acquire().await?;
+    if source_content_protection_installed(&mut conn, bounded_context).await? {
+        return Ok(());
+    }
+    let schema = schema_ident(bounded_context);
+    let mut tx = conn.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("source_content_protection:{bounded_context}"))
+        .execute(&mut *tx)
+        .await?;
+    if !source_content_protection_installed(&mut tx, bounded_context).await? {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "LOCK TABLE {schema}.event_types, {schema}.events IN SHARE ROW EXCLUSIVE MODE; \
+             DROP TRIGGER IF EXISTS protect_external_source ON {schema}.events; \
+             DROP TRIGGER IF EXISTS protect_existing_external_sources ON {schema}.event_types;"
+        )))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(source_content_protection_ddl(&schema)))
+            .execute(&mut *tx)
+            .await?;
+        let protected = protected_source_type("et");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.events e SET origin_source_content = '[redacted]' \
+             FROM {schema}.event_types et WHERE e.event_type_name = et.name \
+             AND e.origin_kind = 'external_triggered' AND {protected} \
+             AND e.origin_source_content IS DISTINCT FROM '[redacted]'"
+        )))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }

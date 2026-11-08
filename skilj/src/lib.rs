@@ -5768,7 +5768,7 @@ async fn scheduler_tick_for_bounded_context(
     }
 }
 
-/// `Some(mapping)` only when it's both active *and* admin-level - the
+/// `Some(mapping)` only when active, unscoped and admin-level - the
 /// exact pair `register_event_type`/`register_command_type`/
 /// `register_projection` each require internally (they'd otherwise
 /// reject with `InsufficientAccessLevel`, an `Err` that would fail
@@ -5783,7 +5783,7 @@ async fn active_admin_mapping(
     Ok(
         skilj_core::db::get_active_role_access_mapping(pool, role_id, bounded_context)
             .await?
-            .filter(|m| m.level == AccessLevel::Admin),
+            .filter(|m| m.level == AccessLevel::Admin && m.scope.is_none()),
     )
 }
 

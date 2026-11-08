@@ -978,3 +978,63 @@ fn event_types_and_command_types_list_every_registered_type() {
         assert_eq!(command_types[0]["consistencyQuery"], json!([]));
     });
 }
+
+#[test]
+fn scoped_admin_cannot_remove_owner_policy_and_anonymous_fragment_bombs_are_bounded() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc, jwt) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let variables = json!({"bc":bc,"name":"Owned"});
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            REGISTER_EVENT_TYPE_MUTATION,
+            variables.clone(),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response}");
+        sqlx::query(
+            "UPDATE role_access_mappings SET scope = 'tenant-a' WHERE bounded_context = $1",
+        )
+        .bind(&bc)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let clearing =
+            REGISTER_EVENT_TYPE_MUTATION.replace("ownerTagKey: \"account\"", "ownerTagKey: null");
+        let response = graphql_request(&router, Some(&jwt), &clearing, variables).await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "unscoped_admin_required",
+            "{response}"
+        );
+        assert_eq!(
+            skilj_core::db::get_event_type(&pool, &bc, "Owned")
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_tag_key
+                .as_deref(),
+            Some("account")
+        );
+        let mut bomb = "{ ...F0 }\n".to_string();
+        for i in 0..20 {
+            bomb.push_str(&format!("fragment F{i} on Query {{ "));
+            if i == 19 {
+                bomb.push_str("__typename");
+            } else {
+                for _ in 0..6 {
+                    bomb.push_str(&format!("...F{} ", i + 1));
+                }
+            }
+            bomb.push_str(" }\n");
+        }
+        let response = graphql_request(&router, None, &bomb, json!({})).await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "query_too_complex",
+            "{response}"
+        );
+    });
+}

@@ -284,6 +284,10 @@ pub fn register_projection(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
+    // Schema and rebuild changes affect every owner in the context.
+    if access_mapping.scope.is_some() {
+        return Err(crate::access_control::Error::UnscopedAdminRequired.into());
+    }
     if !access_mapping.bounded_context.same_as(bounded_context) {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
@@ -418,6 +422,10 @@ pub fn rebuild_projection(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
+    // Schema and rebuild changes affect every owner in the context.
+    if access_mapping.scope.is_some() {
+        return Err(crate::access_control::Error::UnscopedAdminRequired.into());
+    }
     if !access_mapping
         .bounded_context
         .same_as(&projection.bounded_context)
@@ -451,6 +459,10 @@ pub fn discard_projection_rebuild(
     }
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
+    }
+    // Schema and rebuild changes affect every owner in the context.
+    if access_mapping.scope.is_some() {
+        return Err(crate::access_control::Error::UnscopedAdminRequired.into());
     }
     if !access_mapping
         .bounded_context

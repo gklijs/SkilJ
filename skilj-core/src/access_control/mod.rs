@@ -423,6 +423,11 @@ pub enum Error {
     #[error("this grant's access level is too low for this action")]
     InsufficientAccessLevel,
 
+    /// Shared schema or projection rebuild changes need an admin grant
+    /// with no owner scope; they can change every owner's field policy.
+    #[error("schema and projection rebuild changes require an unscoped admin grant")]
+    UnscopedAdminRequired,
+
     /// This RoleAccessMapping is scoped to a different bounded context.
     #[error("this RoleAccessMapping is scoped to a different bounded context")]
     GrantBoundedContextMismatch,
@@ -603,6 +608,7 @@ impl SkiljRejection for Error {
             Error::InsufficientAccessLevel => "insufficient_access_level",
             Error::GrantBoundedContextMismatch => "grant_bounded_context_mismatch",
             Error::GrantScopeMismatch => "grant_scope_mismatch",
+            Error::UnscopedAdminRequired => "unscoped_admin_required",
             Error::TokenScopeBeyondGrant => "token_scope_beyond_grant",
             Error::CapabilityNotHeld => "capability_not_held",
             Error::InvalidCapabilityName => "invalid_capability_name",
@@ -910,7 +916,7 @@ impl SigningAlgorithm {
 /// Caches an IdP's JWKS (JSON Web Key Set), keyed by each key's own
 /// `kid` - see [docs/architecture.md §6](../../../docs/architecture.md#idp-trust-configuration) for why this is reactive-refresh
 /// rather than a background-timer poll: a JWT whose `kid` isn't already
-/// cached triggers exactly one refetch of the whole set before giving
+/// cached, or a key set past its maximum age, triggers one refetch of the whole set before giving
 /// up, rather than a task refreshing on a schedule nothing here needs to
 /// manage the lifecycle of. `min_refetch_interval` (a few seconds', not
 /// configurable - an internal safety margin, not a tuning knob) is what
@@ -933,17 +939,42 @@ pub struct JwksCache {
     fetch_timeout: std::time::Duration,
     jwks_endpoint: reqwest::Url,
     min_refetch_interval: std::time::Duration,
-    keys: tokio::sync::RwLock<std::collections::HashMap<String, jsonwebtoken::DecodingKey>>,
+    max_age: std::time::Duration,
+    keys: tokio::sync::RwLock<CachedSigningKeys>,
     /// Held across the whole refetch, not just the timestamp update, so
     /// concurrent misses queue behind one in-flight fetch and then see
     /// its result - see `key_for`.
     last_refetch: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
+#[derive(Default)]
+struct CachedSigningKeys {
+    keys: std::collections::HashMap<String, jsonwebtoken::DecodingKey>,
+    fetched_at: Option<std::time::Instant>,
+}
+
+impl CachedSigningKeys {
+    fn fresh(&self, max_age: std::time::Duration) -> bool {
+        self.fetched_at.is_some_and(|at| at.elapsed() < max_age)
+    }
+}
+
 impl JwksCache {
     /// How long one JWKS fetch may take before it fails with
     /// `JwksFetchFailed`.
     pub const DEFAULT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Maximum lifetime of a fetched key set, including cache hits.
+    /// Expired keys are refused if refreshing the set fails.
+    pub const DEFAULT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Overrides the maximum key-set age. A known key needs a successful
+    /// refresh after this age. Refresh attempts remain throttled to one
+    /// per five seconds, so shorter lifetimes can temporarily reject JWTs.
+    pub fn with_max_age(mut self, max_age: std::time::Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
 
     /// Overrides [`DEFAULT_FETCH_TIMEOUT`](Self::DEFAULT_FETCH_TIMEOUT).
     pub fn with_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
@@ -959,7 +990,8 @@ impl JwksCache {
             fetch_timeout: Self::DEFAULT_FETCH_TIMEOUT,
             jwks_endpoint,
             min_refetch_interval: std::time::Duration::from_secs(5),
-            keys: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            max_age: Self::DEFAULT_MAX_AGE,
+            keys: tokio::sync::RwLock::new(CachedSigningKeys::default()),
             last_refetch: tokio::sync::Mutex::new(None),
         }
     }
@@ -979,13 +1011,23 @@ impl JwksCache {
     /// recent" and being rejected - which used to 401 every concurrent
     /// request on a cold start or an IdP key rotation.
     async fn key_for(&self, kid: &str) -> crate::error::Result<Option<jsonwebtoken::DecodingKey>> {
-        if let Some(key) = self.keys.read().await.get(kid) {
-            return Ok(Some(key.clone()));
+        {
+            let cached = self.keys.read().await;
+            if cached.fresh(self.max_age) {
+                if let Some(key) = cached.keys.get(kid) {
+                    return Ok(Some(key.clone()));
+                }
+            }
         }
 
         let mut last_refetch = self.last_refetch.lock().await;
-        if let Some(key) = self.keys.read().await.get(kid) {
-            return Ok(Some(key.clone()));
+        {
+            let cached = self.keys.read().await;
+            if cached.fresh(self.max_age) {
+                if let Some(key) = cached.keys.get(kid) {
+                    return Ok(Some(key.clone()));
+                }
+            }
         }
         let now = std::time::Instant::now();
         if last_refetch.is_some_and(|last| now.duration_since(last) < self.min_refetch_interval) {
@@ -994,7 +1036,11 @@ impl JwksCache {
         *last_refetch = Some(now);
 
         self.refetch().await?;
-        Ok(self.keys.read().await.get(kid).cloned())
+        let cached = self.keys.read().await;
+        Ok(cached
+            .fresh(self.max_age)
+            .then(|| cached.keys.get(kid).cloned())
+            .flatten())
     }
 
     #[tracing::instrument(skip_all, fields(jwks_endpoint = %self.jwks_endpoint))]
@@ -1006,12 +1052,14 @@ impl JwksCache {
             .send()
             .await
             .map_err(|e| Error::JwksFetchFailed(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| Error::JwksFetchFailed(e.to_string()))?
             .json()
             .await
             .map_err(|e| Error::JwksFetchFailed(e.to_string()))?;
 
         let mut keys = self.keys.write().await;
-        keys.clear();
+        keys.keys.clear();
         for jwk in &jwks.keys {
             let (Some(kid), Ok(decoding_key)) = (
                 jwk.common.key_id.clone(),
@@ -1019,8 +1067,9 @@ impl JwksCache {
             ) else {
                 continue;
             };
-            keys.insert(kid, decoding_key);
+            keys.keys.insert(kid, decoding_key);
         }
+        keys.fetched_at = Some(std::time::Instant::now());
         Ok(())
     }
 }

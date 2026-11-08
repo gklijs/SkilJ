@@ -1,0 +1,6 @@
+select_matching_events, all 1000: allocations=10010, requested_bytes=4798496
+queue copies, two histories: allocations=20002, requested_bytes=7958000
+cache clone then take 100: allocations=10001, requested_bytes=3979000
+cache take 100 then clone: allocations=1001, requested_bytes=397900
+Arc handles, 1000: allocations=1, requested_bytes=8000
+queue ownership transfer: allocations=0, requested_bytes=0

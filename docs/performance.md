@@ -1,5 +1,10 @@
 # Performance and tuning
 
+The [breaking-release performance review](performance-review-2026-11-08.md)
+identifies remaining opportunities, including owned command preparation,
+bounded cache reads and database-side event selection/counting. It includes an
+isolated allocation probe; proposed throughput improvements remain unmeasured.
+
 What limits command throughput in skilj, what has been measured, and the
 knobs you can turn. Design background: [docs/architecture.md](architecture.md)
 §58-§63.
