@@ -316,6 +316,85 @@ whole. The size decides latency:
   connection before failing with "the server's database connections are
   all busy". Lower it to fail fast; it doesn't add capacity.
 
+## Client connection buffers
+
+Pool width also multiplies **application** memory. SQLx 0.9 grows a
+connection's send/receive buffers for large binds and results and retains
+capacity for reuse. Large projection-state rows and command batches can
+therefore leave many pooled connections with large buffers after requests
+finish. This is separate from Postgres backend memory, prepared statements
+and skilj's bounded event caches. Reducing the event-cache window does not
+reclaim SQLx buffers. Foreground traffic stopping does not mean the system
+is idle: routes and projection catch-up may still grow and read state rows.
+
+SQLx documents [`Connection::shrink_buffers()`](https://docs.rs/sqlx/0.9.0/sqlx/trait.Connection.html#tymethod.shrink_buffers)
+for releasing excess capacity where possible. It also cautions that frequent
+shrinking can cause allocator thrashing and fragmentation. Dropped rows,
+live connection allocations, and process RSS measure different things:
+the allocator may retain freed pages, and a receive allocation may remain
+referenced until a subsequent read. Neither a high RSS plateau nor a fall
+after shrinking alone establishes an unreachable-object leak.
+
+Start by sizing the pool for useful concurrency, bounding projection states,
+and observing background catch-up. `idle_timeout` and `max_lifetime` can
+eventually retire eligible connections but replace sockets and their prepared
+statements. Idle retirement is constrained by `min_connections`, and polling
+may prevent the idle timeout. Neither setting is an immediate RSS bound.
+
+### Opt-in hook experiment
+
+The existing `SkiljBuilder::pool_options` accepts SQLx hooks. For example:
+
+```rust
+use sqlx::Connection;
+use std::time::Duration;
+
+let options = skilj::default_pool_options()
+    .max_connections(10)
+    .before_acquire(|connection, metadata| Box::pin(async move {
+        if metadata.idle_for >= Duration::from_secs(60) {
+            connection.shrink_buffers();
+        }
+        Ok(true)
+    }));
+let builder = skilj::Skilj::builder("postgres://localhost/skilj")
+    .pool_options(options);
+```
+
+This is an experiment, with an illustrative 60-second threshold. It runs
+when a previously idle connection is acquired again, **not** while it sits
+idle; it can leave an entirely quiet pool untouched. Background polling can
+also rotate through every connection before the threshold. It keeps the
+socket and prepared statements, but cannot promise a lower RSS. Start from
+`default_pool_options()` to preserve skilj's disabled acquire ping. Combine
+other `before_acquire` logic in the same closure: a second registration
+replaces the first. The builder method's rustdoc compiles this example.
+
+An `after_release` hook can also call `shrink_buffers()` before returning
+`Ok(true)` to keep the connection. Returning `Ok(false)` closes it. That
+hook's `idle_for` is always zero; testing it for idleness cannot implement
+the policy above. Shrinking on every release can cause repeated buffer
+growth under continuous large-state workloads. Also, a release is not
+necessarily a fully consumed operation: cancelled streams and dropped
+transactions require protocol cleanup. An operation-aware experiment should
+finish/drain its queries, drop rows, commit or roll back, and then shrink
+the connection it actually used. Acquiring an arbitrary connection after a
+large batch can shrink a different socket. SQLx exposes no public buffer-size
+metric for a simple capacity-threshold hook.
+
+The [reproducible comparison](benchmarks/connection-buffers/README.md)
+uses SQLx alone, holds sockets across two load/idle cycles, and compares
+retention, shrinking at a known large-operation boundary, and shrinking
+after every query. It records live requested allocation bytes separately
+from RSS, successful query rate, p95/p99 latency and connection churn.
+It does not measure accepted-command throughput or projection catch-up.
+There is no default shrinking policy: any production policy still needs
+application measurements of accepted commands/s, p95/p99 latency, live
+allocations, RSS and replacement rate over repeated load/idle cycles,
+including background routes, catch-up, cancellation and rollback. Large
+batch completion and projection catch-up boundaries are candidates for
+such an experiment; their live rows and transactions must end first.
+
 ## Sizing the statement cache
 
 sqlx prepares every statement skilj sends and keeps up to

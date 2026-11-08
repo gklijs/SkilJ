@@ -13544,3 +13544,31 @@ rewrite existing backups, WAL archives or exported messages; their retention and
 access controls remain operational responsibilities. The first upgrade and a
 policy change may update many history rows and need time/space for the resulting
 WAL. Event payloads and metadata are not rewritten.
+
+## 241. SQLx client connection buffers (issue #169)
+
+Large binds and result rows grow SQLx's per-connection buffers, which it
+retains for reuse. Pool width multiplies that application memory independently
+of the event cache and Postgres backend memory. Routes and projection catch-up
+can continue reading and growing state after foreground requests stop.
+
+[`docs/performance.md`](performance.md#client-connection-buffers) explains the
+resource policy and shows an opt-in `before_acquire` hook through the existing
+`SkiljBuilder::pool_options`. An idle threshold is evaluated on acquisition,
+not by a timer; background polling may keep it from firing. A release hook
+cannot use `idle_for` (zero there), and shrinking every release can repeatedly
+reallocate buffers. SQLx has no public buffer-capacity metric. A large-operation
+boundary would need the actual connection after queries drain, rows drop and
+the transaction ends, rather than a new acquisition that may select a different
+socket.
+
+The [SQLx-only probe](benchmarks/connection-buffers/README.md) compares retained
+buffers, boundary shrinking and every-query shrinking over two load/idle cycles.
+It measures Rust live requested bytes separately from RSS, checks full echoed
+payloads and subsequent small queries, and verifies unchanged backend identities.
+This isolates transport buffers; it does not measure command acceptance or
+projection performance. Pool defaults stay unchanged. A production reclamation
+policy needs repeated application load/idle measurements, including accepted
+throughput, tail latency, live allocations, RSS, pool churn and cancellation/
+rollback correctness. This documentation and probe add no background sweeper or
+unconditional shrink on the command/projection paths.
