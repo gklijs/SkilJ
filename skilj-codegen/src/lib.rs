@@ -81,8 +81,10 @@ pub enum Error {
     /// user error; nothing about a well-formed `.skilj.toml` file
     /// should be able to trigger this.
     Generated(syn::Error),
-    /// [`emhcl::import`]'s input isn't the JSON `emhcl export` writes.
-    Json(serde_json::Error),
+    /// [`emhcl::import`]'s input isn't the JSON `emhcl export` writes; the
+    /// parser's message. A `String`, not `serde_json::Error`, which would
+    /// make this enum lose `UnwindSafe`/`RefUnwindSafe`.
+    Json(String),
 }
 
 impl std::fmt::Display for Error {
