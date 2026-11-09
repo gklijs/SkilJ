@@ -52,7 +52,7 @@ pub use vault::VaultTransitProvider;
 const KEY_LEN: usize = 32; // AES-256
 
 /// Library-level errors this module's own operations reject for.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The operating system could not supply cryptographically secure randomness.

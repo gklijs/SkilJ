@@ -1,0 +1,16 @@
+
+running 1 test
+policy=clear capacity=128 working_set=64 requests=2048 calls=0 hit_pct=100.00 p50_ns=327 p95_ns=410 p99_ns=760 shallow_bytes=10112
+policy=clock capacity=128 working_set=64 requests=2048 calls=0 hit_pct=100.00 p50_ns=806 p95_ns=1017 p99_ns=3485 shallow_bytes=12024
+policy=clear capacity=128 working_set=128 requests=2048 calls=0 hit_pct=100.00 p50_ns=326 p95_ns=496 p99_ns=1110 shallow_bytes=20224
+policy=clock capacity=128 working_set=128 requests=2048 calls=0 hit_pct=100.00 p50_ns=779 p95_ns=980 p99_ns=1198 shallow_bytes=23928
+policy=clear capacity=128 working_set=129 requests=2048 calls=375 hit_pct=81.69 p50_ns=943 p95_ns=2355103 p99_ns=3511448 shallow_bytes=19968
+policy=clock capacity=128 working_set=129 requests=2048 calls=8 hit_pct=99.61 p50_ns=363 p95_ns=704 p99_ns=2422 shallow_bytes=23928
+policy=clear capacity=128 working_set=256 requests=2048 calls=1492 hit_pct=27.15 p50_ns=2131659 p95_ns=2199782 p99_ns=2375600 shallow_bytes=18816
+policy=clock capacity=128 working_set=256 requests=2048 calls=1030 hit_pct=49.71 p50_ns=1151767 p95_ns=2168681 p99_ns=2226037 shallow_bytes=22696
+burst=scalar requests=256 calls=256 elapsed_us=2532 p95_ns=2379946 p99_ns=2384221
+burst=shared requests=256 calls=1 elapsed_us=2316 p95_ns=2220186 p99_ns=2222379
+test encryption::service::tests::cache_workload_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 79 filtered out; finished in 8.91s
+

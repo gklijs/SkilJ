@@ -1,0 +1,19 @@
+   Compiling skilj-core v0.3.0 (/home/gklijs/projects/skilj/skilj-core)
+    Finished `release` profile [optimized] target(s) in 56.76s
+     Running unittests src/lib.rs (target/release/deps/skilj_core-d35efeff5a396746)
+
+running 1 test
+policy=clear capacity=128 working_set=64 requests=2048 calls=0 hit_pct=100.00 p50_ns=230 p95_ns=350 p99_ns=564 shallow_bytes=10112
+policy=clock capacity=128 working_set=64 requests=2048 calls=0 hit_pct=100.00 p50_ns=668 p95_ns=739 p99_ns=933 shallow_bytes=12024
+policy=clear capacity=128 working_set=128 requests=2048 calls=0 hit_pct=100.00 p50_ns=325 p95_ns=507 p99_ns=893 shallow_bytes=20224
+policy=clock capacity=128 working_set=128 requests=2048 calls=0 hit_pct=100.00 p50_ns=327 p95_ns=474 p99_ns=676 shallow_bytes=23928
+policy=clear capacity=128 working_set=129 requests=2048 calls=375 hit_pct=81.69 p50_ns=936 p95_ns=2170569 p99_ns=2229102 shallow_bytes=19968
+policy=clock capacity=128 working_set=129 requests=2048 calls=8 hit_pct=99.61 p50_ns=376 p95_ns=847 p99_ns=1788 shallow_bytes=23928
+policy=clear capacity=128 working_set=256 requests=2048 calls=1492 hit_pct=27.15 p50_ns=2140723 p95_ns=2213255 p99_ns=2422924 shallow_bytes=18816
+policy=clock capacity=128 working_set=256 requests=2048 calls=1030 hit_pct=49.71 p50_ns=1159637 p95_ns=2620988 p99_ns=5609351 shallow_bytes=21728
+burst=scalar requests=256 calls=256 elapsed_us=3172 p95_ns=2897245 p99_ns=2908272
+burst=shared requests=256 calls=1 elapsed_us=7181 p95_ns=5270494 p99_ns=5274751
+test encryption::service::tests::cache_workload_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 79 filtered out; finished in 9.13s
+

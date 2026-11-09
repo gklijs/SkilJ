@@ -6,9 +6,11 @@
 
 use super::provider::{KeyProvider, WrappedDataKey};
 use super::{DataKey, EncryptionMasterKey, Error};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use futures_util::future::{FutureExt, Shared};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 /// How a data key is stored: by the provider it names, under a version, or,
 /// with `provider: None`, wrapped by the legacy raw master key with its own
@@ -30,37 +32,76 @@ pub const DEFAULT_DATA_KEY_CACHE_TTL: Duration = Duration::from_secs(300);
 /// The default number of unwrapped data keys kept in memory.
 pub const DEFAULT_DATA_KEY_CACHE_CAPACITY: usize = 10_000;
 
+// A clock hit sets one bit instead of relinking an LRU list. Eviction
+// gives recently read entries a second chance; expired entries need none.
+struct Entry {
+    data_key: Option<DataKey>,
+    at: Instant,
+    referenced: bool,
+}
+
+type Digest = [u8; 32];
+type Flight = Shared<super::provider::BoxFuture<'static, Result<DataKey, Error>>>;
+const MAX_UNWRAPS_IN_FLIGHT: usize = 64;
+
 struct Cache {
-    entries: HashMap<Vec<u8>, (DataKey, Instant)>,
+    entries: HashMap<Digest, Entry>,
+    clock: VecDeque<Digest>,
+    flights: HashMap<Digest, Weak<Flight>>,
+    // Identity rather than a wrapping counter: an old operation can never
+    // acquire the identity of a later invalidation.
+    generation: Arc<()>,
     ttl: Duration,
     capacity: usize,
 }
 
 impl Cache {
-    fn get(&mut self, key: &[u8]) -> Option<DataKey> {
-        let (data_key, at) = self.entries.get(key)?;
-        if at.elapsed() < self.ttl {
-            Some(data_key.clone())
+    fn get(&mut self, key: &Digest) -> Option<DataKey> {
+        let entry = self.entries.get_mut(key)?;
+        if entry.at.elapsed() < self.ttl {
+            entry.referenced = true;
+            entry.data_key.clone()
         } else {
-            self.entries.remove(key);
+            // Forget the expired key now, retaining only its clock slot
+            // until insertion reuses it. Removing just the map entry
+            // would accumulate duplicate clock slots on repeated expiry.
+            entry.data_key = None;
             None
         }
     }
 
-    fn insert(&mut self, key: Vec<u8>, data_key: DataKey) {
-        if self.capacity == 0 {
+    fn insert(&mut self, key: Digest, data_key: DataKey) {
+        if self.capacity == 0 || self.ttl.is_zero() {
             return;
         }
-        if self.entries.len() >= self.capacity {
-            let ttl = self.ttl;
-            self.entries.retain(|_, (_, at)| at.elapsed() < ttl);
-            if self.entries.len() >= self.capacity {
-                // Still full of live keys: start over rather than track
-                // recency for every read. The next reads pay one unwrap.
-                self.entries.clear();
+        if !self.entries.contains_key(&key) {
+            while self.entries.len() >= self.capacity {
+                let Some(candidate) = self.clock.pop_front() else {
+                    break;
+                };
+                if let Some(entry) = self.entries.get_mut(&candidate) {
+                    if entry.at.elapsed() < self.ttl && entry.referenced {
+                        entry.referenced = false;
+                        self.clock.push_back(candidate);
+                    } else {
+                        self.entries.remove(&candidate);
+                    }
+                }
             }
+            self.clock.push_back(key);
         }
-        self.entries.insert(key, (data_key, Instant::now()));
+        self.entries.insert(
+            key,
+            Entry {
+                data_key: Some(data_key),
+                at: Instant::now(),
+                referenced: false,
+            },
+        );
+    }
+
+    fn flight(&self, key: &Digest) -> Option<Arc<Flight>> {
+        self.flights.get(key).and_then(Weak::upgrade)
     }
 }
 
@@ -72,6 +113,7 @@ struct Inner {
     providers: Mutex<HashMap<String, Arc<dyn KeyProvider>>>,
     legacy: Option<EncryptionMasterKey>,
     cache: Mutex<Cache>,
+    unwrap_slots: Arc<Semaphore>,
 }
 
 /// The configured [`KeyProvider`] with what skilj keeps around it (see the
@@ -122,9 +164,13 @@ impl KeyService {
                 legacy,
                 cache: Mutex::new(Cache {
                     entries: HashMap::new(),
+                    clock: VecDeque::new(),
+                    flights: HashMap::new(),
+                    generation: Arc::new(()),
                     ttl,
                     capacity,
                 }),
+                unwrap_slots: Arc::new(Semaphore::new(MAX_UNWRAPS_IN_FLIGHT)),
             }),
         }
     }
@@ -144,7 +190,13 @@ impl KeyService {
     }
 
     /// This service with its unwrapped data keys kept for `ttl`, at most
-    /// `capacity` of them; a capacity of 0 turns the cache off.
+    /// `capacity` of them; zero capacity or TTL disables retention. Clock
+    /// eviction gives recently read keys a second chance, evicting one
+    /// key at a time. TTL is measured from insertion, not the last hit.
+    /// Concurrent misses for the same stored wrap share one provider
+    /// request, including its error; failures are not cached. At most 64
+    /// provider unwraps run concurrently per service, even with retention
+    /// disabled. Cancelling every waiter cancels its provider request.
     pub fn with_cache(self, ttl: Duration, capacity: usize) -> Self {
         Self::build(
             Arc::clone(&self.inner.provider),
@@ -220,9 +272,10 @@ impl KeyService {
         &self,
         provider: &dyn KeyProvider,
     ) -> Result<(DataKey, WrappedDataKey), Error> {
+        let generation = self.generation();
         let data_key = DataKey(super::random_bytes::<32>()?);
         let wrapped = provider.wrap(&data_key.0).await?;
-        self.remember(provider.name(), &wrapped, &data_key);
+        self.cache_insert(cache_key(provider.name(), &wrapped), &data_key, &generation);
         Ok((data_key, wrapped))
     }
 
@@ -244,12 +297,69 @@ impl KeyService {
                     ciphertext: stored.ciphertext.to_vec(),
                 };
                 let cache_key = cache_key(provider, &wrapped);
-                if let Some(data_key) = self.cached(&cache_key) {
-                    return Ok(data_key);
+                // Join before admission, so identical bursts do not each
+                // consume a provider slot. No blocking lock crosses an await.
+                let (generation, existing) = {
+                    let mut cache = self.inner.cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(data_key) = cache.get(&cache_key) {
+                        return Ok(data_key);
+                    }
+                    (Arc::clone(&cache.generation), cache.flight(&cache_key))
+                };
+                if let Some(flight) = existing {
+                    return flight.as_ref().clone().await;
                 }
-                let data_key = DataKey(key.unwrap(&wrapped).await?);
-                self.cache_insert(cache_key, &data_key);
-                Ok(data_key)
+                let permit = Arc::clone(&self.inner.unwrap_slots)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::ProviderUnavailable {
+                        provider: provider.to_string(),
+                        message: "unwrap admission closed".into(),
+                    })?;
+                let flight = {
+                    let mut cache = self.inner.cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(data_key) = cache.get(&cache_key) {
+                        return Ok(data_key);
+                    }
+                    if let Some(flight) = cache.flight(&cache_key) {
+                        drop(permit);
+                        flight
+                    } else {
+                        // Weak references retain neither results nor failures.
+                        // Cancelled requests disappear on the next admission.
+                        cache.flights.retain(|_, flight| flight.strong_count() > 0);
+                        let service = self.clone();
+                        let flight_generation = Arc::clone(&generation);
+                        let flight: Flight = (Box::pin(async move {
+                            let _permit = permit;
+                            let result = key.unwrap(&wrapped).await.map(DataKey);
+                            let mut cache = service
+                                .inner
+                                .cache
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if Arc::ptr_eq(&cache.generation, &flight_generation) {
+                                // Stop advertising completed work even if a
+                                // waiter has not consumed its result yet.
+                                cache.flights.remove(&cache_key);
+                                if let Ok(data_key) = &result {
+                                    cache.insert(cache_key, data_key.clone());
+                                }
+                            }
+                            result
+                        })
+                            as super::provider::BoxFuture<'static, _>)
+                            .shared();
+                        let flight = Arc::new(flight);
+                        // A request waiting for admission across invalidation
+                        // may finish, but must not join the new generation.
+                        if Arc::ptr_eq(&cache.generation, &generation) {
+                            cache.flights.insert(cache_key, Arc::downgrade(&flight));
+                        }
+                        flight
+                    }
+                };
+                flight.as_ref().clone().await
             }
             _ => {
                 let legacy = self
@@ -262,46 +372,49 @@ impl KeyService {
         }
     }
 
-    fn remember(&self, provider: &str, wrapped: &WrappedDataKey, data_key: &DataKey) {
-        self.cache_insert(cache_key(provider, wrapped), data_key);
+    fn generation(&self) -> Arc<()> {
+        Arc::clone(
+            &self
+                .inner
+                .cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .generation,
+        )
     }
 
-    fn cached(&self, key: &[u8]) -> Option<DataKey> {
-        self.inner
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
+    fn cache_insert(&self, key: Digest, data_key: &DataKey, generation: &Arc<()>) {
+        let mut cache = self.inner.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if Arc::ptr_eq(&cache.generation, generation) {
+            cache.insert(key, data_key.clone());
+        }
     }
 
-    fn cache_insert(&self, key: Vec<u8>, data_key: &DataKey) {
-        self.inner
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, data_key.clone());
-    }
-
-    /// Forgets every cached data key - after a version is retired, so no
-    /// key unwrapped under it outlives the retirement in memory.
+    /// Forgets every cached data key after retirement or deletion. Work
+    /// already in flight can finish for its callers, but cannot refill
+    /// this cache or be joined by requests starting after the clear.
     pub fn clear_cache(&self) {
-        self.inner
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entries
-            .clear();
+        let mut cache = self.inner.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.generation = Arc::new(());
+        cache.entries.clear();
+        cache.clock.clear();
+        cache.flights.clear();
     }
 }
 
 /// The cache is keyed by a digest of what is stored, so a row read again
 /// after a rewrap or an erasure never finds an entry for what it used to
 /// hold: the database is still read first, every time.
-fn cache_key(provider: &str, wrapped: &WrappedDataKey) -> Vec<u8> {
+fn cache_key(provider: &str, wrapped: &WrappedDataKey) -> Digest {
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     context.update(&(provider.len() as u64).to_be_bytes());
     context.update(provider.as_bytes());
     context.update(&wrapped.version.to_be_bytes());
     context.update(&wrapped.ciphertext);
-    context.finish().as_ref().to_vec()
+    let mut digest = [0; 32];
+    digest.copy_from_slice(context.finish().as_ref());
+    digest
 }
+
+#[cfg(test)]
+mod tests;
