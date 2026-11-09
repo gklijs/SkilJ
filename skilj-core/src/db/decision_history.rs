@@ -21,6 +21,12 @@ pub(super) async fn decision_history<'a>(
     let mut resolved = std::collections::HashMap::new();
     let mut decrypted = events.to_vec();
     for event in &mut decrypted {
+        // Mixed histories keep unprotected payloads byte-for-byte. They need
+        // neither JSON conversion nor cryptographic validation. The slice API
+        // still requires owning the complete vector when any event changes.
+        if event.event_type.sensitive_fields.is_empty() {
+            continue;
+        }
         let unavailable = || crate::event_store::Error::SensitiveHistoryUnavailable {
             sequence: event.sequence,
             event_type: event.event_type.name.clone(),
@@ -71,3 +77,6 @@ pub(super) async fn decision_history<'a>(
     }
     Ok(Cow::Owned(decrypted))
 }
+
+#[cfg(test)]
+mod tests;

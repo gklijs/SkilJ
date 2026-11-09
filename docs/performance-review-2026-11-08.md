@@ -133,6 +133,12 @@ also increase append/WAL cost.
 
 ## 4. Avoid decrypting history solely to validate an unchanged decision
 
+Investigation result (#174, 2026-11-09): retain full locked cryptographic
+validation; skip JSON conversion for nonsensitive events in mixed histories.
+[Measurements, race coverage and evidence-contract requirements](benchmarks/sensitive-history/README.md)
+record why validation-only handling is deferred. The proposal below is the
+original review, before that investigation.
+
 [`decide_command_in_tx`](../skilj-core/src/db/commands.rs) calls
 `decision_history` even when its delta is empty, then discards the returned
 history. This is important validation: keys could have been erased since the
