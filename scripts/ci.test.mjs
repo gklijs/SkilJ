@@ -32,9 +32,17 @@ fi
 if [[ " $* " == *" --doc "* ]]; then exit "\${FAKE_DOC_STATUS:-0}"; fi
 exit "\${FAKE_TEST_STATUS:-0}"
 `, { mode: 0o755 });
-  for (const command of ['psql', 'pg_isready']) {
-    writeFileSync(join(bin, command), '#!/usr/bin/env bash\necho 1\n', { mode: 0o755 });
-  }
+  writeFileSync(join(bin, 'pg_isready'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(bin, 'psql'), `#!/usr/bin/env bash
+printf '%s\\n' "psql $*" >> "$CAPTURE"
+if [[ "$*" == *'SHOW server_version_num'* ]]; then
+  echo "\${FAKE_POSTGRES_VERSION:-150019}"
+  exit "\${FAKE_VERSION_STATUS:-0}"
+fi
+if [[ "$*" == *'CREATE DATABASE'* ]]; then exit "\${FAKE_CREATE_STATUS:-0}"; fi
+if [[ "$*" == *'SELECT 1'* && "\${FAKE_POSTGRES_DOWN:-0}" == 1 ]]; then exit 1; fi
+echo 1
+`, { mode: 0o755 });
   return { dir, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`,
     CAPTURE: join(dir, 'args'), CI_TEST_LOG: join(dir, 'tests.log'), CI_POSTGRES_TIMEOUT: '1' } };
 }
@@ -89,6 +97,85 @@ test('unknown test groups fail before probing services', t => {
   const result = run('ci-test.sh', [], { ...env, CI_TEST_GROUP: 'typo' });
   assert.equal(result.status, 2);
   assert.match(result.stderr, /unknown CI_TEST_GROUP/);
+});
+
+test('Postgres compatibility selects existing whole binaries without brokers or doctests', () => {
+  assert.deepEqual(selection('postgres'), { docs: false, args: ['-p', 'skilj',
+    '--test', 'startup_bounded_contexts', '--test', 'conformance',
+    '--test', 'sync_projections', '--test', 'async_projections',
+    '--test', 'decrypt_on_read', '--test', 'blind_tags'] });
+});
+
+test('compatibility requires an explicit major even for build-only, before probing services', t => {
+  const { env } = fixture(t);
+  for (const major of ['', 'bogus', '15; exit 0', '015']) {
+    const result = run('ci-test.sh', ['--build-only'], {
+      ...env, CI_TEST_GROUP: 'postgres', CI_POSTGRES_MAJOR: major,
+    });
+    assert.equal(result.status, 2, result.stdout + result.stderr);
+    assert.match(result.stdout, /FATAL:.*CI_POSTGRES_MAJOR/);
+  }
+  assert.throws(() => readFileSync(env.CAPTURE, 'utf8'), /ENOENT/);
+});
+
+test('compatibility proves the actual server major on setup and test runs', t => {
+  const { env } = fixture(t);
+  for (const major of ['15', '18']) {
+    for (const args of [['--setup-only'], []]) {
+      const result = run('ci-test.sh', args, { ...env, CI_TEST_GROUP: 'postgres',
+        CI_POSTGRES_MAJOR: major, FAKE_POSTGRES_VERSION: `${major}0019` });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, new RegExp(`verified Postgres ${major}`));
+    }
+  }
+  assert.match(readFileSync(env.CAPTURE, 'utf8'), /test -p skilj --test startup_bounded_contexts.*--nocapture/);
+});
+
+test('wrong, unreadable or malformed server versions fail before database writes or tests', t => {
+  const { env } = fixture(t);
+  for (const settings of [
+    { FAKE_POSTGRES_VERSION: '170011' }, { FAKE_POSTGRES_VERSION: 'unknown' },
+    { FAKE_POSTGRES_VERSION: '150019\n180006' }, { FAKE_VERSION_STATUS: '3' },
+  ]) {
+    const result = run('ci-test.sh', [], { ...env, CI_TEST_GROUP: 'postgres',
+      CI_POSTGRES_MAJOR: '15', ...settings });
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(result.stdout, /FATAL:.*(expected Postgres|cannot read)/);
+  }
+  assert.doesNotMatch(readFileSync(env.CAPTURE, 'utf8'), /CREATE DATABASE|^test /m);
+});
+
+test('unavailable compatibility server fails without invoking the local fallback', t => {
+  const { env } = fixture(t);
+  const result = run('ci-test.sh', ['--setup-only'], { ...env, CI_TEST_GROUP: 'postgres',
+    CI_POSTGRES_MAJOR: '15', CI_POSTGRES_HOST: '127.0.0.1', CI_POSTGRES_PORT: '1',
+    FAKE_POSTGRES_DOWN: '1' });
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stdout, /refusing fallback/);
+  assert.doesNotMatch(result.stdout, /\[postgres-local\]/);
+});
+
+test('compatibility preserves setup, test-exit and no-skip failures', t => {
+  const { env } = fixture(t);
+  for (const [settings, status] of [
+    [{ FAKE_CREATE_STATUS: '4' }, 1],
+    [{ FAKE_TEST_STATUS: '7' }, 7],
+    [{ FAKE_TEST_OUTPUT: 'test prefix skipping: unavailable Postgres' }, 1],
+  ]) {
+    const result = run('ci-test.sh', [], { ...env, CI_TEST_GROUP: 'postgres',
+      CI_POSTGRES_MAJOR: '15', ...settings });
+    assert.equal(result.status, status, result.stdout + result.stderr);
+  }
+});
+
+test('the required test check includes both compatibility boundary jobs', () => {
+  const workflow = readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8');
+  assert.match(workflow, /postgres: \[15, 18\]/);
+  assert.match(workflow, /image: postgres:\$\{\{ matrix.postgres \}\}-alpine/);
+  assert.match(workflow, /CI_POSTGRES_MAJOR: \$\{\{ matrix.postgres \}\}/);
+  assert.match(workflow, /needs: \[test-suites, postgres-compatibility\]/);
+  assert.match(workflow, /POSTGRES_RESULT: \$\{\{ needs.postgres-compatibility.result \}\}/);
+  assert.match(workflow, /test "\$RESULT" = success && test "\$POSTGRES_RESULT" = success/);
 });
 
 test('template preparation keeps the cached target and removes stale generated sources', t => {

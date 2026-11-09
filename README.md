@@ -6,7 +6,7 @@
 [![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
 [![license: MIT OR Apache-2.0](https://img.shields.io/crates/l/skilj.svg)](#license)
 
-`skilj` is a Rust library for building event-sourced applications backed by Postgres 15 or later. You define
+`skilj` is a Rust library for building event-sourced applications backed by Postgres 15–18. You define
 your domain as **events** (facts that happened) and **commands** (requests to make something
 happen), and `skilj` handles storage, consistency checking, and exposing it all over GraphQL and
 REST — so you can focus on the domain logic itself.
@@ -195,6 +195,8 @@ See [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) for the full mapp
   ([`docs/architecture.md` §159](docs/architecture.md)). Take a backup before upgrading
   production; there is no tool to go back to an older schema.
 - **Minimum supported Rust version: 1.95**, checked in CI. Raising it is a minor-release change.
+- **PostgreSQL 15–18**, using current minor releases. CI runs the full suite on 17 and
+  focused compatibility checks on 15 and 18. See the [support policy and coverage](docs/postgres-compatibility.md).
 - **Which crates the promise covers.** `skilj`, `skilj-core`, `skilj-rest`, `skilj-codegen`,
   `skilj-test-fixture`, `skilj-blob-s3` and the bridges (`skilj-kafka`, `skilj-amqp`,
   `skilj-nats`, `skilj-temporal`). `skilj-tui` and `skilj-inspector` are tools: their command

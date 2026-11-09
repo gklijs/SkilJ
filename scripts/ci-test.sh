@@ -42,6 +42,10 @@ setup_database() {
     database_host="$CI_POSTGRES_HOST"
     log "using the postgres service container at ${CI_POSTGRES_HOST}:${CI_POSTGRES_PORT}"
   else
+    if [[ -n "${CI_POSTGRES_MAJOR:-}" ]]; then
+      log "FATAL: required Postgres ${CI_POSTGRES_MAJOR} service is unavailable; refusing fallback"
+      exit 1
+    fi
     # 2. Otherwise, a server in this container, so a broken service is a
     #    loud note in the log rather than a red pipeline.
     log "WARNING: the postgres service container was not usable; falling back to a"
@@ -57,6 +61,25 @@ setup_database() {
   export DATABASE_URL
   log "DATABASE_URL=${DATABASE_URL}"
 
+  # A compatibility job must prove which server it exercised, rather than
+  # silently passing against a different installed major. Check before writes.
+  if [[ -n "${CI_POSTGRES_MAJOR:-}" ]]; then
+    local server_version
+    server_version=$(PGPASSWORD="$CI_POSTGRES_PASSWORD" PGCONNECT_TIMEOUT=5 \
+      psql -h "$database_host" -p "$CI_POSTGRES_PORT" \
+      -U "$CI_POSTGRES_USER" -d "$CI_POSTGRES_DB" -v ON_ERROR_STOP=1 -tAq \
+      -c 'SHOW server_version_num') || {
+        log "FATAL: cannot read the required server version"
+        exit 1
+      }
+    if [[ ! "$server_version" =~ ^[1-9][0-9]{5}$ ]] || \
+        [[ "$((10#$server_version / 10000))" != "$CI_POSTGRES_MAJOR" ]]; then
+      log "FATAL: expected Postgres ${CI_POSTGRES_MAJOR}, got server_version_num=${server_version}"
+      exit 1
+    fi
+    log "verified Postgres ${CI_POSTGRES_MAJOR} (server_version_num=${server_version})"
+  fi
+
   # 3. Prove the tests' own path into that server works before starting a
   #    run that would otherwise report fifty-nine passing tests that never
   #    touched it: connect, and create a database, which is what every test
@@ -66,7 +89,7 @@ setup_database() {
   #    Two `-c` flags rather than one with two statements, because DROP
   #    and CREATE DATABASE cannot run in a transaction block and psql
   #    sends one `-c` as a single query.
-  PGCONNECT_TIMEOUT=5 psql -h "$database_host" -p "$CI_POSTGRES_PORT" \
+  PGPASSWORD="$CI_POSTGRES_PASSWORD" PGCONNECT_TIMEOUT=5 psql -h "$database_host" -p "$CI_POSTGRES_PORT" \
     -U "$CI_POSTGRES_USER" -d "$CI_POSTGRES_DB" -v ON_ERROR_STOP=1 -tAq \
     -c "DROP DATABASE IF EXISTS ci_preflight" -c "CREATE DATABASE ci_preflight" \
     >/dev/null ||
@@ -81,6 +104,14 @@ setup_database() {
 # shellcheck source=scripts/ci-test-targets.sh
 source "$HERE/ci-test-targets.sh"
 ci_test_targets "${CI_TEST_GROUP:-all}"
+if [[ "${CI_TEST_GROUP:-all}" == postgres && -z "${CI_POSTGRES_MAJOR:-}" ]]; then
+  log "FATAL: CI_TEST_GROUP=postgres requires CI_POSTGRES_MAJOR"
+  exit 2
+fi
+if [[ -n "${CI_POSTGRES_MAJOR:-}" && ! "$CI_POSTGRES_MAJOR" =~ ^[1-9][0-9]$ ]]; then
+  log "FATAL: CI_POSTGRES_MAJOR must be a two-digit major version"
+  exit 2
+fi
 case "${1:-}" in
     --build-only)
         cargo test "${test_args[@]}" --no-run --timings

@@ -370,16 +370,65 @@ jobs:
             target/cargo-timings/
           if-no-files-found: ignore
 
-  # Keep the existing required check name and fail if any shard failed or skipped.
+  postgres-compatibility:
+    # Boundary versions only; the full suite above stays on Postgres 17.
+    # No brokers or Temporal, and no fallback to Debian's installed server.
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [15, 18]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: rust:1-bookworm
+    services:
+      skilj-postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CI_TEST_GROUP: postgres
+      CI_POSTGRES_MAJOR: ${{ matrix.postgres }}
+      CI_POSTGRES_HOST: skilj-postgres
+      CI_TEST_LOG: /tmp/postgres-compatibility.log
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v5
+      - run: apt-get update && apt-get install -y --no-install-recommends postgresql-client
+      - run: bash scripts/ci-test.sh --setup-only
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: postgres-compatibility
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.postgres == 15 }}
+      - run: bash scripts/ci-test.sh --build-only
+      - run: bash scripts/ci-test.sh
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: postgres-${{ matrix.postgres }}-timings-and-log
+          path: |
+            /tmp/postgres-compatibility.log
+            target/cargo-timings/
+          if-no-files-found: ignore
+
+  # Keep the required check name; shards and compatibility jobs must all pass.
   test:
     if: always()
-    needs: test-suites
+    needs: [test-suites, postgres-compatibility]
     runs-on: ubuntu-24.04
     steps:
-      - name: Require every test shard
+      - name: Require every test shard and Postgres boundary version
         env:
           RESULT: ${{ needs.test-suites.result }}
-        run: test "$RESULT" = success
+          POSTGRES_RESULT: ${{ needs.postgres-compatibility.result }}
+        run: test "$RESULT" = success && test "$POSTGRES_RESULT" = success
 
   # Line coverage of the same run as `test`, reported in the job summary
   # and attached as lcov. Informational: it never fails the build, and

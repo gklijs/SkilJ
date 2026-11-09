@@ -94,6 +94,10 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 Run `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs` after changing CI scripts.
 The CI regression suite checks that sharding covers every integration target exactly once,
 preserves doctests and `skilj/local`, and still fails when a service-dependent test skips.
+The required `test` check also includes focused PostgreSQL 15/18 compatibility jobs;
+the full suite stays on 17. `CI_TEST_GROUP=postgres` selects their six integration
+binaries and requires `CI_POSTGRES_MAJOR`. These runs verify the server major and
+refuse fallback servers; see docs/postgres-compatibility.md for local reproduction.
 `CI_TEST_GROUP` defaults to `all` locally. `--build-only` needs no database and records timings.
 Most Rust dependency caches save on `main`; semver saves within the PR because it is PR-only.
 Template builds and the CGA tool binary have separate caches; see docs/architecture.md §222.
