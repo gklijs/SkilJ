@@ -11,6 +11,17 @@ ci_test_targets() {
         all) test_args=(--workspace) ;;
         libraries) test_args=(--workspace --exclude skilj) ;;
         business) test_args=(-p skilj --features local --test graphql_business_surfaces) ;;
+        postgres)
+            # Focused major-version compatibility coverage, additional to the
+            # exhaustive shards above. Whole binaries retain their DB isolation.
+            test_args=(-p skilj
+                --test startup_bounded_contexts
+                --test conformance
+                --test sync_projections
+                --test async_projections
+                --test decrypt_on_read
+                --test blind_tags)
+            ;;
         app)
             # The full workspace enables skilj/local through skilj-demo. Keep
             # that feature in this shard so local-mode tests are not lost.

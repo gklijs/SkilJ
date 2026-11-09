@@ -13691,3 +13691,36 @@ doubts and deadlines have no emhcl equivalent; add them to the imported file.
 written to the convention; its import equals `skilj-demo/src/banking.skilj.toml`
 except for `reads_nothing` and the tag key (`account`), which
 `tests/emhcl_import.rs` checks.
+
+## 244. PostgreSQL compatibility boundaries (issue #187)
+
+The advertised PostgreSQL minimum was 15 (`UNIQUE NULLS NOT DISTINCT` in
+`event_tag_dictionary.sql`), but the full CI suite used only 17. The supported
+range is now explicit: 15–18, current minor releases, with new majors admitted
+after testing. `docs/postgres-compatibility.md` records the policy, scenarios,
+local reproduction and gaps.
+
+The full suite and its three shards (§222) stay on 17. Additional jobs on 15
+and 18 run six existing whole `skilj` integration binaries: startup (including
+the first-release schema fixture), REST/GraphQL conformance (including
+idempotency), synchronous and asynchronous projections, sensitive reads and
+blind tags. No broker or Temporal tests are multiplied. The required `test`
+check aggregates both boundary jobs as well as the full-suite shards.
+
+`CI_TEST_GROUP=postgres` selects these binaries. It requires an explicit
+`CI_POSTGRES_MAJOR`; setup checks `SHOW server_version_num` before creating
+databases and refuses fallback to an installed server. The existing no-skip
+guard still applies. Script regression tests cover version mismatch,
+unreadable/malformed versions, unavailable services, database-creation errors,
+test failures and skipped tests, alongside the unchanged shard-coverage checks.
+Jobs separate compilation from measurement, upload test logs and Cargo timings,
+and have a 30-minute limit. Use those timings before extending the matrix.
+
+This is selected SQL coverage across majors, not a full-suite matrix, nor
+proof of PostgreSQL major upgrades or mixed application versions. Version 16
+has no dedicated CI job. Historical fixture migration checks Skilj's schema
+upgrade on each selected server, not PostgreSQL's `pg_upgrade`.
+
+Validated locally against disposable PostgreSQL 15.19 and 18.6: 26 tests
+passed on each, no skips. All 35 Node CI/CGA regression tests, pinned
+actionlint, shellcheck, formatting and section-reference checks passed.

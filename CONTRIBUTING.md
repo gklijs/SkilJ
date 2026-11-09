@@ -74,6 +74,15 @@ a shard, set `CI_TEST_GROUP=business`, `app`, or `libraries` before running
 compiles the selected group without a database and writes Cargo timings.
 The shard jobs upload their timing reports and test logs, including on failure.
 
+It also requires a focused PostgreSQL compatibility matrix on 15 and 18
+(the minimum and newest supported majors). The full suite stays on 17;
+brokers and Temporal are not repeated in the matrix. See
+[PostgreSQL compatibility](docs/postgres-compatibility.md) for the support
+policy, exact scenarios, local command and limits. Compatibility jobs verify
+the actual server major before creating test databases and refuse a fallback
+server. Run `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs` after
+changing the CI scripts.
+
 Coverage is informational and runs on pushes to `main` and manual workflow
 dispatch, rather than repeating the instrumented full run on every PR.
 Clippy and rustdoc stay together; MSRV and CGA keep their own toolchains.
@@ -162,9 +171,10 @@ far as a test exercises them, and some aren't checked at all
   behind Apollo Router and Hive Router, but downloads them, so it runs by
   hand only. Apollo Router's subscriptions need GraphOS, so only Hive
   Router's are exercised (§194).
-- **Postgres versions.** CI runs `postgres:17-alpine`. Locally you get
-  whatever `DATABASE_URL` points at, or the embedded fallback. Nothing
-  runs the suite against several major versions.
+- **Full-suite coverage on every Postgres major.** The full suite runs on
+  17, and a focused compatibility suite runs on 15 and 18. Version 16 has
+  no dedicated CI job. The matrix does not establish compatibility for SQL
+  paths outside its scenarios; see the [coverage inventory](docs/postgres-compatibility.md).
 - **Performance.** The benchmarks (`command_throughput`,
   `inbound_throughput`, `projection_catch_up_throughput`) are
   `#[ignore]`d. A throughput regression fails nothing.
