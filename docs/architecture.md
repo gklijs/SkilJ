@@ -13650,7 +13650,10 @@ down once in `docs/event-modeling-hcl.md` and used by the import, the
 - **One error string against `reason` and `kind`.** A scenario's `then`
   holds one `error` string; `CommandDecision::Rejected` has a `reason` and a
   stable `kind`. The convention writes `error = "<kind>: <reason>"`, so the
-  model names the kind `then_rejected` asserts.
+  model names the kind `then_rejected` asserts. An error without a kind in
+  front imports as the generic kind `rejected` rather than a note, so a model
+  written without the convention still imports cleanly; refine the kinds in
+  `decide()` afterwards.
 - **REST triggering.** `rest_trigger_allowed` is a screen with
   `kind = "api"` and `api_endpoint = "POST /v1/commands/trigger"`. `emhcl export`
   drops `kind` but keeps `api_endpoint`, which is what the import reads.

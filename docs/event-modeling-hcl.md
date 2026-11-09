@@ -56,6 +56,7 @@ Follow these rules in the model, and the import below needs no manual mapping:
    `"<kind>: <reason>"`, with a stable `snake_case` kind:
    `error = "insufficient_funds: withdrawal exceeds the balance"`. The kind is
    the `kind` of `CommandDecision::Rejected` and what `then_rejected` asserts.
+   An error without a kind in front imports as the generic kind `rejected`.
 5. **REST triggering.** A command callers may send over REST has an API screen
    as its issuer: `kind = "api"`, `api_endpoint = "POST /v1/commands/trigger"`.
 6. **Aggregates are optional.** Leave them out, or keep them for the diagram;
@@ -150,8 +151,10 @@ each command's scenarios use. The import:
 - leaves out, with a note, a type that has a list, nested fields, an optional
   field, or a `Double`, `Decimal` or `Custom` field: hand-write that one;
 - keeps a `pii = true` field, with a note to declare it sensitive or blind;
+- gives a scenario error without a `<kind>: ` in front the generic kind
+  `rejected`;
 - notes an event or command without an `id_attribute` field, which has no
-  tags, and a scenario error that doesn't follow `<kind>: <reason>`.
+  tags.
 
 It doesn't write projections, automations, tests or `decide()` bodies; those
 stay hand-written Rust. After importing, add what the model can't say:

@@ -126,9 +126,10 @@ fn leaves_out_what_it_cannot_express_and_says_why() {
         "{notes}"
     );
     assert!(notes.contains("event.orders.order_priced: left out, hand-write it: `total` has type Decimal, `lines` is a list"), "{notes}");
+    assert!(!notes.contains("The order is empty"), "{notes}");
     assert!(
-        notes.contains("doesn't follow `<kind>: <reason>`"),
-        "{notes}"
+        toml.contains("# Rejected as: rejected\n[[command_type]]"),
+        "an error without a kind is the generic kind: {toml}"
     );
     skilj_codegen::generate(toml).unwrap();
 }

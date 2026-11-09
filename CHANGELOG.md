@@ -16,8 +16,9 @@ README.md, "Status and stability").
   [Event Modeling HCL](https://event-modeling-hcl.github.io) model into a
   `.skilj.toml` for one bounded context, with the rejection kinds of each
   command's scenarios as comments; `cargo run -p skilj-codegen --example
-  emhcl_import` runs it from the command line. A type the format can't express
-  is left out with a note. `skilj_codegen::Error` gains a `Json` variant
+  emhcl_import` runs it from the command line. A scenario error without a
+  `<kind>: ` prefix becomes the generic kind `rejected`. A type the format
+  can't express is left out with a note. `skilj_codegen::Error` gains a `Json` variant
   (docs/architecture.md §243).
 
 ### Changed
