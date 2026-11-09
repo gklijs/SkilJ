@@ -68,7 +68,7 @@ workspace = re.sub(r'path = "([^"\n]+)"', r'path = "skilj-workspace/\1"', worksp
 app = Path("Cargo.toml")
 # Direct path dependencies let cargo-chef mask local package versions along
 # with their consumers; registry patches alone retain incompatible versions.
-contents = re.sub(r'(?m)^(skilj(?:-core)?) = "[^"\n]+"$',
+contents = re.sub(r'(?m)^(skilj(?:-core|-test-fixture)?) = "[^"\n]+"$',
                   r'\1 = { path = "skilj-workspace/\1" }', app.read_text())
 app.write_text(contents + "\n" + workspace)
 manifest.unlink()

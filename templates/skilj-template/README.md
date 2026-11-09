@@ -8,6 +8,23 @@ GraphQL and REST surfaces built in - see its own README for what that means and 
 This project has one worked bounded context, `wallet` (deposit/withdraw, one `Balance`
 projection - see `src/wallet.rs`).
 
+## Test the domain
+
+```sh
+cargo test --no-default-features --test wallet_fixture
+```
+
+These tests call `decide()` and `project()` through `skilj-test-fixture`.
+They need no Docker, `DATABASE_URL`, or running Postgres. Start here when
+changing wallet rules: deposits, nonpositive amounts, withdrawals,
+overdrafts, and balance folds have examples in `tests/wallet_fixture.rs`.
+The first run compiles dependencies; measure repeat runs on your machine
+with `time cargo test --no-default-features --test wallet_fixture`.
+
+The supplied histories assume the correct wallet's events were selected.
+These tests do not verify tag selection, projection key routing, persistence,
+authorization, or concurrency. Test those against a running application.
+
 ## Run it
 
 ```sh

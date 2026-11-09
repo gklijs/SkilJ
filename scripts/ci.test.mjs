@@ -107,8 +107,18 @@ test('template preparation keeps the cached target and removes stale generated s
   result = run('check-template.sh', ['--prepared', '--no-run', '--cache-dir', cache], env);
   assert.equal(result.status, 0, result.stderr);
   const calls = readFileSync(env.CAPTURE, 'utf8');
+  assert.match(calls, /test --no-default-features --test wallet_fixture/);
   assert.match(calls, /check --all-targets --no-default-features/);
   assert.ok(calls.includes(`target=${join(cache, 'build')}`));
+});
+
+test('template domain test failure stops before builds and server startup', t => {
+  const { env } = fixture(t);
+  const result = run('check-template.sh', ['--no-run'], { ...env, FAKE_TEST_STATUS: '17' });
+  assert.equal(result.status, 17, result.stdout + result.stderr);
+  const calls = readFileSync(env.CAPTURE, 'utf8');
+  assert.match(calls, /test --no-default-features --test wallet_fixture/);
+  assert.ok(!calls.includes('check --all-targets') && !calls.includes('build --bin server'));
 });
 
 test('Docker cache arguments stay intact and the generated workspace contains only template dependencies', t => {
@@ -137,7 +147,7 @@ esac
   assert.deepEqual(args.slice(0, 5), ['buildx', 'build', '--load', '--cache-to', cache]);
   const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
   const names = metadata.packages.map(p => p.name);
-  for (const name of ['template-check', 'skilj', 'skilj-core', 'skilj-graphql', 'skilj-rest']) assert.ok(names.includes(name), name);
+  for (const name of ['template-check', 'skilj', 'skilj-core', 'skilj-graphql', 'skilj-rest', 'skilj-test-fixture']) assert.ok(names.includes(name), name);
   assert.ok(!names.includes('skilj-kafka') && !names.includes('skilj-temporal'));
 });
 
