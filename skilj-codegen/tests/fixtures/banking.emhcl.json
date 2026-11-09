@@ -1,0 +1,610 @@
+{
+  "slices": [
+    {
+      "id": "workflow.deposit_money",
+      "index": 0,
+      "title": "Deposit money",
+      "sliceType": "STATE_CHANGE",
+      "commands": [
+        {
+          "id": "command.deposit_money.deposit_money",
+          "title": "Deposit Money",
+          "fields": [
+            {
+              "name": "account_id",
+              "type": "String",
+              "example": "acc-1",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100"
+            }
+          ],
+          "type": "COMMAND",
+          "dependencies": [
+            {
+              "id": "screen.deposit_money.deposit_money_request",
+              "type": "INBOUND",
+              "title": "deposit_money_request",
+              "elementType": "SCREEN"
+            },
+            {
+              "id": "event.banking.money_deposited",
+              "type": "OUTBOUND",
+              "title": "Money Deposited",
+              "elementType": "EVENT"
+            }
+          ]
+        }
+      ],
+      "events": [
+        {
+          "id": "event.banking.money_deposited",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "title": "Money Deposited",
+          "fields": [
+            {
+              "name": "account_id",
+              "type": "String",
+              "example": "acc-1",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100"
+            }
+          ],
+          "type": "EVENT",
+          "dependencies": [
+            {
+              "id": "command.deposit_money.deposit_money",
+              "type": "INBOUND",
+              "title": "Deposit Money",
+              "elementType": "COMMAND"
+            },
+            {
+              "id": "readmodel.account_balance.account_balance",
+              "type": "OUTBOUND",
+              "title": "Account Balance",
+              "elementType": "READMODEL"
+            }
+          ]
+        }
+      ],
+      "readmodels": [],
+      "screens": [
+        {
+          "id": "screen.deposit_money.deposit_money_request",
+          "title": "deposit_money_request",
+          "fields": [],
+          "type": "SCREEN",
+          "dependencies": [
+            {
+              "id": "command.deposit_money.deposit_money",
+              "type": "OUTBOUND",
+              "title": "Deposit Money",
+              "elementType": "COMMAND"
+            }
+          ],
+          "apiEndpoint": "POST /v1/commands/trigger"
+        }
+      ],
+      "processors": [],
+      "tables": [],
+      "specifications": [
+        {
+          "id": "scenario.deposit_money.deposit_accepted",
+          "sliceName": "Deposit money",
+          "title": "deposit_accepted",
+          "given": [],
+          "when": [
+            {
+              "title": "Deposit Money",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 100
+                }
+              ],
+              "id": "scenario.deposit_money.deposit_accepted.when.0",
+              "index": 0,
+              "type": "SPEC_COMMAND",
+              "linkedId": "command.deposit_money.deposit_money"
+            }
+          ],
+          "then": [
+            {
+              "title": "Money Deposited",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 100
+                }
+              ],
+              "id": "scenario.deposit_money.deposit_accepted.then.0",
+              "index": 0,
+              "type": "SPEC_EVENT",
+              "linkedId": "event.banking.money_deposited"
+            }
+          ],
+          "linkedId": "workflow.deposit_money"
+        },
+        {
+          "id": "scenario.deposit_money.deposit_not_positive",
+          "sliceName": "Deposit money",
+          "title": "deposit_not_positive",
+          "given": [],
+          "when": [
+            {
+              "title": "Deposit Money",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 0
+                }
+              ],
+              "id": "scenario.deposit_money.deposit_not_positive.when.0",
+              "index": 0,
+              "type": "SPEC_COMMAND",
+              "linkedId": "command.deposit_money.deposit_money"
+            }
+          ],
+          "then": [
+            {
+              "title": "invalid_amount: deposit amount must be positive",
+              "id": "scenario.deposit_money.deposit_not_positive.then.0",
+              "index": 0,
+              "type": "SPEC_ERROR"
+            }
+          ],
+          "linkedId": "workflow.deposit_money"
+        }
+      ],
+      "actors": [
+        {
+          "name": "Account holder",
+          "authRequired": true
+        }
+      ]
+    },
+    {
+      "id": "workflow.withdraw_money",
+      "index": 1,
+      "title": "Withdraw money",
+      "sliceType": "STATE_CHANGE",
+      "commands": [
+        {
+          "id": "command.withdraw_money.withdraw_money",
+          "title": "Withdraw Money",
+          "fields": [
+            {
+              "name": "account_id",
+              "type": "String",
+              "example": "acc-1",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100"
+            }
+          ],
+          "type": "COMMAND",
+          "dependencies": [
+            {
+              "id": "screen.withdraw_money.withdraw_money_request",
+              "type": "INBOUND",
+              "title": "withdraw_money_request",
+              "elementType": "SCREEN"
+            },
+            {
+              "id": "event.banking.money_withdrawn",
+              "type": "OUTBOUND",
+              "title": "Money Withdrawn",
+              "elementType": "EVENT"
+            }
+          ]
+        }
+      ],
+      "events": [
+        {
+          "id": "event.banking.money_deposited",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "title": "Money Deposited",
+          "fields": [
+            {
+              "name": "account_id",
+              "type": "String",
+              "example": "acc-1",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100"
+            }
+          ],
+          "type": "EVENT",
+          "dependencies": [
+            {
+              "id": "command.deposit_money.deposit_money",
+              "type": "INBOUND",
+              "title": "Deposit Money",
+              "elementType": "COMMAND"
+            },
+            {
+              "id": "readmodel.account_balance.account_balance",
+              "type": "OUTBOUND",
+              "title": "Account Balance",
+              "elementType": "READMODEL"
+            }
+          ],
+          "linkedId": "event.banking.money_deposited",
+          "elementCopy": true
+        },
+        {
+          "id": "event.banking.money_withdrawn",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "title": "Money Withdrawn",
+          "fields": [
+            {
+              "name": "account_id",
+              "type": "String",
+              "example": "acc-1",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100"
+            }
+          ],
+          "type": "EVENT",
+          "dependencies": [
+            {
+              "id": "command.withdraw_money.withdraw_money",
+              "type": "INBOUND",
+              "title": "Withdraw Money",
+              "elementType": "COMMAND"
+            },
+            {
+              "id": "readmodel.account_balance.account_balance",
+              "type": "OUTBOUND",
+              "title": "Account Balance",
+              "elementType": "READMODEL"
+            }
+          ]
+        }
+      ],
+      "readmodels": [],
+      "screens": [
+        {
+          "id": "screen.withdraw_money.withdraw_money_request",
+          "title": "withdraw_money_request",
+          "fields": [],
+          "type": "SCREEN",
+          "dependencies": [
+            {
+              "id": "command.withdraw_money.withdraw_money",
+              "type": "OUTBOUND",
+              "title": "Withdraw Money",
+              "elementType": "COMMAND"
+            }
+          ],
+          "apiEndpoint": "POST /v1/commands/trigger"
+        }
+      ],
+      "processors": [],
+      "tables": [],
+      "specifications": [
+        {
+          "id": "scenario.withdraw_money.withdrawal_not_positive",
+          "sliceName": "Withdraw money",
+          "title": "withdrawal_not_positive",
+          "given": [],
+          "when": [
+            {
+              "title": "Withdraw Money",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 0
+                }
+              ],
+              "id": "scenario.withdraw_money.withdrawal_not_positive.when.0",
+              "index": 0,
+              "type": "SPEC_COMMAND",
+              "linkedId": "command.withdraw_money.withdraw_money"
+            }
+          ],
+          "then": [
+            {
+              "title": "invalid_amount: withdrawal amount must be positive",
+              "id": "scenario.withdraw_money.withdrawal_not_positive.then.0",
+              "index": 0,
+              "type": "SPEC_ERROR"
+            }
+          ],
+          "linkedId": "workflow.withdraw_money"
+        },
+        {
+          "id": "scenario.withdraw_money.withdrawal_over_balance",
+          "sliceName": "Withdraw money",
+          "title": "withdrawal_over_balance",
+          "given": [
+            {
+              "title": "Money Deposited",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 100
+                }
+              ],
+              "id": "scenario.withdraw_money.withdrawal_over_balance.given.0",
+              "index": 0,
+              "type": "SPEC_EVENT",
+              "linkedId": "event.banking.money_deposited"
+            }
+          ],
+          "when": [
+            {
+              "title": "Withdraw Money",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 150
+                }
+              ],
+              "id": "scenario.withdraw_money.withdrawal_over_balance.when.0",
+              "index": 0,
+              "type": "SPEC_COMMAND",
+              "linkedId": "command.withdraw_money.withdraw_money"
+            }
+          ],
+          "then": [
+            {
+              "title": "insufficient_funds: withdrawal exceeds the balance",
+              "id": "scenario.withdraw_money.withdrawal_over_balance.then.0",
+              "index": 0,
+              "type": "SPEC_ERROR"
+            }
+          ],
+          "linkedId": "workflow.withdraw_money"
+        },
+        {
+          "id": "scenario.withdraw_money.withdrawal_within_balance",
+          "sliceName": "Withdraw money",
+          "title": "withdrawal_within_balance",
+          "given": [
+            {
+              "title": "Money Deposited",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 100
+                }
+              ],
+              "id": "scenario.withdraw_money.withdrawal_within_balance.given.0",
+              "index": 0,
+              "type": "SPEC_EVENT",
+              "linkedId": "event.banking.money_deposited"
+            }
+          ],
+          "when": [
+            {
+              "title": "Withdraw Money",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 40
+                }
+              ],
+              "id": "scenario.withdraw_money.withdrawal_within_balance.when.0",
+              "index": 0,
+              "type": "SPEC_COMMAND",
+              "linkedId": "command.withdraw_money.withdraw_money"
+            }
+          ],
+          "then": [
+            {
+              "title": "Money Withdrawn",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 40
+                }
+              ],
+              "id": "scenario.withdraw_money.withdrawal_within_balance.then.0",
+              "index": 0,
+              "type": "SPEC_EVENT",
+              "linkedId": "event.banking.money_withdrawn"
+            }
+          ],
+          "linkedId": "workflow.withdraw_money"
+        }
+      ],
+      "actors": [
+        {
+          "name": "Account holder",
+          "authRequired": true
+        }
+      ]
+    },
+    {
+      "id": "workflow.account_balance",
+      "index": 2,
+      "title": "Account balance",
+      "sliceType": "STATE_VIEW",
+      "commands": [],
+      "events": [
+        {
+          "id": "event.banking.money_deposited",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "title": "Money Deposited",
+          "fields": [
+            {
+              "name": "account_id",
+              "type": "String",
+              "example": "acc-1",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100"
+            }
+          ],
+          "type": "EVENT",
+          "dependencies": [
+            {
+              "id": "command.deposit_money.deposit_money",
+              "type": "INBOUND",
+              "title": "Deposit Money",
+              "elementType": "COMMAND"
+            },
+            {
+              "id": "readmodel.account_balance.account_balance",
+              "type": "OUTBOUND",
+              "title": "Account Balance",
+              "elementType": "READMODEL"
+            }
+          ],
+          "linkedId": "event.banking.money_deposited",
+          "elementCopy": true
+        },
+        {
+          "id": "event.banking.money_withdrawn",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "title": "Money Withdrawn",
+          "fields": [
+            {
+              "name": "account_id",
+              "type": "String",
+              "example": "acc-1",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100"
+            }
+          ],
+          "type": "EVENT",
+          "dependencies": [
+            {
+              "id": "command.withdraw_money.withdraw_money",
+              "type": "INBOUND",
+              "title": "Withdraw Money",
+              "elementType": "COMMAND"
+            },
+            {
+              "id": "readmodel.account_balance.account_balance",
+              "type": "OUTBOUND",
+              "title": "Account Balance",
+              "elementType": "READMODEL"
+            }
+          ],
+          "linkedId": "event.banking.money_withdrawn",
+          "elementCopy": true
+        }
+      ],
+      "readmodels": [
+        {
+          "id": "readmodel.account_balance.account_balance",
+          "title": "Account Balance",
+          "fields": [
+            {
+              "name": "account_id",
+              "type": "String",
+              "example": "acc-1",
+              "idAttribute": true
+            },
+            {
+              "name": "balance",
+              "type": "Int",
+              "example": "60"
+            }
+          ],
+          "type": "READMODEL",
+          "dependencies": [
+            {
+              "id": "event.banking.money_deposited",
+              "type": "INBOUND",
+              "title": "Money Deposited",
+              "elementType": "EVENT"
+            },
+            {
+              "id": "event.banking.money_withdrawn",
+              "type": "INBOUND",
+              "title": "Money Withdrawn",
+              "elementType": "EVENT"
+            }
+          ]
+        }
+      ],
+      "screens": [],
+      "processors": [],
+      "tables": [],
+      "specifications": [
+        {
+          "id": "scenario.account_balance.balance_after_deposit_and_withdrawal",
+          "sliceName": "Account balance",
+          "title": "balance_after_deposit_and_withdrawal",
+          "given": [
+            {
+              "title": "Money Deposited",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 100
+                }
+              ],
+              "id": "scenario.account_balance.balance_after_deposit_and_withdrawal.given.0",
+              "index": 0,
+              "type": "SPEC_EVENT",
+              "linkedId": "event.banking.money_deposited"
+            },
+            {
+              "title": "Money Withdrawn",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "amount": 40
+                }
+              ],
+              "id": "scenario.account_balance.balance_after_deposit_and_withdrawal.given.1",
+              "index": 1,
+              "type": "SPEC_EVENT",
+              "linkedId": "event.banking.money_withdrawn"
+            }
+          ],
+          "when": [],
+          "then": [
+            {
+              "title": "Account Balance",
+              "examples": [
+                {
+                  "account_id": "acc-1",
+                  "balance": 60
+                }
+              ],
+              "id": "scenario.account_balance.balance_after_deposit_and_withdrawal.then.0",
+              "index": 0,
+              "type": "SPEC_READMODEL",
+              "linkedId": "readmodel.account_balance.account_balance"
+            }
+          ],
+          "linkedId": "workflow.account_balance"
+        }
+      ]
+    }
+  ]
+}

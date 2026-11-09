@@ -13623,3 +13623,57 @@ consumers and remains a separately reviewed breaking stage, coordinated with
 issue #172. SQL counts and page selection need no such representation change.
 The event cache remains in use by command preparation and other existing readers;
 these browse/count surfaces query authoritative rows directly.
+
+## 243. Event Modeling HCL: a naming convention and an import
+
+[Event Modeling HCL](https://event-modeling-hcl.github.io) is a language, a
+validator (`emhcl`) and a plugin for AI assistants, for writing an Event
+Modeling model as reviewable `.em.hcl` files in Git. It is a design tool with no
+runtime part, so "compatible with skilj" means a model maps onto skilj without
+friction. Mostly it does: bounded contexts, events, commands (`decide()`), read
+models (projections) and given/when/then scenarios (`skilj-test-fixture`) line
+up one to one. `docs/event-modeling-hcl.md` has the whole mapping.
+
+Three places don't line up on their own, and a convention closes each, written
+down once in `docs/event-modeling-hcl.md` and used by the import, the
+`skilj-event-modeling` skill and the fixture:
+
+- **Aggregates against DCB tags.** emhcl is aggregate-oriented: an event has
+  one `aggregate`, an aggregate an `identity`, a lifecycle one aggregate. It has
+  no tag concept (its `tags` attribute is presentation). The convention reads
+  `id_attribute = true` on a field as a DCB tag, keyed by the field name without
+  `_id`, the same keys skilj-demo already uses (`account = "account_id"`). An
+  aggregate is optional and the import ignores it, so a command spanning a
+  course and a student needs no owning aggregate.
+- **One error string against `reason` and `kind`.** A scenario's `then`
+  holds one `error` string; `CommandDecision::Rejected` has a `reason` and a
+  stable `kind`. The convention writes `error = "<kind>: <reason>"`, so the
+  model names the kind `then_rejected` asserts.
+- **REST triggering.** `rest_trigger_allowed` is a screen with
+  `kind = "api"` and `api_endpoint = "POST /v1/commands/trigger"`. `emhcl export`
+  drops `kind` but keeps `api_endpoint`, which is what the import reads.
+
+**The import.** `skilj_codegen::emhcl::import(json, bounded_context)` turns
+`emhcl export` JSON into a `.skilj.toml`. It reads the export rather than the
+HCL: the export keeps everything the import needs (ids, fields with types and
+key flags, dependencies, endpoints, scenarios), and reading HCL would mean
+reimplementing the language and its validation in Rust, which `emhcl` already
+owns; validate with `emhcl` first. Element ids carry the emhcl labels
+(`event.banking.money_deposited`), so names come from labels, never titles. A
+command belongs to the context of the events it emits. A type with a field
+`.skilj.toml` can't express (a list, subfields, optional, `Double`, `Decimal`,
+`Custom`) is left out with a note rather than approximated, the same rule
+`.skilj.toml` follows (§17); `pii = true` is kept with a note, since choosing the
+subject is a decision the model doesn't record. The result is validated like any
+`.skilj.toml` before it is returned, so an import either generates or names its
+problems. It writes the scenarios' rejection kinds as a comment above each
+command, for its hand-written `decide_*`.
+
+What it deliberately doesn't do: projections, automations and scenarios stay
+hand-written, as `.skilj.toml` itself has no projection concept (§17), and a
+generated test would assert examples a domain expert hasn't checked against
+real payloads. `reads_nothing`, consistency queries, blind tags, retractions,
+doubts and deadlines have no emhcl equivalent; add them to the imported file.
+`skilj-codegen/tests/fixtures/banking.em.hcl` is skilj-demo's banking context
+written to the convention; its import equals `skilj-demo/src/banking.skilj.toml`
+except for `reads_nothing`, which `tests/emhcl_import.rs` checks.

@@ -43,6 +43,11 @@
 //! `skilj-demo/build.rs`/`skilj-demo/src/banking.rs` for the real,
 //! working example.
 //!
+//! **Importing from an Event Modeling model.** [`emhcl::import`] writes a
+//! `.skilj.toml` from an [Event Modeling HCL](https://event-modeling-hcl.github.io)
+//! model's `emhcl export` JSON, by the naming convention of
+//! `docs/event-modeling-hcl.md` (docs/architecture.md §243).
+//!
 //! **Reviewing what it generates.** Code written to `$OUT_DIR` never
 //! shows up in a diff. `skilj-demo/tests/generated_code.rs` compares the
 //! `$OUT_DIR` file against a checked-in copy, so a change to the
@@ -50,6 +55,7 @@
 //! (docs/architecture.md §191). A consumer can do the same in a few
 //! lines.
 
+pub mod emhcl;
 mod emit;
 mod spec;
 
@@ -75,6 +81,8 @@ pub enum Error {
     /// user error; nothing about a well-formed `.skilj.toml` file
     /// should be able to trigger this.
     Generated(syn::Error),
+    /// [`emhcl::import`]'s input isn't the JSON `emhcl export` writes.
+    Json(serde_json::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -88,6 +96,7 @@ impl std::fmt::Display for Error {
                 }
                 Ok(())
             }
+            Error::Json(e) => write!(f, "invalid emhcl export JSON: {e}"),
             Error::Generated(e) => {
                 write!(f, "skilj-codegen generated code that failed to parse - this is a bug in skilj-codegen itself, not in your .skilj.toml: {e}")
             }
