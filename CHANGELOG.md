@@ -35,7 +35,7 @@ README.md, "Status and stability").
   Add a SQLx-only two-cycle allocation/RSS and latency probe; pool defaults
   remain unchanged.
 - `docs/event-modeling-hcl.md` maps Event Modeling HCL onto skilj and sets a
-  naming convention: `id_attribute` fields are DCB tags keyed without `_id`,
+  naming convention: `id_attribute` fields are DCB tags keyed by the field name,
   scenario errors are `"<kind>: <reason>"`, and an API screen on
   `POST /v1/commands/trigger` allows REST triggering. The README points to it,
   and the `skilj-event-modeling` skill can write its summary as an `.em.hcl`

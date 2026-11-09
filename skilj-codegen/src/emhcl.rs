@@ -16,8 +16,8 @@
 //!   both are lowercase `snake_case`.
 //! - An event's or command's emhcl label is its `NAME` in PascalCase:
 //!   `money_deposited` becomes `MoneyDeposited`.
-//! - A field with `id_attribute = true` is a DCB tag, keyed by its name
-//!   without a trailing `_id`: `account_id` becomes `account = "account_id"`.
+//! - A field with `id_attribute = true` is a DCB tag with the field name as
+//!   its key: `account_id` becomes `account_id = "account_id"`.
 //!   An aggregate isn't needed and isn't read.
 //! - A command belongs to the bounded context of the events it emits.
 //! - A command issued by a screen whose `api_endpoint` is
@@ -275,14 +275,6 @@ fn pascal_case(label: &str) -> String {
         .collect()
 }
 
-/// `account_id` -> `account`; a name without `_id`, or only `_id`, stays.
-fn tag_key(field: &str) -> &str {
-    match field.strip_suffix("_id") {
-        Some(key) if !key.is_empty() => key,
-        _ => field,
-    }
-}
-
 fn is_label(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_lowercase())
@@ -330,13 +322,7 @@ fn convert(element: &Element, notes: &mut Vec<String>) -> Option<TypeOut> {
             continue;
         }
         if field.id_attribute {
-            let key = tag_key(&field.name);
-            let key = if tags.contains_key(key) {
-                field.name.as_str()
-            } else {
-                key
-            };
-            tags.insert(key.to_string(), field.name.clone());
+            tags.insert(field.name.clone(), field.name.clone());
         }
         if field.pii {
             notes.push(format!(
@@ -435,9 +421,6 @@ mod tests {
     fn names_follow_the_convention() {
         assert_eq!(pascal_case("money_deposited"), "MoneyDeposited");
         assert_eq!(pascal_case("open_v2_course"), "OpenV2Course");
-        assert_eq!(tag_key("account_id"), "account");
-        assert_eq!(tag_key("iban"), "iban");
-        assert_eq!(tag_key("_id"), "_id");
     }
 
     #[test]

@@ -13641,9 +13641,11 @@ down once in `docs/event-modeling-hcl.md` and used by the import, the
 - **Aggregates against DCB tags.** emhcl is aggregate-oriented: an event has
   one `aggregate`, an aggregate an `identity`, a lifecycle one aggregate. It has
   no tag concept (its `tags` attribute is presentation). The convention reads
-  `id_attribute = true` on a field as a DCB tag, keyed by the field name without
-  `_id`, the same keys skilj-demo already uses (`account = "account_id"`). An
-  aggregate is optional and the import ignores it, so a command spanning a
+  `id_attribute = true` on a field as a DCB tag, with the field name as its key
+  (`account_id = "account_id"`). Stripping `_id` would match the keys skilj-demo
+  uses (`account`), but it is one more rule, it needs a fallback when two
+  fields share a stem, and the model would no longer read exactly like the
+  tags; keeping the name has none of that. An aggregate is optional and the import ignores it, so a command spanning a
   course and a student needs no owning aggregate.
 - **One error string against `reason` and `kind`.** A scenario's `then`
   holds one `error` string; `CommandDecision::Rejected` has a `reason` and a
@@ -13676,4 +13678,5 @@ real payloads. `reads_nothing`, consistency queries, blind tags, retractions,
 doubts and deadlines have no emhcl equivalent; add them to the imported file.
 `skilj-codegen/tests/fixtures/banking.em.hcl` is skilj-demo's banking context
 written to the convention; its import equals `skilj-demo/src/banking.skilj.toml`
-except for `reads_nothing`, which `tests/emhcl_import.rs` checks.
+except for `reads_nothing` and the tag key (`account`), which
+`tests/emhcl_import.rs` checks.

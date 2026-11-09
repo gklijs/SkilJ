@@ -32,27 +32,41 @@ fn the_import_generates_and_matches_the_demo_shapes() {
     let output = skilj_codegen::generate(&import.skilj_toml).unwrap();
     assert!(output.contains("impl ::skilj::EventType for MoneyDeposited"));
     assert!(output.contains("impl ::skilj::CommandType for WithdrawMoney"));
-    assert!(output.contains(r#"TagMapping::new("account", "account_id")"#));
+    assert!(output.contains(r#"TagMapping::new("account_id", "account_id")"#));
 
-    // Same events and commands, fields, tags and REST triggering as the
-    // hand-written skilj-demo/src/banking.skilj.toml. Only `reads_nothing`
-    // differs: a model doesn't say that a decision reads no history.
+    // Same events and commands, fields, tagged fields and REST triggering as
+    // the hand-written skilj-demo/src/banking.skilj.toml. Two things differ:
+    // the demo names its tag `account`, where the convention keeps the field
+    // name, and a model doesn't say that a decision reads no history
+    // (`reads_nothing`).
     let demo: toml::Value =
         toml::from_str(include_str!("../../skilj-demo/src/banking.skilj.toml")).unwrap();
     let imported: toml::Value = toml::from_str(&import.skilj_toml).unwrap();
     assert_eq!(imported["bounded_context"], demo["bounded_context"]);
-    assert_eq!(imported["event_type"], demo["event_type"]);
-    let without_reads_nothing = |v: &toml::Value| {
-        let mut commands = v["command_type"].as_array().unwrap().clone();
-        for command in &mut commands {
-            command.as_table_mut().unwrap().remove("reads_nothing");
+    let comparable = |v: &toml::Value, kind: &str| {
+        let mut types = v[kind].as_array().unwrap().clone();
+        for item in &mut types {
+            let table = item.as_table_mut().unwrap();
+            table.remove("reads_nothing");
+            // Keep which fields are tagged, not what the tags are called.
+            let mut tagged: Vec<_> = table["tags"]
+                .as_table()
+                .unwrap()
+                .values()
+                .map(|f| f.as_str().unwrap().to_string())
+                .collect();
+            tagged.sort();
+            table.insert("tags".into(), tagged.into());
         }
-        commands
+        types
     };
-    assert_eq!(
-        without_reads_nothing(&imported),
-        without_reads_nothing(&demo)
-    );
+    for kind in ["event_type", "command_type"] {
+        assert_eq!(
+            comparable(&imported, kind),
+            comparable(&demo, kind),
+            "{kind}"
+        );
+    }
 }
 
 #[test]

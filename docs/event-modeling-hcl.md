@@ -47,8 +47,8 @@ Follow these rules in the model, and the import below needs no manual mapping:
    "withdraw_money"` is `WithdrawMoney`. Name events in the past tense and
    commands in the imperative. Titles are only for people; nothing reads them.
 3. **DCB tags.** Mark each field a decision needs to match on with
-   `id_attribute = true`. Its tag key is the field name without a trailing
-   `_id`: `account_id` becomes `account = "account_id"`. Use the same field name
+   `id_attribute = true`. The field name is the tag key: `account_id` becomes
+   `account_id = "account_id"`. Use the same field name
    for the same thing everywhere (one `field_type` per id), so events and
    commands share tag keys. A command that checks two things at once, such as
    a student and a course, has both id fields; it needs no owning aggregate.
@@ -157,7 +157,8 @@ It doesn't write projections, automations, tests or `decide()` bodies; those
 stay hand-written Rust. After importing, add what the model can't say:
 `reads_nothing`, consistency queries, sensitive fields and blind tags. The
 banking model imports to `skilj-demo/src/banking.skilj.toml` except for
-`reads_nothing` on `DepositMoney`.
+`reads_nothing` on `DepositMoney` and the tag key: the demo, written by hand
+before the convention, names it `account`.
 
 ## Using the plugin with skilj
 
