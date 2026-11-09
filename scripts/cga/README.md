@@ -57,6 +57,19 @@ and uploaded by CI even when comparison fails.
 
 ## Reducing findings
 
+The issue #175 data-key cache change explicitly re-records the baseline after
+review. The new paths include clock queue cleanup, inline SHA-256 digest
+copying, cache and flight map operations, generation `Arc`s, shared futures
+and semaphore permit cleanup. The digest copy uses SHA-256's fixed 32-byte
+output; the analyzer still retains its standard-library length assertion.
+The shared unwrap path adds synchronization, reference-count and allocation
+assertions and propagates provider-future drop behavior; the baseline keeps
+these as potential panic paths, without adding suppressions or claiming they
+cannot occur. Adding `Clone` to the encryption error also changes two derived
+finding identities. Tool, configuration, dependencies and the skipped generic
+target multiset remain unchanged. Tests cover cancellation, admission, expiry,
+retirement and invalidation races, but do not establish panic freedom.
+
 The issue #158 tag-dictionary/search change explicitly re-records the baseline
 after reviewing the analyzer output. New paths include SQLx query construction,
 binding and cleanup, formatting/replacement of the migration SQL, and allocation

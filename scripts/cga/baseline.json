@@ -165,7 +165,7 @@
     },
     {
       "file": "<registry>/hashbrown-0.17.1/src/map.rs",
-      "message": "call to drop of `std::vec::Vec<u8>` which can panic",
+      "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
       "count": 1
     },
@@ -365,6 +365,12 @@
       "file": "<rust>/library/alloc/src/collections/vec_deque/mod.rs",
       "message": "call to method `std::collections::VecDeque::<T, A>::push_front_mut` which can panic",
       "source": "let _ = self.push_front_mut(value);",
+      "count": 1
+    },
+    {
+      "file": "<rust>/library/alloc/src/collections/vec_deque/mod.rs",
+      "message": "call to method `std::collections::VecDeque::<T, A>::truncate` which can panic",
+      "source": "self.truncate(0);",
       "count": 1
     },
     {
@@ -656,6 +662,12 @@
       "count": 1
     },
     {
+      "file": "<rust>/library/core/src/slice/mod.rs",
+      "message": "call to function `core::slice::copy_from_slice_impl::len_mismatch_fail` which can panic",
+      "source": "len_mismatch_fail(dest.len(), src.len());",
+      "count": 1
+    },
+    {
       "file": "<rust>/library/core/src/str/iter.rs",
       "message": "call to function `core::str::count::count_chars` which can panic",
       "source": "super::count::count_chars(self.as_str())",
@@ -713,12 +725,6 @@
       "file": "<rust>/library/std/src/collections/hash/map.rs",
       "message": "call to method `hashbrown::map::HashMap::<K, V, S, A>::insert` which can panic",
       "source": "self.base.insert(k, v)",
-      "count": 1
-    },
-    {
-      "file": "<rust>/library/std/src/collections/hash/map.rs",
-      "message": "call to method `hashbrown::map::HashMap::<K, V, S, A>::retain` which can panic",
-      "source": "self.base.retain(f)",
       "count": 1
     },
     {
@@ -24099,6 +24105,12 @@
     },
     {
       "file": "skilj-core/src/encryption/mod.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "#[derive(Debug, Clone, thiserror::Error)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/mod.rs",
       "message": "call to drop of `std::vec::Vec<u8>` which can panic",
       "source": "}",
       "count": 4
@@ -24148,7 +24160,7 @@
     {
       "file": "skilj-core/src/encryption/mod.rs",
       "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field1_finish` which can panic",
-      "source": "#[derive(Debug, thiserror::Error)]",
+      "source": "#[derive(Debug, Clone, thiserror::Error)]",
       "count": 1
     },
     {
@@ -24213,14 +24225,44 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
-      "message": "call to drop of `encryption::provider::WrappedDataKey` which can panic",
-      "source": "}",
+      "message": "call to associated function `std::boxed::Box::<T>::pin` which can panic",
+      "source": "let flight: Flight = (Box::pin(async move { let _permit = permit; let result = key.unwrap(&wrapped).await.map(DataKey); let mut cache = service .inner .cache .lock() .unwrap_or_else(|e| e.into_inner()); if Arc::ptr_eq(&cache.generation, &flight_generation) { // Stop advertising completed work even if a // waiter has not consumed its result yet. cache.flights.remove(&cache_key); if let Ok(data_key) = &result { cache.insert(cache_key, data_key.clone()); } } result })",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to associated function `std::sync::Arc::<T, A>::downgrade` which can panic",
+      "source": "cache.flights.insert(cache_key, Arc::downgrade(&flight));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to associated function `std::sync::Arc::<T>::new` which can panic",
+      "source": "let flight = Arc::new(flight);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `futures_util::future::Shared<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::DataKey, encryption::Error>> + std::marker::Send>>>` which can panic",
+      "source": "flight.as_ref().clone().await",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `futures_util::future::Shared<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::DataKey, encryption::Error>> + std::marker::Send>>>` which can panic",
+      "source": "return flight.as_ref().clone().await;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::option::Option<std::sync::Weak<futures_util::future::Shared<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::DataKey, encryption::Error>> + std::marker::Send>>>>>` which can panic",
+      "source": "cache.flights.insert(cache_key, Arc::downgrade(&flight));",
       "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<[u8; 32], encryption::Error>> + std::marker::Send>>` which can panic",
-      "source": "let data_key = DataKey(key.unwrap(&wrapped).await?);",
+      "source": "let result = key.unwrap(&wrapped).await.map(DataKey);",
       "count": 1
     },
     {
@@ -24237,27 +24279,63 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "})?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::sync::Arc<()>` which can panic",
+      "source": "(Arc::clone(&cache.generation), cache.flight(&cache_key))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::sync::Arc<()>` which can panic",
+      "source": "cache.generation = Arc::new(());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::sync::Arc<()>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `std::sync::Arc<dyn encryption::provider::KeyProvider>` which can panic",
       "source": "}",
       "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
-      "message": "call to drop of `std::sync::MutexGuard<'_, encryption::service::Cache>` which can panic",
-      "source": ".clear();",
+      "message": "call to drop of `std::sync::Arc<encryption::service::Inner>` which can panic",
+      "source": "}",
       "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
-      "message": "call to drop of `std::sync::MutexGuard<'_, encryption::service::Cache>` which can panic",
-      "source": ".insert(key, data_key.clone());",
+      "message": "call to drop of `std::sync::Arc<futures_util::future::Shared<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::DataKey, encryption::Error>> + std::marker::Send>>>>` which can panic",
+      "source": "}",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::sync::Arc<futures_util::future::Shared<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::DataKey, encryption::Error>> + std::marker::Send>>>>` which can panic",
+      "source": "} else {",
       "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `std::sync::MutexGuard<'_, encryption::service::Cache>` which can panic",
       "source": "}",
-      "count": 1
+      "count": 3
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::sync::MutexGuard<'_, encryption::service::Cache>` which can panic",
+      "source": "};",
+      "count": 2
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
@@ -24267,20 +24345,32 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
-      "message": "call to drop of `std::vec::Vec<u8>` which can panic",
-      "source": "self.entries.insert(key, (data_key, Instant::now()));",
+      "message": "call to drop of `tokio::sync::OwnedSemaphorePermit` which can panic",
+      "source": "let flight: Flight = (Box::pin(async move { let _permit = permit; let result = key.unwrap(&wrapped).await.map(DataKey); let mut cache = service .inner .cache .lock() .unwrap_or_else(|e| e.into_inner()); if Arc::ptr_eq(&cache.generation, &flight_generation) { // Stop advertising completed work even if a // waiter has not consumed its result yet. cache.flights.remove(&cache_key); if let Ok(data_key) = &result { cache.insert(cache_key, data_key.clone()); } } result })",
       "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
-      "message": "call to drop of `std::vec::Vec<u8>` which can panic",
-      "source": "}",
-      "count": 3
+      "message": "call to drop of `tokio::sync::OwnedSemaphorePermit` which can panic",
+      "source": "})",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `{async fn body of tokio::sync::Semaphore::acquire_owned()}` which can panic",
+      "source": ".await",
+      "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to function `encryption::unwrap_data_key` which can panic",
       "source": "super::unwrap_data_key(legacy, stored.ciphertext, stored.nonce.unwrap_or(&[]))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to function `std::mem::drop` which can panic",
+      "source": "drop(permit);",
       "count": 1
     },
     {
@@ -24303,8 +24393,26 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `encryption::service::Cache::flight` which can panic",
+      "source": "(Arc::clone(&cache.generation), cache.flight(&cache_key))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `encryption::service::Cache::flight` which can panic",
+      "source": "if let Some(flight) = cache.flight(&cache_key) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `futures_util::FutureExt::shared` which can panic",
+      "source": "let flight: Flight = (Box::pin(async move { let _permit = permit; let result = key.unwrap(&wrapped).await.map(DataKey); let mut cache = service .inner .cache .lock() .unwrap_or_else(|e| e.into_inner()); if Arc::ptr_eq(&cache.generation, &flight_generation) { // Stop advertising completed work even if a // waiter has not consumed its result yet. cache.flights.remove(&cache_key); if let Ok(data_key) = &result { cache.insert(cache_key, data_key.clone()); } } result }) as super::provider::BoxFuture<'static, _>) .shared();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `ring::digest::Context::finish` which can panic",
-      "source": "context.finish().as_ref().to_vec()",
+      "source": "digest.copy_from_slice(context.finish().as_ref());",
       "count": 1
     },
     {
@@ -24333,6 +24441,18 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::collections::HashMap::<K, V, S, A>::insert` which can panic",
+      "source": "cache.flights.insert(cache_key, Arc::downgrade(&flight));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::collections::HashMap::<K, V, S, A>::retain` which can panic",
+      "source": "cache.flights.retain(|_, flight| flight.strong_count() > 0);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::collections::hash_map::Entry::<'a, K, V, A>::or_insert` which can panic",
       "source": "providers .entry(provider.name().to_string()) .or_insert(provider),",
       "count": 1
@@ -24357,6 +24477,12 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::result::Result::<T, E>::map_err` which can panic",
+      "source": "let permit = Arc::clone(&self.inner.unwrap_slots) .acquire_owned() .await .map_err(|_| Error::ProviderUnavailable { provider: provider.to_string(), message: \"unwrap admission closed\".into(), })?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::slice::<impl [T]>::to_vec` which can panic",
       "source": "ciphertext: stored.ciphertext.to_vec(),",
       "count": 1
@@ -24364,14 +24490,20 @@
     {
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::sync::Mutex::<T>::lock` which can panic",
-      "source": "let mut providers = self .inner .providers .lock()",
+      "source": "&self .inner .cache .lock()",
       "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::sync::Mutex::<T>::lock` which can panic",
-      "source": "self.inner .cache .lock()",
-      "count": 3
+      "source": "let mut cache = self.inner.cache.lock().unwrap_or_else(|e| e.into_inner());",
+      "count": 4
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::sync::Mutex::<T>::lock` which can panic",
+      "source": "let mut providers = self .inner .providers .lock()",
+      "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
@@ -24527,12 +24659,6 @@
       "file": "skilj-core/src/encryption/vault.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "})",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/encryption/vault.rs",
-      "message": "call to drop of `std::string::String` which can panic",
-      "source": "};",
       "count": 1
     },
     {
