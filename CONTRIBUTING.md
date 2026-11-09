@@ -3,6 +3,26 @@
 Thanks for considering a contribution to `skilj`. This is a
 solo-maintainer project, so the process is kept light.
 
+## Choosing a feedback loop
+
+| Changed component | Start with | Broader validation |
+| --- | --- | --- |
+| Application decision or projection fold | `cargo test -p skilj-demo --test banking_fixture`; generated apps use `cargo test --no-default-features --test wallet_fixture` | Application integration tests for tags, persistence, authorization and conflicts |
+| Application template | `bash scripts/check-template.sh --no-run --cache-dir target/template-check` (domain tests and both build modes) | Omit `--no-run` for startup, deposit and overdraft smoke checks |
+| GraphQL or REST | Relevant `skilj` integration target and `cargo test -p skilj --test conformance` | Workspace tests against Postgres |
+| Code generator | `cargo test -p skilj-codegen` and `cargo test -p skilj-demo --test generated_code` | Build demo and template |
+| Federation description | `cargo test -p skilj --test graphql_federation` | `scripts/check-federation-composition.sh` |
+| CI scripts | `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs` | Run the changed script's real path |
+
+For intended fixture changes, prefix the corresponding test command with
+`SKILJ_RECORD_CONFORMANCE=1`, `SKILJ_RECORD_GENERATED=1`, or
+`SKILJ_RECORD_FEDERATION=1`, then review the recorded diff. Domain fixtures
+verify handwritten rules and folds; they do not verify tag selection,
+persistence, authorization or concurrency. Before review, run the build,
+test, lint and docs checks below appropriate to the change; database-backed
+changes need real Postgres coverage. Time repeat runs separately from the
+initial dependency build rather than assuming a universal fast-loop duration.
+
 ## Building and testing
 
 ```sh

@@ -85,6 +85,7 @@ if ! $prepared; then
 [patch.crates-io]
 skilj = { path = "$root/skilj" }
 skilj-core = { path = "$root/skilj-core" }
+skilj-test-fixture = { path = "$root/skilj-test-fixture" }
 EOF
     fi
 else
@@ -95,6 +96,10 @@ if $prepare_only; then
     echo "check-template: prepared $app"
     exit 0
 fi
+
+# Domain tests also run with --no-run: only the server smoke test is skipped.
+# Disable local mode and remove DATABASE_URL to exercise the database-free loop.
+env -u DATABASE_URL cargo test --no-default-features --test wallet_fixture
 
 cargo check --all-targets
 # What the Dockerfile builds: without the embedded-Postgres `local` feature.
