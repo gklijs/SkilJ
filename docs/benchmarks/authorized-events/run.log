@@ -1,0 +1,66 @@
+   Compiling skilj-core v0.3.0 (/home/gklijs/projects/skilj/skilj-core)
+warning: unused import: `EventOrigin`
+ --> skilj-core/tests/authorized_event_bench.rs:9:56
+  |
+9 |     self, BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType,
+  |                                                        ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Metadata`
+  --> skilj-core/tests/authorized_event_bench.rs:11:26
+   |
+11 | use skilj_core::shared::{Metadata, Tag};
+   |                          ^^^^^^^^
+
+warning: `skilj-core` (test "authorized_event_bench") generated 2 warnings (run `cargo fix --test "authorized_event_bench" -p skilj-core` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 32.58s
+     Running tests/authorized_event_bench.rs (target/release/deps/authorized_event_bench-a0b456980d7f4caf)
+
+running 1 test
+test authorized_event_reads has been running for over 60 seconds
+seed events=1000000 seconds=198.68
+all page old-cold samples=20 result=50 median_ms=14.361 p95_ms=62.715 p99_ms=135.691 median_requested_bytes=3987970
+all page old-warm samples=20 result=50 median_ms=3.046 p95_ms=3.656 p99_ms=14.080 median_requested_bytes=446431
+all page sql samples=20 result=50 median_ms=3.006 p95_ms=4.438 p99_ms=7.232 median_requested_bytes=446419
+all count old-cold samples=1 result=1000000 median_ms=10299.814 p95_ms=10299.814 p99_ms=10299.814 median_requested_bytes=3484812687
+all count old-warm samples=1 result=1000000 median_ms=6979.407 p95_ms=6979.407 p99_ms=6979.407 median_requested_bytes=3485473570
+all count sql samples=20 result=1000000 median_ms=71.141 p95_ms=144.443 p99_ms=181.559 median_requested_bytes=16153
+sparse-type page old-cold samples=20 result=50 median_ms=1875.109 p95_ms=2048.734 p99_ms=2213.604 median_requested_bytes=265038883
+sparse-type page old-warm samples=20 result=50 median_ms=2028.892 p95_ms=2634.969 p99_ms=2831.208 median_requested_bytes=261538184
+sparse-type page sql samples=20 result=50 median_ms=3.735 p95_ms=5.484 p99_ms=76.839 median_requested_bytes=445731
+sparse-type count old-cold samples=1 result=1000 median_ms=7875.060 p95_ms=7875.060 p99_ms=7875.060 median_requested_bytes=3485216180
+sparse-type count old-warm samples=1 result=1000 median_ms=8031.635 p95_ms=8031.635 p99_ms=8031.635 median_requested_bytes=3485010940
+sparse-type count sql samples=20 result=1000 median_ms=71.530 p95_ms=91.370 p99_ms=132.218 median_requested_bytes=16153
+sparse-owner page old-cold samples=20 result=50 median_ms=2813.372 p95_ms=4218.565 p99_ms=4615.238 median_requested_bytes=265419817
+sparse-owner page old-warm samples=20 result=50 median_ms=2330.400 p95_ms=2938.011 p99_ms=3153.392 median_requested_bytes=261930880
+sparse-owner page sql samples=20 result=50 median_ms=133.672 p95_ms=145.174 p99_ms=148.634 median_requested_bytes=430207
+sparse-owner count old-cold samples=1 result=1000 median_ms=9312.205 p95_ms=9312.205 p99_ms=9312.205 median_requested_bytes=3485257260
+sparse-owner count old-warm samples=1 result=1000 median_ms=8627.752 p95_ms=8627.752 p99_ms=8627.752 median_requested_bytes=3484945404
+sparse-owner count sql samples=20 result=1000 median_ms=799.682 p95_ms=991.319 p99_ms=1059.625 median_requested_bytes=16808
+sparse-correlation page old-cold samples=20 result=50 median_ms=2129.741 p95_ms=2457.781 p99_ms=2603.354 median_requested_bytes=265514219
+sparse-correlation page old-warm samples=20 result=50 median_ms=2042.363 p95_ms=2763.462 p99_ms=3583.654 median_requested_bytes=261786769
+sparse-correlation page sql samples=20 result=50 median_ms=4.891 p95_ms=9.050 p99_ms=101.368 median_requested_bytes=446060
+sparse-correlation count old-cold samples=1 result=1000 median_ms=9050.243 p95_ms=9050.243 p99_ms=9050.243 median_requested_bytes=3485479204
+sparse-correlation count old-warm samples=1 result=1000 median_ms=8217.316 p95_ms=8217.316 p99_ms=8217.316 median_requested_bytes=3485758372
+sparse-correlation count sql samples=20 result=1000 median_ms=2.212 p95_ms=8.534 p99_ms=9.713 median_requested_bytes=16281
+broad-tag page old-cold samples=20 result=50 median_ms=2.358 p95_ms=5.246 p99_ms=15.349 median_requested_bytes=420040
+broad-tag page old-warm samples=20 result=50 median_ms=2.354 p95_ms=3.604 p99_ms=4.920 median_requested_bytes=420040
+broad-tag page sql samples=20 result=50 median_ms=127.020 p95_ms=179.728 p99_ms=944.557 median_requested_bytes=450565
+broad-tag count old-cold samples=1 result=500000 median_ms=5205.706 p95_ms=5205.706 p99_ms=5205.706 median_requested_bytes=1715537026
+broad-tag count old-warm samples=1 result=500000 median_ms=4053.101 p95_ms=4053.101 p99_ms=4053.101 median_requested_bytes=1715517306
+broad-tag count sql samples=20 result=500000 median_ms=484.723 p95_ms=504.238 p99_ms=518.437 median_requested_bytes=19350
+wide-union page old-cold samples=20 result=50 median_ms=4.358 p95_ms=7.119 p99_ms=14.256 median_requested_bytes=439603
+wide-union page old-warm samples=20 result=50 median_ms=3.771 p95_ms=5.559 p99_ms=5.696 median_requested_bytes=439603
+wide-union page sql samples=20 result=50 median_ms=2310.835 p95_ms=3970.160 p99_ms=9436.786 median_requested_bytes=475609
+wide-union count old-cold samples=1 result=500000 median_ms=6532.234 p95_ms=6532.234 p99_ms=6532.234 median_requested_bytes=1725327197
+wide-union count old-warm samples=1 result=500000 median_ms=6021.060 p95_ms=6021.060 p99_ms=6021.060 median_requested_bytes=1725326681
+wide-union count sql samples=20 result=500000 median_ms=2628.272 p95_ms=3998.011 p99_ms=8555.193 median_requested_bytes=39540
+recent-cache page old-cold samples=20 result=50 median_ms=9.506 p95_ms=10.296 p99_ms=15.988 median_requested_bytes=3877654
+recent-cache page old-warm samples=20 result=50 median_ms=0.697 p95_ms=0.823 p99_ms=9.595 median_requested_bytes=336115
+recent-cache page sql samples=20 result=50 median_ms=3.031 p95_ms=5.059 p99_ms=5.779 median_requested_bytes=446454
+VmHWM:	   13620 kB VmRSS:	   10416 kB
+test authorized_event_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 722.92s
+

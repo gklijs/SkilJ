@@ -195,55 +195,34 @@ pub fn query_events_field(n: &Naming) -> Field {
                     .and_then(|v| v.string().ok())
                     .map(|s| s.to_string());
 
-                // At most `max_events_per_read` events are served - the
-                // caller pages on with `afterSequence` = the last one's
-                // `sequence`. docs/architecture.md §19's "Problem 1" fix:
-                // a non-empty `tags` filter goes straight to the
-                // tag-indexed query (already narrowed, so loaded whole,
-                // then paged); otherwise the bounded context's history is
-                // walked a chunk at a time until the page is full.
-                let select = |events: &[skilj_core::event_store::Event], max: usize| {
-                    skilj_core::event_store::query_events_select(
-                        &access_mapping,
-                        &event_types,
-                        tags.as_deref(),
-                        after_sequence,
-                        correlation_id.as_deref(),
-                        events,
-                        max,
-                    )
-                };
-                let page = match tags.as_deref() {
-                    // docs/architecture.md §108: through the tag index a
-                    // chunk at a time, like the untagged path below -
-                    // never every match of a widely shared tag at once.
-                    Some(wanted) if !wanted.is_empty() => {
-                        skilj_core::db::collect_tagged_event_page(
-                            &state.pool,
-                            &bounded_context_name,
-                            wanted,
-                            after_sequence.unwrap_or(-1),
-                            up_to,
-                            state.max_events_per_read,
-                            select,
-                        )
-                        .await
-                    }
-                    _ => {
-                        skilj_core::db::collect_event_page(
-                            &state.pool,
-                            &state.event_cache,
-                            &bounded_context_name,
-                            None,
-                            after_sequence.unwrap_or(-1),
-                            up_to,
-                            state.max_events_per_read,
-                            select,
-                        )
-                        .await
-                    }
-                }
+                let query = skilj_core::db::AuthorizedEventQuery::for_admin(
+                    &access_mapping,
+                    &event_types,
+                    tags.as_deref(),
+                    after_sequence,
+                    up_to,
+                    correlation_id.as_deref(),
+                )
                 .map_err(to_graphql_error)?;
+                let page = skilj_core::db::collect_authorized_event_page(
+                    &state.pool,
+                    &query,
+                    state.max_events_per_read,
+                    |events, remaining| {
+                        skilj_core::event_store::query_events_select(
+                            &access_mapping,
+                            &event_types,
+                            tags.as_deref(),
+                            after_sequence,
+                            correlation_id.as_deref(),
+                            events,
+                            remaining,
+                        )
+                    },
+                )
+                .await
+                .map_err(to_graphql_error)?
+                .events;
 
                 // Decrypt-on-read's own pre-resolution step - only for
                 // the events actually served.
@@ -355,60 +334,18 @@ pub fn count_events_field(n: &Naming) -> Field {
                     .and_then(|v| v.string().ok())
                     .map(|s| s.to_string());
 
-                // See `query_events_field`'s own identical comment - same
-                // §19 "Problem 1" fix, same tags-supplied-or-not branch.
-                // An aggregate over everything matching (rule `CountEvents`
-                // is deliberately not paged), but never loaded whole: a
-                // non-empty `tags` filter uses the tag index (already
-                // narrowed); otherwise history is walked a chunk at a time and
-                // the rule's own pure count summed per chunk - it runs at
-                // least once, so its validation errors still surface.
-                let count_in = |events: &[skilj_core::event_store::Event]| {
-                    skilj_core::event_store::count_events(
-                        &access_mapping,
-                        &event_types,
-                        tags.as_deref(),
-                        correlation_id.as_deref(),
-                        events,
-                    )
-                };
-                let count = match tags.as_deref() {
-                    Some(wanted) if !wanted.is_empty() => {
-                        let mut total = 0;
-                        skilj_core::db::for_each_tagged_event_chunk(
-                            &state.pool,
-                            &bounded_context_name,
-                            wanted,
-                            -1,
-                            state.max_events_per_read,
-                            |chunk| {
-                                total += count_in(chunk)?;
-                                Ok(true)
-                            },
-                        )
-                        .await
-                        .map_err(to_graphql_error)?;
-                        total
-                    }
-                    _ => {
-                        let mut total = 0;
-                        skilj_core::db::for_each_event_chunk(
-                            &state.pool,
-                            &state.event_cache,
-                            &bounded_context_name,
-                            None,
-                            -1,
-                            state.max_events_per_read,
-                            |chunk| {
-                                total += count_in(chunk)?;
-                                Ok(true)
-                            },
-                        )
-                        .await
-                        .map_err(to_graphql_error)?;
-                        total
-                    }
-                };
+                let query = skilj_core::db::AuthorizedEventQuery::for_admin(
+                    &access_mapping,
+                    &event_types,
+                    tags.as_deref(),
+                    None,
+                    None,
+                    correlation_id.as_deref(),
+                )
+                .map_err(to_graphql_error)?;
+                let count = skilj_core::db::count_authorized_events(&state.pool, &query)
+                    .await
+                    .map_err(to_graphql_error)?;
 
                 Ok(Some(async_graphql::Value::from(count)))
             })

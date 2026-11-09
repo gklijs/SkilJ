@@ -521,3 +521,239 @@ fn inspect_event_rejects_an_event_from_another_bounded_context() {
 // GraphQL-scaffolding gap, same as every prior admin surface's deferred
 // pair/triple (see command_processing.rs's header comment) - no
 // resolver/schema wiring in skilj-graphql yet.
+
+/// SQL is runtime checked: compare selection/counts against the independent
+/// pure rules, including current policy changes after a plan was prepared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorized_sql_matches_pure_rules_and_cursor_progress() {
+    use skilj_core::db::{self, AuthorizedEventQuery};
+    let Some(url) = skilj_test_support::database_url("skilj_authorized_events_test").await else {
+        eprintln!("SKIPPED: Postgres unavailable");
+        return;
+    };
+    let pool = db::connect(&url).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+    let bc = bounded_context(BoundedContextStatus::Active);
+    db::insert_bounded_context(&pool, &bc).await.unwrap();
+    let mut owned = event_type("Owned");
+    owned.owner_tag_key = Some("owner".into());
+    let mut other = event_type("Other");
+    other.owner_tag_key = Some("tenant".into());
+    let public = event_type("Public");
+    for ty in [&owned, &other, &public] {
+        db::upsert_event_type(&pool, ty).await.unwrap();
+    }
+    for sequence in 0..48 {
+        let ty = [&owned, &other, &public][sequence as usize % 3].clone();
+        let mut tags = vec![tag("group", if sequence % 2 == 0 { "a" } else { "b" })];
+        match sequence % 4 {
+            0 => tags.extend([tag("owner", "alice"), tag("tenant", "bob")]),
+            1 => tags.extend([tag("owner", "bob"), tag("tenant", "alice")]),
+            2 => tags.push(Tag {
+                key: "owner".into(),
+                value: None,
+            }),
+            _ => {}
+        }
+        if sequence % 7 == 0 {
+            tags.push(tags[0].clone());
+        }
+        let mut e = event(ty, sequence, "{\"amount\":10}", tags);
+        e.metadata.correlation_id = (sequence % 5 != 0).then(|| format!("corr-{}", sequence % 2));
+        db::insert_event(&pool, &e, None).await.unwrap();
+    }
+    let events = db::list_events_for_bounded_context(&pool, &bc.name)
+        .await
+        .unwrap();
+    let mut mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let tag_cases = [
+        None,
+        Some(vec![]),
+        Some(vec![tag("group", "a")]),
+        Some(vec![
+            tag("group", "a"),
+            tag("owner", "alice"),
+            tag("group", "a"),
+        ]),
+        Some(vec![Tag {
+            key: "owner".into(),
+            value: None,
+        }]),
+        Some(vec![tag("missing", "x")]),
+    ];
+    for scope in [None, Some("alice"), Some("bob"), Some("nobody")] {
+        mapping.scope = scope.map(str::to_owned);
+        for types in [
+            vec![],
+            vec![owned.clone()],
+            vec![public.clone(), other.clone()],
+        ] {
+            for tags in &tag_cases {
+                for correlation in [None, Some("corr-0"), Some("absent")] {
+                    let query = AuthorizedEventQuery::for_admin(
+                        &mapping,
+                        &types,
+                        tags.as_deref(),
+                        Some(5),
+                        Some(39),
+                        correlation,
+                    )
+                    .unwrap();
+                    let bounded: Vec<_> = events
+                        .iter()
+                        .filter(|e| e.sequence > 5 && e.sequence <= 39)
+                        .cloned()
+                        .collect();
+                    let expected = event_store::query_events_select(
+                        &mapping,
+                        &types,
+                        tags.as_deref(),
+                        Some(5),
+                        correlation,
+                        &bounded,
+                        4,
+                    )
+                    .unwrap();
+                    let page =
+                        db::collect_authorized_event_page(&pool, &query, 4, |rows, remaining| {
+                            event_store::query_events_select(
+                                &mapping,
+                                &types,
+                                tags.as_deref(),
+                                Some(5),
+                                correlation,
+                                rows,
+                                remaining,
+                            )
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(page.events, expected, "{scope:?} {tags:?} {correlation:?}");
+                    let expected_count = event_store::count_events(
+                        &mapping,
+                        &types,
+                        tags.as_deref(),
+                        correlation,
+                        &bounded,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        db::count_authorized_events(&pool, &query).await.unwrap(),
+                        expected_count
+                    );
+                }
+            }
+        }
+    }
+    mapping.scope = Some("nobody".into());
+    let query = AuthorizedEventQuery::for_admin(&mapping, &[owned.clone()], None, None, None, None)
+        .unwrap();
+    let empty = db::collect_authorized_event_page(&pool, &query, 4, |rows, _| Ok(rows.to_vec()))
+        .await
+        .unwrap();
+    assert!(empty.events.is_empty());
+    assert_eq!(empty.scanned_through, Some(45));
+
+    // The plan was prepared while Owned required an owner. The SQL statement
+    // must observe its new ownerless registration, just as fresh hydration does.
+    owned.owner_tag_key = None;
+    db::upsert_event_type(&pool, &owned).await.unwrap();
+    assert_eq!(
+        db::count_authorized_events(&pool, &query).await.unwrap(),
+        16
+    );
+    let page = db::collect_authorized_event_page(&pool, &query, 4, |rows, _| Ok(rows.to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 4);
+    assert_eq!(page.scanned_through, Some(9));
+    owned.owner_tag_key = Some("tenant".into());
+    db::upsert_event_type(&pool, &owned).await.unwrap();
+    assert_eq!(db::count_authorized_events(&pool, &query).await.unwrap(), 0);
+
+    // Residual payload filtering can span multiple SQL batches, without losing
+    // position in the filtered tail. Zero capacity serves and advances nothing.
+    mapping.scope = None;
+    let query = AuthorizedEventQuery::for_admin(&mapping, &[], None, None, None, None).unwrap();
+    let page = db::collect_authorized_event_page(&pool, &query, 3, |rows, _| {
+        Ok(rows
+            .iter()
+            .filter(|e| e.sequence % 10 == 0)
+            .cloned()
+            .collect())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        page.events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        [0, 10, 20]
+    );
+    let empty = db::collect_authorized_event_page(&pool, &query, 0, |_, _| unreachable!())
+        .await
+        .unwrap();
+    assert!(empty.events.is_empty());
+    assert_eq!(empty.scanned_through, None);
+    let page = db::collect_authorized_event_page(&pool, &query, 3, |_, _| Ok(vec![]))
+        .await
+        .unwrap();
+    assert_eq!(page.scanned_through, Some(47));
+
+    // An uncommitted append is excluded, and appears on the next count after
+    // commit; no plaintext hydration or cache is involved in either count.
+    let mut tx = pool.begin().await.unwrap();
+    db::insert_event(&mut *tx, &event(public.clone(), 48, "{}", vec![]), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::count_authorized_events(&pool, &query).await.unwrap(),
+        48
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(
+        db::count_authorized_events(&pool, &query).await.unwrap(),
+        49
+    );
+    // An append between candidate batches cannot extend this request's bound.
+    // A later request still sees it. Force the interleaving inside the first
+    // residual predicate rather than depending on scheduling or sleeps.
+    let mut appended = false;
+    let page = db::collect_authorized_event_page(&pool, &query, 7, |_, _| {
+        if !appended {
+            appended = true;
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(db::insert_event(
+                    &pool,
+                    &event(public.clone(), 49, "{}", vec![]),
+                    None,
+                ))
+            })
+            .unwrap();
+        }
+        Ok(vec![])
+    })
+    .await
+    .unwrap();
+    assert_eq!(page.scanned_through, Some(48));
+    assert_eq!(
+        db::count_authorized_events(&pool, &query).await.unwrap(),
+        50
+    );
+    pool.close().await;
+}
+
+#[test]
+fn authorized_query_validates_before_database_access() {
+    use skilj_core::db::AuthorizedEventQuery;
+    let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Admin);
+    assert!(AuthorizedEventQuery::for_admin(&mapping, &[], None, None, None, None).is_err());
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write);
+    assert!(AuthorizedEventQuery::for_admin(&mapping, &[], None, None, None, None).is_err());
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let mut foreign = event_type("Foreign");
+    foreign.bounded_context.name = "foreign".into();
+    assert!(AuthorizedEventQuery::for_admin(&mapping, &[foreign], None, None, None, None).is_err());
+    let excessive = vec![tag("key", "value"); event_store::MAX_QUERY_TAGS + 1];
+    assert!(
+        AuthorizedEventQuery::for_admin(&mapping, &[], Some(&excessive), None, None, None).is_err()
+    );
+}
