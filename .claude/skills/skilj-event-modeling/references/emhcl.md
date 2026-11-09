@@ -12,7 +12,7 @@ summary's parts map onto it.
 | The bounded context | `bounded_context "<snake_case name>"`, the skilj bounded context name |
 | An event, `MoneyDeposited` | `event "money_deposited"` in that context; the label in PascalCase is the `NAME` |
 | A payload sketch | `field` blocks, or one `field_type` per field shared across events and commands |
-| A tag candidate `account: account_id` | `id_attribute = true` on the `account_id` field; the tag key is the field name without `_id` |
+| A tag candidate on `account_id` | `id_attribute = true` on the `account_id` field; the field name is the tag key |
 | A blind tag | `pii = true` on the field, and the blind tag decision (normalization, erasure) in its `description` |
 | A command, `WithdrawMoney` | `command "withdraw_money"` in a `state_change`, with `to = [event.<context>.<event>]` |
 | "Accepted when ..." | A scenario with `then { event = ... }` |
