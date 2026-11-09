@@ -1,0 +1,44 @@
+# Imported from an Event Modeling HCL model by skilj_codegen::emhcl::import.
+# Command decisions stay hand-written: one decide_<name> function per command.
+
+bounded_context = "banking"
+
+[[event_type]]
+# From event.banking.money_deposited
+name = "MoneyDeposited"
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account = "account_id" }
+
+[[event_type]]
+# From event.banking.money_withdrawn
+name = "MoneyWithdrawn"
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account = "account_id" }
+
+# Rejected as: invalid_amount
+[[command_type]]
+# From command.deposit_money.deposit_money
+name = "DepositMoney"
+rest_trigger_allowed = true
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account = "account_id" }
+
+# Rejected as: insufficient_funds, invalid_amount
+[[command_type]]
+# From command.withdraw_money.withdraw_money
+name = "WithdrawMoney"
+rest_trigger_allowed = true
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account = "account_id" }

@@ -156,6 +156,24 @@ banking and courses) if you want to see more before committing. It also has a su
 single-user local mode: `cargo run -p skilj-demo --bin server -- --local` starts an embedded
 Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/architecture.md §216).
 
+## Designing with Event Modeling
+
+skilj's events, commands, projections and given/when/then tests map directly onto
+[Event Modeling](https://eventmodeling.org). To design and review a model before writing
+Rust, [Event Modeling HCL](https://event-modeling-hcl.github.io) keeps it as validated,
+diagrammable `.em.hcl` files in Git, and its [plugin](https://event-modeling-hcl.github.io/plugin.html)
+teaches Claude, Codex and ChatGPT the method. Aggregates aren't needed: by
+[a short naming convention](docs/event-modeling-hcl.md#the-naming-convention), a field marked
+`id_attribute = true` is a DCB tag and a scenario's `error = "<kind>: <reason>"` is a rejection.
+A model written that way imports straight into a `.skilj.toml`:
+
+```sh
+emhcl export model/ -o model.json
+cargo run -p skilj-codegen --example emhcl_import -- model.json banking > src/banking.skilj.toml
+```
+
+See [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) for the full mapping.
+
 ## Status and stability
 
 `skilj` is pre-1.0 and maintained by one person. What a release promises:
@@ -194,7 +212,7 @@ Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/arc
 | [`skilj-core`](skilj-core) | The domain engine: events, commands, projections, and persistence. No web framework dependency. |
 | [`skilj-graphql`](skilj-graphql) | The GraphQL surface `Skilj::graphql_router()` serves - optionally an Apollo Federation subgraph for Apollo Router, Hive Router or Cosmo to compose (docs/architecture.md §194). Internal: use it through `skilj`. |
 | [`skilj-rest`](skilj-rest) | The REST surface - authenticated routes for agents and automated callers. |
-| [`skilj-codegen`](skilj-codegen) | Optional: generate event/command boilerplate from a declarative `.skilj.toml` file instead of hand-writing it. |
+| [`skilj-codegen`](skilj-codegen) | Optional: generate event/command boilerplate from a declarative `.skilj.toml` file instead of hand-writing it, and import that file from an Event Modeling HCL model. |
 | [`skilj-tui`](skilj-tui) | `cargo install skilj-tui` - a terminal console (GraphQL client) for browsing and operating a running deployment. |
 | [`skilj-inspector`](skilj-inspector) | `cargo install skilj-inspector` - a terminal console that reads straight from Postgres, for when the GraphQL server isn't running. |
 | [`skilj-temporal`](skilj-temporal) | Optional: a bridge from skilj's own event stream to [Temporal](https://temporal.io) - start or signal a workflow execution correlated by a DCB tag. See [`docs/architecture.md` §34](docs/architecture.md#skilj-temporal-plan). |
@@ -216,6 +234,8 @@ Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/arc
   sections assume you've read the earlier ones.
 - [`docs/authorization.md`](docs/authorization.md) - diagrams of the authorization flows: JWT and
   token authentication, grants, scopes, capabilities, field-level protection and the access trail.
+- [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) - how an Event Modeling HCL model
+  maps onto skilj, the naming convention, and importing a model into a `.skilj.toml`.
 - [`docs/large-payloads.md`](docs/large-payloads.md) - payload size limits, and blobs for the
   bytes that don't belong in a payload.
 - [`docs/disjoint-consistency-boundaries.md`](docs/disjoint-consistency-boundaries.md) and

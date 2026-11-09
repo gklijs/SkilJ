@@ -12,6 +12,7 @@ categories = ["development-tools::build-utils"]
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 syn = { workspace = true, features = ["full"] }
 quote.workspace = true
@@ -20,5 +21,4 @@ prettyplease.workspace = true
 
 [dev-dependencies]
 serde.workspace = true
-serde_json.workspace = true
 schemars.workspace = true

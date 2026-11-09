@@ -115,6 +115,11 @@ exact shape) to a file and show it to the domain expert - not as a final
 answer, as something to react to. Expect corrections; that's the point
 of writing it down before Rust exists to make changing it expensive.
 
+If the team models with Event Modeling HCL (`.em.hcl` files, `emhcl`, or the
+event-modeling-hcl plugin), also write the summary as an `.em.hcl` model,
+following [references/emhcl.md](references/emhcl.md): it then validates,
+renders as a diagram, and imports straight into a `.skilj.toml`.
+
 Leave genuinely undecided things as open questions in the document
 rather than guessing - a domain expert correcting a stated assumption is
 a much better outcome than one silently agreeing with a wrong one.

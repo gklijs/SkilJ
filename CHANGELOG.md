@@ -10,6 +10,16 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Added
+
+- `skilj_codegen::emhcl::import` turns the JSON `emhcl export` writes for an
+  [Event Modeling HCL](https://event-modeling-hcl.github.io) model into a
+  `.skilj.toml` for one bounded context, with the rejection kinds of each
+  command's scenarios as comments; `cargo run -p skilj-codegen --example
+  emhcl_import` runs it from the command line. A type the format can't express
+  is left out with a note. `skilj_codegen::Error` gains a `Json` variant
+  (docs/architecture.md §243).
+
 ### Changed
 
 - Command batch preparation moves resolved histories and snapshot states into
@@ -24,6 +34,12 @@ README.md, "Status and stability").
   opt-in pool hooks in the performance guide and `SkiljBuilder::pool_options`.
   Add a SQLx-only two-cycle allocation/RSS and latency probe; pool defaults
   remain unchanged.
+- `docs/event-modeling-hcl.md` maps Event Modeling HCL onto skilj and sets a
+  naming convention: `id_attribute` fields are DCB tags keyed without `_id`,
+  scenario errors are `"<kind>: <reason>"`, and an API screen on
+  `POST /v1/commands/trigger` allows REST triggering. The README points to it,
+  and the `skilj-event-modeling` skill can write its summary as an `.em.hcl`
+  model following it.
 
 ## [0.3.0] - 2026-11-04
 

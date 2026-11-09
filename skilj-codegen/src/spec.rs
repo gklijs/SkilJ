@@ -239,7 +239,7 @@ fn is_identifier(name: &str) -> bool {
 /// skilj-core's `valid_bounded_context_name`, mirrored (this crate
 /// doesn't depend on skilj-core): a lowercase ASCII letter, then lowercase
 /// letters, digits or `_`, at most 40 characters.
-fn is_bounded_context_name(name: &str) -> bool {
+pub(crate) fn is_bounded_context_name(name: &str) -> bool {
     let mut chars = name.chars();
     name.len() <= 40
         && chars.next().is_some_and(|c| c.is_ascii_lowercase())
