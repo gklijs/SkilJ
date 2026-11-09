@@ -28,7 +28,8 @@ Keep these to the convention, because the import reads nothing else:
 - Use the same field name for the same thing everywhere, so tag keys match.
 - A command that needs two histories has both id fields. Don't invent an
   aggregate to "own" it; aggregates are optional and the import ignores them.
-- Don't add a scenario error without a stable kind in front.
+- Give every scenario error a stable kind in front. One without imports as
+  the generic kind `rejected`, which a client can't tell apart from others.
 
 Validate before handing it over, with `emhcl validate --profile strict` where
 `emhcl` is installed. To import: `emhcl export model/ -o model.json`, then

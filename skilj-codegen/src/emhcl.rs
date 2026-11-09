@@ -23,8 +23,10 @@
 //! - A command issued by a screen whose `api_endpoint` is
 //!   `POST /v1/commands/trigger` gets `rest_trigger_allowed = true`.
 //! - A scenario's `then { error = "<kind>: <reason>" }` is a rejection with
-//!   that `kind` and `reason`. The kinds are written as a comment above the
-//!   command, to implement in its `decide_*` function.
+//!   that `kind` and `reason`. An error without a kind in front is a
+//!   rejection of the generic kind [`GENERIC_REJECTION_KIND`]. The kinds are
+//!   written as a comment above the command, to implement in its `decide_*`
+//!   function.
 //!
 //! A type with a field this format can't express (a list, nested fields, an
 //! optional field, a `Double`, `Decimal` or `Custom`) is left out with a note
@@ -37,6 +39,9 @@ use crate::Error;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+
+/// The kind of a rejection whose scenario error has no `<kind>: ` in front.
+pub const GENERIC_REJECTION_KIND: &str = "rejected";
 
 /// The endpoint a screen names to make its command `rest_trigger_allowed`.
 pub const REST_TRIGGER_ENDPOINT: &str = "POST /v1/commands/trigger";
@@ -112,7 +117,6 @@ struct Field {
 
 #[derive(Deserialize)]
 struct Specification {
-    id: String,
     #[serde(default)]
     when: Vec<Step>,
     #[serde(default)]
@@ -230,15 +234,8 @@ pub fn import(json: &str, bounded_context: &str) -> Result<Import, Error> {
             continue;
         };
         for step in specification.then.iter().filter(|s| s.ty == "SPEC_ERROR") {
-            match rejection_kind(&step.title) {
-                Some(kind) => {
-                    command.rejections.insert(kind.to_string());
-                }
-                None => notes.push(format!(
-                    "{}: the error {:?} doesn't follow `<kind>: <reason>`, so its rejection kind is unknown",
-                    specification.id, step.title
-                )),
-            }
+            let kind = rejection_kind(&step.title).unwrap_or(GENERIC_REJECTION_KIND);
+            command.rejections.insert(kind.to_string());
         }
     }
 
