@@ -13,6 +13,9 @@
 //! §3.2 for the reasoning and the full module map. Most applications want
 //! the `skilj` crate, whose docs have a quickstart.
 //!
+//! The [documentation guide](https://github.com/gklijs/SkilJ/blob/main/docs/index.md)
+//! links application tutorials, deployment guidance and contribution checks.
+//!
 //! `db`, `command_batcher`, `cross_instance`, `event_cache`,
 //! `template_cache` and `slow_command` are `#[doc(hidden)]`: public only
 //! because `skilj`, `skilj-graphql`, `skilj-rest` and the tools call

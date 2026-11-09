@@ -12,6 +12,10 @@
 //!
 //! # Quickstart
 //!
+//! Follow the [wallet tutorial](https://github.com/gklijs/SkilJ/blob/main/docs/wallet-tutorial.md)
+//! to build and test an application, or choose a task in the
+//! [documentation guide](https://github.com/gklijs/SkilJ/blob/main/docs/index.md).
+//!
 //! The fastest start is a generated project, which has a running wallet
 //! example with an embedded Postgres:
 //!
@@ -124,6 +128,11 @@
 //! for identity providers and access control.
 //!
 //! # Where the details are
+//!
+//! The [courses guide](https://github.com/gklijs/SkilJ/blob/main/docs/courses-dcb.md)
+//! explains a decision spanning two entities; the
+//! [deployment guide](https://github.com/gklijs/SkilJ/blob/main/docs/deployment.md)
+//! covers startup, authorization and upgrades.
 //!
 //! The behavioural specification is
 //! [`specs/skilj.allium`](https://github.com/gklijs/SkilJ/blob/main/specs/skilj.allium),

@@ -72,6 +72,10 @@ logs` instead.
 
 ## Where to go from here
 
+- [Wallet tutorial](https://github.com/gklijs/SkilJ/blob/main/docs/wallet-tutorial.md)
+  explains this example from tags to tests. The
+  [documentation guide](https://github.com/gklijs/SkilJ/blob/main/docs/index.md)
+  links multi-entity decisions, authorization and deployment guidance.
 - `src/wallet.rs` - the `EventType`/`CommandType`/`Projection` trio.
   Rename/replace it with your own domain, or add more bounded contexts
   as their own modules next to it (see `src/lib.rs`'s own doc comment).

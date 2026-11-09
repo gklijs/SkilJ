@@ -1,5 +1,13 @@
 # SkilJ Architecture
 
+For current application guidance, start with the [documentation index](index.md),
+the [wallet tutorial](wallet-tutorial.md), or [deployment and upgrades](deployment.md).
+This document preserves the design history and its section anchors. Earlier
+proposals can be superseded: §1.3's initial macro choice is revised in §1.3.3,
+§6's builder example predates the database URL argument, and §232 replaces
+the original tag storage layout. Consult tested sources and the current API
+for signatures rather than copying historical snippets unchanged.
+
 This document captures the Rust-level implementation design for SkilJ:
 how the library is put together in code. It is a companion to
 [`specs/skilj.allium`](../specs/skilj.allium), not a replacement for it —

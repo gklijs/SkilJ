@@ -31,6 +31,9 @@ README.md, "Status and stability").
 
 ### Documentation
 
+- Add a task-oriented documentation index, wallet tutorial, multi-entity DCB
+  guide and deployment guide. Move environment troubleshooting out of
+  CONTRIBUTING while preserving architecture history and anchors (issue #184).
 - Explain SQLx client-buffer retention, its per-connection memory cost, and
   opt-in pool hooks in the performance guide and `SkiljBuilder::pool_options`.
   Add a SQLx-only two-cycle allocation/RSS and latency probe; pool defaults

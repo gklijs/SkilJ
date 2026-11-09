@@ -11,6 +11,11 @@ your domain as **events** (facts that happened) and **commands** (requests to ma
 happen), and `skilj` handles storage, consistency checking, and exposing it all over GraphQL and
 REST — so you can focus on the domain logic itself.
 
+Start with the [documentation guide](docs/index.md):
+[build and test a wallet](docs/wallet-tutorial.md),
+[check two entities in one decision](docs/courses-dcb.md), or
+[prepare a deployment](docs/deployment.md).
+
 Try it in a minute, with nothing but Rust installed (no database to set up):
 
 ```sh
@@ -230,8 +235,8 @@ See [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) for the full mapp
 - [`specs/skilj.allium`](specs/skilj.allium) - the behavioural specification: what the system
   guarantees, independent of the Rust code.
 - [`docs/architecture.md`](docs/architecture.md) - how that's actually built in Rust, including
-  the reasoning behind each design decision. It's written as a running design log, so later
-  sections assume you've read the earlier ones.
+  the reasoning behind each design decision. This is a chronological history; use the
+  [task-oriented guides](docs/index.md) for current application guidance.
 - [`docs/authorization.md`](docs/authorization.md) - diagrams of the authorization flows: JWT and
   token authentication, grants, scopes, capabilities, field-level protection and the access trail.
 - [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) - how an Event Modeling HCL model
