@@ -148,7 +148,7 @@ struct TypeOut {
 /// name, has no events in the model, or the result wouldn't generate (two
 /// commands with one label in different workflows, say).
 pub fn import(json: &str, bounded_context: &str) -> Result<Import, Error> {
-    let document: Document = serde_json::from_str(json).map_err(Error::Json)?;
+    let document: Document = serde_json::from_str(json).map_err(|e| Error::Json(e.to_string()))?;
     if !spec::is_bounded_context_name(bounded_context) {
         return Err(Error::Invalid(vec![format!(
             "`{bounded_context}` is not a skilj bounded context name: a lowercase letter, then lowercase letters, digits or `_`, at most 40 characters"

@@ -134,3 +134,9 @@ fn an_unknown_bounded_context_names_the_ones_there_are() {
     let err = skilj_codegen::emhcl::import("{\"slices\": 3}", "banking").unwrap_err();
     assert!(matches!(err, skilj_codegen::Error::Json(_)));
 }
+
+#[test]
+fn the_error_stays_unwind_safe() {
+    fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+    unwind_safe::<skilj_codegen::Error>();
+}
