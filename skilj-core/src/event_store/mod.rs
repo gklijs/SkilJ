@@ -3666,7 +3666,8 @@ pub fn visible_matching_events(
 /// See `rule CountEvents`. Same shape and narrowing as `query_events`
 /// above, minus the `after_sequence` cursor - a count is a live aggregate
 /// over everything matching, not a page of it (see the note above the
-/// rule).
+/// rule). The SQL-backed surface evaluates this aggregate in one statement
+/// snapshot, without materializing events; this pure rule is its reference.
 pub fn count_events(
     access_mapping: &RoleAccessMapping,
     event_types: &[EventType],

@@ -1,0 +1,24 @@
+    Finished `release` profile [optimized] target(s) in 0.91s
+     Running tests/authorized_event_bench.rs (target/release/deps/authorized_event_bench-a0b456980d7f4caf)
+
+running 1 test
+seed events=1000000 seconds=1.49
+all page sql samples=20 result=50 median_ms=2.619 p95_ms=4.663 p99_ms=19.903 median_requested_bytes=446141
+all count sql samples=20 result=1000000 median_ms=81.435 p95_ms=92.317 p99_ms=105.645 median_requested_bytes=15973
+sparse-type page sql samples=20 result=50 median_ms=3.703 p95_ms=15.758 p99_ms=30.454 median_requested_bytes=445713
+sparse-type count sql samples=20 result=1000 median_ms=0.864 p95_ms=1.200 p99_ms=1.287 median_requested_bytes=16233
+sparse-owner page sql samples=20 result=50 median_ms=3.725 p95_ms=7.369 p99_ms=9.882 median_requested_bytes=449817
+sparse-owner count sql samples=20 result=1000 median_ms=4.079 p95_ms=9.125 p99_ms=13.120 median_requested_bytes=18456
+sparse-correlation page sql samples=20 result=50 median_ms=4.182 p95_ms=5.381 p99_ms=7.748 median_requested_bytes=446042
+sparse-correlation count sql samples=20 result=1000 median_ms=1.469 p95_ms=2.171 p99_ms=2.247 median_requested_bytes=16233
+broad-tag page sql samples=20 result=50 median_ms=2.886 p95_ms=4.212 p99_ms=6.678 median_requested_bytes=451320
+broad-tag count sql samples=20 result=500000 median_ms=564.918 p95_ms=928.326 p99_ms=1774.533 median_requested_bytes=19031
+wide-union page sql samples=20 result=50 median_ms=5.750 p95_ms=11.001 p99_ms=11.490 median_requested_bytes=484332
+test authorized_event_reads has been running for over 60 seconds
+wide-union count sql samples=20 result=500000 median_ms=2127.622 p95_ms=2750.760 p99_ms=9739.509 median_requested_bytes=39221
+recent-cache page sql samples=20 result=50 median_ms=2.579 p95_ms=4.073 p99_ms=4.979 median_requested_bytes=446176
+VmHWM:	   10340 kB VmRSS:	   10340 kB
+test authorized_event_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 70.80s
+

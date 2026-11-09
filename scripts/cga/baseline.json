@@ -278,6 +278,12 @@
       "count": 1
     },
     {
+      "file": "<registry>/sqlx-core-0.9.0/src/query_as.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "self.inner = self.inner.bind(value);",
+      "count": 1
+    },
+    {
       "file": "<registry>/tracing-0.1.44/src/lib.rs",
       "message": "call to function `tracing::dispatcher::get_default` which can panic",
       "source": "interest.is_always() || crate::dispatcher::get_default(|default| default.enabled(meta))",
@@ -407,7 +413,7 @@
       "file": "<rust>/library/alloc/src/macros.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "$crate::fmt::format($crate::__export::format_args!($($arg)*))",
-      "count": 14
+      "count": 15
     },
     {
       "file": "<rust>/library/alloc/src/macros.rs",
@@ -3960,6 +3966,54 @@
       "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
       "source": "visible.push(proposal);",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/authorized_events.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "JOIN {schema}.event_types et ON et.name = e.event_type_name WHERE {}\",",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/authorized_events.rs",
+      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, (i64,), sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/authorized_events.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "));",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/authorized_events.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "}",
+      "count": 3
+    },
+    {
+      "file": "skilj-core/src/db/authorized_events.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "})",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/authorized_events.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (i64,), sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/authorized_events.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": ".bind(sqlx::query_as(sqlx::AssertSqlSafe(sql)))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/authorized_events.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_fields_finish` which can panic",
+      "source": "#[derive(Clone, Debug)]",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",

@@ -13572,3 +13572,54 @@ policy needs repeated application load/idle measurements, including accepted
 throughput, tail latency, live allocations, RSS, pool churn and cancellation/
 rollback correctness. This documentation and probe add no background sweeper or
 unconditional shrink on the command/projection paths.
+
+## 242. Authorized event selection and SQL counts (issue #173)
+
+`db::AuthorizedEventQuery` is an opaque, owned selection contract shared by
+GraphQL's administrative event queries and REST's event-token reads. Its
+constructors run the existing pure rule's validation before any history query,
+including an empty history. SQL applies type, tag union, current owner policy,
+correlation and sequence predicates before hydration. A scoped reader can still
+see ownerless types; an owned type requires the exact current owner-key tag and
+scope value. Null query tags match null stored tags, `tags: []` matches nothing,
+and an empty type list means every registered type. Dictionary/reference-index
+subqueries select sequences, so overlapping tags never duplicate rows or counts.
+The pure functions remain the independent reference and the final page guard.
+REST's schema-aware payload operators remain pure predicates over bounded
+candidate batches; their SQL translation is outside this change.
+
+`countEvents` now runs `count(*)` in one SQL statement snapshot, including the
+current registrations and tags. It does not fetch payloads, encryption keys or
+originating commands. This deliberately replaces a sum over live chunks, which
+could include an append committed between chunks. A subsequent count sees
+subsequent commits; a count and a page are independent requests and do not share
+a snapshot or promise an identical head.
+
+A page request fixes its upper sequence to the latest committed sequence among
+its requested types at entry, capped by `upToSequence` when supplied. Candidate
+statements use that bound but independently read current registrations and tags;
+this is a sequence bound, not a retained database snapshot. No database
+transaction or connection is held across page walks or pure filtering. Later
+appends appear on later requests. Full pages continue from the last event
+served. Short REST pages advance through the type-filtered bound, including a
+tail rejected by owner, correlation or payload predicates; no such predicate
+can make a token poll the same invisible tail forever. GraphQL keeps its existing
+list response and sequence continuation. No new wire page object is introduced.
+
+Tag page subqueries apply all other predicates and deduplicate stored tag
+references by event sequence before their per-tag limit. The
+first N events in a union must occur in at least one member's first N events;
+limiting before owner/correlation filtering would violate this and is not done.
+Owner selection resolves current owner keys through `event_tag_values` and
+`event_tag_refs`, with type-index ranges for ownerless types. Separate SQL shapes
+for unrestricted and named types avoid the generic-plan trap of a parameterized
+"empty types OR matching type" condition. Measurements and representative query
+plans are in `docs/benchmarks/authorized-events/README.md`.
+
+The public `Event` and `EventOrigin::CommandTriggered { command }` representations
+are retained. This is an additive query API; hand-written dispatchers and event
+consumers need no migration. A smaller public envelope would affect those
+consumers and remains a separately reviewed breaking stage, coordinated with
+issue #172. SQL counts and page selection need no such representation change.
+The event cache remains in use by command preparation and other existing readers;
+these browse/count surfaces query authoritative rows directly.

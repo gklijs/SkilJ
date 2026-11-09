@@ -386,6 +386,9 @@ pub use projection_records::*;
 mod access;
 pub use access::*;
 
+mod authorized_events;
+pub use authorized_events::*;
+
 mod events;
 pub use events::*;
 mod blobs;

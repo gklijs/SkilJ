@@ -1253,15 +1253,16 @@ async fn get_events(
             })
         })
         .transpose()?;
-    // At most `max_events_per_read`, loaded a chunk at a time - a caller
-    // pages on with `after` = this response's `nextCursor`.
-    let page = db::collect_scanned_event_page(
-        &state.pool,
-        &state.event_cache,
-        &token.event_type.bounded_context.name,
-        Some(&token.event_type.name),
+    let selection = db::AuthorizedEventQuery::for_token(
+        &token,
+        &filters,
         after.unwrap_or(-1),
         up_to,
+        query.correlation_id.as_deref(),
+    )?;
+    let page = db::collect_authorized_event_page(
+        &state.pool,
+        &selection,
         state.max_events_per_read,
         |chunk, remaining| {
             event_store::fetch_events_page(
@@ -1395,13 +1396,11 @@ async fn get_events_consume(
         // the filters `ConsumeEvents` serves by (type, `filters`, owner
         // scope), and `consume_events_page` below re-applies them over this
         // already bounded set along with the lease and cursor logic.
-        let candidates = db::collect_scanned_event_page(
+        let selection =
+            db::AuthorizedEventQuery::for_token(&token, &filters, position, None, None)?;
+        let candidates = db::collect_authorized_event_page(
             &state.pool,
-            &state.event_cache,
-            bounded_context_name,
-            Some(&token.event_type.name),
-            position,
-            None,
+            &selection,
             state.max_events_per_read,
             |chunk, remaining| {
                 event_store::fetch_events_page(

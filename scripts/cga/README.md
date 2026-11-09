@@ -137,3 +137,18 @@ panic freedom. No production `unwrap`, `expect`, unchecked indexing or unsafe
 code is added. Tool/configuration, dependency snapshot and the skipped generic
 target multiset are unchanged. Postgres parity tests and an append/erasure
 interleaving exercise the changed read path.
+
+Issue #173's authorized SQL reads review and re-record the baseline with nine
+new finding identities (12 occurrences), plus one additional occurrence of the
+existing formatting-macro string-drop identity. No identities are removed.
+The new paths are the count query's SQLx construction, generic binding,
+fetch/cancellation and cleanup, string formatting/drop, and the query value's
+`Debug` derive. Reviewed sample backtraces reach standard-library formatting,
+allocation/alignment precondition checks, and SQLx argument/future/error cleanup;
+these remain potential panics, not a claim that the paths cannot panic. The
+production change adds no `unwrap`, `expect`, unchecked indexing or unsafe code.
+The tool/configuration, dependency snapshot and skipped generic target multiset
+are unchanged. Differential Postgres tests and page/erasure/failover conformance
+complement this partial analysis; generic page collectors remain subject to its
+existing coverage limits. The benchmark-only counting allocator forwards to
+`System` and is outside the core-library analysis.

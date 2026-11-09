@@ -6243,6 +6243,10 @@ rule CountEvents {
     -- sequence window would only describe how far a caller happened to
     -- have read. It answers the same question the browse answers, which
     -- is why it takes the same filters rather than an unfiltered total.
+    -- Persistence evaluates a count in one SQL statement snapshot, including
+    -- current owner registrations and tags. An append committed after that
+    -- snapshot appears on the next call; a count and a page are independent
+    -- requests and need not observe the same head.
     let matched =
         Events where bounded_context = access_mapping.bounded_context
             and (event_types.count = 0 or event_type in event_types)
