@@ -429,3 +429,193 @@ fn a_tagged_read_walks_matches_in_bounded_chunks() {
         assert_eq!(selects, 1);
     });
 }
+
+/// One event of `et` on `bc`, not yet inserted.
+fn event(bc: &BoundedContext, et: &EventType, sequence: i64, tags: Vec<Tag>) -> Event {
+    Event {
+        bounded_context: bc.clone(),
+        event_type: et.clone(),
+        payload: "{}".to_string(),
+        metadata: Metadata {
+            r#type: et.name.clone(),
+            version: et.schema_version,
+            client_id: "test".to_string(),
+            created_at: test_now(),
+            correlation_id: None,
+            causation_id: None,
+        },
+        sequence,
+        tags,
+        encryption_keys: Vec::new(),
+        origin: EventOrigin::DirectlyCreated,
+    }
+}
+
+/// How often `event_tag_values` of `schema` has been read front to back, as
+/// the statistics of `conn`'s own session have it once they are flushed.
+async fn dictionary_scans(conn: &mut sqlx::PgConnection, schema_name: &str) -> i64 {
+    sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query_scalar(
+        "SELECT seq_scan FROM pg_stat_user_tables \
+         WHERE schemaname = $1 AND relname = 'event_tag_values'",
+    )
+    .bind(schema_name)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap()
+}
+
+/// The `(tag_key, tag_value, sequence)` rows `event_tags` has for `sequences`.
+async fn indexed_tags(
+    pool: &Pool,
+    schema: &str,
+    sequences: &[i64],
+) -> Vec<(String, Option<String>, i64)> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT tag_key, tag_value, sequence FROM {schema}.event_tags \
+         WHERE sequence = ANY($1) ORDER BY sequence, tag_key"
+    )))
+    .bind(sequences)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Appending an event looks its tags up in the dictionary through the
+/// dictionary's index, however many tags the bounded context has used
+/// (docs/architecture.md §245). The trigger before this one read the whole
+/// dictionary for every event; with 20,000 tags in it, PostgreSQL's
+/// statistics count that as a sequential scan per insert.
+#[test]
+fn appending_an_event_does_not_scan_the_tag_dictionary() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let schema_name = format!("bc_{}", bc.name);
+        let schema = format!("\"{schema_name}\"");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.event_tag_values (tag_key, tag_value) \
+             SELECT 'order', 'filler-' || g FROM generate_series(1, 20000) g; \
+             ANALYZE {schema}.event_tag_values"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // One session throughout, so that the counts read are its own.
+        let mut conn = pool.acquire().await.unwrap();
+        let before = dictionary_scans(&mut conn, &schema_name).await;
+        let mut sequences = Vec::new();
+        for n in 0..20 {
+            let sequence = db::next_sequence(&pool, &bc.name).await.unwrap();
+            let tags = vec![
+                // In the dictionary already, new to it, and an explicit null.
+                tag("order", &format!("filler-{}", n + 1)),
+                tag("customer", &format!("c{n}")),
+                Tag {
+                    key: "region".to_string(),
+                    value: None,
+                },
+            ];
+            db::insert_event(&mut *conn, &event(&bc, &et, sequence, tags), None)
+                .await
+                .unwrap();
+            sequences.push(sequence);
+        }
+        let after = dictionary_scans(&mut conn, &schema_name).await;
+        assert_eq!(
+            after, before,
+            "appending 20 events read the whole tag dictionary"
+        );
+
+        let indexed = indexed_tags(&pool, &schema, &sequences).await;
+        let expected: Vec<(String, Option<String>, i64)> = sequences
+            .iter()
+            .enumerate()
+            .flat_map(|(n, &sequence)| {
+                [
+                    ("customer".to_string(), Some(format!("c{n}")), sequence),
+                    (
+                        "order".to_string(),
+                        Some(format!("filler-{}", n + 1)),
+                        sequence,
+                    ),
+                    ("region".to_string(), None, sequence),
+                ]
+            })
+            .collect();
+        assert_eq!(indexed, expected);
+        let (tags, distinct): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*), count(DISTINCT (tag_key, tag_value)) FROM {schema}.event_tag_values"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tags, 20_000 + 20 + 1, "each new tag is added once");
+        assert_eq!(distinct, tags);
+    });
+}
+
+/// A bounded context whose tag index was built by skilj 0.3.0 has the
+/// trigger function that scans the dictionary. Bringing it up to date
+/// replaces that function, once, and leaves the index as it was
+/// (docs/architecture.md §245).
+#[test]
+fn a_bounded_context_with_the_scanning_tag_trigger_gets_the_probing_one() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let schema = format!("\"bc_{}\"", bc.name);
+        let first = insert_tagged_event(&pool, &bc, &et, vec![tag("order", "o1")]).await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            include_str!("fixtures/index_event_tags_0_3_0.sql").replace("@SCHEMA@", &schema),
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The function's source, and the transaction that last wrote it.
+        let function = || async {
+            sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(format!(
+                "SELECT prosrc, xmin::text FROM pg_proc \
+                 WHERE oid = to_regprocedure('{schema}.index_event_tags()')"
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert!(function().await.0.contains("NOT EXISTS"));
+
+        db::ensure_event_tags_index(&pool, &bc.name).await.unwrap();
+        let (source, written_by) = function().await;
+        assert!(!source.contains("NOT EXISTS"), "still the scanning function");
+
+        // Nothing is rewritten for a bounded context that is up to date.
+        db::ensure_event_tags_index(&pool, &bc.name).await.unwrap();
+        assert_eq!(function().await.1, written_by);
+
+        let second = insert_tagged_event(
+            &pool,
+            &bc,
+            &et,
+            vec![tag("order", "o1"), tag("customer", "c1")],
+        )
+        .await;
+        assert_eq!(
+            indexed_tags(&pool, &schema, &[first, second]).await,
+            vec![
+                ("order".to_string(), Some("o1".to_string()), first),
+                ("customer".to_string(), Some("c1".to_string()), second),
+                ("order".to_string(), Some("o1".to_string()), second),
+            ]
+        );
+    });
+}
