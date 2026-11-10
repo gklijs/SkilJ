@@ -29,6 +29,19 @@ README.md, "Status and stability").
   by `submit_prepared`; the existing borrowed `submit` API remains available.
   Conflict checks and failed set-write replay are unchanged.
 
+### Fixed
+
+- Appending an event no longer reads the whole tag dictionary. The trigger
+  that indexes an event's tags checked for new tags with a sub-select
+  PostgreSQL answered by scanning `event_tag_values` once per inserted event,
+  so the cost of an append grew with the number of tags a bounded context had
+  ever used: 1.5 ms per event at 10,000 tags and 5.2 ms at 30,000, against
+  0.07-0.09 ms now. Loading 200,000 events went from 451 to 8,762 events/s
+  with 10,000 tags and from 98 to 7,958 events/s with 55,000. An existing
+  bounded context gets the new trigger function the first time this version
+  brings it up to date; nothing is locked and no data changes
+  (docs/architecture.md §245).
+
 ### Documentation
 
 - Add a task-oriented documentation index, wallet tutorial, multi-entity DCB

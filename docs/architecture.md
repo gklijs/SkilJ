@@ -13724,3 +13724,76 @@ upgrade on each selected server, not PostgreSQL's `pg_upgrade`.
 Validated locally against disposable PostgreSQL 15.19 and 18.6: 26 tests
 passed on each, no skips. All 35 Node CI/CGA regression tests, pinned
 actionlint, shellcheck, formatting and section-reference checks passed.
+
+## 245. The tag trigger probes the dictionary instead of scanning it
+
+`index_event_tags`, the statement-level trigger that fills `event_tag_values`
+and `event_tag_refs` (§210), first adds the tags the dictionary doesn't have
+yet. It decided which those were with `NOT EXISTS (SELECT 1 FROM
+event_tag_values ...)` inside a `CASE`. Inside a `CASE` PostgreSQL can't turn
+that into a join, and it estimates `jsonb_array_elements` at 100 rows, so
+reading the dictionary once and hashing it looked cheaper than a probe per
+row. The plan was a hashed sub-plan over a sequential scan of
+`event_tag_values`, run for every inserted event. Every append paid for every tag the bounded context had ever
+used.
+
+The filter is now a scalar sub-select compared with `NULL`, the form the
+trigger's second statement already used to resolve ids. PostgreSQL never
+hashes a scalar sub-select, so each tag is one probe of the dictionary's
+unique index. The unique constraint is `NULLS NOT DISTINCT`, so the
+sub-select returns at most one row, for a null value too.
+
+**Measured** on PostgreSQL 18.6, two cores, with the trigger and tables
+copied out of `event_tag_dictionary.sql`: 2,000 single-event inserts in one
+transaction, two tags each, against a dictionary of the given size with
+fresh statistics. Microseconds per event:
+
+| tags in the dictionary | before | now |
+|---:|---:|---:|
+| 1,000 | 237 | 70 |
+| 3,000 | 511 | 69 |
+| 10,000 | 1,479 | 67 |
+| 30,000 | 5,231 | 85 |
+| 50,000 | 84 | 83 |
+| 200,000 | 74 | 73 |
+
+With fresh statistics the planner gives up the hash by itself somewhere
+between 30,000 and 50,000 tags. That depends on the statistics and on when
+a session's cached plan is rebuilt, so it is not something to count on. A
+load of 200,000 events, two tags each, committing every 100, that grew the
+dictionary from nothing in one session averaged:
+
+| tags when the load ends | events/s before | events/s now |
+|---:|---:|---:|
+| 10,027 (long-lived tags) | 451 | 8,762 |
+| 55,000 (short-lived tags) | 98 | 7,958 |
+
+With one event per commit on the first of those, 349 events/s became 1,608.
+These time the trigger and the insert, not `submit_command`: no decision, no
+event cache, one session.
+
+**An existing bounded context.** `ensure_event_tags_index` returned as soon as
+it found the `event_tags` view, so a bounded context indexed by 0.3.0 would
+have kept its function. It now also reads the function's source from
+`pg_proc`, and replaces the function when that still has the `NOT EXISTS`.
+The function is created first in the patch, before the tables it names,
+which PL/pgSQL allows, so the two cases share one definition. Replacing it
+changes a catalog row: no table lock, no rewrite, and the advisory lock the
+patch already takes keeps two instances from doing it at once. A bounded
+context that is up to date is still a catalog lookup and nothing else
+(§158). An older instance in a rolling deploy runs whichever function is
+there, as before.
+
+Tests (`skilj-core/tests/tag_indexed_events.rs`):
+`appending_an_event_does_not_scan_the_tag_dictionary` fills a dictionary with
+20,000 tags, appends 20 events on one session - a tag that is there, a new
+one and an explicit null each - and compares that session's `seq_scan` count
+for `event_tag_values` before and after; with the function from 0.3.0 it
+counts 20. `a_bounded_context_with_the_scanning_tag_trigger_gets_the_probing_one`
+puts that function back from `tests/fixtures/index_event_tags_0_3_0.sql`,
+and checks that it is replaced once, that a second call rewrites nothing,
+and that events are indexed as before.
+
+Not done: the statistics behind the plan. `jsonb_array_elements` is still
+estimated at 100 rows in both statements, which no longer changes how the
+dictionary is read.
