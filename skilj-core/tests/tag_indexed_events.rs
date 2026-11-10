@@ -596,7 +596,10 @@ fn a_bounded_context_with_the_scanning_tag_trigger_gets_the_probing_one() {
 
         db::ensure_event_tags_index(&pool, &bc.name).await.unwrap();
         let (source, written_by) = function().await;
-        assert!(!source.contains("NOT EXISTS"), "still the scanning function");
+        assert!(
+            !source.contains("NOT EXISTS"),
+            "still the scanning function"
+        );
 
         // Nothing is rewritten for a bounded context that is up to date.
         db::ensure_event_tags_index(&pool, &bc.name).await.unwrap();
