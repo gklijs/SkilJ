@@ -149,6 +149,9 @@ wired up. Without `DATABASE_URL` it starts an embedded Postgres of its own, keep
 between runs (docs/architecture.md §216); set `DATABASE_URL` to use your own Postgres instead.
 See its own README for more.
 
+The project comes with an `AGENTS.md` for coding agents, and the `skilj` crate ships task guides
+that Claude Code and Codex load as skills: see [agent guidance](docs/agent-guidance.md).
+
 To add `skilj` to an existing project instead:
 
 ```toml

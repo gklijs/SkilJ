@@ -49,11 +49,11 @@ else.
   human or an automated setup script acting as that superadmin, not
   application code.
 - **A demo, a test, or local dev** → [references/local-dev-shortcut.md](references/local-dev-shortcut.md):
-  write the `BoundedContext`/`Role`/`RoleAccessMapping` rows directly
-  via `skilj_core::db`, the same shortcut `skilj-demo/src/bin/server.rs`
-  and every end-to-end test in this workspace already use. Convenient,
-  not the production flow - a real deployment doesn't have code that
-  writes to `roles`/`role_access_mappings` directly.
+  `skilj::dev::seed_admin` creates the bounded contexts and a `Role` with
+  Admin access to them, the shortcut `skilj-demo/src/bin/server.rs` and a
+  project generated from skilj-template take. Convenient, not the
+  production flow - a real deployment doesn't have code that creates
+  Roles and grants.
 
 Both paths end at the same place: a `Role` with an `Admin`-level
 `RoleAccessMapping` on the bounded context, ready to be named in

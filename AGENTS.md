@@ -56,6 +56,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 Every public enum of the library crates is `#[non_exhaustive]` (docs/architecture.md §217, §219), and a new one must be too: match one from another crate with a `_` arm that answers `skilj_core::Error::Unsupported` (or the bridge's `BridgeError::Unsupported`). Adding a variant therefore compiles everywhere - search for the enum's matches in the other crates and handle it there.
 
+## Guides for application authors
+
+This file is for work on skilj itself. What an agent needs to build an application with skilj is in `skilj/agent-guides/`: six skills, shipped inside the `skilj` crate, and linked from `.claude/skills/` (Claude Code) and `.agents/skills/` (Codex). Edit them there, never through a copy (docs/architecture.md §248, docs/agent-guidance.md).
+
+```sh
+node scripts/agent-guides/check.mjs
+node --test scripts/agent-guides/check.test.mjs
+```
+
+The check fails when a guide shows a trait other than as it is, names something the workspace's code doesn't contain, or links to a file that is gone. A change to `EventType`, `CommandType`, `Projection` or another trait a guide lists therefore needs the guide updated in the same diff. A name that only a guide's own example uses goes in `scripts/agent-guides/illustrative-names.txt`. `scripts/agent-guides/eval/check-solutions.sh` applies the reference solutions of the three evaluation tasks in `scripts/agent-guides/eval/` to a generated project (`--no-run` skips starting its server); when one stops applying or passing, fix the guide or the solution, and record the solution again as docs/agent-guidance.md describes.
+
 ## Panic analysis (CGA)
 
 The blocking CI check analyzes `skilj-core` with a pinned [Call Graph Analyzer](https://github.com/OpenDevicePartnership/cga), pinned nightly, and a checked-in compatibility patch. Run:
@@ -73,8 +84,8 @@ Coverage is partial: unresolved generic vtable calls are skipped with their name
 
 The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs. Steps 8-9 run per whole-binary test shard (`business`, `app`, `libraries`), aggregated by the required `test` check; 10-11 stay together. Coverage (15) runs on `main` and manual dispatch; 16 is a weekly workflow:
 1. actionlint — checks the workflow file itself, including shellcheck on its `run:` blocks
-2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`
-3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace, then runs its quickstart (embedded Postgres, a deposit accepted, an overdraft rejected); `--no-run` skips the run
+2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`; the same job runs `node scripts/agent-guides/check.mjs`, which holds `skilj/agent-guides` to the workspace's traits, names and paths
+3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace, then runs its quickstart (embedded Postgres, a deposit accepted, an overdraft rejected); `--no-run` skips the run. The same job then runs `scripts/agent-guides/eval/check-solutions.sh`: the generated project finds the agent guides, and the reference solution of each evaluation task applies, passes and answers over REST
 4. `scripts/check-federation-composition.sh` — composes the recorded federation descriptions with Apollo's and Hive's composition
 5. `cargo fmt --all -- --check`
 6. `cargo deny check` — RustSec advisories, licenses, banned crates and sources, per `deny.toml`
@@ -91,7 +102,7 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 17. `scripts/check-template-docker.sh` — builds `templates/skilj-template`'s Dockerfile against this workspace and starts the image (its own job, needs Docker)
 18. `node scripts/cga/check.mjs` — pinned partial `skilj-core` panic analysis; fails on new findings, new analysis gaps, or analyzer failures. Its Node.js regression tests run in the same job.
 
-Run `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs` after changing CI scripts.
+Run `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs scripts/agent-guides/check.test.mjs` after changing CI scripts.
 The CI regression suite checks that sharding covers every integration target exactly once,
 preserves doctests and `skilj/local`, and still fails when a service-dependent test skips.
 The required `test` check also includes focused PostgreSQL 15/18 compatibility jobs;

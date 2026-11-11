@@ -20,9 +20,9 @@ skilj doesn't orchestrate long-running, multi-step processes itself,
 and doesn't try to - DCB (`skilj-event-modeling`'s own `dcb-tags.md`)
 already replaces the saga/process-manager need for facts checkable in
 one same-database transaction, but has nothing to say once a process
-spans real I/O, real time, or another system entirely. See
-[`docs/architecture.md` §34](../../../docs/architecture.md#skilj-temporal-plan) for the full investigation and decision:
-pair with Temporal rather than build orchestration into skilj.
+spans real I/O, real time, or another system entirely. The decision
+is to pair with Temporal rather than build orchestration into skilj
+(docs/architecture.md §34 has the investigation).
 
 ## Two independent pieces - use either alone or both together
 
@@ -127,5 +127,4 @@ and `PaymentConfirmed` signal that exact run later.
 
 See `skilj-temporal/tests/temporal_bridge.rs` for real, passing,
 end-to-end examples against an ephemeral Temporal service, and
-[`docs/architecture.md` §34](../../../docs/architecture.md#skilj-temporal-plan) for the complete design write-up (including
-what was built vs. deliberately declined).
+`docs/temporal-integration.md` for the pattern as a whole.

@@ -15,7 +15,8 @@ For local or CI setup failures, see [environment troubleshooting](docs/troublesh
 | GraphQL or REST | Relevant `skilj` integration target and `cargo test -p skilj --test conformance` | Workspace tests against Postgres |
 | Code generator | `cargo test -p skilj-codegen` and `cargo test -p skilj-demo --test generated_code` | Build demo and template |
 | Federation description | `cargo test -p skilj --test graphql_federation` | `scripts/check-federation-composition.sh` |
-| CI scripts | `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs` | Run the changed script's real path |
+| Agent guides (`skilj/agent-guides`), or a trait they list | `node scripts/agent-guides/check.mjs` | `bash scripts/agent-guides/eval/check-solutions.sh --no-run --cache-dir target/template-check` (reference solutions of the evaluation tasks); [agent guidance](docs/agent-guidance.md) |
+| CI scripts | `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs scripts/agent-guides/check.test.mjs` | Run the changed script's real path |
 
 For intended fixture changes, prefix the corresponding test command with
 `SKILJ_RECORD_CONFORMANCE=1`, `SKILJ_RECORD_GENERATED=1`, or

@@ -12,6 +12,21 @@ README.md, "Status and stability").
 
 ### Added
 
+- Guides for coding agents ship inside the `skilj` crate, in `agent-guides/`: the six skills that
+  were in `.claude/skills/` (types, bootstrap, uniqueness, large payloads, event modeling,
+  Temporal), so a project has the ones written for its skilj version. Claude Code and Codex both
+  load them as skills. A project generated from `skilj-template` gets an `AGENTS.md` (where the
+  domain code is, the rules a decision and a schema change keep, the checks, which guide a task
+  needs) and `scripts/skilj-guides.sh`, which prints the guides' directory and with `--link` links
+  them into `.claude/skills` and `.agents/skills`. See docs/agent-guidance.md (issue #185,
+  docs/architecture.md §248).
+- The guides now cover what they had fallen behind on: `owner_tag_key`, `private_fields`, commands
+  that need approval, `decide_with` and `consistency_query` in the `CommandType` listing,
+  `Projection::PARTITION_COUNT` and `OWNER_TAG_KEY`, and `skilj::dev::seed_admin` for local
+  development in place of writing rows through `skilj_core::db`. CI compares them with the
+  workspace's traits, names and paths, and runs a reference solution of three tasks (add a command,
+  evolve an event, add a sensitive field) against the generated template.
+
 - `skilj_codegen::emhcl::import` turns the JSON `emhcl export` writes for an
   [Event Modeling HCL](https://event-modeling-hcl.github.io) model into a
   `.skilj.toml` for one bounded context, with the rejection kinds of each

@@ -12,7 +12,10 @@ pub trait EventType {
     const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT; // see registration.md
 
     fn tag_mappings() -> Vec<TagMapping> { Vec::new() }
+    fn owner_tag_key() -> Option<&'static str> { None }
     fn sensitive_fields() -> Vec<SensitiveField> { Vec::new() }
+    fn blob_fields() -> Vec<BlobField> { Vec::new() }
+    fn private_fields() -> Vec<PrivateField> { Vec::new() }
 
     fn external_creation_allowed() -> bool { false }
     fn direct_creation_allowed() -> bool { false }
@@ -25,7 +28,8 @@ pub trait EventType {
 }
 ```
 
-Real example - `skilj-demo/src/banking.rs`:
+Real example - `skilj-demo/src/banking.rs` (`Deposited` in a generated
+project's `src/wallet.rs` has the same shape):
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -104,13 +108,15 @@ mapped fields get indexed, to keep the index footprint bounded.
 
 ```rust
 fn sensitive_fields() -> Vec<SensitiveField> {
-    vec![SensitiveField {
-        field: "email".to_string(),
-        subject_key: "user".to_string(),
-        subject_field: "user_id".to_string(),
-    }]
+    // field, subject_key, subject_field
+    vec![SensitiveField::new("email", "user", "user_id")]
 }
 ```
+
+Writing one needs a key provider on the builder, or the write is refused
+with `encryption_master_key_not_configured`: `.key_provider(...)`, in the
+`skilj-bootstrap` guide's "Keys the builder needs". A project generated
+from skilj-template has none until you add it to `src/bin/server.rs`.
 
 `field` is what gets encrypted (stored as ciphertext, decrypted only for
 an entitled reader). `subject_key`/`subject_field` say *whose* data this
@@ -135,6 +141,43 @@ hash of the normalized field, never the value, so it may name a
 sensitive field. That's how a command checks an email address is unique
 without the address being stored in the clear - see the
 `skilj-uniqueness` skill and docs/architecture.md §205.
+
+A sensitive field is decrypted for `decide()`, into a temporary copy. A
+projection's `project()` only ever sees the ciphertext: see
+`projection.md`, "Sensitive state". A command that carries the value
+declares the same entry in its own `sensitive_fields()`, since its
+payload is stored too.
+
+## `owner_tag_key` - whose record this is
+
+For tenants sharing one bounded context: `Some("company")` names which
+of `tag_mappings()`'s keys says who owns the record. A grant or a token
+with a scope then reads and writes only records whose owner tag equals
+that scope. It must be one of the type's own tag keys
+(`InvalidOwnerTagKey` otherwise), and startup never removes one that is
+registered. `None`, the default, is a type no scope confines.
+`docs/authorization.md` shows where a scope is checked.
+
+## `private_fields` - a field only some readers see
+
+```rust
+fn private_fields() -> Vec<PrivateField> {
+    vec![PrivateField {
+        field: "internal_note".to_string(),
+        kind: PrivateFieldKind::Capability,
+        capability: Some("staff".to_string()),
+        addressee_field: None,
+    }]
+}
+```
+
+Redacted when read, not encrypted: `forgetSubject` doesn't erase it, and
+a projection or snapshot folding it keeps it readable in its state.
+`kind` says who reads it: `Own` the record's creator, `Capability` a
+grant holding `capability`, `Addressed` the party the payload field
+`addressee_field` names. Set `capability` or `addressee_field` only for
+the kind that uses it. Personal data wants `sensitive_fields`; this is
+for a field that part of the audience shouldn't see.
 
 ## `blob_fields` - a field holding a reference to large bytes
 
@@ -173,8 +216,8 @@ is rejected outright rather than silently accepted
 Additive-only is a deliberate, permanent limitation, not a bug to work
 around by force - a genuine reshape (rename, retype, split/merge a
 field) is never a legal revision of an existing type. See
-`references/common-mistakes.md`'s own `SchemaIncompatible` entry and
-[`docs/architecture.md` §33](../../../../docs/architecture.md#payload-upcasting) for the real options, including
+`common-mistakes.md`'s `SchemaIncompatible` entry for the real options
+(the reasoning is docs/architecture.md §33), including
 `skilj_core::plugin::upcast_payload` for interpreting an old payload
 differently based on `event.metadata.version` without minting a new
 type at all.

@@ -41,6 +41,15 @@ another type, made blind while a registered type maps it plainly, or a
 `BlindTag::NORMALIZER_VERSION` other than the stored one. The
 `skilj-uniqueness` skill's error table has the fixes.
 
+**`InvalidOwnerTagKey`** - `owner_tag_key()` names a key that isn't one
+of the type's own `tag_mappings()` keys. Map the owner field as a tag
+first.
+
+**`InvalidPrivateField`** - a `PrivateField` names a field the schema
+doesn't declare, or its `capability`/`addressee_field` doesn't fit its
+`kind`: `Capability` needs `capability`, `Addressed` needs
+`addressee_field`, and neither is set otherwise.
+
 **`InvalidBlobField`** - a blob field that's empty, declared twice, not in
 the schema, has half a subject, overlaps a sensitive field, or changes or
 drops an existing subject. See the `skilj-large-payloads` skill.
@@ -51,13 +60,13 @@ field tightened from optional to required, or a field's type changed.
 Fix: add new fields as `Option<T>`, never remove, narrow, or retype an
 existing one. If you need a genuine reshape (rename a field, change its
 type, split/merge fields) rather than an additive change, that's not
-something a schema revision can express at all - see
-[`docs/architecture.md` §33](../../../../docs/architecture.md#payload-upcasting) for the full menu of options (a new,
+something a schema revision can express at all. The options (reasoning
+in docs/architecture.md §33) are: a new,
 differently-named type; a custom serde `Deserialize`; reshaping inside
 `Projection::project()`; or `skilj_core::plugin::upcast_payload`/
 `UpcastStep`, sugar for branching on `event.metadata.version` inside a
 hand-written `BoundedContextEvent::try_from_event` to interpret an old
-payload differently without a new registered type at all).
+payload differently without a new registered type at all.
 
 Not this error: an *older* version of the application starting after a
 newer one registered the type (a restart mid-rollout, or a rollback).

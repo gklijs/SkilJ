@@ -1,0 +1,271 @@
+diff -ruN ../pristine/src/bin/server.rs src/bin/server.rs
+--- a/src/bin/server.rs	2026-11-11 16:58:41.834420249 +0100
++++ b/src/bin/server.rs	2026-11-11 16:58:41.847837313 +0100
+@@ -24,7 +24,7 @@
+ 
+ use skilj::Skilj;
+ 
+-const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw"];
++const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw", "CloseWallet"];
+ 
+ // A `main` returning `Result` prints its error with `Debug`; this prints
+ // the message instead, which for local mode says what to install or set.
+diff -ruN ../pristine/src/wallet.rs src/wallet.rs
+--- a/src/wallet.rs	2026-11-11 16:58:41.834468987 +0100
++++ b/src/wallet.rs	2026-11-11 16:58:41.847497202 +0100
+@@ -10,7 +10,9 @@
+ //! There's no separate "open wallet" step: the first `Deposit` for a
+ //! given `wallet_id` is what brings it into existence - `decide()`
+ //! folds `matching_events` (empty, the first time) to find the current
+-//! balance, so an unopened wallet reads as balance zero.
++//! balance, so an unopened wallet reads as balance zero. `CloseWallet`
++//! ends it: an empty wallet can be closed, and a closed one refuses
++//! every command.
+ 
+ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+@@ -61,12 +63,29 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct WalletClosedPayload {
++    pub wallet_id: String,
++}
++
++pub struct WalletClosed;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl EventType for WalletClosed {
++    type Payload = WalletClosedPayload;
++    const NAME: &'static str = "WalletClosed";
++    fn tag_mappings() -> Vec<TagMapping> {
++        wallet_tag()
++    }
++}
++
+ /// This bounded context's own hand-written event enum - every `decide()`
+ /// below only ever sees the events its own tags matched, so folding
+ /// this never has to check which wallet an event belongs to.
+ pub enum WalletEvent {
+     Deposited(DepositedPayload),
+     Withdrawn(WithdrawnPayload),
++    WalletClosed(WalletClosedPayload),
+ }
+ 
+ impl BoundedContextEvent for WalletEvent {
+@@ -74,6 +93,9 @@
+         match event.event_type.name.as_str() {
+             "Deposited" => Some(serde_json::from_str(&event.payload).map(WalletEvent::Deposited)),
+             "Withdrawn" => Some(serde_json::from_str(&event.payload).map(WalletEvent::Withdrawn)),
++            "WalletClosed" => {
++                Some(serde_json::from_str(&event.payload).map(WalletEvent::WalletClosed))
++            }
+             _ => None,
+         }
+     }
+@@ -83,9 +105,23 @@
+     matching_events.iter().fold(0i64, |balance, event| match event {
+         WalletEvent::Deposited(p) => balance + p.amount,
+         WalletEvent::Withdrawn(p) => balance - p.amount,
++        WalletEvent::WalletClosed(_) => balance,
+     })
+ }
+ 
++fn is_closed(matching_events: &[WalletEvent]) -> bool {
++    matching_events
++        .iter()
++        .any(|event| matches!(event, WalletEvent::WalletClosed(_)))
++}
++
++fn wallet_closed(wallet_id: &str) -> CommandDecision {
++    CommandDecision::Rejected {
++        reason: format!("wallet {wallet_id} is closed"),
++        kind: "wallet_closed".into(),
++    }
++}
++
+ // --- commands ---
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+@@ -107,13 +143,16 @@
+     fn rest_trigger_allowed() -> bool {
+         true
+     }
+-    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
++    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
+         if payload.amount <= 0 {
+             return CommandDecision::Rejected {
+                 reason: "deposit amount must be positive".into(),
+                 kind: "invalid_amount".into(),
+             };
+         }
++        if is_closed(matching_events) {
++            return wallet_closed(&payload.wallet_id);
++        }
+         CommandDecision::Accepted {
+             events: vec![EventSpec {
+                 event_type: "Deposited".into(),
+@@ -156,6 +195,9 @@
+                 kind: "invalid_amount".into(),
+             };
+         }
++        if is_closed(matching_events) {
++            return wallet_closed(&payload.wallet_id);
++        }
+         let balance = balance_of(matching_events);
+         if payload.amount > balance {
+             return CommandDecision::Rejected {
+@@ -178,6 +220,47 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct CloseWalletPayload {
++    pub wallet_id: String,
++}
++
++pub struct CloseWallet;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl CommandType for CloseWallet {
++    type Payload = CloseWalletPayload;
++    type Event = WalletEvent;
++    const NAME: &'static str = "CloseWallet";
++    fn tag_mappings() -> Vec<TagMapping> {
++        wallet_tag()
++    }
++    fn rest_trigger_allowed() -> bool {
++        true
++    }
++    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
++        if is_closed(matching_events) {
++            return wallet_closed(&payload.wallet_id);
++        }
++        let balance = balance_of(matching_events);
++        if balance != 0 {
++            return CommandDecision::Rejected {
++                reason: format!(
++                    "wallet {} still holds {balance}, withdraw it first",
++                    payload.wallet_id
++                ),
++                kind: "wallet_not_empty".into(),
++            };
++        }
++        CommandDecision::Accepted {
++            events: vec![EventSpec {
++                event_type: "WalletClosed".into(),
++                payload: serde_json::json!({ "wallet_id": payload.wallet_id }),
++            }],
++        }
++    }
++}
++
+ // --- projection ---
+ 
+ #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+@@ -205,12 +288,14 @@
+         match event {
+             WalletEvent::Deposited(p) => vec![p.wallet_id.clone()],
+             WalletEvent::Withdrawn(p) => vec![p.wallet_id.clone()],
++            WalletEvent::WalletClosed(p) => vec![p.wallet_id.clone()],
+         }
+     }
+     fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+         match event {
+             WalletEvent::Deposited(p) => state.balance += p.amount,
+             WalletEvent::Withdrawn(p) => state.balance -= p.amount,
++            WalletEvent::WalletClosed(_) => {}
+         }
+     }
+ }
+diff -ruN ../pristine/tests/wallet_fixture.rs tests/wallet_fixture.rs
+--- a/tests/wallet_fixture.rs	2026-11-11 16:58:41.834564475 +0100
++++ b/tests/wallet_fixture.rs	2026-11-11 16:58:41.847919936 +0100
+@@ -6,10 +6,84 @@
+ use skilj_test_fixture::command::GivenEvents as GivenCommandEvents;
+ use skilj_test_fixture::projection::GivenEvents as GivenProjectionEvents;
+ use template_check::wallet::{
+-    Balance, BalanceState, Deposit, DepositPayload, DepositedPayload, WalletEvent, Withdraw,
+-    WithdrawPayload, WithdrawnPayload,
++    Balance, BalanceState, CloseWallet, CloseWalletPayload, Deposit, DepositPayload,
++    DepositedPayload, WalletClosedPayload, WalletEvent, Withdraw, WithdrawPayload,
++    WithdrawnPayload,
+ };
+ 
++fn deposited(amount: i64) -> WalletEvent {
++    WalletEvent::Deposited(DepositedPayload {
++        wallet_id: "a".into(),
++        amount,
++    })
++}
++
++fn closed() -> WalletEvent {
++    WalletEvent::WalletClosed(WalletClosedPayload {
++        wallet_id: "a".into(),
++    })
++}
++
++#[test]
++fn empty_wallet_can_be_closed() {
++    GivenCommandEvents::<CloseWallet>::new()
++        .event(deposited(100))
++        .event(WalletEvent::Withdrawn(WithdrawnPayload {
++            wallet_id: "a".into(),
++            amount: 100,
++        }))
++        .when(CloseWalletPayload {
++            wallet_id: "a".into(),
++        })
++        .then_accepted(vec![EventSpec {
++            event_type: "WalletClosed".into(),
++            payload: serde_json::json!({ "wallet_id": "a" }),
++        }]);
++}
++
++#[test]
++fn wallet_holding_money_cannot_be_closed() {
++    GivenCommandEvents::<CloseWallet>::new()
++        .event(deposited(100))
++        .when(CloseWalletPayload {
++            wallet_id: "a".into(),
++        })
++        .then_rejected("wallet_not_empty");
++}
++
++#[test]
++fn closed_wallet_refuses_every_command() {
++    GivenCommandEvents::<CloseWallet>::new()
++        .event(closed())
++        .when(CloseWalletPayload {
++            wallet_id: "a".into(),
++        })
++        .then_rejected("wallet_closed");
++    GivenCommandEvents::<Deposit>::new()
++        .event(closed())
++        .when(DepositPayload {
++            wallet_id: "a".into(),
++            amount: 1,
++        })
++        .then_rejected("wallet_closed");
++    GivenCommandEvents::<Withdraw>::new()
++        .event(deposited(0))
++        .event(closed())
++        .when(WithdrawPayload {
++            wallet_id: "a".into(),
++            amount: 1,
++        })
++        .then_rejected("wallet_closed");
++}
++
++#[test]
++fn closing_leaves_the_balance_projection_alone() {
++    GivenProjectionEvents::<Balance>::new()
++        .event(deposited(0))
++        .event(closed())
++        .then_state(BalanceState { balance: 0 });
++}
++
+ #[test]
+ fn deposit_of_a_positive_amount_is_accepted() {
+     GivenCommandEvents::<Deposit>::new()

@@ -8,8 +8,8 @@
 # future renumbering fails CI instead of leaving stale citations behind.
 #
 # What it checks, for every "§..." citation found anywhere in the repo
-# (docs, README/CHANGELOG/CONTRIBUTING, .claude skills, Rust doc comments,
-# etc.):
+# (docs, README/CHANGELOG/CONTRIBUTING, skilj/agent-guides, Rust doc
+# comments, etc.):
 #   - bare top-level refs, e.g. "§41", "§10b"
 #   - slash-separated lists of the above, e.g. "§39/§40"
 #   - the top-level number in a dotted subsection ref, e.g. "§1.3.1" -> "1"
