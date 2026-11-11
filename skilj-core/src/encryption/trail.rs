@@ -217,11 +217,31 @@ impl MasterKeyChange {
     /// `EncryptionDataKeysRewrapped`: `rewrapped` of `bounded_context`'s
     /// active data keys are now wrapped under `version`; `unreadable` ones
     /// could not be unwrapped and were left as they were.
-    /// `retiring_provider` names the key whose retirement had them tried -
-    /// a key the bounded context used before and left data keys under
-    /// (docs/architecture.md §247) - and is null for a rewrap `provider`'s
-    /// own rotation or assignment asked for.
+    /// Asked for by `provider`'s own rotation or assignment: its
+    /// `retiring_provider` is null.
     pub fn rewrapped(
+        provider: &str,
+        version: u32,
+        bounded_context: &str,
+        rewrapped: u64,
+        unreadable: u64,
+    ) -> Self {
+        Self::rewrapped_for_retirement(
+            provider,
+            version,
+            bounded_context,
+            rewrapped,
+            unreadable,
+            None,
+        )
+    }
+
+    /// [`rewrapped`](Self::rewrapped), with `retiring_provider` naming the
+    /// key whose retirement had the data keys tried - a key the bounded
+    /// context used before and left data keys under
+    /// (docs/architecture.md §247) - or `None` for a rewrap `provider`'s
+    /// own rotation or assignment asked for.
+    pub fn rewrapped_for_retirement(
         provider: &str,
         version: u32,
         bounded_context: &str,
@@ -376,8 +396,15 @@ mod tests {
                 true,
                 Some("r"),
             ),
-            MasterKeyChange::rewrapped("file", 2, "banking", 3, 0, None),
-            MasterKeyChange::rewrapped("file:tenant", 1, "banking", 1, 1, Some("file")),
+            MasterKeyChange::rewrapped("file", 2, "banking", 3, 0),
+            MasterKeyChange::rewrapped_for_retirement(
+                "file:tenant",
+                1,
+                "banking",
+                1,
+                1,
+                Some("file"),
+            ),
             MasterKeyChange::retired("file", 2),
             MasterKeyChange::assigned("file:banking", "banking", "file", true, Some("r")),
             MasterKeyChange::deleted("file:banking", true),
@@ -398,7 +425,7 @@ mod tests {
 
     #[test]
     fn a_rewrap_is_tagged_by_its_bounded_context_too() {
-        let event = MasterKeyChange::rewrapped("file", 2, "banking", 3, 0, None).into_event(
+        let event = MasterKeyChange::rewrapped("file", 2, "banking", 3, 0).into_event(
             &admin(),
             1,
             Utc::now(),

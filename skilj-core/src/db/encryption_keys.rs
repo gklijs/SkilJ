@@ -310,25 +310,33 @@ pub(super) async fn unwrap_row(
         // (docs/architecture.md §247). Before the mark is cleared: a
         // rewrap batch takes the key's row and then the data key's, and
         // the other order here could deadlock with one.
+        //
+        // Both in one transaction - a savepoint in a caller's - so no
+        // rewrap check finds the rewrap pending and the data key still
+        // marked: it would pass the data key by and mark the rewrap done,
+        // leaving the data key where it is for good.
         let its_key =
             master_key::bounded_context_key(&mut *db.conn().await?, bounded_context).await?;
         let current = key_service.provider_for(its_key.as_deref())?;
+        let schema = schema_ident(bounded_context);
+        let mut conn = db.conn().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         master_key::mark_data_keys_behind_for(
-            &mut *db.conn().await?,
+            &mut *tx,
             current.name(),
             row.key_provider.as_deref(),
             row.master_key_version,
         )
         .await?;
-        let schema = schema_ident(bounded_context);
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.encryption_keys SET unreadable_since = NULL \
              WHERE id = $1 AND wrapped_key = $2"
         )))
         .bind(row.id)
         .bind(wrapped)
-        .execute(&mut *db.conn().await?)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
     }
     Ok(data_key)
 }
