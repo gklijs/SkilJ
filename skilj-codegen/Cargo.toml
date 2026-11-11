@@ -11,6 +11,8 @@ keywords = ["event-sourcing", "codegen", "build-script", "skilj"]
 categories = ["development-tools::build-utils"]
 
 [dependencies]
+clap.workspace = true
+tempfile = "3"
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

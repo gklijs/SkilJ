@@ -250,12 +250,13 @@ pub(crate) fn is_bounded_context_name(name: &str) -> bool {
 /// returns each blind key with the `subject_tag` it is erased by, if any.
 fn validate_blind_tags(
     spec: &BoundedContextSpec,
-    problems: &mut Vec<String>,
-    claim: &mut dyn FnMut(String, String, &mut Vec<String>),
+    problems: &mut Problems,
+    claim: &mut dyn FnMut(String, String, &mut Problems),
 ) -> BTreeMap<String, Option<String>> {
     let mut keys = BTreeMap::new();
     for blind in &spec.blind_tags {
         let what = format!("blind_tag {:?}", blind.name);
+        problems.context = what.clone();
         if !is_identifier(&blind.name) || is_keyword(&blind.name) {
             problems.push(format!(
                 "{what}: the name must be a Rust identifier and not a keyword"
@@ -300,6 +301,7 @@ fn validate_blind_tags(
         }
     }
     for blind in &spec.blind_tags {
+        problems.context = format!("blind_tag {:?}", blind.name);
         if let Some(Some(subject_tag)) = keys.get(&blind.key) {
             if keys.contains_key(subject_tag) {
                 problems.push(format!(
@@ -317,7 +319,32 @@ fn validate_blind_tags(
 /// failure at startup - all of them, not just the first, so one build
 /// shows everything to fix. Empty when `spec` is sound.
 pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
-    let mut problems = Vec::new();
+    validate_detailed(spec)
+        .into_iter()
+        .map(|p| p.message)
+        .collect()
+}
+
+#[derive(Default)]
+struct Problems {
+    context: String,
+    items: Vec<crate::ValidationProblem>,
+}
+
+impl Problems {
+    fn push(&mut self, message: String) {
+        self.items.push(crate::ValidationProblem {
+            context: self.context.clone(),
+            message,
+        });
+    }
+}
+
+pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::ValidationProblem> {
+    let mut problems = Problems {
+        context: "bounded_context".into(),
+        ..Problems::default()
+    };
     if !is_bounded_context_name(&spec.bounded_context) {
         problems.push(format!(
             "bounded_context {:?} must start with a lowercase letter and contain only \
@@ -330,8 +357,9 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
     // so they share the value namespace with `BOUNDED_CONTEXT` and the
     // `decide_*` functions.
     let mut generated: BTreeMap<String, String> = BTreeMap::new();
-    let mut claim = |name: String, what: String, problems: &mut Vec<String>| {
+    let mut claim = |name: String, what: String, problems: &mut Problems| {
         if let Some(earlier) = generated.get(&name) {
+            problems.context = what.clone();
             problems.push(format!(
                 "{what} generates `{name}`, which {earlier} already generates"
             ));
@@ -388,6 +416,7 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
             )
         }));
     for (kind, name, fields, tags, sensitive, blobs) in blob_types {
+        problems.context = format!("{kind} {name:?}");
         let is_blob = |field: &str| {
             fields
                 .iter()
@@ -435,6 +464,7 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
         );
     for (kind, name, fields, tags, sensitive) in types {
         let what = format!("{kind} {name:?}");
+        problems.context = what.clone();
         if !is_identifier(name) || is_keyword(name) {
             problems.push(format!(
                 "{what}: the name must be a Rust identifier (a letter or `_`, then letters, \
@@ -506,6 +536,7 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
     }
     let built_in_event_types = crate::emit::built_in_event_types(spec);
     for event in &spec.event_types {
+        problems.context = format!("event_type {:?}", event.name);
         if crate::emit::BUILT_IN_EVENT_TYPES.contains(&event.name.as_str()) {
             problems.push(format!(
                 "event_type {:?}: this name is reserved for a built-in event type; set \
@@ -519,6 +550,7 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
     event_type_names.extend(built_in_event_types.iter().copied());
     for command in &spec.command_types {
         let what = format!("command_type {:?}", command.name);
+        problems.context = what.clone();
         if command.retractable && !spec.retractions {
             problems.push(format!(
                 "{what}: retractable needs retractions = true at the top of the file"
@@ -537,6 +569,7 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
         }
         for (index, item) in command.query.iter().enumerate() {
             let item_what = format!("{what}: query item {}", index + 1);
+            problems.context = item_what.clone();
             if item.event_types.is_empty() && item.tags.is_empty() {
                 problems.push(format!(
                     "{item_what} names neither event types nor tags, so it matches nothing; \
@@ -564,5 +597,5 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
             }
         }
     }
-    problems
+    problems.items
 }

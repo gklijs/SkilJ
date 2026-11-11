@@ -165,3 +165,10 @@ are unchanged. Differential Postgres tests and page/erasure/failover conformance
 complement this partial analysis; generic page collectors remain subject to its
 existing coverage limits. The benchmark-only counting allocator forwards to
 `System` and is outside the core-library analysis.
+
+Issue #191's codegen CLI refreshes the analysis dependency snapshot to record
+`skilj-codegen`'s new `clap` and `tempfile` dependencies. Both packages were
+already present in the snapshot; no dependency versions change. A fresh pinned
+analysis leaves every finding identity/count and skipped generic target unchanged
+(6,054 potential panic occurrences and 186 skipped targets). Only the baseline's
+lockfile fingerprint changes; analyzer pins and configuration remain unchanged.

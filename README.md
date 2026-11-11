@@ -217,7 +217,7 @@ See [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) for the full mapp
 | [`skilj-core`](skilj-core) | The domain engine: events, commands, projections, and persistence. No web framework dependency. |
 | [`skilj-graphql`](skilj-graphql) | The GraphQL surface `Skilj::graphql_router()` serves - optionally an Apollo Federation subgraph for Apollo Router, Hive Router or Cosmo to compose (docs/architecture.md §194). Internal: use it through `skilj`. |
 | [`skilj-rest`](skilj-rest) | The REST surface - authenticated routes for agents and automated callers. |
-| [`skilj-codegen`](skilj-codegen) | Optional: generate event/command boilerplate from a declarative `.skilj.toml` file instead of hand-writing it, and import that file from an Event Modeling HCL model. |
+| [`skilj-codegen`](skilj-codegen) | Optional: generate event/command boilerplate from a declarative `.skilj.toml` file, [validate and preview it from the CLI](docs/codegen-cli.md), and import it from an Event Modeling HCL model. |
 | [`skilj-tui`](skilj-tui) | `cargo install skilj-tui` - a terminal console (GraphQL client) for browsing and operating a running deployment. |
 | [`skilj-inspector`](skilj-inspector) | `cargo install skilj-inspector` - a terminal console that reads straight from Postgres, for when the GraphQL server isn't running. |
 | [`skilj-temporal`](skilj-temporal) | Optional: a bridge from skilj's own event stream to [Temporal](https://temporal.io) - start or signal a workflow execution correlated by a DCB tag. See [`docs/architecture.md` §34](docs/architecture.md#skilj-temporal-plan). |

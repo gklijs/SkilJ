@@ -43,6 +43,10 @@
 //! `skilj-demo/build.rs`/`skilj-demo/src/banking.rs` for the real,
 //! working example.
 //!
+//! **Terminal and CI use.** The `skilj-codegen` binary provides `check`,
+//! `generate`, JSON diagnostics and `generate --check FILE` for drift checks.
+//! See [the CLI guide](../../docs/codegen-cli.md) for examples and exit statuses.
+//!
 //! **Importing from an Event Modeling model.** [`emhcl::import`] writes a
 //! `.skilj.toml` from an [Event Modeling HCL](https://event-modeling-hcl.github.io)
 //! model's `emhcl export` JSON, by the naming convention of
@@ -122,4 +126,23 @@ pub fn generate(toml_source: &str) -> Result<String, Error> {
     let tokens = emit::emit(&spec);
     let file: syn::File = syn::parse2(tokens).map_err(Error::Generated)?;
     Ok(prettyplease::unparse(&file))
+}
+
+/// A semantic validation problem, with declaration or query context.
+/// Semantic validation does not currently retain source spans.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ValidationProblem {
+    /// Declaration (and query item, where applicable) containing the problem.
+    pub context: String,
+    /// Human-readable explanation; wording is not a stable machine interface.
+    pub message: String,
+}
+
+/// Parses and validates a model using the same validator as [`generate`].
+/// Parse errors are returned as [`Error::Toml`]; semantic problems are collected
+/// together. An empty vector means generation may proceed, not that domain
+/// decisions or the complete application have been verified.
+pub fn validate(toml_source: &str) -> Result<Vec<ValidationProblem>, Error> {
+    let spec: BoundedContextSpec = toml::from_str(toml_source).map_err(Error::Toml)?;
+    Ok(spec::validate_detailed(&spec))
 }
