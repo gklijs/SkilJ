@@ -1,0 +1,108 @@
+diff -ruN ../pristine/src/wallet.rs src/wallet.rs
+--- a/src/wallet.rs	2026-11-11 16:58:41.834468987 +0100
++++ b/src/wallet.rs	2026-11-11 17:00:52.036516050 +0100
+@@ -31,6 +31,8 @@
+ pub struct DepositedPayload {
+     pub wallet_id: String,
+     pub amount: i64,
++    /// What the deposit was for. Deposits stored before this field have none.
++    pub reference: Option<String>,
+ }
+ 
+ pub struct Deposited;
+@@ -92,6 +94,7 @@
+ pub struct DepositPayload {
+     pub wallet_id: String,
+     pub amount: i64,
++    pub reference: Option<String>,
+ }
+ 
+ pub struct Deposit;
+@@ -120,6 +123,7 @@
+                 payload: serde_json::json!({
+                     "wallet_id": payload.wallet_id,
+                     "amount": payload.amount,
++                    "reference": payload.reference,
+                 }),
+             }],
+         }
+diff -ruN ../pristine/tests/wallet_fixture.rs tests/wallet_fixture.rs
+--- a/tests/wallet_fixture.rs	2026-11-11 16:58:41.834564475 +0100
++++ b/tests/wallet_fixture.rs	2026-11-11 17:00:25.656401129 +0100
+@@ -16,20 +16,43 @@
+         .when(DepositPayload {
+             wallet_id: "a".into(),
+             amount: 100,
++            reference: None,
+         })
+         .then_accepted(vec![EventSpec {
+             event_type: "Deposited".into(),
+-            payload: serde_json::json!({ "wallet_id": "a", "amount": 100 }),
++            payload: serde_json::json!({ "wallet_id": "a", "amount": 100, "reference": null }),
+         }]);
+ }
+ 
+ #[test]
++fn deposit_records_its_reference() {
++    GivenCommandEvents::<Deposit>::new()
++        .when(DepositPayload {
++            wallet_id: "a".into(),
++            amount: 100,
++            reference: Some("rent".into()),
++        })
++        .then_accepted(vec![EventSpec {
++            event_type: "Deposited".into(),
++            payload: serde_json::json!({ "wallet_id": "a", "amount": 100, "reference": "rent" }),
++        }]);
++}
++
++#[test]
++fn deposit_stored_before_references_still_reads() {
++    let stored = serde_json::json!({ "wallet_id": "a", "amount": 100 });
++    let payload: DepositedPayload = serde_json::from_value(stored).unwrap();
++    assert_eq!(payload.reference, None);
++}
++
++#[test]
+ fn deposit_of_a_non_positive_amount_is_rejected() {
+     for amount in [0, -1] {
+         GivenCommandEvents::<Deposit>::new()
+             .when(DepositPayload {
+                 wallet_id: "a".into(),
+                 amount,
++                reference: None,
+             })
+             .then_rejected("invalid_amount");
+     }
+@@ -41,6 +64,7 @@
+         .event(WalletEvent::Deposited(DepositedPayload {
+             wallet_id: "a".into(),
+             amount: 100,
++            reference: None,
+         }))
+         .when(WithdrawPayload {
+             wallet_id: "a".into(),
+@@ -59,6 +83,7 @@
+         .event(WalletEvent::Deposited(DepositedPayload {
+             wallet_id: "a".into(),
+             amount: 100,
++            reference: None,
+         }))
+         .event(WalletEvent::Withdrawn(WithdrawnPayload {
+             wallet_id: "a".into(),
+@@ -77,6 +102,7 @@
+         .event(WalletEvent::Deposited(DepositedPayload {
+             wallet_id: "a".into(),
+             amount: 100,
++            reference: None,
+         }))
+         .event(WalletEvent::Withdrawn(WithdrawnPayload {
+             wallet_id: "a".into(),
+@@ -113,6 +139,7 @@
+         .event(WalletEvent::Deposited(DepositedPayload {
+             wallet_id: "a".into(),
+             amount: 100,
++            reference: None,
+         }))
+         .when(WithdrawPayload {
+             wallet_id: "a".into(),

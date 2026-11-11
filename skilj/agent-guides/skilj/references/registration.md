@@ -97,5 +97,6 @@ deploy, however often the process restarts - `report.skipped_no_access`
 (returned alongside `skilj` from `.build()`) names anything that hit
 this, so check it rather than assuming registration silently succeeded.
 Creating the bounded context itself and granting that first access is
-outside this skill's scope - see `docs/architecture.md` if you're doing
-that, not just adding a type to a context that already works.
+the `skilj-bootstrap` guide (`../../skilj-bootstrap/SKILL.md`). A project
+generated from skilj-template does both in `src/bin/server.rs`, with the
+local shortcut that guide describes.

@@ -1,0 +1,9 @@
+# Names a guide uses in an example of its own, which the workspace's code
+# therefore doesn't contain. Everything else a guide puts in backticks has to
+# occur in the code (scripts/agent-guides/check.mjs).
+that_role
+order_number
+occurred_at
+SomeName
+CustomerRegistered
+CustomerEmailChanged

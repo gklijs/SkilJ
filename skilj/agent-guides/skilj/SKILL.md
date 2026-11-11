@@ -62,6 +62,13 @@ tree: a command uses one through a snapshot item in its consistency
 query (see `references/command-type.md`, "snapshot items"), and
 `docs/architecture.md` §202 has the design.
 
+**Who may see or do it** is declared on the type too: `owner_tag_key`
+for tenants sharing a bounded context and `private_fields` for a field
+only some readers see (`references/event-type.md`), a projection's
+`REQUIRES_CAPABILITY` (`references/projection.md`), and a command that
+waits for an approver (`references/command-type.md`, "Commands that need
+approval").
+
 ## The three traits, at a glance
 
 All three live in `skilj_core::plugin` (re-exported from `skilj` - use
@@ -101,9 +108,10 @@ impl EventType for MoneyDeposited {
 ```
 
 Real, complete example (all three types, one bounded context):
-`skilj-demo/src/banking.rs`. Read it before writing your first type -
-every reference file below excerpts from it rather than inventing a
-separate example, so it's worth having open already.
+`skilj-demo/src/banking.rs`. Every reference file below excerpts from it
+rather than inventing a separate example. A project generated from
+skilj-template has the same shape in its own `src/wallet.rs`, with tests
+in `tests/wallet_fixture.rs`: read that one instead.
 
 ## Registration in one line
 
@@ -198,7 +206,8 @@ each with what actually causes it and the fix, taken directly from
 ## What this skill does not cover
 
 Creating a bounded context itself (`AddBoundedContext`, superadmin/
-access-control setup), the GraphQL/REST wire contracts, `skilj-tui`,
-and anything under `skilj-core`/`skilj-graphql`/`skilj-rest`'s own
-internals - those aren't the plugin API a consuming application touches.
-`docs/architecture.md` is the real reference for all of that.
+access-control setup) is the `skilj-bootstrap` skill. The GraphQL/REST
+wire contracts, `skilj-tui`, and anything under `skilj-core`/
+`skilj-graphql`/`skilj-rest`'s own internals aren't the plugin API a
+consuming application touches: `docs/authorization.md`,
+`docs/rest-event-reading.md` and `docs/deployment.md` describe them.

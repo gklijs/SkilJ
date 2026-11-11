@@ -18,6 +18,7 @@ pub trait Projection {
     const SUBJECT_KEY: Option<&'static str> = None;          // see below
     const LIVE_FOLD_COMPATIBLE: bool = false;                // see below
     const REQUIRES_CAPABILITY: Option<&'static str> = None;
+    const PARTITION_COUNT: u32 = 1;                          // see below
 
     fn project(state: &mut Self::State, event: &Self::Event, key: &str);
 }
@@ -78,8 +79,8 @@ Same purity rule as `decide()` (§1.1: no I/O, no async) and for the
 identical reason - it may run as part of history replay, not just live.
 Mutates `state` in place for one event at a time; never rebuilds from
 scratch itself (that's `RebuildProjection`'s own job, triggered
-explicitly by an admin, not implied by a schema change - see
-`docs/architecture.md` if you need that flow).
+explicitly by an admin, not implied by a schema change - see "Rebuilds"
+below).
 
 ## `keys()` - single-instance vs. multi-instance projections
 
@@ -114,6 +115,23 @@ disturbs what it's already serving, whichever `sync` setting - a change
 that can't honestly be applied to already-folded content is staged,
 waiting for an explicit `RebuildProjection` call, never triggered
 automatically by a deploy.
+
+## Tenants in one bounded context: `OWNER_TAG_KEY`
+
+`const OWNER_TAG_KEY: Option<&'static str> = Some("company");` names the
+tag key that says who owns an instance. Each instance takes its owner
+from the events folded into it (the value of that tag), and a grant with
+a scope reads only the instances whose owner equals it. The consumed
+event types carry the tag by mapping it in `tag_mappings()`, and declare
+the same key as their `owner_tag_key()` (see `event-type.md`).
+
+## Sharing background catch-up: `PARTITION_COUNT`
+
+Only for `sync() == false`. With the default `1`, one instance at a time
+catches the projection up. A larger value hashes `keys()` into that many
+partitions, which several instances of the application claim and fold
+side by side; order is kept per key. Changing it needs no rebuild. Reach
+for it when a background projection falls behind, not before.
 
 ## Sensitive state: `SUBJECT_KEY`
 

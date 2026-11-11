@@ -13,18 +13,44 @@ pub trait CommandType {
     const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT; // see registration.md
 
     fn tag_mappings() -> Vec<TagMapping> { Vec::new() }
+    fn owner_tag_key() -> Option<&'static str> { None }
     fn sensitive_fields() -> Vec<SensitiveField> { Vec::new() }
+    fn blob_fields() -> Vec<BlobField> { Vec::new() }
+    fn private_fields() -> Vec<PrivateField> { Vec::new() }
     fn rest_trigger_allowed() -> bool { false }
     fn required_role() -> Option<&'static str> { None }
 
-    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision;
+    // Implement one of these two; see "decide()" and "snapshot items".
+    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision { /* refuses */ }
+    fn decide_with(payload: &Self::Payload, decision: &Decision<'_, Self::Event>) -> CommandDecision { /* calls decide() */ }
+    fn consistency_query() -> Vec<QueryItemMapping> { Vec::new() }
+
+    // See "Commands that need approval".
+    fn requires_approval() -> bool { false }
+    fn approval_role() -> Option<&'static str> { None }
+    fn approval_deadline_seconds() -> Option<i64> { None }
+    fn approval_allows_self_approval() -> bool { false }
+
+    // The older single-tag snapshot pair; new code uses snapshot items.
+    fn snapshot() -> Option<&'static str> { None }
+    fn decide_from_snapshot(
+        payload: &Self::Payload,
+        snapshot_state_json: &str,
+        events_since_snapshot: &[Self::Event],
+        context: &DecisionContext,
+    ) -> CommandDecision { /* refuses */ }
 }
 ```
 
-`tag_mappings`/`sensitive_fields` have the identical shape and rules as
-`EventType`'s own (see `event-type.md`) - a command's payload is stored
-too (`CommandQuery` reads it back), so the same encryption-at-rest and
-DCB-tag mechanics apply.
+`tag_mappings`, `owner_tag_key`, `sensitive_fields`, `blob_fields` and
+`private_fields` have the identical shape and rules as `EventType`'s own
+(see `event-type.md`) - a command's payload is stored too (`CommandQuery`
+reads it back), so the same encryption-at-rest and DCB-tag mechanics
+apply. A value that is sensitive in the event is sensitive in the command
+that carries it: declare it in both.
+
+A type implementing neither `decide()` nor `decide_with()` compiles, and
+refuses every command with `decide_not_implemented`.
 
 ## `decide()` - pure, synchronous, no I/O
 
@@ -261,6 +287,26 @@ See `skilj-demo/src/banking.rs`'s own `BankingEvent` (covers both
 (`try_from_event`, one match arm per registered `EventType::NAME`) -
 when you add a new `EventType` to an existing bounded context, add its
 variant and match arm to this same enum, not a new one.
+
+## Commands that need approval
+
+```rust
+fn requires_approval() -> bool { true }
+fn approval_role() -> Option<&'static str> { Some("Controller") } // optional
+fn approval_deadline_seconds() -> Option<i64> { Some(86_400) }    // optional
+```
+
+A submission, over REST or GraphQL, is then stored as a proposal and
+answers `accepted: false, pendingApproval: true` with a `proposalId`;
+`decide()` doesn't run. A Role with an Admin grant on the bounded context
+runs `approveCommand` or `rejectCommand` over GraphQL, and
+`commandProposals` lists what is waiting. Approval runs the ordinary
+submission, so `decide()` sees the state at approval time and can still
+reject. The proposer can't approve their own proposal unless
+`approval_allows_self_approval()` says so, and can always withdraw it.
+`approval_role()` also requires the approver's `Role.name` to match. A
+proposal past its deadline is recorded as expired. `docs/authorization.md`
+section 6 has the full sequence.
 
 ## `required_role()` - an extra caller-facing gate
 

@@ -18,6 +18,7 @@ Git tag matching your dependency when working with an older release.
 | Task | Start here |
 | --- | --- |
 | Generate a working project | [Wallet tutorial](wallet-tutorial.md), [template README](../templates/skilj-template/README.md) |
+| Work with a coding agent (Claude Code, Codex) | [Agent guidance](agent-guidance.md), the generated project's `AGENTS.md` |
 | Write and test domain rules | [Wallet tests](../templates/skilj-template/tests/wallet_fixture.rs), [fixture API](https://docs.rs/skilj-test-fixture) |
 | Implement traits or configure a server | [skilj API](https://docs.rs/skilj), [domain API](https://docs.rs/skilj-core) |
 | Configure roles, tokens and protected fields | [Authorization flows](authorization.md) |

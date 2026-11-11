@@ -40,10 +40,13 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - run: node --test scripts/ci.test.mjs
+      - run: node --test scripts/ci.test.mjs scripts/agent-guides/check.test.mjs
       # Validates every "§N" citation of docs/architecture.md's own section
       # headings (a past renumbering silently broke ~600 of them).
       - run: scripts/check-section-refs.sh
+      # skilj/agent-guides still describes the traits, names and paths this
+      # workspace has (docs/architecture.md §248).
+      - run: node scripts/agent-guides/check.mjs
 
   check-cga:
     runs-on: ubuntu-24.04
@@ -122,6 +125,10 @@ jobs:
       # nothing else notices when a change breaks it (docs/architecture.md §105) -
       # and runs the quickstart: deposit accepted, overdraft rejected.
       - run: scripts/check-template.sh --prepared --cache-dir target/template-check
+      # What the template gives a coding agent: the guides are found, and
+      # the reference solutions of their three evaluation tasks still pass
+      # against this workspace (docs/architecture.md §248).
+      - run: scripts/agent-guides/eval/check-solutions.sh --cache-dir target/template-check
 
   check-template-docker:
     # The template's Dockerfile, built the way a user builds it (amd64;

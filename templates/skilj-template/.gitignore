@@ -1,0 +1,8 @@
+/target
+
+# Made by scripts/skilj-guides.sh --link: they point into this machine's
+# Cargo registry.
+/.claude/skills/skilj
+/.claude/skills/skilj-*
+/.agents/skills/skilj
+/.agents/skills/skilj-*

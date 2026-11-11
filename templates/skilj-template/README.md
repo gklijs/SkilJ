@@ -70,6 +70,18 @@ besides the binary and a CA bundle. That means `docker exec ... sh` (or
 any interactive debugging inside the container) won't work; use `docker
 logs` instead.
 
+## Working with a coding agent
+
+`AGENTS.md` tells an agent (Claude Code, Codex, or another that reads it)
+where the domain code is, the rules a `decide()` and a schema change have
+to keep, and which checks to run. It is yours to extend.
+
+skilj's task guides ship inside the `skilj` crate, so they match the
+version in your `Cargo.lock`. `bash scripts/skilj-guides.sh` prints where
+they are, and `bash scripts/skilj-guides.sh --link` links them as skills
+into `.claude/skills` and `.agents/skills`; run it again after upgrading
+skilj. The links are in `.gitignore`: they point into your Cargo registry.
+
 ## Where to go from here
 
 - [Wallet tutorial](https://github.com/gklijs/SkilJ/blob/main/docs/wallet-tutorial.md)

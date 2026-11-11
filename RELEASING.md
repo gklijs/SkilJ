@@ -175,5 +175,8 @@ root available; wherever the publish actually runs needs this too,
   the semver step in `.github/workflows/ci.yml`.
 - Run `scripts/check-template.sh --published` - it generates the
   template and builds it against what crates.io now serves (step 4 of
-  "Version sync" already pointed it at the new version). 0.0.8 shipped
+  "Version sync" already pointed it at the new version). Then
+  `scripts/agent-guides/eval/check-solutions.sh --published`: the agent
+  guides are in the published `skilj` crate, and the evaluation tasks'
+  reference solutions pass against it (docs/agent-guidance.md). 0.0.8 shipped
   with the template still on 0.0.7, where it didn't compile at all.
