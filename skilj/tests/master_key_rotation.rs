@@ -2974,6 +2974,97 @@ fn a_data_key_read_again_after_a_move_is_brought_along_and_lets_go_of_the_former
     });
 }
 
+/// The race CI found: a rewrap check that ran while the data key was still
+/// marked passed it by, and marked the rewrap done after the read had
+/// made it pending - so the data key stayed under the former key.
+#[test]
+fn a_rewrap_is_not_marked_done_over_a_data_key_read_again_meanwhile() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_read_again_epoch_test").await else {
+            return;
+        };
+        let bc = insert_bounded_context(&pool).await;
+        let keys = KeyService::new(InMemoryKeyProvider::new()).with_cache(Duration::ZERO, 0);
+        settled(&url, &keys).await;
+        db::assign_encryption_key(&pool, &keys, &bc, Some("former"), true, None)
+            .await
+            .unwrap();
+        let sealed = seal_for(&pool, &bc, "late", &keys).await;
+        db::assign_encryption_key(&pool, &keys, &bc, Some("current"), true, None)
+            .await
+            .unwrap();
+        // The move marked it unreadable and left it under the former key.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"bc_{bc}\".encryption_keys SET unreadable_since = now() \
+             WHERE subject_value = 'late'"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Twice: with the rewrap pending already, and with it done.
+        for done_before in [false, true] {
+            if done_before {
+                let state = db::master_key_state(&pool, "in-memory:current")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(db::mark_data_keys_rewrapped(
+                    &pool,
+                    "in-memory:current",
+                    state.version,
+                    state.assignment_epoch
+                )
+                .await
+                .unwrap());
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE \"bc_{bc}\".encryption_keys SET unreadable_since = now() \
+                     WHERE subject_value = 'late'"
+                )))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            // A check reads the key's epoch, and finds the data key marked...
+            let read = db::master_key_state(&pool, "in-memory:current")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                providers_of(&pool, &bc).await,
+                (vec![], 1),
+                "done before: {done_before}"
+            );
+            // ...then the data key is read, and loses its mark...
+            assert_eq!(
+                open_for(&pool, &bc, "late", &keys, &sealed).await,
+                "late@example.com"
+            );
+            assert_eq!(
+                providers_of(&pool, &bc).await,
+                (vec![(Some("in-memory:former".to_string()), 1)], 0)
+            );
+            // ...so that check's rewrap, which passed it by, isn't done.
+            assert!(
+                !db::mark_data_keys_rewrapped(
+                    &pool,
+                    "in-memory:current",
+                    read.version,
+                    read.assignment_epoch
+                )
+                .await
+                .unwrap(),
+                "done before: {done_before}"
+            );
+            let now = db::master_key_state(&pool, "in-memory:current")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(now.rewrapped_at.is_none());
+        }
+    });
+}
+
 /// How [`Asked`] has its key answer a batch.
 #[derive(Clone, Copy, PartialEq)]
 enum Asking {

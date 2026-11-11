@@ -199,6 +199,16 @@ added lines moved. The two additions decided with it - a read that clears an
 unreadable mark making the context's key's rewrap pending, and the event's
 `retiring_provider` - add 12 more: the conditional update's `query`, `bind`
 and `execute` cleanup, `KeyService::provider_for`, the statement connections'
-drops in `unwrap_row`, the changed `MasterKeyChange::rewrapped` call and
+drops in `unwrap_row`, the `MasterKeyChange::rewrapped_for_retirement` call and
 moved `tracing::instrument` identities. No `unwrap`, `expect`, unchecked
 indexing or unsafe code in any of it.
+
+Making that read's two updates one transaction, after CI found a rewrap check
+running between them (docs/architecture.md §247), adds 14 more in
+`db/encryption_keys.rs` and `db/master_key.rs`, reviewed the same way: the
+transaction's `begin`, its future's drop, the two `deref_mut`s, `commit` and
+the transaction's and the mark update's drops in `unwrap_row`; the conditional
+update's `query` and three `bind`s, whose identities carry the statement's
+text, which now raises `assignment_epoch` too; and four moved
+`tracing::instrument` identities. No `unwrap`, `expect`, unchecked indexing or
+unsafe code in it either.

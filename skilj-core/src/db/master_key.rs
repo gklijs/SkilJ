@@ -73,7 +73,8 @@ pub struct MasterKeyState {
     pub created_by_skilj: bool,
     /// When the key, used by no bounded context, is deleted or let go.
     pub delete_after: Option<DateTime<Utc>>,
-    /// Raised by every assignment to the key: a rewrap is marked done only
+    /// Raised by every assignment to the key, and by a data key behind it
+    /// that turned out readable after all: a rewrap is marked done only
     /// when it is still the one read before the assignments were.
     pub assignment_epoch: i64,
 }
@@ -301,7 +302,9 @@ pub async fn rotate_master_key(
 /// is still the one in use and no bounded context was assigned the key
 /// since `epoch` was read - read before the assignments the rewrap went by,
 /// so a context assigned meanwhile, which that rewrap didn't cover, keeps
-/// it pending. Answers whether it did.
+/// it pending. So does a data key that lost its unreadable mark meanwhile
+/// (`mark_data_keys_behind_for`), which that rewrap passed by. Answers
+/// whether it did.
 pub async fn mark_data_keys_rewrapped(
     pool: &Pool,
     provider: &str,
@@ -338,6 +341,11 @@ pub async fn mark_data_keys_behind(pool: &Pool, provider: &str) -> crate::error:
 /// legacy one, or an older version - on the caller's connection. For a
 /// data key that turned out readable after all (docs/architecture.md
 /// §247): the rewrap had passed it by, and takes it at the next check.
+///
+/// It raises the key's `assignment_epoch` as an assignment does, and also
+/// when the rewrap is pending already: a rewrap check running meanwhile
+/// read its rows while this data key was still marked, and must not mark
+/// the rewrap done on what it saw.
 pub(super) async fn mark_data_keys_behind_for<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     provider: &str,
@@ -345,8 +353,9 @@ pub(super) async fn mark_data_keys_behind_for<'e>(
     row_version: Option<i32>,
 ) -> crate::error::Result<()> {
     sqlx::query(
-        "UPDATE encryption_master_keys SET rewrapped_at = NULL \
-         WHERE provider = $1 AND rewrapped_at IS NOT NULL \
+        "UPDATE encryption_master_keys \
+         SET rewrapped_at = NULL, assignment_epoch = assignment_epoch + 1 \
+         WHERE provider = $1 \
          AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)",
     )
     .bind(provider)
@@ -1149,7 +1158,7 @@ pub async fn rewrap_data_keys(
         readable_since("$3")
     );
     let event = |outcome: RewrapOutcome| {
-        MasterKeyChange::rewrapped(
+        MasterKeyChange::rewrapped_for_retirement(
             &target_name,
             version,
             bounded_context,

@@ -10205,7 +10205,7 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `db::encryption_keys::Held<'_>` which can panic",
       "source": ".await?;",
-      "count": 4
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -10251,8 +10251,14 @@
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to drop of `sqlx::Transaction<'_, sqlx::Postgres>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
-      "source": ".execute(&mut *db.conn().await?)",
+      "source": ".execute(&mut *tx)",
       "count": 1
     },
     {
@@ -10287,6 +10293,12 @@
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to drop of `std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error>> + std::marker::Send>>` which can panic",
+      "source": "let mut tx = sqlx::Connection::begin(&mut *conn).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `std::result::Result<encryption::DataKey, encryption::Error>` which can panic",
       "source": "};",
       "count": 1
@@ -10307,7 +10319,7 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 7
+      "count": 6
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -10323,13 +10335,13 @@
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:351:1: 351:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:359:1: 359:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:521:1: 521:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:529:1: 529:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -10349,6 +10361,12 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `{async block@sqlx::Pool<sqlx::Postgres>::acquire::{closure#0}}` which can panic",
       "source": "Db::Pool(pool) => Held::Owned(pool.acquire().await?),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::commit()}` which can panic",
+      "source": "tx.commit().await?;",
       "count": 1
     },
     {
@@ -10421,6 +10439,24 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
       "source": "let name = key_service.provider_for(Some(key))?.name().to_string();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to method `<sqlx::PgConnection as sqlx::Connection>::begin` which can panic",
+      "source": "let mut tx = sqlx::Connection::begin(&mut *conn).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "&mut *tx,",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": ".execute(&mut *tx)",
       "count": 1
     },
     {
@@ -13443,8 +13479,8 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to associated function `encryption::trail::MasterKeyChange::rewrapped` which can panic",
-      "source": "MasterKeyChange::rewrapped( &target_name, version, bounded_context, outcome.rewrapped, outcome.unreadable, retiring, )",
+      "message": "call to associated function `encryption::trail::MasterKeyChange::rewrapped_for_retirement` which can panic",
+      "source": "MasterKeyChange::rewrapped_for_retirement( &target_name, version, bounded_context, outcome.rewrapped, outcome.unreadable, retiring, )",
       "count": 1
     },
     {
@@ -13791,13 +13827,13 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/master_key.rs:1131:1: 1131:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/master_key.rs:1140:1: 1140:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/master_key.rs:136:1: 136:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/master_key.rs:137:1: 137:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -14128,13 +14164,13 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL \\ WHERE provider = $1 AND rewrapped_at IS NOT NULL \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", )",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL, delete_after = NULL, \\ created_by_skilj = created_by_skilj OR $2, \\ assignment_epoch = assignment_epoch + 1 WHERE provider = $1\", )",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL, delete_after = NULL, \\ created_by_skilj = created_by_skilj OR $2, \\ assignment_epoch = assignment_epoch + 1 WHERE provider = $1\", )",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys \\ SET rewrapped_at = NULL, assignment_epoch = assignment_epoch + 1 \\ WHERE provider = $1 \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", )",
       "count": 1
     },
     {
@@ -14608,24 +14644,6 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL \\ WHERE provider = $1 AND rewrapped_at IS NOT NULL \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL \\ WHERE provider = $1 AND rewrapped_at IS NOT NULL \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider) .bind(row_provider)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL \\ WHERE provider = $1 AND rewrapped_at IS NOT NULL \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider) .bind(row_provider) .bind(row_version)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL, delete_after = NULL, \\ created_by_skilj = created_by_skilj OR $2, \\ assignment_epoch = assignment_epoch + 1 WHERE provider = $1\", ) .bind(provider.name())",
       "count": 1
     },
@@ -14633,6 +14651,24 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL, delete_after = NULL, \\ created_by_skilj = created_by_skilj OR $2, \\ assignment_epoch = assignment_epoch + 1 WHERE provider = $1\", ) .bind(provider.name()) .bind(created)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys \\ SET rewrapped_at = NULL, assignment_epoch = assignment_epoch + 1 \\ WHERE provider = $1 \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys \\ SET rewrapped_at = NULL, assignment_epoch = assignment_epoch + 1 \\ WHERE provider = $1 \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider) .bind(row_provider)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys \\ SET rewrapped_at = NULL, assignment_epoch = assignment_epoch + 1 \\ WHERE provider = $1 \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider) .bind(row_provider) .bind(row_version)",
       "count": 1
     },
     {
