@@ -277,7 +277,8 @@ pub(super) fn version_column(version: u32) -> crate::error::Result<i32> {
 ///
 /// A row marked unreadable that unwraps after all - its key was put right -
 /// has its mark cleared, so it counts again for the rewrap, the retirement
-/// and the key's deletion.
+/// and the key's deletion, and when it is behind the bounded context's key
+/// that key's rewrap is made pending again, to bring it there.
 pub(super) async fn unwrap_row(
     db: &mut Db<'_>,
     bounded_context: &str,
@@ -302,6 +303,23 @@ pub(super) async fn unwrap_row(
         other => other?,
     };
     if row.unreadable_since.is_some() {
+        // Readable after all, and no rewrap is looking: the one that
+        // marked it is done. The bounded context's key gets its rewrap
+        // pending again, so the next check brings this data key to it -
+        // and a key the context used before is not kept in use by it
+        // (docs/architecture.md §247). Before the mark is cleared: a
+        // rewrap batch takes the key's row and then the data key's, and
+        // the other order here could deadlock with one.
+        let its_key =
+            master_key::bounded_context_key(&mut *db.conn().await?, bounded_context).await?;
+        let current = key_service.provider_for(its_key.as_deref())?;
+        master_key::mark_data_keys_behind_for(
+            &mut *db.conn().await?,
+            current.name(),
+            row.key_provider.as_deref(),
+            row.master_key_version,
+        )
+        .await?;
         let schema = schema_ident(bounded_context);
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.encryption_keys SET unreadable_since = NULL \

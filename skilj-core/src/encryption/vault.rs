@@ -389,6 +389,115 @@ impl KeyProvider for VaultTransitProvider {
         })
     }
 
+    /// Transit's batch `decrypt`: one request for the batch. Read as
+    /// [`rewrap`](Self::rewrap) reads its batch - per item, from a 400 too -
+    /// with a failed item the key refusing that ciphertext
+    /// ([`Error::DecryptFailed`], or [`Error::KeyVersionRetired`] for "too
+    /// old"). A 400 or 404 without per-item results is the key refusing all
+    /// of them, as it is for [`unwrap`](Self::unwrap): a key this Vault
+    /// doesn't have. A 403 is the token's permissions and fails the batch.
+    fn unwrap_batch<'a>(
+        &'a self,
+        wrapped: &'a [WrappedDataKey],
+    ) -> BoxFuture<'a, super::provider::UnwrappedBatch> {
+        Box::pin(async move {
+            if wrapped.is_empty() {
+                return Ok(Vec::new());
+            }
+            let batch: Vec<Value> = wrapped
+                .iter()
+                .map(|w| json!({ "ciphertext": String::from_utf8_lossy(&w.ciphertext) }))
+                .collect();
+            let path = format!("decrypt/{}", self.key);
+            let body = json!({ "batch_input": batch, "partial_failure_response_code": 200 });
+            let (status, body) = self
+                .request_with_body(reqwest::Method::POST, &path, Some(body))
+                .await?;
+            if !matches!(status, 200 | 400 | 404) {
+                return Err(self.refused(format!("{path}: {status} {}", errors_of(&body))));
+            }
+            let refusal = |error: &str, input: &WrappedDataKey| {
+                if error.contains("too old") || error.contains("disallowed by policy") {
+                    Error::KeyVersionRetired {
+                        version: input.version,
+                    }
+                } else {
+                    Error::DecryptFailed
+                }
+            };
+            let results = body
+                .get("data")
+                .and_then(|data| data.get("batch_results"))
+                .and_then(Value::as_array);
+            let Some(results) = results else {
+                if status == 200 {
+                    return Err(self.refused("decrypt answered no batch"));
+                }
+                let error = errors_of(&body);
+                return Ok(wrapped.iter().map(|w| Err(refusal(&error, w))).collect());
+            };
+            if results.len() != wrapped.len() {
+                return Err(self.refused("decrypt answered no batch of the right size"));
+            }
+            Ok(results
+                .iter()
+                .zip(wrapped)
+                .map(|(result, input)| {
+                    let error = str_field(result, "error").filter(|e| !e.is_empty());
+                    match (str_field(result, "plaintext"), error) {
+                        (Some(plaintext), None) => crate::base64::decode(plaintext)
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .ok_or(Error::DecryptFailed),
+                        (_, Some(error)) => Err(refusal(error, input)),
+                        _ => Err(Error::DecryptFailed),
+                    }
+                })
+                .collect())
+        })
+    }
+
+    /// Transit's batch `encrypt`: one request for the batch. An item Vault
+    /// answers without a ciphertext fails the batch.
+    fn wrap_batch<'a>(
+        &'a self,
+        data_keys: &'a [[u8; 32]],
+    ) -> BoxFuture<'a, Result<Vec<WrappedDataKey>, Error>> {
+        Box::pin(async move {
+            if data_keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            let batch: Vec<Value> = data_keys
+                .iter()
+                .map(|key| json!({ "plaintext": crate::base64::encode(key) }))
+                .collect();
+            let data = self
+                .call(
+                    &format!("encrypt/{}", self.key),
+                    Some(json!({ "batch_input": batch })),
+                )
+                .await?;
+            let Some(results) = data
+                .get("batch_results")
+                .and_then(Value::as_array)
+                .filter(|r| r.len() == data_keys.len())
+            else {
+                return Err(self.refused("encrypt answered no batch of the right size"));
+            };
+            results
+                .iter()
+                .map(|result| {
+                    let ciphertext = str_field(result, "ciphertext").ok_or_else(|| {
+                        self.refused(format!(
+                            "encrypt answered no ciphertext for an item: {}",
+                            str_field(result, "error").unwrap_or("no error given")
+                        ))
+                    })?;
+                    self.wrapped_from(ciphertext)
+                })
+                .collect()
+        })
+    }
+
     /// Transit's batch `rewrap`, the data keys never leaving Vault. Vault
     /// answers a batch in which an item failed with HTTP 400 - unless
     /// `partial_failure_response_code` (Vault 1.14+, OpenBao) is set and some

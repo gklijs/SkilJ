@@ -21,8 +21,23 @@ README.md, "Status and stability").
   can't express is left out with a note. `skilj_codegen::Error` gains a `Json` variant
   (docs/architecture.md §243).
 
+- `KeyProvider::unwrap_batch` and `KeyProvider::wrap_batch`, with default
+  implementations that call `unwrap` and `wrap` at most
+  `KeyProvider::batch_concurrency()` at a time (eight unless overridden), and
+  `KeyService::unwrap_batch` (issue #176). A key provider of your own keeps
+  compiling; override the two when it has a batch operation, or
+  `batch_concurrency` when it is behind a rate limit.
+- `EncryptionDataKeysRewrapped` has an optional `retiring_provider`: the key
+  whose retirement had a bounded context's left-behind data keys tried once
+  more (docs/architecture.md §247).
+
 ### Changed
 
+- Moving a bounded context's data keys to another key, or off the legacy
+  master key, asks each key once per batch of 200 instead of twice per data
+  key. `VaultTransitProvider` uses Transit's batch `decrypt` and `encrypt`:
+  1,000 data keys at 5 ms a request move in 0.12 s instead of 13 s
+  (docs/architecture.md §246).
 - Command batch preparation moves resolved histories and snapshot states into
   the queue instead of deep-copying them (issue #172, ownership stage).
   `CommandBatcher::prepare_command` returns an opaque `PreparedCommand` consumed
@@ -31,6 +46,17 @@ README.md, "Status and stability").
 
 ### Fixed
 
+- A master key's retirement no longer waits on data keys that a bounded
+  context left under it when it moved to a key of its own - marked unreadable
+  during the move, or readable again since. They held it up, a
+  `retireImmediately` leak response included, until the context's own key
+  rotated. They are now tried once more before the key retires: what unwraps
+  moves to the context's key, the rest is marked again
+  (docs/architecture.md §247).
+- A data key marked unreadable that a later read unwraps is rewrapped under
+  its bounded context's key at the next check. It stayed where it was until
+  that key's next rotation, and kept a key the context no longer used from
+  being deleted (docs/architecture.md §247).
 - Appending an event no longer reads the whole tag dictionary. The trigger
   that indexes an event's tags checked for new tags with a sub-select
   PostgreSQL answered by scanning `event_tag_values` once per inserted event,

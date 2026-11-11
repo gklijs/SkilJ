@@ -176,8 +176,66 @@ async fn check_provider(server: &Server) {
     let v2 = results[0].as_ref().unwrap().clone();
     assert_eq!(vault.unwrap(&v2).await.unwrap(), data_key);
 
+    // The batch operations a move to another key uses (§246): one request
+    // each, the wraps under the latest version, and an unwrap batch of
+    // both versions with a refused ciphertext among them read per item.
+    let data_keys = [[1u8; 32], [2u8; 32], [3u8; 32]];
+    let wrapped = vault.wrap_batch(&data_keys).await.unwrap();
+    assert_eq!(wrapped.len(), 3);
+    assert!(wrapped.iter().all(|w| w.version == 2));
+    let unwrapped = vault
+        .unwrap_batch(&[
+            v1.clone(),
+            bad.clone(),
+            wrapped[2].clone(),
+            wrapped[0].clone(),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(unwrapped[0].as_ref().unwrap(), &data_key);
+    assert!(
+        matches!(unwrapped[1], Err(encryption::Error::DecryptFailed)),
+        "{:?}",
+        unwrapped[1].as_ref().err()
+    );
+    assert_eq!(unwrapped[2].as_ref().unwrap(), &data_keys[2]);
+    assert_eq!(unwrapped[3].as_ref().unwrap(), &data_keys[0]);
+    // Every item refused: still per item.
+    let all_bad = vault
+        .unwrap_batch(&[bad.clone(), bad.clone()])
+        .await
+        .unwrap();
+    assert!(all_bad
+        .iter()
+        .all(|r| matches!(r, Err(encryption::Error::DecryptFailed))));
+
     // Retiring: the server itself refuses the old version, and says so.
     vault.retire_below(2).await.unwrap();
+    let retired = vault
+        .unwrap_batch(&[v1.clone(), v2.clone(), bad.clone()])
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            retired[0],
+            Err(encryption::Error::KeyVersionRetired { version: 1 })
+        ),
+        "{:?}",
+        retired[0].as_ref().err()
+    );
+    assert_eq!(retired[1].as_ref().unwrap(), &data_key);
+    assert!(
+        matches!(
+            retired[2],
+            Err(encryption::Error::KeyVersionRetired { version: 1 })
+        ),
+        "a refused ciphertext of a retired version reads as retired: {:?}",
+        retired[2].as_ref().err()
+    );
+    let only_retired = vault.unwrap_batch(&[v1.clone(), v1.clone()]).await.unwrap();
+    assert!(only_retired
+        .iter()
+        .all(|r| matches!(r, Err(encryption::Error::KeyVersionRetired { version: 1 }))));
     assert!(matches!(
         vault.unwrap(&v1).await,
         Err(encryption::Error::KeyVersionRetired { version: 1 })
@@ -203,6 +261,19 @@ async fn check_provider(server: &Server) {
         missing.unwrap(&v2).await,
         Err(encryption::Error::DecryptFailed)
     ));
+    // In a batch too: each item, as the single unwrap answers it.
+    for key in [&other, &missing] {
+        let refused = key.unwrap_batch(&[v2.clone(), v2.clone()]).await.unwrap();
+        assert_eq!(refused.len(), 2);
+        assert!(
+            refused
+                .iter()
+                .all(|r| matches!(r, Err(encryption::Error::DecryptFailed))),
+            "{}: {:?}",
+            key.name(),
+            refused.iter().map(|r| r.as_ref().err()).collect::<Vec<_>>()
+        );
+    }
     other.delete().await.unwrap();
     assert!(other.versions().await.is_err(), "deleted");
 
@@ -211,6 +282,14 @@ async fn check_provider(server: &Server) {
     let limited = VaultTransitProvider::new(&server.address, "skilj", no_decrypt.clone());
     assert!(matches!(
         limited.unwrap(&v2).await,
+        Err(encryption::Error::ProviderRefused { .. })
+    ));
+    assert!(matches!(
+        limited.unwrap_batch(&[v2.clone(), v2.clone()]).await,
+        Err(encryption::Error::ProviderRefused { .. })
+    ));
+    assert!(matches!(
+        limited.wrap_batch(&data_keys).await,
         Err(encryption::Error::ProviderRefused { .. })
     ));
     // One that may create but not read can't claim an existing key.
@@ -222,6 +301,14 @@ async fn check_provider(server: &Server) {
     let gone = VaultTransitProvider::new("http://127.0.0.1:1", "skilj", ROOT_TOKEN);
     assert!(matches!(
         gone.versions().await,
+        Err(encryption::Error::ProviderUnavailable { .. })
+    ));
+    assert!(matches!(
+        gone.unwrap_batch(std::slice::from_ref(&v2)).await,
+        Err(encryption::Error::ProviderUnavailable { .. })
+    ));
+    assert!(matches!(
+        gone.wrap_batch(&data_keys).await,
         Err(encryption::Error::ProviderUnavailable { .. })
     ));
 }
@@ -319,9 +406,15 @@ async fn lifecycle(server: &Server, database: &str) {
         .await
         .unwrap();
     let sealed = encryption::encrypt_leaf(&data_key, "1@example.com");
-    db::get_or_create_encryption_key(&pool, &tenant, "user", "2", &keys)
-        .await
-        .unwrap();
+    // The tenant's: a few, to be moved to its own key.
+    let mut tenant_sealed = Vec::new();
+    for subject in ["2", "3", "4"] {
+        let (_, _, data_key) =
+            db::get_or_create_encryption_key(&pool, &tenant, "user", subject, &keys)
+                .await
+                .unwrap();
+        tenant_sealed.push((subject, encryption::encrypt_leaf(&data_key, subject)));
+    }
 
     let (_skilj, _) = Skilj::builder(url.clone())
         .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
@@ -345,6 +438,46 @@ async fn lifecycle(server: &Server, database: &str) {
         s.rewrapped_at.is_some()
     })
     .await;
+    // Moved by the servers' batch decrypt and encrypt (§246): every data
+    // key is the tenant key's now and opens what it sealed.
+    let moved: Vec<(String, Option<String>, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT subject_value, key_provider, unreadable_since IS NOT NULL \
+         FROM \"bc_{tenant}\".encryption_keys WHERE status = 'active' ORDER BY subject_value"
+    )))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        moved,
+        vec![
+            ("2".to_string(), Some(tenant_name.clone()), false),
+            ("3".to_string(), Some(tenant_name.clone()), false),
+            ("4".to_string(), Some(tenant_name.clone()), false),
+        ]
+    );
+    for (subject, ciphertext) in &tenant_sealed {
+        let (_, _, data_key) =
+            db::get_or_create_encryption_key(&pool, &tenant, "user", subject, &keys)
+                .await
+                .unwrap();
+        assert_eq!(
+            encryption::decrypt_leaf(&data_key, ciphertext).unwrap(),
+            *subject
+        );
+    }
+    let rewrapped = admin_events(&pool, "EncryptionDataKeysRewrapped").await;
+    let rewrapped: Vec<&Value> = rewrapped
+        .iter()
+        .filter(|e| e["bounded_context"] == tenant.as_str())
+        .collect();
+    assert_eq!(rewrapped.len(), 1, "{rewrapped:?}");
+    assert_eq!(
+        (
+            rewrapped[0]["rewrapped"].clone(),
+            rewrapped[0]["unreadable"].clone()
+        ),
+        (json!(3), json!(0))
+    );
 
     // A leak response on the default key: rotated, rewrapped in Vault,
     // and the old version refused by Vault itself.

@@ -10205,7 +10205,13 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `db::encryption_keys::Held<'_>` which can panic",
       "source": ".await?;",
-      "count": 3
+      "count": 4
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to drop of `db::encryption_keys::Held<'_>` which can panic",
+      "source": "master_key::bounded_context_key(&mut *db.conn().await?, bounded_context).await?;",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -10317,13 +10323,13 @@
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:333:1: 333:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:351:1: 351:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:503:1: 503:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:521:1: 521:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -10446,6 +10452,12 @@
       "message": "call to method `db::encryption_keys::EncryptionKeyRow::to_domain` which can panic",
       "source": "return Ok((row.to_domain(bc), row.id, data_key));",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to method `encryption::service::KeyService::provider_for` which can panic",
+      "source": "let current = key_service.provider_for(its_key.as_deref())?;",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -13384,6 +13396,12 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"wrap_batch answered {} wraps for {} data keys\",",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "FROM {schema}.encryption_keys WHERE {behind_filter} AND id > $4 \\",
       "count": 1
     },
@@ -13426,7 +13444,7 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to associated function `encryption::trail::MasterKeyChange::rewrapped` which can panic",
-      "source": "MasterKeyChange::rewrapped( &target_name, version, bounded_context, outcome.rewrapped, outcome.unreadable, )",
+      "source": "MasterKeyChange::rewrapped( &target_name, version, bounded_context, outcome.rewrapped, outcome.unreadable, retiring, )",
       "count": 1
     },
     {
@@ -13444,7 +13462,19 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to associated function `std::vec::Vec::<T>::with_capacity` which can panic",
+      "source": "let mut data_keys: Vec<[u8; 32]> = Vec::with_capacity(moving.len());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to associated function `std::vec::Vec::<T>::with_capacity` which can panic",
       "source": "let mut done: Vec<(i64, Vec<u8>, WrappedDataKey)> = Vec::with_capacity(rows.len());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to associated function `std::vec::Vec::<T>::with_capacity` which can panic",
+      "source": "let mut readable: Vec<(i64, Vec<u8>)> = Vec::with_capacity(moving.len());",
       "count": 1
     },
     {
@@ -13457,7 +13487,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `encryption::Error` which can panic",
       "source": "}",
-      "count": 4
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -13499,7 +13529,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `sqlx::Transaction<'_, sqlx::Postgres>` which can panic",
       "source": "}",
-      "count": 3
+      "count": 4
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -13623,12 +13653,6 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
-      "source": "}",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `std::option::Option<std::sync::Arc<dyn encryption::provider::KeyProvider>>` which can panic",
       "source": ".find(|p| key_service.provider_named(p).is_none())",
       "count": 1
@@ -13665,8 +13689,8 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to drop of `std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::provider::WrappedDataKey, encryption::Error>> + std::marker::Send>>` which can panic",
-      "source": "let rewrapped = target.wrap(data_key.bytes()).await?;",
+      "message": "call to drop of `std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<std::vec::Vec<encryption::provider::WrappedDataKey>, encryption::Error>> + std::marker::Send>>` which can panic",
+      "source": "let rewrapped = target.wrap_batch(&data_keys).await?;",
       "count": 1
     },
     {
@@ -13707,6 +13731,12 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `std::vec::IntoIter<(i64, std::vec::Vec<u8>, std::option::Option<std::vec::Vec<u8>>, std::option::Option<std::string::String>, std::option::Option<i32>)>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `std::vec::IntoIter<std::string::String>` which can panic",
       "source": "}",
       "count": 1
@@ -13714,6 +13744,12 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `std::vec::Vec<(std::vec::Vec<u8>, i32)>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `std::vec::Vec<[u8; 32]>` which can panic",
       "source": "}",
       "count": 1
     },
@@ -13733,11 +13769,17 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `std::vec::Vec<std::string::String>` which can panic",
       "source": "}",
-      "count": 2
+      "count": 4
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `std::vec::Vec<std::vec::Vec<u8>>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `std::vec::Vec<u8>` which can panic",
       "source": "}",
       "count": 1
     },
@@ -13749,7 +13791,7 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/master_key.rs:1058:1: 1058:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/master_key.rs:1131:1: 1131:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -13769,7 +13811,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::Pool<sqlx::Postgres>::begin()}` which can panic",
       "source": "let mut tx = pool.begin().await?;",
-      "count": 7
+      "count": 8
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -13781,7 +13823,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::rollback()}` which can panic",
       "source": "tx.rollback().await?;",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -13793,7 +13835,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 19
+      "count": 20
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -13990,8 +14032,14 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let names: Vec<String> = sqlx::query_scalar(\"SELECT name FROM bounded_contexts ORDER BY name\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
       "source": "let names: Vec<String> = sqlx::query_scalar(\"SELECT name FROM bounded_contexts\")",
-      "count": 2
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -14080,6 +14128,12 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL \\ WHERE provider = $1 AND rewrapped_at IS NOT NULL \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL, delete_after = NULL, \\ created_by_skilj = created_by_skilj OR $2, \\ assignment_epoch = assignment_epoch + 1 WHERE provider = $1\", )",
       "count": 1
     },
@@ -14153,6 +14207,12 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(\"UPDATE encryption_master_keys SET rewrapped_at = NULL WHERE provider = $1\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to function `std::mem::drop` which can panic",
+      "source": "drop(stored);",
       "count": 1
     },
     {
@@ -14248,6 +14308,12 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "let contexts = contexts_below_on(&mut tx, provider, version, since, false).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "let sequence = next_sequence(&mut **tx, &admin.name).await?;",
       "count": 1
     },
@@ -14278,7 +14344,19 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<std::iter::Zip<A, B> as std::iter::Iterator>::next` which can panic",
+      "source": "for ((id, old), new) in readable.into_iter().zip(rewrapped) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `<std::iter::Zip<A, B> as std::iter::Iterator>::next` which can panic",
       "source": "for ((id, old), result) in same_key.into_iter().zip(results) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `<std::iter::Zip<A, B> as std::iter::Iterator>::next` which can panic",
+      "source": "for ((id, wrapped, ..), result) in moving.into_iter().zip(unwrapped) {",
       "count": 1
     },
     {
@@ -14309,7 +14387,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<std::string::String as std::clone::Clone>::clone` which can panic",
       "source": "provider: target_name.clone(),",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -14525,6 +14603,24 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "sqlx::query( \"UPDATE encryption_master_keys SET delete_after = $2 \\ WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL\", ) .bind(provider) .bind(at)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL \\ WHERE provider = $1 AND rewrapped_at IS NOT NULL \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL \\ WHERE provider = $1 AND rewrapped_at IS NOT NULL \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider) .bind(row_provider)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET rewrapped_at = NULL \\ WHERE provider = $1 AND rewrapped_at IS NOT NULL \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider) .bind(row_provider) .bind(row_version)",
       "count": 1
     },
     {
@@ -14824,13 +14920,31 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let stored: Vec<StoredWrap<'_>> = moving .iter() .map(|(_, wrapped, nonce, provider, row_version)| StoredWrap { provider: provider.as_deref(), version: row_version.and_then(|v| u32::try_from(v).ok()), ciphertext: wrapped, nonce: nonce.as_deref(), }) .collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
       "source": "let versions: Vec<i32> = done .iter() .map(|(_, _, w)| version_column(w.version)) .collect::<crate::error::Result<_>>()?;",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `std::iter::Iterator::zip` which can panic",
+      "source": "for ((id, old), new) in readable.into_iter().zip(rewrapped) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `std::iter::Iterator::zip` which can panic",
       "source": "for ((id, old), result) in same_key.into_iter().zip(results) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `std::iter::Iterator::zip` which can panic",
+      "source": "for ((id, wrapped, ..), result) in moving.into_iter().zip(unwrapped) {",
       "count": 1
     },
     {
@@ -14854,7 +14968,31 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
-      "source": "done.push((id, wrapped, rewrapped));",
+      "source": "data_keys.push(*data_key.bytes());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "done.push((id, old, new));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "found.push(name);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "moving.push(row);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "readable.push((id, wrapped));",
       "count": 1
     },
     {
@@ -14949,13 +15087,13 @@
     },
     {
       "file": "skilj-core/src/db/mod.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/mod.rs:295:1: 295:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/mod.rs:296:1: 296:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/mod.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/mod.rs:303:1: 303:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/mod.rs:304:1: 304:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -24165,6 +24303,18 @@
     },
     {
       "file": "skilj-core/src/encryption/provider.rs",
+      "message": "call to drop of `futures_util::stream::Collect<futures_util::stream::Buffered<futures_util::stream::Iter<std::vec::IntoIter<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<[u8; 32], encryption::Error>> + std::marker::Send>>>>>, std::vec::Vec<std::result::Result<[u8; 32], encryption::Error>>>` which can panic",
+      "source": ".await)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/provider.rs",
+      "message": "call to drop of `futures_util::stream::TryCollect<futures_util::stream::Buffered<futures_util::stream::Iter<std::vec::IntoIter<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::provider::WrappedDataKey, encryption::Error>> + std::marker::Send>>>>>, std::vec::Vec<encryption::provider::WrappedDataKey>>` which can panic",
+      "source": ".await",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/provider.rs",
       "message": "call to drop of `std::path::PathBuf` which can panic",
       "source": "}))",
       "count": 1
@@ -24243,6 +24393,18 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to associated function `std::vec::Vec::<T>::with_capacity` which can panic",
+      "source": "let mut out: Vec<Option<Result<DataKey, Error>>> = Vec::with_capacity(stored.len());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `encryption::Error` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `futures_util::future::Shared<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::DataKey, encryption::Error>> + std::marker::Send>>>` which can panic",
       "source": "flight.as_ref().clone().await",
       "count": 1
@@ -24251,6 +24413,24 @@
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `futures_util::future::Shared<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::DataKey, encryption::Error>> + std::marker::Send>>>` which can panic",
       "source": "return flight.as_ref().clone().await;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::iter::Zip<std::vec::IntoIter<usize>, std::vec::IntoIter<std::result::Result<[u8; 32], encryption::Error>>>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::option::Option<std::result::Result<encryption::DataKey, encryption::Error>>` which can panic",
+      "source": "*slot = Some(Err(err.clone()));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::option::Option<std::result::Result<encryption::DataKey, encryption::Error>>` which can panic",
+      "source": "*slot = Some(result.map(DataKey));",
       "count": 1
     },
     {
@@ -24269,6 +24449,30 @@
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::provider::WrappedDataKey, encryption::Error>> + std::marker::Send>>` which can panic",
       "source": "let wrapped = provider.wrap(&data_key.0).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<std::vec::Vec<std::result::Result<[u8; 32], encryption::Error>>, encryption::Error>> + std::marker::Send>>` which can panic",
+      "source": "Ok(_permit) => key.unwrap_batch(&wrapped).await,",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "})",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "})));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "}),",
       "count": 1
     },
     {
@@ -24305,7 +24509,7 @@
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `std::sync::Arc<dyn encryption::provider::KeyProvider>` which can panic",
       "source": "}",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
@@ -24328,6 +24532,12 @@
     {
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `std::sync::MutexGuard<'_, encryption::service::Cache>` which can panic",
+      "source": ".get(&cache_key(provider, &wrapped));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::sync::MutexGuard<'_, encryption::service::Cache>` which can panic",
       "source": "}",
       "count": 3
     },
@@ -24345,6 +24555,36 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::vec::IntoIter<usize>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::vec::Vec<encryption::provider::WrappedDataKey>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::vec::Vec<std::option::Option<std::result::Result<encryption::DataKey, encryption::Error>>>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::vec::Vec<std::result::Result<[u8; 32], encryption::Error>>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `std::vec::Vec<std::result::Result<[u8; 32], encryption::Error>>` which can panic",
+      "source": "});",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `tokio::sync::OwnedSemaphorePermit` which can panic",
       "source": "let flight: Flight = (Box::pin(async move { let _permit = permit; let result = key.unwrap(&wrapped).await.map(DataKey); let mut cache = service .inner .cache .lock() .unwrap_or_else(|e| e.into_inner()); if Arc::ptr_eq(&cache.generation, &flight_generation) { // Stop advertising completed work even if a // waiter has not consumed its result yet. cache.flights.remove(&cache_key); if let Ok(data_key) = &result { cache.insert(cache_key, data_key.clone()); } } result })",
       "count": 1
@@ -24357,8 +24597,26 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `tokio::sync::SemaphorePermit<'_>` which can panic",
+      "source": "Ok(_permit) => key.unwrap_batch(&wrapped).await,",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to drop of `{async fn body of tokio::sync::Semaphore::acquire()}` which can panic",
+      "source": "let answered = match self.inner.unwrap_slots.acquire().await {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to drop of `{async fn body of tokio::sync::Semaphore::acquire_owned()}` which can panic",
       "source": ".await",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to function `encryption::unwrap_data_key` which can panic",
+      "source": "super::unwrap_data_key(legacy, one.ciphertext, one.nonce.unwrap_or(&[]))",
       "count": 1
     },
     {
@@ -24375,14 +24633,38 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "message: \"unwrap admission closed\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
       "source": "configured: self.provider_name().to_string(),",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
+      "source": "provider: key.name().to_string(),",
       "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
       "source": "stored: provider.to_string(),",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `<encryption::Error as std::clone::Clone>::clone` which can panic",
+      "source": "*slot = Some(Err(err.clone()));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `<std::iter::Enumerate<I> as std::iter::Iterator>::next` which can panic",
+      "source": "for (position, one) in stored.iter().enumerate() {",
       "count": 1
     },
     {
@@ -24441,6 +24723,12 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::collections::BTreeMap::<K, V, A>::entry` which can panic",
+      "source": "let batch = batches .entry(provider)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::collections::HashMap::<K, V, S, A>::insert` which can panic",
       "source": "cache.flights.insert(cache_key, Arc::downgrade(&flight));",
       "count": 1
@@ -24449,6 +24737,12 @@
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::collections::HashMap::<K, V, S, A>::retain` which can panic",
       "source": "cache.flights.retain(|_, flight| flight.strong_count() > 0);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::collections::btree_map::Entry::<'a, K, V, A>::or_insert_with` which can panic",
+      "source": "let batch = batches .entry(provider) .or_insert_with(|| (key, Vec::new(), Vec::new()));",
       "count": 1
     },
     {
@@ -24471,14 +24765,32 @@
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::iter::Iterator::zip` which can panic",
+      "source": "for (position, result) in positions.into_iter().zip(results) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::option::Option::<T>::ok_or` which can panic",
       "source": "let legacy = self .inner .legacy .as_ref() .ok_or(Error::LegacyMasterKeyRequired)?;",
       "count": 1
     },
     {
       "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::result::Result::<T, E>::and_then` which can panic",
+      "source": "let answered = answered.and_then(|results| { if results.len() == positions.len() { Ok(results) } else { Err(Error::ProviderRefused { provider: key.name().to_string(), message: format!( \"unwrap_batch answered {} results for {} data keys\", results.len(), positions.len() ), }) } });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::result::Result::<T, E>::map_err` which can panic",
       "source": "let permit = Arc::clone(&self.inner.unwrap_slots) .acquire_owned() .await .map_err(|_| Error::ProviderUnavailable { provider: provider.to_string(), message: \"unwrap admission closed\".into(), })?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::slice::<impl [T]>::to_vec` which can panic",
+      "source": "ciphertext: one.ciphertext.to_vec(),",
       "count": 1
     },
     {
@@ -24491,6 +24803,12 @@
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::sync::Mutex::<T>::lock` which can panic",
       "source": "&self .inner .cache .lock()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::sync::Mutex::<T>::lock` which can panic",
+      "source": "let cached = self .inner .cache .lock()",
       "count": 1
     },
     {
@@ -24509,6 +24827,42 @@
       "file": "skilj-core/src/encryption/service.rs",
       "message": "call to method `std::sync::Mutex::<T>::lock` which can panic",
       "source": "self.inner .providers .lock()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "batch.1.push(position);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "batch.2.push(wrapped);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "out.push(None);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "out.push(Some(Err(Error::ProviderChanged { stored: provider.to_string(), configured: self.provider_name().to_string(), })));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "out.push(Some(Ok(data_key)));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/encryption/service.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "out.push(Some(match self.inner.legacy.as_ref() { Some(legacy) => { super::unwrap_data_key(legacy, one.ciphertext, one.nonce.unwrap_or(&[])) } None => Err(Error::LegacyMasterKeyRequired), }));",
       "count": 1
     },
     {
@@ -24629,7 +24983,7 @@
       "file": "skilj-core/src/encryption/vault.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": ".await?;",
-      "count": 6
+      "count": 7
     },
     {
       "file": "skilj-core/src/encryption/vault.rs",
@@ -24658,6 +25012,12 @@
     {
       "file": "skilj-core/src/encryption/vault.rs",
       "message": "call to drop of `std::string::String` which can panic",
+      "source": "})",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/encryption/vault.rs",
+      "message": "call to drop of `std::vec::Vec<serde_json::Value>` which can panic",
       "source": "})",
       "count": 1
     },

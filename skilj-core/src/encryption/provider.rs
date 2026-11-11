@@ -21,6 +21,7 @@
 
 use super::random_bytes;
 use super::Error;
+use futures_util::{StreamExt, TryStreamExt};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -30,6 +31,16 @@ use std::sync::{Arc, Mutex};
 
 /// The future a [`KeyProvider`] method answers with.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// What [`KeyProvider::unwrap_batch`] answers: one result per data key
+/// asked for, in order, or the error that failed the whole request.
+pub type UnwrappedBatch = Result<Vec<Result<[u8; 32], Error>>, Error>;
+
+/// What [`KeyProvider::batch_concurrency`] answers unless a provider says
+/// otherwise: how many [`KeyProvider::unwrap`] or [`KeyProvider::wrap`]
+/// calls the default [`KeyProvider::unwrap_batch`] and
+/// [`KeyProvider::wrap_batch`] have in flight at once.
+pub const SCALAR_BATCH_CONCURRENCY: usize = 8;
 
 /// A data key as a [`KeyProvider`] wrapped it: the key version it is
 /// wrapped under, and the provider's own opaque ciphertext.
@@ -84,6 +95,65 @@ pub trait KeyProvider: Send + Sync + 'static {
                 out.push(rewrapped);
             }
             Ok(out)
+        })
+    }
+
+    /// How many single [`unwrap`](Self::unwrap) or [`wrap`](Self::wrap)
+    /// calls the default [`unwrap_batch`](Self::unwrap_batch) and
+    /// [`wrap_batch`](Self::wrap_batch) have in flight at once
+    /// ([`SCALAR_BATCH_CONCURRENCY`] unless overridden; `0` counts as `1`).
+    /// A move of data keys to another key is background work next to the
+    /// reads and writes that use the same key: a provider behind a rate
+    /// limit answers less here, or reads it from its own configuration.
+    /// One that overrides both batch operations never has it asked.
+    fn batch_concurrency(&self) -> usize {
+        SCALAR_BATCH_CONCURRENCY
+    }
+
+    /// The data key each of `wrapped` holds, one result per input, in
+    /// order: one that fails doesn't fail the rest. Moving a bounded
+    /// context's data keys to another key reads them through this, a batch
+    /// at a time (docs/architecture.md §246).
+    ///
+    /// The default calls [`unwrap`](Self::unwrap) for each, at most
+    /// [`batch_concurrency`](Self::batch_concurrency) at a time, and
+    /// answers each call's own result. A remote provider with a batch operation overrides it to
+    /// make one request; it then answers `Err` for the whole batch only
+    /// when the request itself failed (unreachable, not permitted), and a
+    /// ciphertext it refuses as that item's [`Error::DecryptFailed`] or
+    /// [`Error::KeyVersionRetired`] - the two that mark a data key
+    /// unreadable. Any other error, per item or for the batch, ends the
+    /// move for a later run to retry.
+    fn unwrap_batch<'a>(&'a self, wrapped: &'a [WrappedDataKey]) -> BoxFuture<'a, UnwrappedBatch> {
+        Box::pin(async move {
+            // Made before they are streamed: nothing runs until polled.
+            let calls: Vec<BoxFuture<'a, Result<[u8; 32], Error>>> =
+                wrapped.iter().map(|one| self.unwrap(one)).collect();
+            Ok(futures_util::stream::iter(calls)
+                .buffered(self.batch_concurrency().max(1))
+                .collect()
+                .await)
+        })
+    }
+
+    /// Each of `data_keys` wrapped under the latest version, in order. A
+    /// wrap doesn't fail for one data key and not another, so one failure
+    /// fails the batch, and nothing of it is stored.
+    ///
+    /// The default calls [`wrap`](Self::wrap) for each, at most
+    /// [`batch_concurrency`](Self::batch_concurrency) at a time; a remote
+    /// provider with a batch operation overrides it to make one request.
+    fn wrap_batch<'a>(
+        &'a self,
+        data_keys: &'a [[u8; 32]],
+    ) -> BoxFuture<'a, Result<Vec<WrappedDataKey>, Error>> {
+        Box::pin(async move {
+            let calls: Vec<BoxFuture<'a, Result<WrappedDataKey, Error>>> =
+                data_keys.iter().map(|one| self.wrap(one)).collect();
+            futures_util::stream::iter(calls)
+                .buffered(self.batch_concurrency().max(1))
+                .try_collect()
+                .await
         })
     }
 
@@ -479,6 +549,25 @@ impl KeyProvider for KeyFileProvider {
 
     fn unwrap<'a>(&'a self, wrapped: &'a WrappedDataKey) -> BoxFuture<'a, Result<[u8; 32], Error>> {
         Box::pin(async move { self.read()?.unwrap(wrapped) })
+    }
+
+    /// The key file read once for the batch.
+    fn unwrap_batch<'a>(&'a self, wrapped: &'a [WrappedDataKey]) -> BoxFuture<'a, UnwrappedBatch> {
+        Box::pin(async move {
+            let keyring = self.read()?;
+            Ok(wrapped.iter().map(|one| keyring.unwrap(one)).collect())
+        })
+    }
+
+    /// The key file read once for the batch.
+    fn wrap_batch<'a>(
+        &'a self,
+        data_keys: &'a [[u8; 32]],
+    ) -> BoxFuture<'a, Result<Vec<WrappedDataKey>, Error>> {
+        Box::pin(async move {
+            let keyring = self.read()?;
+            data_keys.iter().map(|one| keyring.wrap(one)).collect()
+        })
     }
 
     fn versions(&self) -> BoxFuture<'_, Result<KeyVersions, Error>> {
