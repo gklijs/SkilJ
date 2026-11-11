@@ -314,6 +314,23 @@ pub async fn connect_with_statement_cache(
     options.connect_with(connect_options).await
 }
 
+/// [`connect_with_statement_cache`], with every connection read-only
+/// (`default_transaction_read_only`): Postgres refuses any write on it.
+/// `SkiljBuilder::preflight` runs on one (docs/architecture.md §249).
+pub async fn connect_read_only(
+    database_url: &str,
+    options: PgPoolOptions,
+    statement_cache_capacity: Option<usize>,
+) -> Result<Pool, sqlx::Error> {
+    let mut connect_options: sqlx::postgres::PgConnectOptions = database_url.parse()?;
+    if let Some(capacity) = statement_cache_capacity {
+        connect_options = connect_options.statement_cache_capacity(capacity);
+    }
+    options
+        .connect_with(connect_options.options([("default_transaction_read_only", "on")]))
+        .await
+}
+
 /// sqlx's own default for how many prepared statements each connection
 /// keeps (least recently used out).
 pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 100;
@@ -349,10 +366,24 @@ pub const STATEMENT_CACHE_MIN_PER_BOUNDED_CONTEXT: usize = 10;
 /// `skilj-core` owns its schema this way. Only ever touches the global
 /// tables - per-bounded-context schemas are provisioned separately, see
 /// `provision_bounded_context_schema`.
+///
+/// Refuses with `schema_too_new` first when a newer release upgraded the
+/// database and doesn't declare this one compatible. A migration this
+/// binary doesn't know is otherwise let through: that check, not sqlx's
+/// `VersionMissing`, is the guard (docs/architecture.md §249).
 #[tracing::instrument(skip_all)]
-pub async fn migrate(pool: &Pool) -> Result<(), sqlx::migrate::MigrateError> {
-    sqlx::migrate!("./migrations").run(pool).await
+pub async fn migrate(pool: &Pool) -> crate::error::Result<()> {
+    preflight::check_schema_compatibility(pool).await?;
+    preflight::migrator().run(pool).await?;
+    Ok(())
 }
+
+mod preflight;
+pub use preflight::{
+    bounded_context_shape, ensure_admin_bounded_context, record_schema_level,
+    upgrade_bounded_context, EXPECTED_BOUNDED_CONTEXT_SHAPE,
+};
+pub(crate) use preflight::{check_schema_compatibility, inspect as inspect_for_preflight};
 
 mod schema;
 pub use schema::*;

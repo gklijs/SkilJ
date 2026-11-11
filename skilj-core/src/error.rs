@@ -136,6 +136,30 @@ pub enum Error {
     /// #132). Like `Database`, the detail is for the server log only.
     #[error("blob store error: {0}")]
     BlobStore(String),
+
+    /// The database was upgraded by a release that doesn't declare this
+    /// one compatible (docs/architecture.md §249). Startup only.
+    #[error(
+        "the database was upgraded by {upgraded_by}, which requires schema level \
+         {min_compatible_level} or later; this release is level {level} - deploy the newer \
+         release, or restore a backup taken before the upgrade"
+    )]
+    SchemaTooNew {
+        /// This release's schema level.
+        level: i64,
+        /// The oldest level the database accepts.
+        min_compatible_level: i64,
+        /// The release that upgraded the database.
+        upgraded_by: String,
+    },
+
+    /// Startup was configured not to change the schema, and the schema
+    /// needs upgrading (docs/architecture.md §249). Startup only.
+    #[error("the database schema needs upgrading before this release can start: {pending}")]
+    SchemaUpgradeRequired {
+        /// What the upgrade would change, in brief.
+        pending: String,
+    },
 }
 
 impl Error {
@@ -196,6 +220,8 @@ impl SkiljRejection for Error {
             Error::Unsupported { .. } => "unsupported",
             Error::NotProcessed => "not_processed",
             Error::BlobStore(_) => "blob_store_error",
+            Error::SchemaTooNew { .. } => "schema_too_new",
+            Error::SchemaUpgradeRequired { .. } => "schema_upgrade_required",
         }
     }
 
@@ -227,6 +253,7 @@ impl SkiljRejection for Error {
             Error::Unsupported { .. } => self.to_string(),
             Error::NotProcessed => self.to_string(),
             Error::BlobStore(_) => "an internal blob store error occurred".to_string(),
+            Error::SchemaTooNew { .. } | Error::SchemaUpgradeRequired { .. } => self.to_string(),
         }
     }
 

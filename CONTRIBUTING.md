@@ -135,6 +135,13 @@ far as a test exercises them, and some aren't checked at all
   and standby, used by `skilj/tests/event_fetch_rest.rs` (§176).
 - **Upgrading from v0.0.1**: a checked-in schema fixture in
   `skilj/tests/startup_bounded_contexts.rs` (§159).
+- **Upgrade preflight and migration** (§249): the same file checks that the
+  preflight reports a v0.0.1 bounded context's missing objects and changes
+  nothing, that `migrate` stops at its lock timeout and a rerun completes,
+  that two migrations at once both finish, and that the recorded schema
+  shape matches what provisioning creates. `scripts/check-upgrade-pair.sh`
+  (CI) upgrades a real database written by the previous release, as
+  separate processes.
 - **Known races**: a targeted test each, often using a trigger to force
   the interleaving. There is one property test,
   `UniqueReadCursorPerToken` in `skilj-core/tests/event_fetch_surface.rs`.
@@ -182,7 +189,12 @@ far as a test exercises them, and some aren't checked at all
 - **Mixed versions on one database.** Upgrading is tested. Two skilj
   versions running side by side during a rolling deploy are not; §164
   records one known gap, and §205 another: a version from before blind
-  tags would derive a blind tag's value in the clear.
+  tags would derive a blind tag's value in the clear. What *is* tested:
+  the previous release and this one run one after the other against one
+  database, and the previous one then refuses it
+  (`scripts/check-upgrade-pair.sh`); a release refuses a schema level it is
+  too old for, and starts at one declared compatible (§249). No pair has
+  been declared compatible yet, so no two versions have run side by side.
 - **Fallbacks for a variant a crate predates** (§219): the `_` arms
   that answer `Unsupported`, halt a bridge's partition or consumer, or
   treat a cross-instance notification as a resync. No such variant

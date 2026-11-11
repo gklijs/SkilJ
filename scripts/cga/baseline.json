@@ -293,7 +293,7 @@
       "file": "<registry>/tracing-0.1.44/src/macros.rs",
       "message": "call to associated function `tracing::level_filters::LevelFilter::current` which can panic",
       "source": "&& $lvl <= $crate::level_filters::LevelFilter::current()",
-      "count": 142
+      "count": 139
     },
     {
       "file": "<registry>/tracing-0.1.44/src/macros.rs",
@@ -335,6 +335,12 @@
       "file": "<rust>/library/alloc/src/boxed/convert.rs",
       "message": "call to associated function `std::boxed::Box::<T>::new` which can panic",
       "source": "Box::new(StringError(err))",
+      "count": 1
+    },
+    {
+      "file": "<rust>/library/alloc/src/collections/btree/map.rs",
+      "message": "call to method `<std::collections::btree_map::Iter<'a, K, V> as std::iter::Iterator>::next` which can panic",
+      "source": "self.inner.next().map(|(k, _)| k)",
       "count": 1
     },
     {
@@ -419,7 +425,7 @@
       "file": "<rust>/library/alloc/src/macros.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "$crate::fmt::format($crate::__export::format_args!($($arg)*))",
-      "count": 15
+      "count": 16
     },
     {
       "file": "<rust>/library/alloc/src/macros.rs",
@@ -512,6 +518,12 @@
       "count": 1
     },
     {
+      "file": "<rust>/library/core/src/char/methods.rs",
+      "message": "call to function `std::char::encode_utf8_raw` which can panic",
+      "source": "unsafe { from_utf8_unchecked_mut(encode_utf8_raw(self as u32, dst)) }",
+      "count": 1
+    },
+    {
       "file": "<rust>/library/core/src/fmt/mod.rs",
       "message": "call to method `std::fmt::Write::write_str` which can panic",
       "source": "self.buf.write_str(data)",
@@ -525,7 +537,7 @@
     },
     {
       "file": "<rust>/library/core/src/fmt/rt.rs",
-      "message": "possible later call to method `<std::string::String as std::fmt::Display>::fmt` which can panic",
+      "message": "possible later call to method `<&T as std::fmt::Display>::fmt` which can panic",
       "source": "argument_new!(T, x, <T as Display>::fmt)",
       "count": 1
     },
@@ -587,7 +599,13 @@
       "file": "<rust>/library/core/src/macros/mod.rs",
       "message": "call to method `std::fmt::Formatter::<'a>::write_fmt` which can panic",
       "source": "$dst.write_fmt($crate::format_args!($($arg)*))",
-      "count": 8
+      "count": 10
+    },
+    {
+      "file": "<rust>/library/core/src/macros/mod.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::write_fmt` which can panic",
+      "source": "$dst.write_fmt($crate::format_args_nl!($($arg)*))",
+      "count": 21
     },
     {
       "file": "<rust>/library/core/src/option.rs",
@@ -597,7 +615,7 @@
     },
     {
       "file": "<rust>/library/core/src/option.rs",
-      "message": "call to drop of `event_store::Error` which can panic",
+      "message": "call to drop of `encryption::Error` which can panic",
       "source": "}",
       "count": 1
     },
@@ -681,6 +699,12 @@
     },
     {
       "file": "<rust>/library/core/src/str/mod.rs",
+      "message": "call to method `<char as std::str::pattern::Pattern>::into_searcher` which can panic",
+      "source": "matcher: pat.into_searcher(self),",
+      "count": 1
+    },
+    {
+      "file": "<rust>/library/core/src/str/mod.rs",
       "message": "call to method `core::str::<impl str>::trim_matches` which can panic",
       "source": "self.trim_matches(char::is_whitespace)",
       "count": 1
@@ -689,6 +713,12 @@
       "file": "<rust>/library/core/src/str/pattern.rs",
       "message": "call to associated function `std::str::pattern::TwoWaySearcher::new` which can panic",
       "source": "searcher: StrSearcherImpl::TwoWay(TwoWaySearcher::new( needle.as_bytes(), haystack.len(), )),",
+      "count": 1
+    },
+    {
+      "file": "<rust>/library/core/src/str/pattern.rs",
+      "message": "call to method `core::slice::<impl [T]>::starts_with` which can panic",
+      "source": "haystack.as_bytes().starts_with(self.as_bytes())",
       "count": 1
     },
     {
@@ -843,6 +873,12 @@
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
+      "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to drop of `std::result::Result<jsonwebtoken::DecodingKey, jsonwebtoken::errors::Error>` which can panic",
       "source": "};",
       "count": 1
@@ -851,12 +887,6 @@
       "file": "skilj-core/src/access_control/mod.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "#[derive(Debug, Clone, PartialEq, Eq)]",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to drop of `std::string::String` which can panic",
-      "source": "}",
       "count": 1
     },
     {
@@ -1188,6 +1218,12 @@
       "message": "call to drop of `serde_json::Value` which can panic",
       "source": "}",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/access_trail/mod.rs",
+      "message": "call to drop of `std::array::IntoIter<access_trail::AccessEventKind, 8>` which can panic",
+      "source": "}",
+      "count": 1
     },
     {
       "file": "skilj-core/src/access_trail/mod.rs",
@@ -2157,6 +2193,18 @@
     },
     {
       "file": "skilj-core/src/db/access.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/access.rs:377:1: 377:33}>` which can panic",
+      "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/access.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/access.rs:436:1: 436:33}>` which can panic",
+      "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/access.rs",
       "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/access.rs:562:1: 562:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
@@ -2199,7 +2247,7 @@
     },
     {
       "file": "skilj-core/src/db/access.rs",
-      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String, std::string::String, chrono::DateTime<chrono::Utc>), sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String, std::string::String, chrono::DateTime<chrono::Utc>), sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
       "count": 1
     },
@@ -3173,12 +3221,6 @@
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:7:1: 7:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:89:1: 89:95}>` which can panic",
-      "source": "#[tracing::instrument(skip_all, fields(bounded_context = %command_type.bounded_context.name))]",
       "count": 1
     },
     {
@@ -6095,7 +6137,7 @@
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to drop of `sqlx::Transaction<'_, sqlx::Postgres>` which can panic",
       "source": "}",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/commands.rs",
@@ -6497,7 +6539,7 @@
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to drop of `std::vec::Vec<event_store::Event>` which can panic",
       "source": "}",
-      "count": 3
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/commands.rs",
@@ -8625,6 +8667,12 @@
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:262:1: 262:33}>` which can panic",
+      "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
       "message": "call to drop of `{async fn body of sqlx::Pool<sqlx::Postgres>::begin()}` which can panic",
       "source": "let mut tx = pool.begin().await?;",
       "count": 1
@@ -10373,13 +10421,7 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
-      "source": ".await?;",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -10391,7 +10433,13 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::encryption_keys::EncryptionKeyRow, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 2
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::encryption_keys::EncryptionKeyRow, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -10776,6 +10824,12 @@
       "message": "call to drop of `tracing::Span` which can panic",
       "source": "}",
       "count": 7
+    },
+    {
+      "file": "skilj-core/src/db/event_types.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/event_types.rs:104:1: 104:33}>` which can panic",
+      "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/event_types.rs",
@@ -11291,6 +11345,12 @@
       "file": "skilj-core/src/db/events.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "format!(\"= {}\", param(&mut binds, Bind::Text(Some(value.clone()))))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/events.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "let (epoch,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(\"SELECT {EPOCH_SQL}\")))",
       "count": 1
     },
     {
@@ -11889,6 +11949,12 @@
     },
     {
       "file": "skilj-core/src/db/events.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/events.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::events::EventRowAnyType, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": "let rows: Vec<EventRowAnyType> = query.fetch_all(&mut *conn).await?;",
       "count": 1
@@ -11963,6 +12029,12 @@
       "file": "skilj-core/src/db/events.rs",
       "message": "call to function `serde_json::to_string` which can panic",
       "source": "serde_json::to_string(rest).expect(\"Tag serialisation is infallible\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/events.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let (epoch,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(\"SELECT {EPOCH_SQL}\")))",
       "count": 1
     },
     {
@@ -15093,6 +15165,12 @@
     },
     {
       "file": "skilj-core/src/db/mod.rs",
+      "message": "call to drop of `sqlx::migrate::Migrator` which can panic",
+      "source": "preflight::migrator().run(pool).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/mod.rs",
       "message": "call to drop of `sqlx::pool::PoolOptions<sqlx::Postgres>` which can panic",
       "source": ") -> Result<Pool, sqlx::Error> { let mut connect_options: sqlx::postgres::PgConnectOptions = database_url.parse()?; if let Some(capacity) = statement_cache_capacity { connect_options = connect_options.statement_cache_capacity(capacity); } options.connect_with(connect_options).await }",
       "count": 1
@@ -15100,7 +15178,19 @@
     {
       "file": "skilj-core/src/db/mod.rs",
       "message": "call to drop of `sqlx::pool::PoolOptions<sqlx::Postgres>` which can panic",
+      "source": ".connect_with(connect_options.options([(\"default_transaction_read_only\", \"on\")]))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/mod.rs",
+      "message": "call to drop of `sqlx::pool::PoolOptions<sqlx::Postgres>` which can panic",
       "source": "pub async fn connect_with(database_url: &str, options: PgPoolOptions) -> Result<Pool, sqlx::Error> { connect_with_statement_cache(database_url, options, None).await }",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/mod.rs",
+      "message": "call to drop of `sqlx::pool::PoolOptions<sqlx::Postgres>` which can panic",
+      "source": "}",
       "count": 1
     },
     {
@@ -15136,7 +15226,13 @@
     {
       "file": "skilj-core/src/db/mod.rs",
       "message": "call to drop of `{async fn body of sqlx::migrate::Migrator::run<'_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
-      "source": "sqlx::migrate!(\"./migrations\").run(pool).await",
+      "source": "preflight::migrator().run(pool).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/mod.rs",
+      "message": "call to drop of `{async fn body of sqlx::pool::PoolOptions<sqlx::Postgres>::connect_with()}` which can panic",
+      "source": ".await",
       "count": 1
     },
     {
@@ -15191,7 +15287,7 @@
       "file": "skilj-core/src/db/mod.rs",
       "message": "call to method `core::str::<impl str>::parse` which can panic",
       "source": "let mut connect_options: sqlx::postgres::PgConnectOptions = database_url.parse()?;",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/mod.rs",
@@ -15213,8 +15309,1202 @@
     },
     {
       "file": "skilj-core/src/db/mod.rs",
+      "message": "call to method `sqlx::sqlx_postgres::PgConnectOptions::options` which can panic",
+      "source": ".connect_with(connect_options.options([(\"default_transaction_read_only\", \"on\")]))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/mod.rs",
       "message": "call to method `std::iter::Iterator::collect` which can panic",
       "source": "let payloads: Vec<String> = events .iter() .map(|event| { serde_json::json!({ \"bounded_context\": event.bounded_context.name, \"sequence\": event.sequence, \"origin_instance_id\": origin_instance_id, }) .to_string() }) .collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `access_trail::AccessEventKind::from_name` which can panic",
+      "source": "if stored.is_some() && AccessEventKind::from_name(&wanted.name).is_some() {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `chrono::Utc::now` which can panic",
+      "source": "chrono::Utc::now(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"SELECT schema FROM {schema}.event_types WHERE name = $1\"",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"global migration {version} is recorded as failed; inspect it before rerunning\"",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "(\"ACCESS EXCLUSIVE\", table, format!(\"column {name}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "(\"ACCESS EXCLUSIVE\", table, format!(\"constraint {name}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "(\"SHARE\", table, format!(\"index {name}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": ".bind(format!(\"bc_{bounded_context}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "WHERE conrelid = to_regclass('{}.events') AND contype = 'c'\",",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "and {PARKED_DELIVERIES_OCCURRENCE_INDEX} is built\"",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "detail: format!(\"bounded context {name} is registered but its schema is gone\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "detail: format!(\"global migration {version} differs from the one that was applied\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "let raw = format!(\"bc_{bounded_context}\");",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "reason: format!(\"adds {}\", adds.join(\", \")),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `access_trail::AccessHistory` which can panic",
+      "source": "if !fold_access_events(&records, DateTime::<Utc>::MAX_UTC).held {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `db::preflight::ShapeDiff` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `error::Error` which can panic",
+      "source": "}",
+      "count": 4
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `event_store::BoundedContext` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `event_store::EventType` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `preflight::AdminContext` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `preflight::BoundedContextReport` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `sqlx::migrate::Migrator` which can panic",
+      "source": "let known: BTreeSet<i64> = migrator().iter().map(|m| m.version).collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `sqlx::migrate::Migrator` which can panic",
+      "source": "let mut migrator = sqlx::migrate!(\"./migrations\");",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `sqlx::migrate::Migrator` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".execute(&mut *tx)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `sqlx::query::QueryScalar<'_, sqlx::Postgres, f32, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".bind(format!(\"bc_{bounded_context}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::collections::BTreeMap<&str, &str>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::collections::BTreeSet<i64>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::collections::btree_map::Entry<'_, std::string::String, (&str, std::vec::Vec<std::string::String>)>` which can panic",
+      "source": ".or_insert((mode, Vec::new()));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::option::Option<event_store::BoundedContext>` which can panic",
+      "source": ".is_none()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::option::Option<event_store::BoundedContext>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::option::Option<serde_json::Value>` which can panic",
+      "source": ".is_some_and(|s| parse(s).is_some() && parse(s) == parse(&wanted.schema));",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::option::Option<std::borrow::Cow<'_, str>>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
+      "source": "}",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
+      "source": "} else {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": ")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "changed: stored.is_some_and(|s| s != current.as_str()),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "}",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "});",
+      "count": 10
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::vec::Vec<(std::string::String, std::string::String)>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::vec::Vec<access_trail::AccessEventRecord>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::vec::Vec<preflight::BoundedContextReport>` which can panic",
+      "source": "})",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::vec::Vec<preflight::Rewrite>` which can panic",
+      "source": "(Vec::new(), Vec::new())",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::vec::Vec<preflight::Rewrite>` which can panic",
+      "source": ")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::vec::Vec<preflight::Rewrite>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::vec::Vec<preflight::TableLock>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::vec::Vec<std::string::String>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async block@sqlx::Pool<sqlx::Postgres>::acquire::{closure#0}}` which can panic",
+      "source": "let mut conn = pool.acquire().await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::Pool<sqlx::Postgres>::begin()}` which can panic",
+      "source": "let mut tx = pool.begin().await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::rollback()}` which can panic",
+      "source": "tx.rollback().await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (i64, bool, std::vec::Vec<u8>), sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?,",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (i64, i64, std::string::String, chrono::DateTime<chrono::Utc>), sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String, std::string::String), sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, bool, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?,",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, bool, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, f32, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, i64, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 3
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `access_trail::fold_access_events` which can panic",
+      "source": "if !fold_access_events(&records, DateTime::<Utc>::MAX_UTC).held {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `bootstrap::stamp_admin_bounded_context` which can panic",
+      "source": "if let Some(admin_context) = crate::bootstrap::stamp_admin_bounded_context( existing_admin_context.as_ref(), chrono::Utc::now(), ) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `db::preflight::admin_placeholder` which can panic",
+      "source": "let admin = admin_placeholder();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `db::preflight::compatibility_refusal` which can panic",
+      "source": "if let Some(err) = compatibility_refusal(recorded.as_ref(), &global.unknown) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `db::preflight::compatibility_refusal` which can panic",
+      "source": "match compatibility_refusal(recorded.as_ref(), &unknown) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `db::preflight::diff_shape` which can panic",
+      "source": "let diff = diff_shape(expected, &actual);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `db::preflight::lost_a_concurrent_creation` which can panic",
+      "source": "Err(err) if attempt < ATTEMPTS && lost_a_concurrent_creation(&err) => {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `encryption::trail::master_key_event_type` which can panic",
+      "source": ".map(|kind| master_key_event_type(&admin, *kind)),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let active: Vec<(String, String)> = sqlx::query_as( \"SELECT role_id, bounded_context FROM role_access_mappings WHERE status = 'active' \\ ORDER BY role_id, bounded_context\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let checks: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT pg_get_constraintdef(oid) FROM pg_constraint \\ WHERE conrelid = to_regclass('{}.events') AND contype = 'c'\", schema.replace('\\'', \"''\") )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let row: Option<(i64, i64, String, DateTime<Utc>)> = sqlx::query_as( \"SELECT level, min_compatible_level, upgraded_by, upgraded_at \\ FROM skilj_schema_compatibility WHERE id = 1\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "sqlx::query_as(\"SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!( \"SELECT count(*) FROM {}.\\\"{}\\\"\", schema_ident(bounded_context), table.replace('\"', \"\\\"\\\"\") )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let estimate: Option<f32> = sqlx::query_scalar( \"SELECT c.reltuples FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \\ WHERE n.nspname = $1 AND c.relname = $2\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let event_tags_kind: Option<String> = sqlx::query_scalar( \"SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \\ WHERE n.nspname = $1 AND c.relname = 'event_tags'\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let guards: i64 = sqlx::query_scalar( \"SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ JOIN pg_namespace n ON n.oid = c.relnamespace \\ WHERE n.nspname = $1 AND NOT t.tgisinternal AND \\ ((c.relname = 'events' AND t.tgname = 'protect_external_source') OR \\ (c.relname = 'event_types' AND t.tgname = 'protect_existing_external_sources'))\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let has_current: bool = sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND indexname = $2)\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let scoped: bool = sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM information_schema.key_column_usage \\ WHERE table_schema = $1 AND table_name = 'idempotency_keys' \\ AND constraint_name = 'idempotency_keys_pkey' AND column_name = 'client_id')\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let server_version_num: String = sqlx::query_scalar(\"SHOW server_version_num\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let stored: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!( \"SELECT schema FROM {schema}.event_types WHERE name = $1\" )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "sqlx::query_scalar(\"SELECT epoch FROM skilj_epoch WHERE id = 1\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "sqlx::query_scalar(\"SELECT name FROM bounded_contexts ORDER BY name\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "sqlx::query_scalar::<_, bool>(\"SELECT to_regclass($1) IS NOT NULL\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(\"SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "blocks: \"commands with an idempotency key, while the primary key is rebuilt\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "blocks: \"event writes and type registration, while protected external \\ source content is replaced by [redacted]\" .into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "blocks: \"event writes, while every event's tags are indexed\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "check: \"access_trail_baseline\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "code: \"bounded_context_schema_missing\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "code: \"migration_checksum_mismatch\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "code: \"migration_failed\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "code: \"schema_too_new\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "lock: \"ACCESS EXCLUSIVE\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "lock: \"SHARE ROW EXCLUSIVE\".into(),",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "lock: \"SHARE\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "mode: mode.into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "name: \"idempotency_key_rescope\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "name: \"parked_delivery_dedupe\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "name: \"source_content_scrub\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "name: \"tag_dictionary\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "reason: \"the admin context's tag index is patched first; the grants to baseline \\ can't be read until then\" .into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "table: \"events\".into(),",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "table: \"idempotency_keys\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "table: \"parked_deliveries\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
+      "source": ".entry(table.to_string())",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
+      "source": "description: m.description.to_string(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
+      "source": "detail: err.to_string(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
+      "source": "name: name.to_string(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
+      "source": "skilj_version: env!(\"CARGO_PKG_VERSION\").to_string(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": ".execute(&mut *tx)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "let conn: &mut PgConnection = &mut tx;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<sqlx::pool::PoolConnection<DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "let recorded = recorded_level(&mut conn).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<sqlx::pool::PoolConnection<DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "let unknown: Vec<i64> = applied_migrations(&mut conn)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::collections::btree_map::Iter<'a, K, V> as std::iter::Iterator>::next` which can panic",
+      "source": "for (key, line) in &expected_keys {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::collections::btree_map::Iter<'a, K, V> as std::iter::Iterator>::next` which can panic",
+      "source": "for (version, m) in &embedded {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "[ \"column event_types.registered_by_version \", \"column command_types.registered_by_version \", \"column projections.registered_by_version \", ] .iter() .any(|prefix| line.starts_with(prefix))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "let origin_kind_widened = checks .iter() .any(|(def,)| def.contains(\"origin_kind\") && def.contains(\"skilj_recorded\"));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "|| admin_report .rewrites .iter() .any(|r| r.name == \"tag_dictionary\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "|| bounded_contexts .iter() .any(BoundedContextReport::needs_upgrade);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "} else if admin_report.missing.iter().any(|l| l.contains(\"event_tag\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::find` which can panic",
+      "source": "let admin_report = bounded_contexts .iter() .find(|r| r.name == ADMIN_BOUNDED_CONTEXT_NAME);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for (role_id, bounded_context) in &active {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for (version, success, checksum) in &applied {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for line in missing {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for name in &names {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for version in &global.checksum_mismatch {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for version in &global.failed {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::str::Split<'a, P> as std::iter::Iterator>::next` which can panic",
+      "source": "let column = rest.split(' ').next().unwrap_or(rest);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::str::Split<'a, P> as std::iter::Iterator>::next` which can panic",
+      "source": "let table = rest.split(' ').next().unwrap_or(rest);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::string::String as std::clone::Clone>::clone` which can panic",
+      "source": "event_types_to_register.push(wanted.name.clone());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::parse` which can panic",
+      "source": "let server_major = server_version_num.parse::<u32>().unwrap_or(0) / 10_000;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::rsplit_once` which can panic",
+      "source": "line.rsplit_once(' ').map_or(line, |(key, _)| key)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::split_once` which can panic",
+      "source": "let Some((name, rest)) = rest.split_once(\" on \") else {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::split_once` which can panic",
+      "source": "let Some((name, table)) = rest.split_once(\" on \") else {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::split_once` which can panic",
+      "source": "let Some((table, name)) = column.split_once('.') else {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::split` which can panic",
+      "source": "let column = rest.split(' ').next().unwrap_or(rest);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::split` which can panic",
+      "source": "let table = rest.split(' ').next().unwrap_or(rest);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::strip_prefix` which can panic",
+      "source": "let (mode, table, what) = if let Some(rest) = line.strip_prefix(\"column \") {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::strip_prefix` which can panic",
+      "source": "} else if let Some(rest) = line.strip_prefix(\"constraint \") {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `core::str::<impl str>::strip_prefix` which can panic",
+      "source": "} else if let Some(rest) = line.strip_prefix(\"index \") {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::error::DatabaseError::code` which can panic",
+      "source": "match db.code().as_deref() {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::error::DatabaseError::constraint` which can panic",
+      "source": "Some(\"23505\") => db .constraint()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::error::DatabaseError::message` which can panic",
+      "source": "Some(\"XX000\") => db.message().contains(\"concurrently\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level\", ) .bind(SCHEMA_LEVEL)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level\", ) .bind(SCHEMA_LEVEL) .bind(MIN_COMPATIBLE_SCHEMA_LEVEL)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level\", ) .bind(SCHEMA_LEVEL) .bind(MIN_COMPATIBLE_SCHEMA_LEVEL) .bind(env!(\"CARGO_PKG_VERSION\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", ) .bind(&raw)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", ) .bind(&raw) .bind(&quoted)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let estimate: Option<f32> = sqlx::query_scalar( \"SELECT c.reltuples FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \\ WHERE n.nspname = $1 AND c.relname = $2\", ) .bind(format!(\"bc_{bounded_context}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let estimate: Option<f32> = sqlx::query_scalar( \"SELECT c.reltuples FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \\ WHERE n.nspname = $1 AND c.relname = $2\", ) .bind(format!(\"bc_{bounded_context}\")) .bind(table)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let event_tags_kind: Option<String> = sqlx::query_scalar( \"SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \\ WHERE n.nspname = $1 AND c.relname = 'event_tags'\", ) .bind(&raw)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let guards: i64 = sqlx::query_scalar( \"SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ JOIN pg_namespace n ON n.oid = c.relnamespace \\ WHERE n.nspname = $1 AND NOT t.tgisinternal AND \\ ((c.relname = 'events' AND t.tgname = 'protect_external_source') OR \\ (c.relname = 'event_types' AND t.tgname = 'protect_existing_external_sources'))\", ) .bind(&raw)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let has_current: bool = sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND indexname = $2)\", ) .bind(&raw)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let has_current: bool = sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND indexname = $2)\", ) .bind(&raw) .bind(PARKED_DELIVERIES_OCCURRENCE_INDEX)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let scoped: bool = sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM information_schema.key_column_usage \\ WHERE table_schema = $1 AND table_name = 'idempotency_keys' \\ AND constraint_name = 'idempotency_keys_pkey' AND column_name = 'client_id')\", ) .bind(&raw)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let stored: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!( \"SELECT schema FROM {schema}.event_types WHERE name = $1\" ))) .bind(&wanted.name)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query_scalar::<_, bool>(\"SELECT to_regclass($1) IS NOT NULL\") .bind(name)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::collections::BTreeMap::<K, V, A>::entry` which can panic",
+      "source": "let entry = by_table .entry(table.to_string())",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::collections::BTreeMap::<K, V, A>::get` which can panic",
+      "source": "match actual_keys.get(key) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::collections::BTreeMap::<K, V, A>::get` which can panic",
+      "source": "match embedded.get(version) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::collections::BTreeSet::<T, A>::contains` which can panic",
+      "source": "if !applied_versions.contains(version) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::collections::BTreeSet::<T, A>::contains` which can panic",
+      "source": "if !tables.contains(table) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::collections::BTreeSet::<T, A>::contains` which can panic",
+      "source": "if tables.contains(\"events\") {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::collections::BTreeSet::<T, A>::contains` which can panic",
+      "source": "if tables.contains(\"idempotency_keys\") {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::collections::BTreeSet::<T, A>::contains` which can panic",
+      "source": "if tables.contains(\"parked_deliveries\") {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::collections::btree_map::Entry::<'a, K, V, A>::or_insert` which can panic",
+      "source": "let entry = by_table .entry(table.to_string()) .or_insert((mode, Vec::new()));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let applied_versions: BTreeSet<i64> = applied.iter().map(|(v, _, _)| *v).collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let embedded: BTreeMap<i64, _> = migrator .iter() .filter(|m| !m.migration_type.is_down_migration()) .map(|m| (m.version, m)) .collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let known: BTreeSet<i64> = migrator().iter().map(|m| m.version).collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let tables: BTreeSet<String> = actual .iter() .filter_map(|l| l.strip_prefix(\"table \")) .map(str::to_string) .collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::option::Option::<T>::is_some_and` which can panic",
+      "source": "let up_to_date = stored .as_deref() .is_some_and(|s| parse(s).is_some() && parse(s) == parse(&wanted.schema));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::slice::<impl [T]>::join` which can panic",
+      "source": "reason: format!(\"adds {}\", adds.join(\", \")),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::slice::<impl [T]>::sort` which can panic",
+      "source": "lines.sort();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::str::<impl str>::replace` which can panic",
+      "source": "schema.replace('\\'', \"''\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::str::<impl str>::replace` which can panic",
+      "source": "table.replace('\"', \"\\\"\\\"\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "None => global.unknown.push(*version),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "Some(_) => global.applied.push(*version),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "Some(_) if !success => global.failed.push(*version),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "bounded_contexts.push(report);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "entry.1.push(what);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "event_types_to_register.push(wanted.name.clone());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "global.checksum_mismatch.push(*version)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "global.pending.push(PendingMigration { version: *version, description: m.description.to_string(), });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "locks.push(TableLock { table, mode: mode.into(), reason: format!(\"adds {}\", adds.join(\", \")), rows, });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "refusals.push(Refusal { code: \"bounded_context_schema_missing\".into(), detail: format!(\"bounded context {name} is registered but its schema is gone\"), });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "refusals.push(Refusal { code: \"migration_checksum_mismatch\".into(), detail: format!(\"global migration {version} differs from the one that was applied\"), });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "refusals.push(Refusal { code: \"migration_failed\".into(), detail: format!( \"global migration {version} is recorded as failed; inspect it before rerunning\" ), });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "refusals.push(Refusal { code: \"schema_too_new\".into(), detail: err.to_string(), });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "rewrites.push(Rewrite { name: \"idempotency_key_rescope\".into(), table: \"idempotency_keys\".into(), lock: \"ACCESS EXCLUSIVE\".into(), blocks: \"commands with an idempotency key, while the primary key is rebuilt\".into(), rows: row_count(conn, bounded_context, \"idempotency_keys\", exact).await?, });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "rewrites.push(Rewrite { name: \"parked_delivery_dedupe\".into(), table: \"parked_deliveries\".into(), lock: \"SHARE\".into(), blocks: format!( \"parked-delivery writes, while duplicates are deleted (all but the newest) \\ and {PARKED_DELIVERIES_OCCURRENCE_INDEX} is built\" ), rows: row_count(conn, bounded_context, \"parked_deliveries\", exact).await?, });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "rewrites.push(Rewrite { name: \"source_content_scrub\".into(), table: \"events\".into(), lock: \"SHARE ROW EXCLUSIVE\".into(), blocks: \"event writes and type registration, while protected external \\ source content is replaced by [redacted]\" .into(), rows: row_count(conn, bounded_context, \"events\", exact).await?, });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "rewrites.push(Rewrite { name: \"tag_dictionary\".into(), table: \"events\".into(), lock: \"SHARE ROW EXCLUSIVE\".into(), blocks: \"event writes, while every event's tags are indexed\".into(), rows: row_count(conn, bounded_context, \"events\", exact).await?, });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "unknown.push(Unknown { check: \"access_trail_baseline\".into(), reason: \"the admin context's tag index is patched first; the grants to baseline \\ can't be read until then\" .into(), });",
       "count": 1
     },
     {
@@ -15503,7 +16793,7 @@
       "file": "skilj-core/src/db/projection_consumers.rs",
       "message": "call to drop of `projections::Projection` which can panic",
       "source": "}",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/projection_consumers.rs",
@@ -15665,7 +16955,7 @@
       "file": "skilj-core/src/db/projection_consumers.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 4
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/projection_consumers.rs",
@@ -15774,12 +17064,6 @@
       "message": "call to drop of `tracing::Span` which can panic",
       "source": "}",
       "count": 4
-    },
-    {
-      "file": "skilj-core/src/db/projection_consumers.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/projection_consumers.rs:1858:1: 1858:33}>` which can panic",
-      "source": "#[tracing::instrument(skip_all)]",
-      "count": 1
     },
     {
       "file": "skilj-core/src/db/projection_consumers.rs",
@@ -17543,7 +18827,13 @@
       "file": "skilj-core/src/db/projection_records.rs",
       "message": "call to drop of `db::projection_records::ProjectionRow` which can panic",
       "source": "}",
-      "count": 2
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/projection_records.rs",
+      "message": "call to drop of `event_store::BoundedContext` which can panic",
+      "source": "}",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/projection_records.rs",
@@ -17625,7 +18915,7 @@
     },
     {
       "file": "skilj-core/src/db/projection_records.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/projection_records.rs:756:1: 756:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/projection_records.rs:1107:1: 1107:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -19089,6 +20379,12 @@
     },
     {
       "file": "skilj-core/src/db/routes.rs",
+      "message": "call to drop of `std::option::Option<db::routes::ParkedDelivery>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/routes.rs",
       "message": "call to drop of `std::option::Option<db::routes::ParkedDeliveryCursor>` which can panic",
       "source": "after = Some(ParkedDeliveryCursor::of(last));",
       "count": 1
@@ -19187,7 +20483,7 @@
       "file": "skilj-core/src/db/routes.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 16
+      "count": 15
     },
     {
       "file": "skilj-core/src/db/routes.rs",
@@ -19323,7 +20619,7 @@
     },
     {
       "file": "skilj-core/src/db/routes.rs",
-      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::routes::ParkedDeliveryRow, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::routes::ParkedDeliveryRow, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
       "count": 1
     },
@@ -21081,6 +22377,18 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2955:1: 2955:33}>` which can panic",
+      "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3205:1: 3205:33}>` which can panic",
+      "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3523:1: 3523:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
@@ -21101,13 +22409,13 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::RawSql::execute<'_, &mut sqlx::PgConnection, sqlx::Postgres>()}` which can panic",
       "source": ".await?;",
-      "count": 6
+      "count": 7
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::RawSql::execute<'_, &sqlx::Pool<sqlx::Postgres>, sqlx::Postgres>()}` which can panic",
       "source": ".await?;",
-      "count": 6
+      "count": 5
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -21119,13 +22427,13 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 73
+      "count": 72
     },
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
-      "count": 52
+      "count": 53
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -25077,7 +26385,7 @@
     },
     {
       "file": "skilj-core/src/error.rs",
-      "message": "call to method `std::fmt::Formatter::<'a>::debug_tuple_field1_finish` which can panic",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field1_finish` which can panic",
       "source": "#[derive(Debug, Error)]",
       "count": 1
     },
@@ -25431,7 +26739,7 @@
     },
     {
       "file": "skilj-core/src/event_store/mod.rs",
-      "message": "call to closure `db::events::create_and_insert_external_event::{closure#0}::{closure#0}::{closure#1}` which can panic",
+      "message": "call to closure `db::event_types::fire_system_event::{closure#0}::{closure#0}::{closure#1}` which can panic",
       "source": "let (key, data_key) = resolve_key(&sf.subject_key, &subject_value);",
       "count": 1
     },
@@ -26111,6 +27419,150 @@
       "file": "skilj-core/src/plugin/mod.rs",
       "message": "call to method `std::fmt::Formatter::<'a>::debug_tuple_field1_finish` which can panic",
       "source": "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "connect = connect.options([(\"lock_timeout\", format!(\"{}ms\", timeout.as_millis().max(1)))]);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `error::Error` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `event_store::BoundedContext` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `preflight::PreflightReport` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `sqlx::sqlx_postgres::PgConnectOptions` which can panic",
+      "source": "connect = connect.options([(\"lock_timeout\", format!(\"{}ms\", timeout.as_millis().max(1)))]);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `sqlx::sqlx_postgres::PgConnectOptions` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `std::option::Option<event_store::BoundedContext>` which can panic",
+      "source": ".is_some()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": ")?;",
+      "count": 3
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `{async block@sqlx::pool::inner::PoolInner<sqlx::Postgres>::close::{closure#0}}` which can panic",
+      "source": "pool.close().await;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::pool::PoolOptions<sqlx::Postgres>::connect_with()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to function `preflight::rows` which can panic",
+      "source": "rows(&l.rows),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to function `preflight::rows` which can panic",
+      "source": "rows(&r.rows),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `core::str::<impl str>::parse` which can panic",
+      "source": "let mut connect: sqlx::postgres::PgConnectOptions = database_url.parse()?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `sqlx::Pool::<DB>::close` which can panic",
+      "source": "pool.close().await;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `sqlx::sqlx_postgres::PgConnectOptions::options` which can panic",
+      "source": "connect = connect.options([(\"lock_timeout\", format!(\"{}ms\", timeout.as_millis().max(1)))]);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field1_finish` which can panic",
+      "source": "#[derive(Debug, Clone, Default)]",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field2_finish` which can panic",
+      "source": "#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field2_finish` which can panic",
+      "source": "#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field2_finish` which can panic",
+      "source": "#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]",
+      "count": 4
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field3_finish` which can panic",
+      "source": "#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field4_finish` which can panic",
+      "source": "#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]",
+      "count": 3
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field5_finish` which can panic",
+      "source": "#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field5_finish` which can panic",
+      "source": "#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_fields_finish` which can panic",
+      "source": "#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]",
       "count": 2
     },
     {

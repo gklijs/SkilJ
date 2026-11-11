@@ -321,6 +321,7 @@ pub use skilj_core::plugin::{
     EventType, MissedRunPolicy, Projection, RecurrenceSpec, ScheduleDeadline, Snapshot,
     DEFAULT_BOUNDED_CONTEXT,
 };
+pub use skilj_core::preflight;
 pub use skilj_core::retraction;
 pub use skilj_graphql::federation::FederationOptions;
 pub use skilj_graphql::limits::GraphqlLimits;
@@ -330,6 +331,23 @@ pub use skilj_graphql::limits::GraphqlLimits;
 /// `SnapshotRegistrar` below), so it's re-exported here rather than through
 /// `skilj_core::plugin`.
 pub use skilj_macros::auto_register;
+
+/// What [`SkiljBuilder::build`] does when the database's schema needs
+/// upgrading (docs/architecture.md §249).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SchemaChanges {
+    /// Upgrade it: the global migrations, every bounded context's schema
+    /// patches, the admin context's access trail. The default.
+    #[default]
+    Apply,
+    /// Change no schema: refuse with `schema_upgrade_required` when
+    /// [`preflight::inspect`] finds anything to upgrade. For deployments
+    /// where a separate job runs [`preflight::migrate`] first. A bounded
+    /// context an older instance creates later is still brought up to date
+    /// on first use (docs/architecture.md §200).
+    Refuse,
+}
 
 /// `Skilj`'s own bundle of an `IdpConfig` and the `JwksCache` verifying
 /// against it - built once, at `.build()` time, and held for the
@@ -1103,6 +1121,7 @@ impl Skilj {
             max_blob_bytes: skilj_core::blob::DEFAULT_MAX_BLOB_BYTES,
             blob_orphan_grace: skilj_core::blob::DEFAULT_ORPHAN_GRACE,
             application_version: None,
+            schema_changes: SchemaChanges::Apply,
         }
     }
 
@@ -1427,6 +1446,7 @@ impl MasterKeyRotation {
 async fn check_encryption_keys(
     pool: &Pool,
     key_service: &KeyService,
+    record: bool,
 ) -> Result<(), skilj_core::Error> {
     skilj_core::db::register_known_keys(pool, key_service).await?;
     // Each key is checked once per startup, whatever the number of bounded
@@ -1453,6 +1473,10 @@ async fn check_encryption_keys(
                     .is_some_and(|code| code == "42P01" || code == "3F000") => {}
             Err(err) => return Err(err),
         }
+    }
+    // A preflight (docs/architecture.md §249) records nothing.
+    if !record {
+        return Ok(());
     }
     if let Err(err) = record_key_in_use(pool, key_service.provider(), None).await {
         tracing::error!(
@@ -1910,13 +1934,29 @@ fn keep_stored_blob_subjects(
     kept
 }
 
+/// `registered`, `unchanged` or `updated`: what registering `new` does to
+/// the stored `existing`.
+fn registration_outcome<T: PartialEq>(existing: Option<&T>, new: &T) -> &'static str {
+    match existing {
+        None => "registered",
+        Some(existing) if existing == new => "unchanged",
+        Some(_) => "updated",
+    }
+}
+
 /// The startup registration side of `SkiljBuilder::application_version`
 /// (docs/architecture.md §104).
+///
+/// Also carries whether reconciliation applies what it decides or only
+/// previews it (`SkiljBuilder::preflight`, docs/architecture.md §249): a
+/// preview writes nothing and collects what it would have done.
 struct RegistrationVersion {
     version: Option<i64>,
     /// Bounded contexts whose `registered_by_version` columns this startup
     /// has already ensured.
     ensured: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// `Some` in a preview: the outcomes, and no writes.
+    preview: Option<std::sync::Mutex<Vec<preflight::RegistrationOutcome>>>,
 }
 
 impl RegistrationVersion {
@@ -1924,7 +1964,37 @@ impl RegistrationVersion {
         Self {
             version: version.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
             ensured: Default::default(),
+            preview: None,
         }
+    }
+
+    fn preview(version: Option<u64>) -> Self {
+        Self {
+            preview: Some(Default::default()),
+            ..Self::new(version)
+        }
+    }
+
+    /// Whether reconciliation writes what it decides.
+    fn applies(&self) -> bool {
+        self.preview.is_none()
+    }
+
+    /// Notes what reconciliation would do with `key` (`bounded_context/name`),
+    /// in a preview.
+    fn note(&self, kind: &str, key: &str, outcome: &str, detail: Option<String>) {
+        if let Some(preview) = &self.preview {
+            let (bounded_context, name) = key.split_once('/').unwrap_or((key, ""));
+            preview.lock().unwrap_or_else(|e| e.into_inner()).push(
+                preflight::RegistrationOutcome::new(bounded_context, kind, name, outcome, detail),
+            );
+        }
+    }
+
+    fn into_outcomes(self) -> Vec<preflight::RegistrationOutcome> {
+        self.preview
+            .map(|p| p.into_inner().unwrap_or_else(|e| e.into_inner()))
+            .unwrap_or_default()
     }
 
     /// Whether this process is older than whatever last registered
@@ -1939,12 +2009,23 @@ impl RegistrationVersion {
         let Some(ours) = self.version else {
             return Ok(false);
         };
-        self.ensure_columns(pool, bounded_context).await?;
-        Ok(
-            skilj_core::db::registration_version(pool, bounded_context, table, name)
-                .await?
-                .is_some_and(|stored| ours < stored),
-        )
+        if self.applies() {
+            self.ensure_columns(pool, bounded_context).await?;
+        }
+        let stored = match skilj_core::db::registration_version(pool, bounded_context, table, name)
+            .await
+        {
+            Ok(stored) => stored,
+            // A preview doesn't add the column; without it nothing is stamped.
+            Err(skilj_core::Error::Database(e))
+                if !self.applies()
+                    && e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42703") =>
+            {
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(stored.is_some_and(|stored| ours < stored))
     }
 
     /// Once per bounded context per startup - see
@@ -1974,6 +2055,7 @@ impl RegistrationVersion {
         name: &str,
     ) -> skilj_core::error::Result<()> {
         match self.version {
+            Some(_) if !self.applies() => Ok(()),
             Some(version) => {
                 self.ensure_columns(pool, bounded_context).await?;
                 skilj_core::db::set_registration_version(
@@ -2274,6 +2356,7 @@ async fn check_stored_blind_tags(
     blind_tags: &HashMap<(String, String), RegisteredBlindTag>,
     blind_index: &skilj_core::blind::BlindIndex,
     template_cache: &skilj_core::template_cache::TemplateCache,
+    record: bool,
 ) -> Result<Vec<PendingBlindRotation>, skilj_core::Error> {
     let mut pending = Vec::new();
     if blind_tags.is_empty() {
@@ -2350,7 +2433,8 @@ async fn check_stored_blind_tags(
             }
         }
     }
-    for (bc, tag_key, fingerprint) in missing {
+    // A preflight (docs/architecture.md §249) records nothing.
+    for (bc, tag_key, fingerprint) in missing.into_iter().filter(|_| record) {
         skilj_core::db::record_blind_tag_fingerprint(pool, &bc, &tag_key, &fingerprint).await?;
     }
     Ok(pending)
@@ -3092,6 +3176,7 @@ pub struct SkiljBuilder {
     max_blob_bytes: u64,
     blob_orphan_grace: std::time::Duration,
     application_version: Option<u64>,
+    schema_changes: SchemaChanges,
 }
 
 impl SkiljBuilder {
@@ -3695,6 +3780,14 @@ impl SkiljBuilder {
         self
     }
 
+    /// Whether startup may upgrade the database's schema
+    /// ([`SchemaChanges::Apply`], the default) or must find it up to date
+    /// ([`SchemaChanges::Refuse`]); docs/architecture.md §249.
+    pub fn schema_changes(mut self, mode: SchemaChanges) -> Self {
+        self.schema_changes = mode;
+        self
+    }
+
     /// How long a resolved deadline (fired, cancelled, parked or
     /// forgotten) is kept before a background task deletes it
     /// (docs/architecture.md §163). Defaults to
@@ -3870,12 +3963,10 @@ impl SkiljBuilder {
         self
     }
 
-    /// Runs the startup reconciliation loop automatically (§1.5). Returns
-    /// `Err` only for a genuine registration rejection (e.g. an
-    /// incompatible schema change) - a bounded context the reconciliation
-    /// Role has no admin access to yet is reported in
-    /// `ReconciliationReport`, not an error.
-    pub async fn build(self) -> Result<(Skilj, ReconciliationReport), skilj_core::Error> {
+    /// The checks of this configuration that need no database, which
+    /// [`build`](Self::build) and [`preflight`](Self::preflight) both run
+    /// first.
+    fn validate(&self) -> Result<(), skilj_core::Error> {
         // docs/architecture.md §186: the cross-instance listener keeps one
         // connection for good, so a pool of one serves nothing else.
         if let Some(options) = &self.pool_options {
@@ -3922,6 +4013,282 @@ impl SkiljBuilder {
             skilj_core::blob::validate_blob_fields(&t.schema, &t.blob_fields, &t.sensitive_fields)
                 .map_err(|e| invalid_blob_declaration("command type", bc, name, e))?;
         }
+        Ok(())
+    }
+
+    /// What [`build`](Self::build) would change, refuse or leave
+    /// undetermined, without changing anything (docs/architecture.md §249).
+    ///
+    /// [`preflight::inspect`]'s report of the database, plus what needs
+    /// this builder: the stored data keys checked against the key provider
+    /// (without recording the key version in use), the stored blind tags
+    /// against the blind-index key, and - with a reconciliation role - what
+    /// reconciliation would do with each declared type
+    /// ([`preflight::PreflightReport::registrations`]). Starts no
+    /// background task and serves nothing.
+    ///
+    /// Every connection it opens is read-only
+    /// (`default_transaction_read_only`), so Postgres refuses any write. On
+    /// a schema that needs upgrading, registrations are read from the old
+    /// schema and may not be readable at all; that is reported as unknown.
+    pub async fn preflight(self) -> Result<preflight::PreflightReport, skilj_core::Error> {
+        self.validate()?;
+        let pool = skilj_core::db::connect_read_only(
+            &self.database_url,
+            self.pool_options
+                .clone()
+                .unwrap_or_else(default_pool_options),
+            self.statement_cache_capacity,
+        )
+        .await?;
+        let result = self.preflight_on(&pool).await;
+        pool.close().await;
+        result
+    }
+
+    async fn preflight_on(
+        self,
+        pool: &Pool,
+    ) -> Result<preflight::PreflightReport, skilj_core::Error> {
+        let mut report = preflight::inspect(pool, &preflight::InspectOptions::new()).await?;
+        if report.verdict == preflight::Verdict::Refused {
+            report.unknown.push(preflight::Unknown::new(
+                "registrations",
+                "not checked: startup would be refused before reconciling",
+            ));
+            return Ok(report);
+        }
+        // What the old schema can't answer is unknown, not a refusal: the
+        // upgrade adds it (docs/architecture.md §159).
+        fn unreadable_before_upgrade(err: &skilj_core::Error) -> bool {
+            matches!(err, skilj_core::Error::Database(e)
+                if e.as_database_error().and_then(|d| d.code()).as_deref()
+                    .is_some_and(|code| code == "42703" || code == "42P01"))
+        }
+        let refuse = |report: &mut preflight::PreflightReport,
+                      check: &str,
+                      err: skilj_core::Error| {
+            if unreadable_before_upgrade(&err) {
+                report.unknown.push(preflight::Unknown::new(
+                    check,
+                    "the schema has to be upgraded first (preflight::migrate) before this can be read",
+                ));
+            } else {
+                report.refusals.push(preflight::Refusal::new(
+                    skilj_core::error::SkiljRejection::code(&err),
+                    err.to_string(),
+                ));
+            }
+        };
+
+        let template_cache = skilj_core::template_cache::TemplateCache::new();
+        if let Err(err) = template_cache.refresh(pool).await {
+            refuse(&mut report, "templates", err);
+            return Ok(finish(report));
+        }
+        let key_service = match (self.key_service, self.legacy_encryption_master_key) {
+            (Some(service), Some(legacy)) => Some(service.with_legacy_master_key(legacy)),
+            (service, _) => service,
+        };
+        if let Some(key_service) = &key_service {
+            if let Err(err) = check_encryption_keys(pool, key_service, false).await {
+                refuse(&mut report, "encryption_keys", err);
+            }
+        }
+        let blind_index = match &self.blind_index_key {
+            Some(key) => skilj_core::blind::BlindIndex::new(
+                key.clone(),
+                self.blind_tags
+                    .iter()
+                    .map(|((bc, tag_key), b)| (bc.clone(), tag_key.clone(), b.normalize)),
+            )
+            .with_previous_keys(self.previous_blind_index_keys.iter().cloned())
+            .with_templates(template_cache.clone()),
+            None => skilj_core::blind::BlindIndex::default(),
+        };
+        let pending_rotations = match check_stored_blind_tags(
+            pool,
+            &self.blind_tags,
+            &blind_index,
+            &template_cache,
+            false,
+        )
+        .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                refuse(&mut report, "blind_tags", err);
+                Vec::new()
+            }
+        };
+
+        let Some(external_subject) = &self.reconciliation_role else {
+            for rotation in &pending_rotations {
+                report
+                    .registrations
+                    .push(preflight::RegistrationOutcome::new(
+                        &rotation.bounded_context,
+                        "blind_tag",
+                        &rotation.tag_key,
+                        "rotation_pending",
+                        Some("an instance with a reconciliation role rotates it".into()),
+                    ));
+            }
+            return Ok(finish(report));
+        };
+        let roles = skilj_core::db::list_roles(pool).await?;
+        let role = match skilj_core::access_control::resolve_role_by_external_subject(
+            external_subject,
+            &roles,
+        ) {
+            Ok(role) => role.clone(),
+            Err(err) => {
+                refuse(&mut report, "reconciliation_role", err);
+                return Ok(finish(report));
+            }
+        };
+
+        // Blind tags: registered when not stored yet, and rotated when
+        // behind the current key.
+        let mut declared: Vec<_> = self.blind_tags.keys().collect();
+        declared.sort();
+        for (bounded_context, tag_key) in declared {
+            let outcome =
+                match resolve_bounded_context_and_admin_mapping(pool, &role.id, bounded_context)
+                    .await
+                {
+                    Ok(None) => "skipped_no_access",
+                    Ok(Some(_)) => {
+                        match skilj_core::db::list_blind_tags(pool, bounded_context).await {
+                            Ok(stored) if stored.iter().any(|s| &s.tag_key == tag_key) => {
+                                if pending_rotations.iter().any(|r| {
+                                    &r.bounded_context == bounded_context && &r.tag_key == tag_key
+                                }) {
+                                    "rotated"
+                                } else {
+                                    "unchanged"
+                                }
+                            }
+                            Ok(_) => "registered",
+                            Err(err) => {
+                                refuse(&mut report, "blind_tags", err);
+                                continue;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        refuse(&mut report, "blind_tags", err);
+                        continue;
+                    }
+                };
+            report
+                .registrations
+                .push(preflight::RegistrationOutcome::new(
+                    bounded_context,
+                    "blind_tag",
+                    tag_key,
+                    outcome,
+                    None,
+                ));
+        }
+
+        let projections = Arc::new(self.projections);
+        let dispatcher = ProjectionDispatcherImpl {
+            projections: projections.clone(),
+            template_cache: template_cache.clone(),
+            payload_limits: self.payload_limits,
+        };
+        let version = RegistrationVersion::preview(self.application_version);
+        let mut reports: Vec<(&str, ReconciliationReport)> = Vec::new();
+        let mut phase = ReconciliationReport::default();
+        let outcome = reconcile_event_types(
+            pool,
+            &role,
+            &self.event_types,
+            &mut phase,
+            chrono::Utc::now(),
+            &version,
+        )
+        .await;
+        reports.push(("event_type", std::mem::take(&mut phase)));
+        let outcome = match outcome {
+            Ok(()) => {
+                let outcome =
+                    reconcile_command_types(pool, &role, &self.command_types, &mut phase, &version)
+                        .await;
+                reports.push(("command_type", std::mem::take(&mut phase)));
+                outcome
+            }
+            err => err,
+        };
+        let outcome = match outcome {
+            Ok(()) => {
+                let outcome = reconcile_projections(
+                    pool,
+                    &role,
+                    &projections,
+                    &mut phase,
+                    &dispatcher,
+                    &version,
+                )
+                .await;
+                reports.push(("projection", std::mem::take(&mut phase)));
+                outcome
+            }
+            err => err,
+        };
+        if let Err(err) = outcome {
+            refuse(&mut report, "registrations", err);
+            report.unknown.push(preflight::Unknown::new(
+                "registrations",
+                "reconciliation stops at its first refusal; the types after it were not checked",
+            ));
+        }
+        report.registrations.extend(version.into_outcomes());
+        for (kind, phase) in reports {
+            for key in phase.kept_newer {
+                let (bc, name) = key.split_once('/').unwrap_or((&key, ""));
+                report
+                    .registrations
+                    .push(preflight::RegistrationOutcome::new(
+                        bc,
+                        kind,
+                        name,
+                        "kept_newer",
+                        None,
+                    ));
+            }
+            for key in phase.skipped_no_access {
+                let (bc, name) = key.split_once('/').unwrap_or((&key, ""));
+                report
+                    .registrations
+                    .push(preflight::RegistrationOutcome::new(
+                        bc,
+                        kind,
+                        name,
+                        "skipped_no_access",
+                        None,
+                    ));
+            }
+        }
+        return Ok(finish(report));
+
+        /// Refusals found here make the verdict `Refused`.
+        fn finish(mut report: preflight::PreflightReport) -> preflight::PreflightReport {
+            if !report.refusals.is_empty() {
+                report.verdict = preflight::Verdict::Refused;
+            }
+            report
+        }
+    }
+
+    /// Runs the startup reconciliation loop automatically (§1.5). Returns
+    /// `Err` only for a genuine registration rejection (e.g. an
+    /// incompatible schema change) - a bounded context the reconciliation
+    /// Role has no admin access to yet is reported in
+    /// `ReconciliationReport`, not an error.
+    pub async fn build(self) -> Result<(Skilj, ReconciliationReport), skilj_core::Error> {
+        self.validate()?;
         // docs/architecture.md §194.
         let graphql_naming = match &self.graphql_federation {
             Some(options) => options.naming().map_err(skilj_core::Error::configuration)?,
@@ -3938,6 +4305,18 @@ impl SkiljBuilder {
             &self.database_url,
             self.statement_cache_capacity,
         );
+        // docs/architecture.md §249: a schema this release is too old for
+        // is refused before anything else; with `Refuse`, so is one that
+        // needs upgrading.
+        if self.schema_changes == SchemaChanges::Refuse {
+            preflight::check_compatibility(&pool).await?;
+            let report = preflight::inspect(&pool, &preflight::InspectOptions::new()).await?;
+            if report.verdict != preflight::Verdict::UpToDate {
+                return Err(skilj_core::Error::SchemaUpgradeRequired {
+                    pending: report.summary(),
+                });
+            }
+        }
         skilj_core::db::migrate(&pool).await?;
         // docs/architecture.md §176: a promotion or restore since the last
         // instance ran is reported, not just survived.
@@ -3960,27 +4339,7 @@ impl SkiljBuilder {
         // exists either way, which is all this cares about) apart from a
         // real error (the row still doesn't exist, so whatever failed the
         // insert is a genuine problem worth propagating).
-        let existing_admin_context = skilj_core::db::get_bounded_context(
-            &pool,
-            skilj_core::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME,
-        )
-        .await?;
-        if let Some(admin_context) = skilj_core::bootstrap::stamp_admin_bounded_context(
-            existing_admin_context.as_ref(),
-            chrono::Utc::now(),
-        ) {
-            if let Err(e) = skilj_core::db::insert_bounded_context(&pool, &admin_context).await {
-                if skilj_core::db::get_bounded_context(
-                    &pool,
-                    skilj_core::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME,
-                )
-                .await?
-                .is_none()
-                {
-                    return Err(e);
-                }
-            }
-        }
+        skilj_core::db::ensure_admin_bounded_context(&pool).await?;
 
         // Needed unconditionally now, not only when a reconciliation role
         // is configured - `generate_bootstrap_secret` below needs the
@@ -4100,177 +4459,7 @@ impl SkiljBuilder {
                 let event_cache = &event_cache;
                 async move {
                     let prepared = async {
-                        // issue #12: `idempotency_keys` patched into
-                        // every bounded context, every startup - including
-                        // ones provisioned before this feature existed, since
-                        // `provision_bounded_context_schema` itself only ever
-                        // runs once, at creation, and there's no general
-                        // per-bounded-context migration mechanism in this
-                        // codebase. `CREATE TABLE IF NOT EXISTS` makes this
-                        // free once the table already exists - see
-                        // `ensure_idempotency_keys_table`'s own doc comment.
-                        skilj_core::db::ensure_idempotency_keys_table(pool, &bc.name).await?;
-                        // docs/architecture.md §37: patches an already-
-                        // provisioned bounded context's `idempotency_keys`
-                        // (a real table since 0.0.2) onto the `client_id`-
-                        // scoped shape `ensure_idempotency_keys_table` above
-                        // already gives a brand-new one directly - a no-op
-                        // for one that already has it, migrated or fresh.
-                        // See `migrate_idempotency_keys_client_id_scoping`'s
-                        // own doc comment.
-                        skilj_core::db::migrate_idempotency_keys_client_id_scoping(pool, &bc.name)
-                            .await?;
-                        // Cross-tenant projection read fix
-                        // (docs/architecture.md's own write-up of this pass):
-                        // same "patched into every bounded context, every
-                        // startup" treatment, for `projection_state.owner`/
-                        // `projection_rebuild_state.owner` instead - see
-                        // `ensure_projection_state_owner_columns`'s own doc
-                        // comment.
-                        skilj_core::db::ensure_projection_state_owner_columns(pool, &bc.name)
-                            .await?;
-                        // issue #25: `projection_state.as_of_sequence`/
-                        // `projection_rebuild_state.as_of_sequence`, the real
-                        // fix for a genuine cross-instance double-fold race
-                        // found while investigating that issue - see
-                        // `ensure_projection_state_as_of_sequence_columns`'s
-                        // own doc comment.
-                        skilj_core::db::ensure_projection_state_as_of_sequence_columns(
-                            pool, &bc.name,
-                        )
-                        .await?;
-                        // Same pass's own raw-event half - `event_types.owner_tag_key`/
-                        // `access_tokens.scope` - see
-                        // `ensure_event_scoping_columns`'s own doc comment.
-                        skilj_core::db::ensure_event_scoping_columns(pool, &bc.name).await?;
-                        // Private-field mechanism (docs/architecture.md's own
-                        // write-up of this pass) - `event_types.private_fields`/
-                        // `command_types.private_fields` columns, and the new
-                        // `private_field_grants` table - same "patched into
-                        // every bounded context, every startup" treatment. See
-                        // `ensure_private_field_columns`/
-                        // `ensure_private_field_grants_table`'s own doc
-                        // comments.
-                        skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
-                        skilj_core::db::ensure_projection_owner_tag_key_column(pool, &bc.name)
-                            .await?;
-                        skilj_core::db::ensure_projection_requires_capability_column(
-                            pool, &bc.name,
-                        )
-                        .await?;
-                        skilj_core::db::ensure_private_field_grants_table(pool, &bc.name).await?;
-                        // issue #98: the approval policy and
-                        // proposal tables, same "patched into every bounded
-                        // context, every startup" treatment.
-                        skilj_core::db::ensure_command_approval_tables(pool, &bc.name).await?;
-                        // Secrets (docs/architecture.md's own write-up of
-                        // this pass) - the new `secret_versions`/
-                        // `secret_grants` tables, same "patched into every
-                        // bounded context, every startup" treatment. See
-                        // `ensure_secret_tables`'s own doc comment.
-                        skilj_core::db::ensure_secret_tables(pool, &bc.name).await?;
-                        // Cross-context event router (docs/architecture.md's
-                        // own write-up of this pass) - same "patched into
-                        // every bounded context, every startup" treatment.
-                        // See `ensure_cross_context_route_cursors_table`'s
-                        // own doc comment.
-                        skilj_core::db::ensure_cross_context_route_cursors_table(pool, &bc.name)
-                            .await?;
-                        // issue #20: native one-shot, per-entity
-                        // deadlines - same "patched into every bounded
-                        // context, every startup" treatment, for the new
-                        // `deadline_cursors`/`deadlines` tables. See
-                        // `ensure_deadline_cursors_table`/`ensure_deadlines_table`'s
-                        // own doc comments.
-                        skilj_core::db::ensure_deadline_cursors_table(pool, &bc.name).await?;
-                        skilj_core::db::ensure_deadlines_table(pool, &bc.name).await?;
-                        // issue #25: partitioned async Projection
-                        // catch-up - same "patched into every bounded
-                        // context, every startup" treatment, for a brand-new
-                        // table that needs no migration dance. See
-                        // `ensure_projection_partition_progress_table`'s own
-                        // doc comment.
-                        skilj_core::db::ensure_projection_partition_progress_table(pool, &bc.name)
-                            .await?;
-                        // issue #25 (docs/architecture.md §52):
-                        // partitioned Snapshot catch-up - same treatment,
-                        // for `Snapshot`'s own twin table. See
-                        // `ensure_snapshot_partition_progress_table`'s own
-                        // doc comment.
-                        skilj_core::db::ensure_snapshot_partition_progress_table(pool, &bc.name)
-                            .await?;
-                        // issue #25 (docs/architecture.md §53): the
-                        // read_cursors checkout mechanism closing the
-                        // Kafka/AMQP/NATS outbound bridges' double-publish
-                        // gap. See `ensure_read_cursors_checkout_column`'s
-                        // own doc comment.
-                        skilj_core::db::ensure_read_cursors_checkout_column(pool, &bc.name).await?;
-                        // External-message dedup (docs/architecture.md §39,
-                        // specs/skilj.allium's own rule CreateExternalEvent) -
-                        // same "patched into every bounded context, every
-                        // startup" treatment, for a brand-new table that needs
-                        // no migration dance. See
-                        // `ensure_external_message_cursors_table`'s own doc
-                        // comment.
-                        skilj_core::db::ensure_external_message_cursors_table(pool, &bc.name)
-                            .await?;
-                        // Its per-message counterpart (docs/architecture.md §175).
-                        skilj_core::db::ensure_external_message_keys_table(pool, &bc.name).await?;
-                        // "New subscriber replays all history" fix
-                        // (docs/architecture.md's own write-up of this pass) -
-                        // `access_tokens.start_from`, same "patched into every
-                        // bounded context, every startup" treatment. See
-                        // `ensure_event_read_token_start_from_column`'s own
-                        // doc comment.
-                        skilj_core::db::ensure_event_read_token_start_from_column(pool, &bc.name)
-                            .await?;
-                        // Correlation/causation ids (issue #18) -
-                        // same "patched into every bounded context, every
-                        // startup" treatment. See
-                        // `ensure_correlation_causation_columns`'s own doc
-                        // comment.
-                        skilj_core::db::ensure_correlation_causation_columns(pool, &bc.name)
-                            .await?;
-                        // issue #21 (dead-letter/parking for failed
-                        // event/message handler delivery) - `cross_context_route_cursors`'
-                        // own three new retry-backoff columns, same "patched
-                        // into every bounded context, every startup"
-                        // treatment. See
-                        // `ensure_cross_context_route_retry_columns`'s own
-                        // doc comment for why this is a separate `ALTER
-                        // TABLE` patch rather than folded into
-                        // `ensure_cross_context_route_cursors_table` above.
-                        skilj_core::db::ensure_cross_context_route_retry_columns(pool, &bc.name)
-                            .await?;
-                        // Same pass's own `parked_deliveries` table - a
-                        // brand-new table, so (unlike the retry columns just
-                        // above) this needs no `ALTER TABLE` patch, only the
-                        // identical `CREATE TABLE IF NOT EXISTS` every other
-                        // brand-new per-bounded-context table already gets
-                        // here.
-                        skilj_core::db::ensure_parked_deliveries_table(pool, &bc.name).await?;
-                        // issue #25 review (docs/architecture.md
-                        // §56): the concurrent-instance parked-delivery
-                        // duplication fix's own belt-and-suspenders unique
-                        // index, plus the one-time dedup a bounded context
-                        // that already hit the race needs before that index
-                        // can even be created. See
-                        // `migrate_parked_deliveries_dedup_and_unique_index`'s
-                        // own doc comment.
-                        skilj_core::db::migrate_parked_deliveries_dedup_and_unique_index(
-                            pool, &bc.name,
-                        )
-                        .await?;
-                        // docs/architecture.md §189: the counter the event
-                        // cache stamps registrations with, instead of
-                        // hashing them on every read.
-                        skilj_core::db::ensure_registrations_generation(pool, &bc.name).await?;
-                        // docs/architecture.md §198: the per-tag index a
-                        // consistency query's typed items read, and the
-                        // column a command's query is recorded in, each in
-                        // its own transaction (§200). Always run here, not
-                        // skipped for one this process already saw (§204).
-                        skilj_core::db::make_bounded_context_current(pool, &bc).await?;
+                        skilj_core::db::upgrade_bounded_context(pool, &bc).await?;
                         // Last: it reads `events` as the patches above
                         // leave it - a bounded context from before
                         // `metadata_correlation_id`/`metadata_causation_id`
@@ -4317,6 +4506,10 @@ impl SkiljBuilder {
                 "access trail: recorded the starting state of grants that had no history"
             );
         }
+        // Every bounded context listed above is patched, and the access
+        // trail is set up: this release's schema level holds
+        // (docs/architecture.md §249).
+        skilj_core::db::record_schema_level(&pool).await?;
 
         // After the schema patches above (docs/architecture.md §159):
         // reconciliation reads each declared bounded context's
@@ -4325,10 +4518,11 @@ impl SkiljBuilder {
         // docs/architecture.md §230: after the access trail, whose admin
         // context records the master key's events.
         if let Some(key_service) = &key_service {
-            check_encryption_keys(&pool, key_service).await?;
+            check_encryption_keys(&pool, key_service, true).await?;
         }
         let pending_rotations =
-            check_stored_blind_tags(&pool, &self.blind_tags, &blind_index, &template_cache).await?;
+            check_stored_blind_tags(&pool, &self.blind_tags, &blind_index, &template_cache, true)
+                .await?;
         let mut report = ReconciliationReport::default();
         if let Some(external_subject) = &self.reconciliation_role {
             let role = skilj_core::access_control::resolve_role_by_external_subject(
@@ -6021,6 +6215,17 @@ async fn reconcile_event_types(
                  fields, owner tag key) than the stored registration - keeping the stored ones"
             );
             report.kept_protections.push(key.clone());
+            version.note("event_type", &key, "kept_protections", None);
+        }
+        version.note(
+            "event_type",
+            &key,
+            registration_outcome(existing.as_ref(), registration.event_type()),
+            None,
+        );
+        if !version.applies() {
+            report.registered.push(key);
+            continue;
         }
         skilj_core::db::upsert_event_type(pool, registration.event_type()).await?;
         version
@@ -6144,6 +6349,17 @@ async fn reconcile_command_types(
                  fields, owner tag key) than the stored registration - keeping the stored ones"
             );
             report.kept_protections.push(key.clone());
+            version.note("command_type", &key, "kept_protections", None);
+        }
+        version.note(
+            "command_type",
+            &key,
+            registration_outcome(existing.as_ref(), registration.command_type()),
+            None,
+        );
+        if !version.applies() {
+            report.registered.push(key);
+            continue;
         }
         skilj_core::db::upsert_command_type(pool, registration.command_type()).await?;
         if let Some(policy) = &registered.approval_policy {
@@ -6309,6 +6525,27 @@ async fn reconcile_projections(
         };
         let registration =
             registration.with_owner_tag_key(registered.owner_tag_key.map(str::to_owned));
+        if !version.applies() {
+            let outcome = match &registration {
+                ProjectionRegistration::Created {
+                    needs_history_fold, ..
+                } => (
+                    "registered",
+                    needs_history_fold.then(|| "folds the existing history at startup".into()),
+                ),
+                ProjectionRegistration::ReconciledTrivially(projection) => {
+                    (registration_outcome(existing.as_ref(), projection), None)
+                }
+                ProjectionRegistration::RebuildStaged(_) => (
+                    "rebuild_staged",
+                    Some("replays the consumed event types' history in the background".into()),
+                ),
+                _ => ("updated", None),
+            };
+            version.note("projection", &key, outcome.0, outcome.1);
+            report.registered.push(key);
+            continue;
+        }
         match registration {
             ProjectionRegistration::Created {
                 projection,

@@ -116,15 +116,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Prepare template at a stable path
         run: scripts/check-template.sh --prepare-only --cache-dir target/template-check
+      # docs/architecture.md §249: the previous release's template, from its
+      # tag, for the upgrade check below. The checkout has no tags.
+      - name: Prepare the previous release
+        run: |
+          from="$(sed -n 's/^DEFAULT_FROM=//p' scripts/check-upgrade-pair.sh)"
+          git fetch --no-tags --depth=1 origin "refs/tags/$from:refs/tags/$from"
+          scripts/check-upgrade-pair.sh --prepare-only --cache-dir target/upgrade-pair
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: target/template-check/app -> ../build
+          workspaces: |
+            target/template-check/app -> ../build
+            target/upgrade-pair/old -> ../old-build
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Generates templates/skilj-template, builds it against this
       # workspace's crates - the template isn't a workspace member, so
       # nothing else notices when a change breaks it (docs/architecture.md §105) -
       # and runs the quickstart: deposit accepted, overdraft rejected.
       - run: scripts/check-template.sh --prepared --cache-dir target/template-check
+      # The previous release on an empty database, this workspace upgrading
+      # it with the previous release's data intact, and the previous release
+      # then refusing the upgraded database - as separate processes, on one
+      # embedded Postgres (docs/architecture.md §249). Before the agent-guide
+      # solutions, which change the generated app this reuses.
+      - run: >-
+          scripts/check-upgrade-pair.sh --prepared --cache-dir target/upgrade-pair
+          --new-cache target/template-check
       # What the template gives a coding agent: the guides are found, and
       # the reference solutions of their three evaluation tasks still pass
       # against this workspace (docs/architecture.md §248).

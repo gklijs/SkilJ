@@ -47,6 +47,7 @@ pub mod event_cache;
 pub mod event_store;
 pub mod payload_limits;
 pub mod plugin;
+pub mod preflight;
 pub mod projections;
 pub mod retraction;
 pub mod secrets;

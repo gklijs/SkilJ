@@ -38,25 +38,100 @@ The template's `skilj::dev::seed_admin` bypasses that flow for development.
 ## Upgrade with a restore plan
 
 Read the [changelog](../CHANGELOG.md) for every release crossed by an upgrade.
-Rehearse on a restored backup with the intended application registrations,
-database version and representative data volume. Verify recovery from that
-backup before updating the production database; there is no down-migration
-tool. Restoring also means deciding how to handle writes made after the backup.
+Its "Upgrading from" section says what the first startup does and whether the
+previous release may keep running. Rehearse on a restored backup with the
+intended application registrations, database version and representative data
+volume. Verify recovery from that backup before updating the production
+database; there is no down-migration tool. Restoring also means deciding how
+to handle writes made after the backup.
 
-For example, upgrading from 0.2 to 0.3 requires Postgres 15 or later.
-The first startup interns historical tags while locking event writes;
-large histories require a maintenance window. Sensitive projections need
-`Projection::SUBJECT_KEY` for decryption, and a staged or building rebuild
-can pause live folding unless `LIVE_FOLD_COMPATIBLE` is declared. A paused
-synchronous projection refuses writes with `live_fold_paused`. Follow the
-release's instructions and verify rebuild readiness before resuming traffic.
+### Which upgrades are supported
 
-Mixed application versions on one database are untested. Use a stop,
-upgrade and restart procedure instead of assuming a rolling deployment is
-compatible. The historical-schema fixture tests upgrade from v0.0.1;
-it does not establish arbitrary mixed-version compatibility. Likewise,
-local use of Postgres 15+ is not a multi-major CI guarantee; the full suite
-currently runs against Postgres 17. See [coverage limits](../CONTRIBUTING.md#what-the-tests-do-and-dont-verify).
+- **Stop, upgrade, start** from any release. Stop every instance, start the new
+  release (or run its migration step), then start the rest. The suite upgrades
+  a bounded context from v0.0.1's schema, and CI runs the previous release and
+  this one against one database (`scripts/check-upgrade-pair.sh`).
+- **Rolling deploys** only between two releases whose changelog says the older
+  one may keep running. A release records a schema level and the oldest level
+  allowed to run against its schema. An instance of an older release then
+  refuses to start with `schema_too_new`, naming the release that upgraded the
+  database. Instances already running keep running, but don't restart them.
+  Releases up to 0.3.0 record no level and refuse with sqlx's `VersionMissing`
+  instead.
+- **Rollback** only by restoring the backup.
+
+### Before: preflight
+
+Run the preflight with production's configuration against the restored copy,
+and against production just before the window:
+
+```rust
+let report = my_app::register(Skilj::builder(database_url))
+    .reconciliation_role(subject)
+    .preflight()
+    .await?;
+println!("{report}"); // or serde_json::to_string(&report)
+```
+
+It changes nothing: its connections are read-only, and Postgres refuses any
+write. The report lists:
+
+- pending global migrations;
+- each bounded context's missing objects;
+- the patches that rewrite rows or block writes (`rewrites`), and the table
+  locks of the rest (`locks`), with row counts. The counts are planner
+  estimates; `InspectOptions::exact_counts` counts them instead;
+- what reconciliation would do with each type, such as `rebuild_staged`, which
+  replays history in the background, `kept_newer` and `refused`;
+- `unknown`: checks it couldn't answer, such as registrations on a schema that
+  must be upgraded before they can be read.
+
+A `refused` verdict means startup would fail. `skilj::preflight::inspect(&pool,
+..)` gives the database part from any binary.
+
+### During: who migrates, and locks
+
+By default the first instance to start upgrades the schema. Several starting
+together is safe: each step serializes on a lock and skips what another
+already did. To make the change a step of its own, run
+`skilj::preflight::migrate(database_url, &MigrateOptions::new().lock_timeout(..))`
+from a deploy job or init container. Then start the application with
+`.schema_changes(SchemaChanges::Refuse)`, so an instance that would otherwise
+upgrade fails with `schema_upgrade_required` instead.
+
+A schema change that has real work to do waits for every open transaction on
+its table, and queries on that table queue behind it. Startup itself sets no
+lock timeout. Run the upgrade with no long-running transactions open: no
+reporting queries, no idle `psql` sessions. `migrate`'s `lock_timeout` turns a
+long wait into a failure. The step that waited is not committed, and the steps
+before it stay done.
+
+### If it's interrupted
+
+Each global migration and each patch commits on its own. After a crash, a
+timeout or a killed deploy, run the upgrade again: it carries on where it
+stopped, and a preflight shows where that is. A global migration recorded as
+failed (`migration_failed` in the preflight) needs inspecting before a rerun.
+
+### After: rebuilds
+
+Projections the preflight reported as `rebuild_staged` replay their history in
+the background. Watch each projection's `pendingRebuild`/`buildingRebuild`
+until promoted before relying on it. A staged or building rebuild can pause
+live folding unless `LIVE_FOLD_COMPATIBLE` is declared, and a paused
+synchronous projection refuses writes with `live_fold_paused`.
+
+### Upgrading from 0.2 to 0.3
+
+Requires Postgres 15 or later. The first startup interns historical tags
+while locking event writes, so large histories need a maintenance window.
+Sensitive projections need `Projection::SUBJECT_KEY` for decryption.
+
+Mixed application versions beyond a declared pair are untested; see
+[coverage limits](../CONTRIBUTING.md#what-the-tests-do-and-dont-verify).
+Local use of Postgres 15+ is not a multi-major CI guarantee either; the full
+suite runs against Postgres 17. The design behind the preflight is in
+[upgrade-preflight-design.md](upgrade-preflight-design.md).
 
 ## Shutdown and capacity
 
