@@ -333,6 +333,30 @@ pub async fn mark_data_keys_behind(pool: &Pool, provider: &str) -> crate::error:
     Ok(())
 }
 
+/// [`mark_data_keys_behind`] for `provider`'s key when a data key stored
+/// as `row_provider` under `row_version` is behind it - another key's, a
+/// legacy one, or an older version - on the caller's connection. For a
+/// data key that turned out readable after all (docs/architecture.md
+/// §247): the rewrap had passed it by, and takes it at the next check.
+pub(super) async fn mark_data_keys_behind_for<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    provider: &str,
+    row_provider: Option<&str>,
+    row_version: Option<i32>,
+) -> crate::error::Result<()> {
+    sqlx::query(
+        "UPDATE encryption_master_keys SET rewrapped_at = NULL \
+         WHERE provider = $1 AND rewrapped_at IS NOT NULL \
+         AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)",
+    )
+    .bind(provider)
+    .bind(row_provider)
+    .bind(row_version)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Retires every version of `provider`'s key below `version` at the
 /// provider and records `EncryptionMasterKeyRetired`, under the key's lock,
 /// so it can't interleave with a rotation. Does nothing when they already
@@ -870,17 +894,49 @@ pub async fn key_in_use(pool: &Pool, provider: &str) -> crate::error::Result<boo
 
 /// Whether any bounded context has a data key that still counts (not
 /// marked unreadable since `since`) wrapped by `provider` under a version
-/// below `version`. A savepoint per context, as in [`key_in_use_on`].
+/// below `version`.
 async fn key_rows_below_on(
     conn: &mut sqlx::PgConnection,
     provider: &str,
     version: u32,
     since: DateTime<Utc>,
 ) -> crate::error::Result<bool> {
-    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM bounded_contexts")
+    Ok(!contexts_below_on(conn, provider, version, since, true)
+        .await?
+        .is_empty())
+}
+
+/// The bounded contexts with a data key that still counts (not marked
+/// unreadable since `since`) wrapped by `provider` under a version below
+/// `version` - whatever key they are assigned now: one that moved to
+/// another key can have left some behind (docs/architecture.md §247).
+pub async fn contexts_with_data_keys_below(
+    pool: &Pool,
+    provider: &str,
+    version: u32,
+    since: DateTime<Utc>,
+) -> crate::error::Result<Vec<String>> {
+    let mut tx = pool.begin().await?;
+    let contexts = contexts_below_on(&mut tx, provider, version, since, false).await?;
+    tx.rollback().await?;
+    Ok(contexts)
+}
+
+/// [`contexts_with_data_keys_below`] on a connection in a transaction,
+/// only the first one found with `first_only`. A savepoint per context,
+/// as in [`key_in_use_on`].
+async fn contexts_below_on(
+    conn: &mut sqlx::PgConnection,
+    provider: &str,
+    version: u32,
+    since: DateTime<Utc>,
+    first_only: bool,
+) -> crate::error::Result<Vec<String>> {
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM bounded_contexts ORDER BY name")
         .fetch_all(&mut *conn)
         .await?;
     let counts = readable_since("$3");
+    let mut found = Vec::new();
     for name in names {
         let schema = schema_ident(&name);
         sqlx::query("SAVEPOINT key_rows_below")
@@ -898,25 +954,29 @@ async fn key_rows_below_on(
         .await
         .map_err(crate::error::Error::from);
         match below {
-            Ok(true) => {
+            Ok(below) => {
                 sqlx::query("RELEASE SAVEPOINT key_rows_below")
                     .execute(&mut *conn)
                     .await?;
-                return Ok(true);
+                if below {
+                    found.push(name);
+                    if first_only {
+                        break;
+                    }
+                }
             }
-            Ok(false) => {}
             Err(err) if super::is_missing_schema(&err) => {
                 sqlx::query("ROLLBACK TO SAVEPOINT key_rows_below")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("RELEASE SAVEPOINT key_rows_below")
                     .execute(&mut *conn)
                     .await?;
             }
             Err(err) => return Err(err),
         }
-        sqlx::query("RELEASE SAVEPOINT key_rows_below")
-            .execute(&mut *conn)
-            .await?;
     }
-    Ok(false)
+    Ok(found)
 }
 
 async fn key_in_use_on(
@@ -1006,6 +1066,7 @@ pub async fn rewrap_data_keys_once(
     target: &dyn KeyProvider,
     version: u32,
     since: DateTime<Utc>,
+    retiring: Option<&str>,
 ) -> crate::error::Result<Option<RewrapOutcome>> {
     let mut lock = pool.acquire().await?;
     let name = format!("skilj_rewrap:{}:{bounded_context}", target.name());
@@ -1016,8 +1077,16 @@ pub async fn rewrap_data_keys_once(
     if !held {
         return Ok(None);
     }
-    let outcome =
-        rewrap_data_keys(pool, bounded_context, key_service, target, version, since).await;
+    let outcome = rewrap_data_keys(
+        pool,
+        bounded_context,
+        key_service,
+        target,
+        version,
+        since,
+        retiring,
+    )
+    .await;
     let released = sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
         .bind(&name)
         .execute(&mut *lock)
@@ -1034,8 +1103,10 @@ pub async fn rewrap_data_keys_once(
 /// `target` already wrapped through its own rewrap (Vault does it without
 /// the data key leaving it), one another key wrapped - the bounded
 /// context's previous key - by unwrapping it with that key and wrapping it
-/// with `target`, and a legacy one with the legacy master key. The data key
-/// stays the same, so no event, command or secret is rewritten.
+/// with `target`, and a legacy one with the legacy master key - a batch's
+/// rows in one unwrap batch per key they name and one wrap batch by
+/// `target` (docs/architecture.md §246). The data key stays the same, so
+/// no event, command or secret is rewritten.
 ///
 /// In batches, each its own transaction; each row is updated only if it
 /// still holds what was read, so a concurrent `forgetSubject` or another
@@ -1054,7 +1125,9 @@ pub async fn rewrap_data_keys_once(
 /// transaction of the batch that leaves nothing behind - or, when the rows
 /// left were taken away meanwhile, on its own once the run finds none - so
 /// a crash can't leave the work done and the event missing. Only when the
-/// run changed something.
+/// run changed something. `retiring` is the key whose retirement asked for
+/// this run - one the bounded context left data keys under
+/// (docs/architecture.md §247) - and is named in the event.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn rewrap_data_keys(
     pool: &Pool,
@@ -1063,6 +1136,7 @@ pub async fn rewrap_data_keys(
     target: &dyn KeyProvider,
     version: u32,
     since: DateTime<Utc>,
+    retiring: Option<&str>,
 ) -> crate::error::Result<RewrapOutcome> {
     // Before any batch's transaction: a second pooled connection while one
     // is held is what §117 rules out.
@@ -1081,6 +1155,7 @@ pub async fn rewrap_data_keys(
             bounded_context,
             outcome.rewrapped,
             outcome.unreadable,
+            retiring,
         )
     };
     let mut outcome = RewrapOutcome::default();
@@ -1113,35 +1188,65 @@ pub async fn rewrap_data_keys(
         let mut done: Vec<(i64, Vec<u8>, WrappedDataKey)> = Vec::with_capacity(rows.len());
         let mut unreadable: Vec<(i64, Vec<u8>)> = Vec::new();
         let mut same_key = Vec::new();
-        for (id, wrapped, nonce, provider, row_version) in rows {
-            if provider.as_deref() == Some(target_name.as_str()) {
-                same_key.push((
-                    id,
-                    WrappedDataKey {
-                        version: row_version.and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
-                        ciphertext: wrapped,
-                    },
-                ));
+        // The ones another key wrapped, or the legacy master key.
+        let mut moving: Vec<RewrapRow> = Vec::new();
+        for row in rows {
+            if row.3.as_deref() != Some(target_name.as_str()) {
+                moving.push(row);
                 continue;
             }
-            let unwrapped = key_service
-                .unwrap(StoredWrap {
+            let (id, wrapped, _, _, row_version) = row;
+            same_key.push((
+                id,
+                WrappedDataKey {
+                    version: row_version.and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+                    ciphertext: wrapped,
+                },
+            ));
+        }
+        if !moving.is_empty() {
+            // One unwrap batch per key the rows name and one wrap batch by
+            // the target, rather than two provider calls per row (§246).
+            let stored: Vec<StoredWrap<'_>> = moving
+                .iter()
+                .map(|(_, wrapped, nonce, provider, row_version)| StoredWrap {
                     provider: provider.as_deref(),
                     version: row_version.and_then(|v| u32::try_from(v).ok()),
-                    ciphertext: &wrapped,
+                    ciphertext: wrapped,
                     nonce: nonce.as_deref(),
                 })
-                .await;
-            match unwrapped {
-                Ok(data_key) => {
-                    let rewrapped = target.wrap(data_key.bytes()).await?;
-                    done.push((id, wrapped, rewrapped));
+                .collect();
+            let unwrapped = key_service.unwrap_batch(&stored).await;
+            drop(stored);
+            let mut readable: Vec<(i64, Vec<u8>)> = Vec::with_capacity(moving.len());
+            let mut data_keys: Vec<[u8; 32]> = Vec::with_capacity(moving.len());
+            for ((id, wrapped, ..), result) in moving.into_iter().zip(unwrapped) {
+                match result {
+                    Ok(data_key) => {
+                        readable.push((id, wrapped));
+                        data_keys.push(*data_key.bytes());
+                    }
+                    Err(err) if definitively_unreadable(&err) => {
+                        tracing::warn!(encryption_key_id = id, error = %err, "data key unreadable, marked");
+                        unreadable.push((id, wrapped));
+                    }
+                    Err(err) => return Err(err.into()),
                 }
-                Err(err) if definitively_unreadable(&err) => {
-                    tracing::warn!(encryption_key_id = id, error = %err, "data key unreadable, marked");
-                    unreadable.push((id, wrapped));
+            }
+            let rewrapped = target.wrap_batch(&data_keys).await?;
+            if rewrapped.len() != readable.len() {
+                return Err(encryption::Error::ProviderRefused {
+                    provider: target_name.clone(),
+                    message: format!(
+                        "wrap_batch answered {} wraps for {} data keys",
+                        rewrapped.len(),
+                        readable.len()
+                    ),
                 }
-                Err(err) => return Err(err.into()),
+                .into());
+            }
+            for ((id, old), new) in readable.into_iter().zip(rewrapped) {
+                done.push((id, old, new));
             }
         }
         if !same_key.is_empty() {

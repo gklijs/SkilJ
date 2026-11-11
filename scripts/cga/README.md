@@ -172,3 +172,33 @@ already present in the snapshot; no dependency versions change. A fresh pinned
 analysis leaves every finding identity/count and skipped generic target unchanged
 (6,054 potential panic occurrences and 186 skipped targets). Only the baseline's
 lockfile fingerprint changes; analyzer pins and configuration remain unchanged.
+
+Issue #176's batched data-key moves review and re-record the baseline: 62 new
+finding occurrences in `encryption/service.rs`, `encryption/provider.rs`,
+`encryption/vault.rs` and `db/master_key.rs`, and the removal of the replaced
+row-by-row loop's identities (its `wrap` future, `push` and string drops), for
+6,111 potential panic occurrences in total. The new paths are the batch
+grouping's vector and map allocation, iterator adaptors (`zip`, `enumerate`,
+`collect`), the cache lock already used by `unwrap`, the unwrap-slot permit,
+error cloning and formatting, and the drops of the batch vectors, boxed
+provider futures and buffered streams. Reviewed backtraces reach
+standard-library allocation and precondition checks and future cleanup; these
+remain potential panics, not a claim that the paths cannot panic. The
+production change adds no `unwrap`, `expect`, unchecked indexing or unsafe
+code: positions are written through `get_mut`. Tool/configuration, dependency
+snapshot and the 186 skipped generic targets are unchanged. The provider's
+batch futures are trait-object calls, so the existing coverage limit applies
+to what a provider does inside them.
+
+The retirement fix made with it (docs/architecture.md §247) adds 11 more
+occurrences in `db/master_key.rs` and `db/mod.rs`, reviewed the same way:
+`contexts_with_data_keys_below`'s transaction begin and rollback, its
+`query_scalar`, the vector of context names and its drop, and the
+`tracing::instrument` wrappers whose identities carry a line number that the
+added lines moved. The two additions decided with it - a read that clears an
+unreadable mark making the context's key's rewrap pending, and the event's
+`retiring_provider` - add 12 more: the conditional update's `query`, `bind`
+and `execute` cleanup, `KeyService::provider_for`, the statement connections'
+drops in `unwrap_row`, the changed `MasterKeyChange::rewrapped` call and
+moved `tracing::instrument` identities. No `unwrap`, `expect`, unchecked
+indexing or unsafe code in any of it.

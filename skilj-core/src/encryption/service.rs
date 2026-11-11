@@ -7,7 +7,7 @@
 use super::provider::{KeyProvider, WrappedDataKey};
 use super::{DataKey, EncryptionMasterKey, Error};
 use futures_util::future::{FutureExt, Shared};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -370,6 +370,111 @@ impl KeyService {
                 super::unwrap_data_key(legacy, stored.ciphertext, stored.nonce.unwrap_or(&[]))
             }
         }
+    }
+
+    /// The data key each of `stored` holds, one result per input, in
+    /// order - [`unwrap`](Self::unwrap) for the rows of a rewrap batch
+    /// (docs/architecture.md §246). The ones a key wrapped go to that key
+    /// in one [`KeyProvider::unwrap_batch`], each key's batch under one of
+    /// the service's unwrap slots; a legacy one is unwrapped here. A cached
+    /// data key is answered from the cache, but nothing is added to it:
+    /// what was read is about to be stored under another wrap, so an entry
+    /// for it would only push out one in use.
+    ///
+    /// An error is per item: a batch its key couldn't answer has that
+    /// error on each of its items.
+    pub async fn unwrap_batch(&self, stored: &[StoredWrap<'_>]) -> Vec<Result<DataKey, Error>> {
+        let mut out: Vec<Option<Result<DataKey, Error>>> = Vec::with_capacity(stored.len());
+        // Per key: the key, the positions of its data keys and their wraps.
+        type Batch = (Arc<dyn KeyProvider>, Vec<usize>, Vec<WrappedDataKey>);
+        let mut batches: BTreeMap<&str, Batch> = BTreeMap::new();
+        for (position, one) in stored.iter().enumerate() {
+            let (Some(provider), Some(version)) = (one.provider, one.version) else {
+                out.push(Some(match self.inner.legacy.as_ref() {
+                    Some(legacy) => {
+                        super::unwrap_data_key(legacy, one.ciphertext, one.nonce.unwrap_or(&[]))
+                    }
+                    None => Err(Error::LegacyMasterKeyRequired),
+                }));
+                continue;
+            };
+            let Some(key) = self.provider_named(provider) else {
+                out.push(Some(Err(Error::ProviderChanged {
+                    stored: provider.to_string(),
+                    configured: self.provider_name().to_string(),
+                })));
+                continue;
+            };
+            let wrapped = WrappedDataKey {
+                version,
+                ciphertext: one.ciphertext.to_vec(),
+            };
+            let cached = self
+                .inner
+                .cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&cache_key(provider, &wrapped));
+            if let Some(data_key) = cached {
+                out.push(Some(Ok(data_key)));
+                continue;
+            }
+            let batch = batches
+                .entry(provider)
+                .or_insert_with(|| (key, Vec::new(), Vec::new()));
+            batch.1.push(position);
+            batch.2.push(wrapped);
+            out.push(None);
+        }
+        for (key, positions, wrapped) in batches.into_values() {
+            let answered = match self.inner.unwrap_slots.acquire().await {
+                Ok(_permit) => key.unwrap_batch(&wrapped).await,
+                Err(_) => Err(Error::ProviderUnavailable {
+                    provider: key.name().to_string(),
+                    message: "unwrap admission closed".into(),
+                }),
+            };
+            let answered = answered.and_then(|results| {
+                if results.len() == positions.len() {
+                    Ok(results)
+                } else {
+                    Err(Error::ProviderRefused {
+                        provider: key.name().to_string(),
+                        message: format!(
+                            "unwrap_batch answered {} results for {} data keys",
+                            results.len(),
+                            positions.len()
+                        ),
+                    })
+                }
+            });
+            match answered {
+                Ok(results) => {
+                    for (position, result) in positions.into_iter().zip(results) {
+                        if let Some(slot) = out.get_mut(position) {
+                            *slot = Some(result.map(DataKey));
+                        }
+                    }
+                }
+                Err(err) => {
+                    for position in positions {
+                        if let Some(slot) = out.get_mut(position) {
+                            *slot = Some(Err(err.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        out.into_iter()
+            .map(|one| {
+                one.unwrap_or_else(|| {
+                    Err(Error::ProviderRefused {
+                        provider: self.provider_name().to_string(),
+                        message: "a data key of the batch was left unanswered".into(),
+                    })
+                })
+            })
+            .collect()
     }
 
     fn generation(&self) -> Arc<()> {

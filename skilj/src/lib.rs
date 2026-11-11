@@ -311,7 +311,7 @@ pub use skilj_core::blind::{normalize, BlindIndexKey};
 /// here because `skilj_core::db` is internal (docs/architecture.md §220).
 pub use skilj_core::db::PgPoolOptions;
 // A key provider of your own implements `KeyProvider` with these.
-pub use skilj_core::encryption::provider::BoxFuture;
+pub use skilj_core::encryption::provider::{BoxFuture, UnwrappedBatch};
 pub use skilj_core::encryption::{
     EncryptionMasterKey, InMemoryKeyProvider, KeyFileProvider, KeyProvider, KeyService,
     KeyVersions, VaultTransitProvider, WrappedDataKey,
@@ -1707,6 +1707,7 @@ async fn key_lifecycle(
                 provider,
                 state.version,
                 state.rotated_at,
+                None,
             )
             .await?
             else {
@@ -1764,6 +1765,51 @@ async fn key_lifecycle(
         if behind(bounded_context).await? {
             skilj_core::db::mark_data_keys_behind(pool, provider.name()).await?;
             return Ok(());
+        }
+    }
+    // A bounded context that moved to another key can have left data keys
+    // behind under this one: marked unreadable during the move, or readable
+    // again since. Nothing else tries them before the move's key rotates,
+    // and they would hold up this retirement until then. Each is tried
+    // once more, towards its context's key: what unwraps moves there, and
+    // what doesn't is marked again and no longer counts
+    // (docs/architecture.md §247).
+    for bounded_context in skilj_core::db::contexts_with_data_keys_below(
+        pool,
+        provider.name(),
+        state.version,
+        state.rotated_at,
+    )
+    .await?
+    {
+        let its_key = skilj_core::db::bounded_context_key(pool, &bounded_context).await?;
+        let target = key_service.provider_for(its_key.as_deref())?;
+        let Some(target_state) = skilj_core::db::master_key_state(pool, target.name()).await?
+        else {
+            continue;
+        };
+        // Since the later of the two rotations: what this key's rotation
+        // hasn't tried yet is tried, and what it has is left alone.
+        let since = state.rotated_at.max(target_state.rotated_at);
+        if let Some(outcome) = skilj_core::db::rewrap_data_keys_once(
+            pool,
+            &bounded_context,
+            key_service,
+            target.as_ref(),
+            target_state.version,
+            since,
+            Some(provider.name()),
+        )
+        .await?
+        {
+            tracing::info!(
+                bounded_context = %bounded_context,
+                provider = provider.name(),
+                moved_to = target.name(),
+                rewrapped = outcome.rewrapped,
+                unreadable = outcome.unreadable,
+                "data keys left under a key about to retire were tried once more"
+            );
         }
     }
     if skilj_core::db::retire_master_key_versions(pool, key_service, provider, state.version)

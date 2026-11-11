@@ -557,3 +557,68 @@ fn a_default_capacity_insertion_preserves_the_rest_of_the_live_working_set() {
     assert_eq!(cache.clock.len(), DEFAULT_DATA_KEY_CACHE_CAPACITY);
     assert!(!cache.entries.contains_key(&[0; 32]));
 }
+
+#[tokio::test]
+async fn a_batch_asks_each_key_once_and_answers_in_order_without_filling_the_cache() {
+    let provider = Provider::new(false);
+    let legacy = EncryptionMasterKey::from_bytes([3; 32]);
+    let service = KeyService::new(provider.clone()).with_legacy_master_key(legacy.clone());
+    let name = provider.name().to_string();
+    let other = service.provider_for(Some("other")).unwrap();
+    other.create().await.unwrap();
+    let wrapped = [
+        provider.wrap(&[1; 32]).await.unwrap(),
+        provider.wrap(&[2; 32]).await.unwrap(),
+    ];
+    let elsewhere = other.wrap(&[4; 32]).await.unwrap();
+    let corrupt = WrappedDataKey {
+        version: 1,
+        ciphertext: vec![0, 1, 2],
+    };
+    let (_, old_wrap, old_nonce) = super::super::generate_and_wrap_data_key(&legacy);
+    // One already in the cache: answered from it, not asked for.
+    service.unwrap(stored(&name, &wrapped[1])).await.unwrap();
+    let asked = provider.calls.load(Ordering::SeqCst);
+
+    let batch = [
+        stored(&name, &wrapped[0]),
+        StoredWrap {
+            provider: None,
+            version: None,
+            ciphertext: &old_wrap,
+            nonce: Some(&old_nonce),
+        },
+        stored("in-memory:unknown", &wrapped[0]),
+        stored(&name, &corrupt),
+        stored(other.name(), &elsewhere),
+        stored(&name, &wrapped[1]),
+    ];
+    let results = service.unwrap_batch(&batch).await;
+    assert_eq!(results.len(), 6);
+    assert_eq!(results[0].as_ref().ok().unwrap().0, [1; 32]);
+    assert!(results[1].is_ok());
+    assert!(matches!(results[2], Err(Error::ProviderChanged { .. })));
+    assert!(matches!(results[3], Err(Error::DecryptFailed)));
+    assert_eq!(results[4].as_ref().ok().unwrap().0, [4; 32]);
+    assert_eq!(results[5].as_ref().ok().unwrap().0, [2; 32]);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), asked + 2);
+
+    // Nothing the batch read was kept: the same batch asks again.
+    service.unwrap_batch(&batch[..1]).await;
+    assert_eq!(provider.calls.load(Ordering::SeqCst), asked + 3);
+
+    // A key that can't answer fails its own items, with its error, and
+    // neither the other key's nor the legacy ones.
+    provider.failures.store(1, Ordering::SeqCst);
+    let results = service.unwrap_batch(&batch).await;
+    assert!(matches!(results[0], Err(Error::ProviderUnavailable { .. })));
+    assert!(results[1].is_ok());
+    assert!(matches!(results[3], Err(Error::ProviderUnavailable { .. })));
+    assert!(results[4].is_ok());
+    assert!(results[5].is_ok(), "from the cache");
+
+    // Without the legacy key a legacy one says so.
+    let plain = KeyService::new(provider.clone());
+    let results = plain.unwrap_batch(&batch[1..2]).await;
+    assert!(matches!(results[0], Err(Error::LegacyMasterKeyRequired)));
+}

@@ -1,0 +1,24 @@
+   Compiling skilj v0.3.0 (/home/gklijs/projects/skilj/skilj)
+    Finished `release` profile [optimized] target(s) in 28.44s
+     Running tests/master_key_rotation.rs (target/release/deps/master_key_rotation-d2dcb8be1365697b)
+
+running 1 test
+| Request latency | Asked | Requests | Elapsed | Per data key | Connections in use, most | Longest transaction seen | RSS after | Peak RSS |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 ms | row by row (before) | 2000 | 2742 ms | 2.742 ms | 1 | 5.6 ms | 35216 KiB | 35216 KiB |
+| 0 ms | trait defaults | 2000 | 407 ms | 0.407 ms | 1 | 5.8 ms | 38008 KiB | 38008 KiB |
+| 0 ms | Vault batches | 10 | 43 ms | 0.043 ms | 1 | 4.4 ms | 41428 KiB | 41428 KiB |
+| 1 ms | row by row (before) | 2000 | 5188 ms | 5.188 ms | 1 | 5.2 ms | 42640 KiB | 42640 KiB |
+| 1 ms | trait defaults | 2000 | 719 ms | 0.719 ms | 1 | 4.9 ms | 43168 KiB | 43168 KiB |
+| 1 ms | Vault batches | 10 | 55 ms | 0.055 ms | 1 | 5.0 ms | 44832 KiB | 44832 KiB |
+| 5 ms | row by row (before) | 2000 | 13140 ms | 13.140 ms | 1 | 4.5 ms | 44844 KiB | 44844 KiB |
+| 5 ms | trait defaults | 2000 | 1693 ms | 1.693 ms | 1 | 5.6 ms | 45176 KiB | 45176 KiB |
+| 5 ms | Vault batches | 10 | 119 ms | 0.119 ms | 1 | 8.4 ms | 45828 KiB | 45828 KiB |
+test move_measurement has been running for over 60 seconds
+| 20 ms | row by row (before) | 2000 | 43032 ms | 43.032 ms | 1 | 7.8 ms | 46660 KiB | 46660 KiB |
+| 20 ms | trait defaults | 2000 | 5443 ms | 5.443 ms | 1 | 5.0 ms | 47580 KiB | 47580 KiB |
+| 20 ms | Vault batches | 10 | 250 ms | 0.250 ms | 1 | 4.9 ms | 47604 KiB | 47604 KiB |
+test move_measurement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 74.63s
+
