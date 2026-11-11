@@ -532,3 +532,603 @@ fn build_refuses_a_pool_the_listener_would_take_whole() {
         assert_eq!(skilj::MIN_POOL_CONNECTIONS, 2);
     });
 }
+
+// --- docs/architecture.md §249: upgrade preflight, migration, compatibility ---
+
+const SHAPE_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../skilj-core/src/db/sql/bounded_context_shape.txt"
+);
+
+/// A bounded context whose schema is v0.0.1's, marked current in this
+/// process first so no background tick of another test's instance patches
+/// part of it meanwhile (docs/architecture.md §204).
+async fn v0_0_1_bounded_context(pool: &Pool) -> String {
+    let name = seed_bounded_context(pool).await;
+    let bc = db::get_bounded_context(pool, &name).await.unwrap().unwrap();
+    db::ensure_bounded_context_current(pool, &bc).await.unwrap();
+    let schema = format!("\"bc_{name}\"");
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(pool)
+        .await
+        .unwrap();
+    let v0_0_1 = include_str!("fixtures/v0_0_1_bounded_context.sql").replace("{schema}", &schema);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(v0_0_1))
+        .execute(pool)
+        .await
+        .unwrap();
+    name
+}
+
+async fn shape(pool: &Pool, bounded_context: &str) -> Vec<String> {
+    let mut conn = pool.acquire().await.unwrap();
+    db::bounded_context_shape(&mut conn, bounded_context)
+        .await
+        .unwrap()
+}
+
+/// What a preflight must leave exactly as it found it.
+async fn persistent_state(pool: &Pool, bounded_context: &str) -> Vec<String> {
+    let mut state = shape(pool, bounded_context).await;
+    state.extend(
+        sqlx::query_as::<_, (String,)>(
+            "SELECT format('%s %s %s', version, success, encode(checksum, 'hex')) \
+             FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(l,)| l),
+    );
+    state.extend(
+        sqlx::query_as::<_, (String,)>(
+            "SELECT format('%s %s %s', level, min_compatible_level, upgraded_at) \
+             FROM skilj_schema_compatibility",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(l,)| l),
+    );
+    state.extend(
+        sqlx::query_as::<_, (String,)>("SELECT name FROM bounded_contexts ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(l,)| l),
+    );
+    state
+}
+
+fn report_for<'r>(
+    report: &'r skilj::preflight::PreflightReport,
+    name: &str,
+) -> &'r skilj::preflight::BoundedContextReport {
+    report
+        .bounded_contexts
+        .iter()
+        .find(|bc| bc.name == name)
+        .unwrap_or_else(|| panic!("{name} not in the report"))
+}
+
+/// The expected shape `inspect` compares against is what provisioning
+/// creates today. A change to provisioning or a patch re-records it:
+/// `SKILJ_RECORD_SHAPE=1 cargo test -p skilj --test startup_bounded_contexts`.
+#[test]
+fn the_expected_shape_is_a_freshly_provisioned_bounded_context() {
+    runtime().block_on(async {
+        let Some((_, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let name = seed_bounded_context(&pool).await;
+        let fresh = shape(&pool, &name).await;
+        assert!(fresh.len() > 100, "{fresh:#?}");
+        let recorded = format!(
+            "# A bounded context's schema as provisioned today, as\n\
+             # db::bounded_context_shape describes it (docs/architecture.md §249).\n\
+             # Re-record: SKILJ_RECORD_SHAPE=1 cargo test -p skilj --test startup_bounded_contexts\n\
+             {}\n",
+            fresh.join("\n")
+        );
+        if std::env::var_os("SKILJ_RECORD_SHAPE").is_some() {
+            std::fs::write(SHAPE_FIXTURE, &recorded).unwrap();
+            return;
+        }
+        let expected: Vec<&str> = db::EXPECTED_BOUNDED_CONTEXT_SHAPE
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        let missing: Vec<_> = fresh.iter().filter(|l| !expected.contains(&l.as_str())).collect();
+        let extra: Vec<_> = expected.iter().filter(|l| !fresh.contains(&l.to_string())).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "the recorded shape is stale; re-record it with SKILJ_RECORD_SHAPE=1\n\
+             not recorded: {missing:#?}\nrecorded, not provisioned: {extra:#?}"
+        );
+    });
+}
+
+/// `inspect` reports what startup would change on a v0.0.1 bounded context
+/// and changes none of it; after `build()` it reports nothing.
+#[test]
+fn inspect_reports_a_v0_0_1_bounded_context_and_changes_nothing() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let old = v0_0_1_bounded_context(&pool).await;
+        let before = persistent_state(&pool, &old).await;
+
+        let options = skilj::preflight::InspectOptions::new();
+        let report = skilj::preflight::inspect(&pool, &options).await.unwrap();
+        assert_eq!(
+            report.verdict,
+            skilj::preflight::Verdict::UpgradeNeeded,
+            "{report}"
+        );
+        let bc = report_for(&report, &old);
+        assert!(
+            bc.missing
+                .contains(&"column events.metadata_causation_id text null".to_string()),
+            "{report}"
+        );
+        assert!(
+            bc.missing.iter().any(|l| l.starts_with("table deadlines")),
+            "{report}"
+        );
+        let rewrites: Vec<&str> = bc.rewrites.iter().map(|r| r.name.as_str()).collect();
+        assert!(rewrites.contains(&"tag_dictionary"), "{rewrites:?}");
+        assert!(rewrites.contains(&"source_content_scrub"), "{rewrites:?}");
+        assert!(bc.locks.iter().any(|l| l.table == "events"), "{report}");
+        assert!(bc.unexpected.is_empty(), "{report}");
+        assert_eq!(bc.drops, ["index events_by_tags on events"], "{report}");
+        // Estimates by default; exact on request.
+        assert!(bc.rewrites.iter().all(|r| !r.rows.exact));
+        let exact = skilj::preflight::inspect(&pool, &options.clone().exact_counts(true))
+            .await
+            .unwrap();
+        let events = report_for(&exact, &old)
+            .rewrites
+            .iter()
+            .find(|r| r.name == "tag_dictionary")
+            .unwrap()
+            .rows;
+        assert_eq!((events.value, events.exact), (Some(0), true));
+        // Machine-readable, and back.
+        let json = serde_json::to_string(&report).unwrap();
+        assert_eq!(
+            serde_json::from_str::<skilj::preflight::PreflightReport>(&json).unwrap(),
+            report
+        );
+
+        assert_eq!(
+            persistent_state(&pool, &old).await,
+            before,
+            "inspect changed something"
+        );
+
+        Skilj::builder(database_url)
+            .pool_options(db::PgPoolOptions::new().max_connections(2))
+            .build()
+            .await
+            .unwrap();
+        let after = skilj::preflight::inspect(&pool, &options).await.unwrap();
+        assert_eq!(
+            after.verdict,
+            skilj::preflight::Verdict::UpToDate,
+            "{after}"
+        );
+        let bc = report_for(&after, &old);
+        assert!(!bc.needs_upgrade() && bc.unexpected.is_empty(), "{after}");
+        assert_eq!(
+            bc.lazy.len(),
+            3,
+            "registered_by_version is added on first use"
+        );
+        let recorded = after.compatibility.recorded.as_ref().unwrap();
+        assert_eq!(recorded.level, skilj::preflight::SCHEMA_LEVEL);
+    });
+}
+
+/// A database no release has touched: everything is pending, and the
+/// preflight leaves it without a single table.
+#[test]
+fn inspect_reports_an_empty_database_and_creates_nothing() {
+    runtime().block_on(async {
+        let Some((_, _pool)) = test_database().await else {
+            return;
+        };
+        let Some(url) = skilj_test_support::database_url("skilj_preflight_empty_test").await else {
+            return;
+        };
+        let pool = db::connect(&url).await.unwrap();
+        let tables = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(tables().await, 0);
+        let report = skilj::preflight::inspect(&pool, &skilj::preflight::InspectOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(report.verdict, skilj::preflight::Verdict::UpgradeNeeded);
+        assert!(report.global.applied.is_empty());
+        assert!(report.global.pending.len() >= 10, "{report}");
+        assert!(!report.admin_context.exists);
+        assert!(report.compatibility.recorded.is_none());
+        assert_eq!(tables().await, 0, "inspect created something");
+        pool.close().await;
+    });
+}
+
+/// `migrate` with a lock timeout gives up on a table another transaction
+/// holds; what it finished stays done, and running it again completes it.
+#[test]
+fn migrate_stops_at_its_lock_timeout_and_a_rerun_completes() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let old = v0_0_1_bounded_context(&pool).await;
+        let options = skilj::preflight::MigrateOptions::new()
+            .lock_timeout(std::time::Duration::from_millis(200));
+
+        // In-flight writes on the v0.0.1 events table.
+        let mut writes = pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "LOCK TABLE \"bc_{old}\".events IN ROW EXCLUSIVE MODE"
+        )))
+        .execute(&mut *writes)
+        .await
+        .unwrap();
+        let err = skilj::preflight::migrate(&database_url, &options)
+            .await
+            .expect_err("migrate got past a held lock");
+        let lock_not_available = matches!(&err, skilj_core::Error::Database(e)
+            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("55P03"));
+        assert!(lock_not_available, "{err:?}");
+        writes.rollback().await.unwrap();
+        // The patches before the one that waited are committed.
+        let partial = shape(&pool, &old).await;
+        assert!(
+            partial
+                .iter()
+                .any(|l| l.starts_with("table idempotency_keys")),
+            "{partial:#?}"
+        );
+
+        let report = skilj::preflight::migrate(&database_url, &options)
+            .await
+            .unwrap();
+        assert!(report_for(&report.before, &old).needs_upgrade());
+        assert_eq!(
+            report.after.verdict,
+            skilj::preflight::Verdict::UpToDate,
+            "{}",
+            report.after
+        );
+    });
+}
+
+/// Two migrations at once, as two deploy jobs or replicas would run them:
+/// both finish, and the schema is current.
+#[test]
+fn concurrent_migrations_both_finish() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let old = v0_0_1_bounded_context(&pool).await;
+        let options = skilj::preflight::MigrateOptions::new();
+        let (a, b) = tokio::join!(
+            skilj::preflight::migrate(&database_url, &options),
+            skilj::preflight::migrate(&database_url, &options),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        for report in [&a, &b] {
+            assert!(
+                !report_for(&report.after, &old).needs_upgrade(),
+                "{}",
+                report.after
+            );
+        }
+    });
+}
+
+/// `SchemaChanges::Refuse`: an outdated schema is refused, unchanged; a
+/// current one starts.
+#[test]
+fn refuse_mode_refuses_an_outdated_schema_and_starts_on_a_current_one() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let old = v0_0_1_bounded_context(&pool).await;
+        let before = persistent_state(&pool, &old).await;
+        let refusing = || {
+            Skilj::builder(database_url.clone())
+                .pool_options(db::PgPoolOptions::new().max_connections(2))
+                .schema_changes(skilj::SchemaChanges::Refuse)
+                .build()
+        };
+        match refusing().await.map(|_| ()) {
+            Err(err @ skilj_core::Error::SchemaUpgradeRequired { .. }) => {
+                assert!(err.to_string().contains(&old), "{err}")
+            }
+            other => panic!("expected schema_upgrade_required, got {other:?}"),
+        }
+        assert_eq!(persistent_state(&pool, &old).await, before);
+
+        skilj::preflight::migrate(&database_url, &skilj::preflight::MigrateOptions::new())
+            .await
+            .unwrap();
+        refusing().await.unwrap();
+    });
+}
+
+/// Sets the recorded compatibility row, returning what it held.
+async fn set_recorded_level(pool: &Pool, level: i64, min: i64) {
+    sqlx::query(
+        "INSERT INTO skilj_schema_compatibility \
+             (id, level, min_compatible_level, upgraded_by, upgraded_at) \
+         VALUES (1, $1, $2, '9.9.9', now()) \
+         ON CONFLICT (id) DO UPDATE SET level = $1, min_compatible_level = $2, \
+             upgraded_by = '9.9.9'",
+    )
+    .bind(level)
+    .bind(min)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// docs/architecture.md §249: what a release does with a database a newer
+/// one has upgraded. The recorded compatibility level decides, not sqlx's
+/// `VersionMissing`: a newer release that declares this one compatible
+/// lets it start with migrations it doesn't know; one that doesn't, or
+/// migrations recorded without any level, make it refuse with
+/// `schema_too_new` before it changes anything.
+#[test]
+fn a_newer_releases_level_decides_whether_an_older_one_starts() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let level = skilj::preflight::SCHEMA_LEVEL;
+        // A migration from a newer release: numbered past every embedded
+        // one, recorded as applied the way sqlx records them.
+        let newer: i64 = 99_999;
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, success, checksum, execution_time) \
+             VALUES ($1, 'from a newer release', true, '\\x00'::bytea, 0)",
+        )
+        .bind(newer)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let start = || {
+            Skilj::builder(database_url.clone())
+                .pool_options(db::PgPoolOptions::new().max_connections(2))
+                .build()
+        };
+
+        // Declared compatible: starts, and leaves the newer record alone.
+        set_recorded_level(&pool, level + 1, level).await;
+        let compatible = start().await.map(|_| ());
+        let kept: (i64, String) = sqlx::query_as(
+            "SELECT level, upgraded_by FROM skilj_schema_compatibility WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Not declared compatible.
+        set_recorded_level(&pool, level + 1, level + 1).await;
+        let too_old = start().await.map(|_| ());
+        let preflight = skilj::preflight::inspect(&pool, &skilj::preflight::InspectOptions::new())
+            .await
+            .unwrap();
+
+        // No level recorded at all, but a migration this release doesn't know.
+        sqlx::query("DELETE FROM skilj_schema_compatibility")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unrecorded = start().await.map(|_| ());
+
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+            .bind(newer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_recorded_level(&pool, level, skilj::preflight::MIN_COMPATIBLE_SCHEMA_LEVEL).await;
+
+        compatible.unwrap();
+        assert_eq!(kept, (level + 1, "9.9.9".to_string()));
+        for outcome in [too_old, unrecorded] {
+            match outcome {
+                Err(err @ skilj_core::Error::SchemaTooNew { .. }) => {
+                    assert_eq!(
+                        skilj_core::error::SkiljRejection::code(&err),
+                        "schema_too_new"
+                    )
+                }
+                other => panic!("expected schema_too_new, got {other:?}"),
+            }
+        }
+        assert_eq!(preflight.verdict, skilj::preflight::Verdict::Refused);
+        assert_eq!(preflight.refusals[0].code, "schema_too_new");
+        assert_eq!(preflight.global.unknown, [newer]);
+    });
+}
+
+/// A Role with an Admin grant on `bounded_context`, for reconciliation.
+async fn reconciler_for(pool: &Pool, bounded_context: &str) -> skilj_core::access_control::Role {
+    let role = skilj_core::access_control::Role {
+        id: generate_token_id(),
+        external_subject: format!("reconciler_{}", generate_token_id()),
+        name: "Reconciliation Role".to_string(),
+        superadmin: false,
+        status: skilj_core::access_control::RoleStatus::Active,
+        created_at: Utc::now().trunc_subsecs(6),
+        revoked_at: None,
+    };
+    db::insert_role(pool, &role).await.unwrap();
+    db::insert_role_access_mapping(
+        pool,
+        &skilj_core::access_control::RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: db::get_bounded_context(pool, bounded_context)
+                .await
+                .unwrap()
+                .unwrap(),
+            level: skilj_core::access_control::AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
+            status: skilj_core::access_control::RoleStatus::Active,
+            created_at: Utc::now().trunc_subsecs(6),
+            revoked_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    role
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+struct MoneyWithdrawnPayload {
+    amount: i64,
+}
+
+struct MoneyWithdrawn;
+
+impl skilj::EventType for MoneyWithdrawn {
+    type Payload = MoneyWithdrawnPayload;
+    const NAME: &'static str = "MoneyWithdrawn";
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+struct MoneyDepositedAsTextPayload {
+    amount: String,
+}
+
+/// `MoneyDeposited` with an incompatible schema.
+struct MoneyDepositedAsText;
+
+impl skilj::EventType for MoneyDepositedAsText {
+    type Payload = MoneyDepositedAsTextPayload;
+    const NAME: &'static str = "MoneyDeposited";
+}
+
+/// `SkiljBuilder::preflight` reports what reconciliation would do with the
+/// builder's types - new, unchanged, kept for a newer version, refused -
+/// and writes nothing (its connections are read-only).
+#[test]
+fn builder_preflight_previews_registrations_and_writes_nothing() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let name = seed_bounded_context(&pool).await;
+        let role = reconciler_for(&pool, &name).await;
+        let builder = |version: u64| {
+            Skilj::builder(database_url.clone())
+                .pool_options(db::PgPoolOptions::new().max_connections(2))
+                .bounded_context(name.clone())
+                .reconciliation_role(role.external_subject.clone())
+                .application_version(version)
+        };
+        builder(2)
+            .event_type::<MoneyDeposited>()
+            .build()
+            .await
+            .unwrap();
+
+        let state = || async {
+            let mut state = persistent_state(&pool, &name).await;
+            state.extend(
+                sqlx::query_as::<_, (String, String, Option<i64>)>(sqlx::AssertSqlSafe(format!(
+                    "SELECT name, schema, registered_by_version FROM \"bc_{name}\".event_types \
+                     ORDER BY name"
+                )))
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| format!("{row:?}")),
+            );
+            state
+        };
+        let before = state().await;
+        let outcome = |report: &skilj::preflight::PreflightReport, type_name: &str| {
+            report
+                .registrations
+                .iter()
+                .find(|r| r.name == type_name && r.bounded_context == name)
+                .map(|r| r.outcome.clone())
+        };
+
+        let report = builder(2)
+            .event_type::<MoneyDeposited>()
+            .event_type::<MoneyWithdrawn>()
+            .preflight()
+            .await
+            .unwrap();
+        assert_eq!(
+            report.verdict,
+            skilj::preflight::Verdict::UpToDate,
+            "{report}"
+        );
+        assert_eq!(
+            outcome(&report, "MoneyDeposited").as_deref(),
+            Some("unchanged"),
+            "{report}"
+        );
+        assert_eq!(
+            outcome(&report, "MoneyWithdrawn").as_deref(),
+            Some("registered"),
+            "{report}"
+        );
+
+        let older = builder(1)
+            .event_type::<MoneyDeposited>()
+            .preflight()
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome(&older, "MoneyDeposited").as_deref(),
+            Some("kept_newer"),
+            "{older}"
+        );
+
+        let incompatible = builder(2)
+            .event_type::<MoneyDepositedAsText>()
+            .preflight()
+            .await
+            .unwrap();
+        assert_eq!(
+            incompatible.verdict,
+            skilj::preflight::Verdict::Refused,
+            "{incompatible}"
+        );
+        assert!(!incompatible.refusals.is_empty());
+
+        assert_eq!(state().await, before, "the preflight changed something");
+    });
+}

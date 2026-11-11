@@ -1,0 +1,502 @@
+# A bounded context's schema as provisioned today, as
+# db::bounded_context_shape describes it (docs/architecture.md §249).
+# Re-record: SKILJ_RECORD_SHAPE=1 cargo test -p skilj --test startup_bounded_contexts
+column access_tokens.command_type_name text null
+column access_tokens.created_at timestamp with time zone not null
+column access_tokens.event_type_name text null
+column access_tokens.id text not null
+column access_tokens.kind text not null
+column access_tokens.revoked_at timestamp with time zone null
+column access_tokens.scope text null
+column access_tokens.secret text not null
+column access_tokens.start_at_sequence bigint null
+column access_tokens.start_at_time timestamp with time zone null
+column access_tokens.start_from text not null
+column access_tokens.status text not null
+column blind_tags.erasure jsonb not null
+column blind_tags.key_fingerprint text null
+column blind_tags.key_generation bigint not null
+column blind_tags.normalizer_version bigint not null
+column blind_tags.registered_at timestamp with time zone not null
+column blind_tags.tag_key text not null
+column blob_bytes.bytes bytea not null
+column blob_bytes.storage_key text not null
+column blob_pins.blob_id text not null
+column blob_pins.holder_id text not null
+column blob_pins.holder_kind text not null
+column blob_references.blob_id text not null
+column blob_references.command_id bigint null
+column blob_references.event_sequence bigint null
+column blob_references.field text not null
+column blob_references.id bigint not null
+column blobs.bytes_removed_at timestamp with time zone null
+column blobs.created_at timestamp with time zone not null
+column blobs.deleted_at timestamp with time zone null
+column blobs.grace_from timestamp with time zone not null
+column blobs.id text not null
+column blobs.media_type text not null
+column blobs.referenced_at timestamp with time zone null
+column blobs.sha256 text not null
+column blobs.size bigint not null
+column blobs.state text not null
+column blobs.storage_key text not null
+column blobs.subject_key text null
+column blobs.subject_value text null
+column command_approval_policies.allow_self_approval boolean not null
+column command_approval_policies.approver_role text null
+column command_approval_policies.command_type_name text not null
+column command_approval_policies.deadline_seconds bigint null
+column command_encryption_keys.command_id bigint not null
+column command_encryption_keys.encryption_key_id bigint not null
+column command_proposals.command_external_id text null
+column command_proposals.command_type_name text not null
+column command_proposals.created_at timestamp with time zone not null
+column command_proposals.decided_at timestamp with time zone null
+column command_proposals.decided_by_role_id text null
+column command_proposals.expires_at timestamp with time zone null
+column command_proposals.id text not null
+column command_proposals.idempotency_key text null
+column command_proposals.metadata_causation_id text null
+column command_proposals.metadata_client_id text not null
+column command_proposals.metadata_correlation_id text null
+column command_proposals.metadata_created_at timestamp with time zone not null
+column command_proposals.metadata_version bigint not null
+column command_proposals.payload text not null
+column command_proposals.rejection_kind text null
+column command_proposals.rejection_reason text null
+column command_proposals.status text not null
+column command_types.blob_fields jsonb not null
+column command_types.name text not null
+column command_types.owner_tag_key text null
+column command_types.private_fields jsonb not null
+column command_types.registered_by_version bigint null
+column command_types.rest_trigger_allowed boolean not null
+column command_types.schema text not null
+column command_types.schema_version bigint not null
+column command_types.sensitive_fields jsonb not null
+column command_types.tag_mappings jsonb not null
+column commands.command_type_name text not null
+column commands.consistency_boundary bigint null
+column commands.consistency_query jsonb not null
+column commands.consistency_tags jsonb not null
+column commands.external_id text not null
+column commands.id bigint not null
+column commands.metadata_causation_id text null
+column commands.metadata_client_id text not null
+column commands.metadata_correlation_id text null
+column commands.metadata_created_at timestamp with time zone not null
+column commands.metadata_type text not null
+column commands.metadata_version bigint not null
+column commands.payload text not null
+column cross_context_route_cursors.last_dispatched_sequence bigint not null
+column cross_context_route_cursors.retry_attempt_count integer not null
+column cross_context_route_cursors.retry_first_failed_at timestamp with time zone null
+column cross_context_route_cursors.retry_next_attempt_at timestamp with time zone null
+column cross_context_route_cursors.route_name text not null
+column cross_context_route_cursors.updated_at timestamp with time zone not null
+column deadline_cursors.cursor_owner text not null
+column deadline_cursors.last_dispatched_sequence bigint not null
+column deadline_cursors.updated_at timestamp with time zone not null
+column deadlines.attempt_count integer not null
+column deadlines.correlation_id text null
+column deadlines.created_at timestamp with time zone not null
+column deadlines.expires_at timestamp with time zone null
+column deadlines.fire_at timestamp with time zone not null
+column deadlines.firing_at timestamp with time zone null
+column deadlines.first_failed_at timestamp with time zone null
+column deadlines.id text not null
+column deadlines.last_error text null
+column deadlines.next_attempt_at timestamp with time zone null
+column deadlines.payload text not null
+column deadlines.recurrence_end_at timestamp with time zone null
+column deadlines.recurrence_parent_id text null
+column deadlines.recurrence_policy text null
+column deadlines.recurrence_schedule text null
+column deadlines.recurrence_sequence bigint null
+column deadlines.recurrence_start_at timestamp with time zone null
+column deadlines.recurrence_valid_until timestamp with time zone null
+column deadlines.resolved_at timestamp with time zone null
+column deadlines.schedule_name text not null
+column deadlines.status text not null
+column deadlines.tags jsonb not null
+column deadlines.target_bounded_context text not null
+column deadlines.target_command_type text not null
+column encryption_keys.created_at timestamp with time zone not null
+column encryption_keys.destroyed_at timestamp with time zone null
+column encryption_keys.id bigint not null
+column encryption_keys.key_provider text null
+column encryption_keys.master_key_version integer null
+column encryption_keys.status text not null
+column encryption_keys.subject_key text not null
+column encryption_keys.subject_value text not null
+column encryption_keys.unreadable_since timestamp with time zone null
+column encryption_keys.wrap_nonce bytea null
+column encryption_keys.wrapped_key bytea null
+column event_encryption_keys.encryption_key_id bigint not null
+column event_encryption_keys.event_sequence bigint not null
+column event_tag_refs.event_type_name text not null
+column event_tag_refs.sequence bigint not null
+column event_tag_refs.tag_id bigint not null
+column event_tag_values.id bigint not null
+column event_tag_values.tag_key text not null
+column event_tag_values.tag_value text null
+column event_tags.event_type_name text null
+column event_tags.sequence bigint null
+column event_tags.tag_id bigint null
+column event_tags.tag_key text null
+column event_tags.tag_value text null
+column event_types.blob_fields jsonb not null
+column event_types.direct_creation_allowed boolean not null
+column event_types.event_read_allowed boolean not null
+column event_types.external_creation_allowed boolean not null
+column event_types.last_fired_at timestamp with time zone null
+column event_types.missed_occurrence_policy text null
+column event_types.name text not null
+column event_types.owner_tag_key text null
+column event_types.private_fields jsonb not null
+column event_types.registered_by_version bigint null
+column event_types.schedule_position timestamp with time zone null
+column event_types.schema text not null
+column event_types.schema_version bigint not null
+column event_types.sensitive_fields jsonb not null
+column event_types.system_triggered_allowed boolean not null
+column event_types.system_triggered_schedule text null
+column event_types.tag_mappings jsonb not null
+column events.event_type_name text not null
+column events.metadata_causation_id text null
+column events.metadata_client_id text not null
+column events.metadata_correlation_id text null
+column events.metadata_created_at timestamp with time zone not null
+column events.metadata_type text not null
+column events.metadata_version bigint not null
+column events.origin_command_id bigint null
+column events.origin_kind text not null
+column events.origin_source_content text null
+column events.origin_source_context text null
+column events.payload text not null
+column events.sequence bigint not null
+column events.tags jsonb not null
+column external_message_cursors.adapter_id text not null
+column external_message_cursors.last_sequence bigint not null
+column external_message_cursors.partition_key text not null
+column external_message_cursors.updated_at timestamp with time zone not null
+column external_message_keys.adapter_id text not null
+column external_message_keys.created_at timestamp with time zone not null
+column external_message_keys.event_sequence bigint not null
+column external_message_keys.message_key text not null
+column idempotency_keys.client_id text not null
+column idempotency_keys.command_type_name text not null
+column idempotency_keys.created_at timestamp with time zone not null
+column idempotency_keys.idempotency_key text not null
+column idempotency_keys.triggered_event_sequences bigint[] not null
+column parked_deliveries.access_token_id text null
+column parked_deliveries.attempt_count integer not null
+column parked_deliveries.error text not null
+column parked_deliveries.first_failed_at timestamp with time zone not null
+column parked_deliveries.id text not null
+column parked_deliveries.identifier text not null
+column parked_deliveries.kind text not null
+column parked_deliveries.last_failed_at timestamp with time zone not null
+column parked_deliveries.request_json jsonb not null
+column parked_deliveries.source text not null
+column parked_deliveries.target_bounded_context text null
+column parked_deliveries.target_command_type text null
+column private_field_grants.command_id bigint null
+column private_field_grants.created_at timestamp with time zone not null
+column private_field_grants.event_sequence bigint null
+column private_field_grants.field text null
+column private_field_grants.grantee_role_id text not null
+column private_field_grants.grantor_role_id text not null
+column private_field_grants.id text not null
+column private_field_grants.revoked_at timestamp with time zone null
+column private_field_grants.status text not null
+column projection_consumed_event_types.event_type_name text not null
+column projection_consumed_event_types.projection_name text not null
+column projection_partition_progress.caught_up_to bigint not null
+column projection_partition_progress.partition_index integer not null
+column projection_partition_progress.projection_name text not null
+column projection_partition_progress.updated_at timestamp with time zone not null
+column projection_rebuild_consumed_event_types.event_type_name text not null
+column projection_rebuild_consumed_event_types.projection_name text not null
+column projection_rebuild_consumed_event_types.status text not null
+column projection_rebuild_state.as_of_sequence bigint not null
+column projection_rebuild_state.key text not null
+column projection_rebuild_state.owner text null
+column projection_rebuild_state.projection_name text not null
+column projection_rebuild_state.state text not null
+column projection_rebuild_state.status text not null
+column projection_rebuild_state.updated_at timestamp with time zone not null
+column projection_rebuilds.caught_up_to bigint null
+column projection_rebuilds.projection_name text not null
+column projection_rebuilds.schema text not null
+column projection_rebuilds.schema_version bigint not null
+column projection_rebuilds.status text not null
+column projection_rebuilds.sync boolean not null
+column projection_state.as_of_sequence bigint not null
+column projection_state.key text not null
+column projection_state.owner text null
+column projection_state.projection_name text not null
+column projection_state.state text not null
+column projection_state.updated_at timestamp with time zone not null
+column projections.caught_up_to bigint null
+column projections.name text not null
+column projections.owner_tag_key text null
+column projections.registered_by_version bigint null
+column projections.requires_capability text null
+column projections.schema text not null
+column projections.schema_version bigint not null
+column projections.sync boolean not null
+column read_cursors.ack_mode text not null
+column read_cursors.checked_out_at timestamp with time zone null
+column read_cursors.sequence bigint not null
+column read_cursors.token_id text not null
+column read_cursors.updated_at timestamp with time zone not null
+column registrations_generation.generation bigint not null
+column registrations_generation.id boolean not null
+column secret_grants.created_at timestamp with time zone not null
+column secret_grants.grantee_role_id text not null
+column secret_grants.id text not null
+column secret_grants.name text not null
+column secret_grants.revoked_at timestamp with time zone null
+column secret_grants.status text not null
+column secret_versions.ciphertext text not null
+column secret_versions.created_at timestamp with time zone not null
+column secret_versions.encryption_key_id bigint not null
+column secret_versions.expires_at timestamp with time zone null
+column secret_versions.id bigint not null
+column secret_versions.last_read_at timestamp with time zone null
+column secret_versions.last_read_by text null
+column secret_versions.name text not null
+column secret_versions.revoked_at timestamp with time zone null
+column secret_versions.rotated_at timestamp with time zone null
+column secret_versions.status text not null
+column secret_versions.version bigint not null
+column sequence.max_payload_bytes bigint null
+column sequence.next_value bigint not null
+column sequence.warn_payload_bytes bigint null
+column snapshot_partition_progress.caught_up_to bigint not null
+column snapshot_partition_progress.partition_index integer not null
+column snapshot_partition_progress.snapshot_name text not null
+column snapshot_partition_progress.updated_at timestamp with time zone not null
+column snapshot_progress.caught_up_to bigint not null
+column snapshot_progress.snapshot_name text not null
+column snapshots.as_of_sequence bigint not null
+column snapshots.owner text null
+column snapshots.snapshot_name text not null
+column snapshots.snapshot_version bigint not null
+column snapshots.state jsonb not null
+column snapshots.tag_key text not null
+column snapshots.tag_value text not null
+column snapshots.updated_at timestamp with time zone not null
+constraint access_tokens_check on access_tokens (c)
+constraint access_tokens_command_type_name_fkey on access_tokens (f)
+constraint access_tokens_event_type_name_fkey on access_tokens (f)
+constraint access_tokens_kind_check on access_tokens (c)
+constraint access_tokens_pkey on access_tokens (p)
+constraint access_tokens_start_from_check on access_tokens (c)
+constraint access_tokens_status_check on access_tokens (c)
+constraint blind_tags_pkey on blind_tags (p)
+constraint blob_bytes_pkey on blob_bytes (p)
+constraint blob_pins_blob_id_fkey on blob_pins (f)
+constraint blob_pins_pkey on blob_pins (p)
+constraint blob_references_blob_id_fkey on blob_references (f)
+constraint blob_references_check on blob_references (c)
+constraint blob_references_pkey on blob_references (p)
+constraint blobs_pkey on blobs (p)
+constraint blobs_size_check on blobs (c)
+constraint command_approval_policies_command_type_name_fkey on command_approval_policies (f)
+constraint command_approval_policies_deadline_seconds_check on command_approval_policies (c)
+constraint command_approval_policies_pkey on command_approval_policies (p)
+constraint command_encryption_keys_command_id_fkey on command_encryption_keys (f)
+constraint command_encryption_keys_encryption_key_id_fkey on command_encryption_keys (f)
+constraint command_encryption_keys_pkey on command_encryption_keys (p)
+constraint command_proposals_command_external_id_fkey on command_proposals (f)
+constraint command_proposals_command_type_name_fkey on command_proposals (f)
+constraint command_proposals_decided_by_role_id_fkey on command_proposals (f)
+constraint command_proposals_pkey on command_proposals (p)
+constraint command_proposals_status_check on command_proposals (c)
+constraint command_types_pkey on command_types (p)
+constraint commands_command_type_name_fkey on commands (f)
+constraint commands_external_id_key on commands (u)
+constraint commands_pkey on commands (p)
+constraint cross_context_route_cursors_pkey on cross_context_route_cursors (p)
+constraint deadline_cursors_pkey on deadline_cursors (p)
+constraint deadlines_pkey on deadlines (p)
+constraint deadlines_recurrence_policy_check on deadlines (c)
+constraint encryption_keys_pkey on encryption_keys (p)
+constraint encryption_keys_status_check on encryption_keys (c)
+constraint event_encryption_keys_encryption_key_id_fkey on event_encryption_keys (f)
+constraint event_encryption_keys_event_sequence_fkey on event_encryption_keys (f)
+constraint event_encryption_keys_pkey on event_encryption_keys (p)
+constraint event_tag_values_pkey on event_tag_values (p)
+constraint event_tag_values_tag_key_tag_value_key on event_tag_values (u)
+constraint event_types_missed_occurrence_policy_check on event_types (c)
+constraint event_types_pkey on event_types (p)
+constraint events_event_type_name_fkey on events (f)
+constraint events_origin_command_id_fkey on events (f)
+constraint events_origin_kind_check on events (c)
+constraint events_pkey on events (p)
+constraint external_message_cursors_pkey on external_message_cursors (p)
+constraint external_message_keys_pkey on external_message_keys (p)
+constraint idempotency_keys_pkey on idempotency_keys (p)
+constraint parked_deliveries_pkey on parked_deliveries (p)
+constraint private_field_grants_check on private_field_grants (c)
+constraint private_field_grants_command_id_fkey on private_field_grants (f)
+constraint private_field_grants_event_sequence_fkey on private_field_grants (f)
+constraint private_field_grants_grantee_role_id_fkey on private_field_grants (f)
+constraint private_field_grants_grantor_role_id_fkey on private_field_grants (f)
+constraint private_field_grants_pkey on private_field_grants (p)
+constraint private_field_grants_status_check on private_field_grants (c)
+constraint projection_consumed_event_types_event_type_name_fkey on projection_consumed_event_types (f)
+constraint projection_consumed_event_types_pkey on projection_consumed_event_types (p)
+constraint projection_consumed_event_types_projection_name_fkey on projection_consumed_event_types (f)
+constraint projection_partition_progress_pkey on projection_partition_progress (p)
+constraint projection_partition_progress_projection_name_fkey on projection_partition_progress (f)
+constraint projection_rebuild_consumed_event_t_projection_name_status_fkey on projection_rebuild_consumed_event_types (f)
+constraint projection_rebuild_consumed_event_types_event_type_name_fkey on projection_rebuild_consumed_event_types (f)
+constraint projection_rebuild_consumed_event_types_pkey on projection_rebuild_consumed_event_types (p)
+constraint projection_rebuild_state_pkey on projection_rebuild_state (p)
+constraint projection_rebuild_state_projection_name_status_fkey on projection_rebuild_state (f)
+constraint projection_rebuilds_pkey on projection_rebuilds (p)
+constraint projection_rebuilds_projection_name_fkey on projection_rebuilds (f)
+constraint projection_rebuilds_status_check on projection_rebuilds (c)
+constraint projection_state_pkey on projection_state (p)
+constraint projection_state_projection_name_fkey on projection_state (f)
+constraint projections_pkey on projections (p)
+constraint read_cursors_ack_mode_check on read_cursors (c)
+constraint read_cursors_pkey on read_cursors (p)
+constraint read_cursors_token_id_fkey on read_cursors (f)
+constraint registrations_generation_id_check on registrations_generation (c)
+constraint registrations_generation_pkey on registrations_generation (p)
+constraint secret_grants_grantee_role_id_fkey on secret_grants (f)
+constraint secret_grants_pkey on secret_grants (p)
+constraint secret_grants_status_check on secret_grants (c)
+constraint secret_versions_encryption_key_id_fkey on secret_versions (f)
+constraint secret_versions_name_version_key on secret_versions (u)
+constraint secret_versions_pkey on secret_versions (p)
+constraint secret_versions_status_check on secret_versions (c)
+constraint sequence_max_payload_bytes_check on sequence (c)
+constraint sequence_warn_payload_bytes_check on sequence (c)
+constraint snapshot_partition_progress_pkey on snapshot_partition_progress (p)
+constraint snapshot_progress_pkey on snapshot_progress (p)
+constraint snapshots_pkey on snapshots (p)
+function bump_registrations_generation() ea6d2d056472
+function change_event_tag() 9dc62e79b110
+function event_tag_id(text, text) ff4e4c37cf5e
+function index_event_tags() aceb6839ec2c
+function protect_existing_external_sources() e26a9d0f32e1
+function protect_external_source() e5ecc370b4a8
+index access_tokens_pkey on access_tokens
+index blind_tags_pkey on blind_tags
+index blob_bytes_pkey on blob_bytes
+index blob_pins_pkey on blob_pins
+index blob_references_by_blob on blob_references
+index blob_references_pkey on blob_references
+index blobs_by_subject on blobs
+index blobs_pending on blobs
+index blobs_pkey on blobs
+index blobs_to_remove on blobs
+index command_approval_policies_pkey on command_approval_policies
+index command_encryption_keys_pkey on command_encryption_keys
+index command_proposals_by_status on command_proposals
+index command_proposals_page_order on command_proposals
+index command_proposals_pending_idempotency on command_proposals
+index command_proposals_pkey on command_proposals
+index command_types_pkey on command_types
+index commands_by_correlation_id on commands
+index commands_by_created_at on commands
+index commands_external_id_key on commands
+index commands_pkey on commands
+index cross_context_route_cursors_pkey on cross_context_route_cursors
+index deadline_cursors_pkey on deadline_cursors
+index deadlines_due on deadlines
+index deadlines_pkey on deadlines
+index deadlines_tags_gin on deadlines
+index encryption_keys_master_key on encryption_keys
+index encryption_keys_pkey on encryption_keys
+index encryption_keys_unique_active on encryption_keys
+index event_encryption_keys_pkey on event_encryption_keys
+index event_tag_refs_lookup on event_tag_refs
+index event_tag_values_pkey on event_tag_values
+index event_tag_values_tag_key_tag_value_key on event_tag_values
+index event_types_pkey on event_types
+index events_by_correlation_id on events
+index events_by_type on events
+index events_pkey on events
+index external_message_cursors_pkey on external_message_cursors
+index external_message_keys_created_at on external_message_keys
+index external_message_keys_pkey on external_message_keys
+index idempotency_keys_created_at on idempotency_keys
+index idempotency_keys_pkey on idempotency_keys
+index parked_deliveries_occurrence_key on parked_deliveries
+index parked_deliveries_page_order on parked_deliveries
+index parked_deliveries_pkey on parked_deliveries
+index private_field_grants_by_grantee on private_field_grants
+index private_field_grants_pkey on private_field_grants
+index projection_consumed_event_types_pkey on projection_consumed_event_types
+index projection_partition_progress_pkey on projection_partition_progress
+index projection_rebuild_consumed_event_types_pkey on projection_rebuild_consumed_event_types
+index projection_rebuild_state_pkey on projection_rebuild_state
+index projection_rebuilds_pkey on projection_rebuilds
+index projection_state_pkey on projection_state
+index projections_pkey on projections
+index read_cursors_pkey on read_cursors
+index registrations_generation_pkey on registrations_generation
+index secret_grants_by_grantee on secret_grants
+index secret_grants_pkey on secret_grants
+index secret_versions_by_name on secret_versions
+index secret_versions_name_version_key on secret_versions
+index secret_versions_pkey on secret_versions
+index secret_versions_unique_active on secret_versions
+index snapshot_partition_progress_pkey on snapshot_partition_progress
+index snapshot_progress_pkey on snapshot_progress
+index snapshots_pkey on snapshots
+table access_tokens
+table blind_tags
+table blob_bytes
+table blob_pins
+table blob_references
+table blobs
+table command_approval_policies
+table command_encryption_keys
+table command_proposals
+table command_types
+table commands
+table cross_context_route_cursors
+table deadline_cursors
+table deadlines
+table encryption_keys
+table event_encryption_keys
+table event_tag_refs
+table event_tag_values
+table event_types
+table events
+table external_message_cursors
+table external_message_keys
+table idempotency_keys
+table parked_deliveries
+table private_field_grants
+table projection_consumed_event_types
+table projection_partition_progress
+table projection_rebuild_consumed_event_types
+table projection_rebuild_state
+table projection_rebuilds
+table projection_state
+table projections
+table read_cursors
+table registrations_generation
+table secret_grants
+table secret_versions
+table sequence
+table snapshot_partition_progress
+table snapshot_progress
+table snapshots
+trigger command_types_bump_registrations_generation on command_types
+trigger command_types_change_bumps_registrations_generation on command_types
+trigger event_tags_change on event_tags
+trigger event_types_bump_registrations_generation on event_types
+trigger event_types_change_bumps_registrations_generation on event_types
+trigger events_index_tags on events
+trigger protect_existing_external_sources on event_types
+trigger protect_external_source on events
+view event_tags

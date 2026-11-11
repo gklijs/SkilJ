@@ -10,7 +10,49 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Upgrading from 0.3
+
+- Stop every 0.3 instance before the first instance of this release starts,
+  and don't restart one afterwards. This release adds global migration 0010,
+  and 0.3 refuses a database with a migration it doesn't know (sqlx's
+  `VersionMissing`). Going back to 0.3 means restoring the backup taken before
+  the upgrade. `scripts/check-upgrade-pair.sh` checks exactly this pair.
+- First run `SkiljBuilder::preflight` with production's configuration against
+  a restored copy. The first startup replaces protected external source content
+  with `[redacted]` in every bounded context (docs/architecture.md §240), under
+  a lock that blocks event writes. The report lists it per bounded context,
+  with the events table's estimated size. To run it as a separate step, use
+  `skilj::preflight::migrate` with a `lock_timeout`, then start the
+  application with `SchemaChanges::Refuse`.
+
 ### Added
+
+- An upgrade preflight (issue #188, docs/architecture.md §249,
+  docs/upgrade-preflight-design.md). `skilj::preflight::inspect` reports
+  what starting this release would change in a database without changing it:
+  pending global migrations, every bounded context's missing columns,
+  indexes, constraints, triggers and functions, the patches that rewrite rows
+  or block writes (with estimated row counts, exact on request), and what
+  can't be determined. Everything it reads runs in one read-only transaction.
+  `SkiljBuilder::preflight` adds the key-provider and blind-index checks and
+  what reconciliation would do with each declared type, on read-only
+  connections. The report serializes to JSON and holds names, counts and codes
+  only.
+- `skilj::preflight::migrate` upgrades the schema and nothing else: the global
+  migrations, the admin context, every bounded context's patches. It takes
+  an optional `lock_timeout`, for a deploy job that owns the schema change.
+  `SkiljBuilder::schema_changes(SchemaChanges::Refuse)` makes `build()` refuse
+  with `schema_upgrade_required` instead of upgrading. The default is
+  unchanged.
+- A schema compatibility level. A release records its level and the oldest
+  level allowed to keep running against the schema it upgraded
+  (`skilj_schema_compatibility`, global migration 0010). An older release
+  refuses with `schema_too_new`. sqlx's `VersionMissing` is no longer the
+  guard: a release a newer one declares compatible can start with
+  migrations it doesn't know. Releases up to 0.3.0 still refuse a database
+  this release has migrated, and docs/deployment.md has the upgrade
+  procedure. `scripts/check-upgrade-pair.sh` runs the previous release and
+  this one against one database in CI.
 
 - Guides for coding agents ship inside the `skilj` crate, in `agent-guides/`: the six skills that
   were in `.claude/skills/` (types, bootstrap, uniqueness, large payloads, event modeling,
@@ -60,6 +102,11 @@ README.md, "Status and stability").
   Conflict checks and failed set-write replay are unchanged.
 
 ### Fixed
+
+- Two instances starting at the same time against a bounded context from an
+  older release could fail with a duplicate-key error on Postgres's catalog.
+  Both found a table, column or function missing and both created it. The
+  loser now runs the idempotent patches again (docs/architecture.md §249).
 
 - A master key's retirement no longer waits on data keys that a bounded
   context left under it when it moved to a key of its own - marked unreadable

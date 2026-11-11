@@ -195,8 +195,10 @@ See [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) for the full mapp
   unknown rather than failing.
 - **Database upgrades are automatic and forward-only.** Startup patches an older schema in place;
   an upgrade from the very first release's schema is part of the test suite
-  ([`docs/architecture.md` §159](docs/architecture.md)). Take a backup before upgrading
-  production; there is no tool to go back to an older schema.
+  ([`docs/architecture.md` §159](docs/architecture.md)). `SkiljBuilder::preflight` reports what an
+  upgrade would change without changing anything, and `skilj::preflight::migrate` runs it as a
+  step of its own ([deployment guide](docs/deployment.md#upgrade-with-a-restore-plan)). Take a backup
+  before upgrading production; there is no tool to go back to an older schema.
 - **Minimum supported Rust version: 1.95**, checked in CI. Raising it is a minor-release change.
 - **PostgreSQL 15–18**, using current minor releases. CI runs the full suite on 17 and
   focused compatibility checks on 15 and 18. See the [support policy and coverage](docs/postgres-compatibility.md).

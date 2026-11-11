@@ -51,6 +51,17 @@ the same reason `skilj-tui`/`skilj-inspector` need no entry).
    change together, and the template already matches the moment the
    crates are on crates.io.
 
+5. The schema level (docs/architecture.md §249,
+   docs/upgrade-preflight-design.md). When the release changes the schema
+   since the previous one - a new global migration under
+   `skilj-core/migrations/`, a new or changed startup patch, a re-recorded
+   `skilj-core/src/db/sql/bounded_context_shape.txt` - raise
+   `skilj_core::preflight::SCHEMA_LEVEL` by one. Leave
+   `MIN_COMPATIBLE_SCHEMA_LEVEL` equal to it, unless the previous release
+   is declared able to keep running against the upgraded database: then
+   set it to the previous release's level, say so in the CHANGELOG, and
+   make CI's `scripts/check-upgrade-pair.sh` run with `--expect-compatible`.
+
 ### Doing this with `cargo-release`
 
 The manual version above is correct but tedious and easy to get wrong
@@ -170,6 +181,9 @@ root available; wherever the publish actually runs needs this too,
 ## After publishing
 
 - Tag the release: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+- Point `DEFAULT_FROM` in `scripts/check-upgrade-pair.sh` at the new tag,
+  so the next release's CI upgrades from this one, and drop
+  `--expect-compatible` from its CI step if it was set.
 - The first release of a crate (`skilj-blob-s3` in 0.3.0) gives
   `cargo semver-checks` a baseline: drop it from the `--exclude` list of
   the semver step in `.github/workflows/ci.yml`.
