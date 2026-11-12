@@ -197,9 +197,30 @@ struct Transit {
     /// A request to fail, once: the operation, how many of its requests
     /// to answer first, and the status to fail with.
     fault: Option<(&'static str, usize, u16)>,
+    /// A request never to answer, once: the operation and how many of its
+    /// requests to answer first. `hung` is notified when it arrives.
+    hang: Option<(&'static str, usize)>,
+    hung: Arc<tokio::sync::Notify>,
 }
 
 impl Transit {
+    /// Whether this request to `op` is the one never to answer.
+    fn hangs(&mut self, op: &'static str) -> bool {
+        let Some((hanging, left)) = self.hang.as_mut() else {
+            return false;
+        };
+        if *hanging != op {
+            return false;
+        }
+        if *left > 0 {
+            *left -= 1;
+            return false;
+        }
+        self.hang = None;
+        self.hung.notify_one();
+        true
+    }
+
     /// Whether this request to `op` is the one to fail, and with what.
     fn faulted(&mut self, op: &'static str) -> Option<(StatusCode, Json<Value>)> {
         let (faulted, left, status) = self.fault.as_mut()?;
@@ -327,6 +348,8 @@ async fn serve_transit() -> (String, Fake) {
         requests: Vec::new(),
         delay: Duration::ZERO,
         fault: None,
+        hang: None,
+        hung: Arc::default(),
     }));
     let app = Router::new()
         .route(
@@ -337,6 +360,10 @@ async fn serve_transit() -> (String, Fake) {
                 }
                 let delay = f.lock().unwrap().delay;
                 tokio::time::sleep(delay).await;
+                let hangs = f.lock().unwrap().hangs("encrypt");
+                if hangs {
+                    std::future::pending::<()>().await;
+                }
                 let mut t = f.lock().unwrap();
                 t.calls.push("encrypt".into());
                 if let Some(fault) = t.faulted("encrypt") {
@@ -353,7 +380,8 @@ async fn serve_transit() -> (String, Fake) {
                         .collect();
                     return batch_answer(&body, results);
                 }
-                t.requests.push(("encrypt", key, 1));
+                // Recorded apart: the provider sends a batch of one.
+                t.requests.push(("single encrypt", key, 1));
                 let plaintext = unb64(body["plaintext"].as_str().unwrap());
                 let ciphertext = encrypt(&t, &plaintext);
                 (StatusCode::OK, Json(json!({ "data": { "ciphertext": ciphertext, "key_version": t.latest } })))
@@ -367,10 +395,22 @@ async fn serve_transit() -> (String, Fake) {
                 }
                 let delay = f.lock().unwrap().delay;
                 tokio::time::sleep(delay).await;
+                let hangs = f.lock().unwrap().hangs("decrypt");
+                if hangs {
+                    std::future::pending::<()>().await;
+                }
                 let mut t = f.lock().unwrap();
                 t.calls.push("decrypt".into());
                 if let Some(fault) = t.faulted("decrypt") {
                     return fault;
+                }
+                // As Transit: a key that isn't there refuses the request
+                // before it looks at any item.
+                if key != "skilj" && !t.created.contains(&key) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "errors": ["encryption key not found"] })),
+                    );
                 }
                 if let Some(batch) = body.get("batch_input").and_then(Value::as_array) {
                     t.requests.push(("decrypt", key, batch.len()));
@@ -383,7 +423,7 @@ async fn serve_transit() -> (String, Fake) {
                         .collect();
                     return batch_answer(&body, results);
                 }
-                t.requests.push(("decrypt", key, 1));
+                t.requests.push(("single decrypt", key, 1));
                 match decrypt(&t, body["ciphertext"].as_str().unwrap()) {
                     Ok(plaintext) => (StatusCode::OK, Json(json!({ "data": { "plaintext": b64(&plaintext) } }))),
                     Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "errors": [e] }))),
@@ -392,12 +432,16 @@ async fn serve_transit() -> (String, Fake) {
         )
         .route(
             "/v1/transit/rewrap/{key}",
-            post(|State(f): State<Fake>, headers: HeaderMap, Json(body): Json<Value>| async move {
+            post(|State(f): State<Fake>, headers: HeaderMap, Path(key): Path<String>, Json(body): Json<Value>| async move {
                 if let Some(denied) = denied(&headers) {
                     return denied;
                 }
+                let delay = f.lock().unwrap().delay;
+                tokio::time::sleep(delay).await;
                 let mut t = f.lock().unwrap();
                 t.calls.push("rewrap".into());
+                let items = body["batch_input"].as_array().map_or(1, Vec::len);
+                t.requests.push(("rewrap", key, items));
                 let inputs: Vec<Value> = match body.get("batch_input") {
                     Some(batch) => batch.as_array().unwrap().clone(),
                     None => vec![json!({ "ciphertext": body["ciphertext"] })],
@@ -2315,6 +2359,241 @@ fn the_vault_provider_unwraps_and_wraps_a_batch_in_one_request() {
     });
 }
 
+#[test]
+fn a_single_vault_call_is_a_batch_of_one_and_a_refused_request_is_no_verdict() {
+    runtime().block_on(async {
+        let (address, fake) = serve_transit().await;
+        let vault = VaultTransitProvider::new(&address, "skilj", "test-token");
+        let data_key = [4u8; 32];
+
+        // A single wrap and unwrap go out as batches of one, and read
+        // their answers as a batch's (docs/architecture.md §250).
+        let wrapped = vault.wrap(&data_key).await.unwrap();
+        assert_eq!(vault.unwrap(&wrapped).await.unwrap(), data_key);
+        let corrupt = WrappedDataKey {
+            version: 1,
+            ciphertext: b"vault:v1:x.00".to_vec(),
+        };
+        assert!(matches!(
+            vault.unwrap(&corrupt).await,
+            Err(encryption::Error::DecryptFailed)
+        ));
+        assert_eq!(
+            fake.lock().unwrap().requests,
+            vec![
+                ("encrypt", "skilj".to_string(), 1),
+                ("decrypt", "skilj".to_string(), 1),
+                ("decrypt", "skilj".to_string(), 1),
+            ]
+        );
+
+        // A key this Vault doesn't have refuses every item: what it is
+        // asked to unwrap is unreadable to it.
+        let missing = vault.key("never-created").unwrap();
+        assert!(matches!(
+            missing.unwrap(&wrapped).await,
+            Err(encryption::Error::DecryptFailed)
+        ));
+        let refused = missing
+            .unwrap_batch(&[wrapped.clone(), wrapped.clone()])
+            .await
+            .unwrap();
+        assert_eq!(refused.len(), 2);
+        assert!(refused
+            .iter()
+            .all(|r| matches!(r, Err(encryption::Error::DecryptFailed))));
+
+        // Any other 400 or 404 without per-item results is Vault refusing
+        // the request - a proxy, a mount that isn't there - and no verdict
+        // on the data keys: the batch fails and nothing is marked on it.
+        for status in [400, 404] {
+            fake.lock().unwrap().fault = Some(("decrypt", 0, status));
+            let batch = vault
+                .unwrap_batch(&[wrapped.clone(), wrapped.clone()])
+                .await;
+            assert!(
+                matches!(batch, Err(encryption::Error::ProviderRefused { .. })),
+                "{status}: {batch:?}"
+            );
+            fake.lock().unwrap().fault = Some(("decrypt", 0, status));
+            let one = vault.unwrap(&wrapped).await;
+            assert!(
+                matches!(one, Err(encryption::Error::ProviderRefused { .. })),
+                "{status}: {one:?}"
+            );
+        }
+        let elsewhere = VaultTransitProvider::new(&address, "skilj", "test-token").mount("nope");
+        assert!(matches!(
+            elsewhere.unwrap(&wrapped).await,
+            Err(encryption::Error::ProviderRefused { .. })
+        ));
+
+        // Not one single request went out.
+        assert!(fake
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|(op, ..)| !op.starts_with("single")));
+    });
+}
+
+#[test]
+fn a_refused_decrypt_request_mid_move_marks_nothing() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_move_refused_request_test").await else {
+            return;
+        };
+        let (address, fake) = serve_transit().await;
+        let vault = VaultTransitProvider::new(&address, "skilj", "test-token");
+        let keys = KeyService::new(vault.clone()).with_cache(Duration::ZERO, 0);
+        settled(&url, &keys).await;
+        let bc = insert_bounded_context(&pool).await;
+        seed(&pool, &bc, &vault, "s", 250).await;
+        let (target, version, since) = assign(&pool, &keys, &bc, "tenant").await;
+        let tenant = Some("vault-transit:transit/tenant".to_string());
+        let default = Some("vault-transit:transit/skilj".to_string());
+        let run = || db::rewrap_data_keys(&pool, &bc, &keys, target.as_ref(), version, since, None);
+
+        // The second batch's decrypt answered 400 without item results:
+        // before §250 its 50 rows were all marked unreadable.
+        fake.lock().unwrap().fault = Some(("decrypt", 1, 400));
+        let err = run().await.unwrap_err();
+        assert_eq!(err.code(), "encryption_key_provider_refused", "{err}");
+        assert_eq!(
+            providers_of(&pool, &bc).await,
+            (vec![(default, 50), (tenant.clone(), 200)], 0)
+        );
+        assert!(events_about(&pool, "EncryptionDataKeysRewrapped", &bc)
+            .await
+            .is_empty());
+
+        let outcome = run().await.unwrap();
+        assert_eq!((outcome.rewrapped, outcome.unreadable), (50, 0));
+        assert_eq!(providers_of(&pool, &bc).await, (vec![(tenant, 250)], 0));
+        let recorded = events_about(&pool, "EncryptionDataKeysRewrapped", &bc).await;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+    });
+}
+
+/// The advisory locks held on the test's database.
+async fn advisory_locks(pool: &Pool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \
+         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[test]
+fn a_move_dropped_mid_batch_keeps_what_committed_and_lets_go_of_its_lock() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_move_dropped_test").await else {
+            return;
+        };
+        let (address, fake) = serve_transit().await;
+        let vault = VaultTransitProvider::new(&address, "skilj", "test-token");
+        let keys = KeyService::new(vault.clone()).with_cache(Duration::ZERO, 0);
+        settled(&url, &keys).await;
+        let bc = insert_bounded_context(&pool).await;
+        // Three batches' worth.
+        seed(&pool, &bc, &vault, "s", 450).await;
+        let (target, version, since) = assign(&pool, &keys, &bc, "tenant").await;
+        let tenant = Some("vault-transit:transit/tenant".to_string());
+        let default = Some("vault-transit:transit/skilj".to_string());
+        let run =
+            || db::rewrap_data_keys_once(&pool, &bc, &keys, target.as_ref(), version, since, None);
+
+        // The second batch's encrypt never answers, and the run is dropped
+        // while it waits - what `Skilj::shutdown` aborting the loop does.
+        let hung = {
+            let mut t = fake.lock().unwrap();
+            t.hang = Some(("encrypt", 1));
+            t.hung.clone()
+        };
+        tokio::select! {
+            outcome = run() => panic!("the run finished: {outcome:?}"),
+            () = hung.notified() => {}
+        }
+
+        // The first batch committed; the second never reached its
+        // transaction, and nothing recorded the move as done.
+        assert_eq!(
+            providers_of(&pool, &bc).await,
+            (vec![(default, 250), (tenant.clone(), 200)], 0)
+        );
+        assert!(events_about(&pool, "EncryptionDataKeysRewrapped", &bc)
+            .await
+            .is_empty());
+        // The lock went with its connection instead of back to the pool,
+        // where every later run would have found it held.
+        let mut waited = Duration::ZERO;
+        while advisory_locks(&pool).await > 0 {
+            assert!(
+                waited < Duration::from_secs(10),
+                "the rewrap lock is still held"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += Duration::from_millis(50);
+        }
+
+        // The next run takes the lock, carries on and records the move.
+        let outcome = run().await.unwrap().expect("the lock was free");
+        assert_eq!((outcome.rewrapped, outcome.unreadable), (250, 0));
+        assert_eq!(providers_of(&pool, &bc).await, (vec![(tenant, 450)], 0));
+        let recorded = events_about(&pool, "EncryptionDataKeysRewrapped", &bc).await;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0]["rewrapped"], 250);
+        assert_eq!(
+            advisory_locks(&pool).await,
+            0,
+            "released after a finished run"
+        );
+    });
+}
+
+#[test]
+fn a_provider_that_stops_answering_mid_move_marks_nothing() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_move_timeout_test").await else {
+            return;
+        };
+        let (address, fake) = serve_transit().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let vault = VaultTransitProvider::new(&address, "skilj", "test-token").client(client);
+        let keys = KeyService::new(vault.clone()).with_cache(Duration::ZERO, 0);
+        settled(&url, &keys).await;
+        let bc = insert_bounded_context(&pool).await;
+        seed(&pool, &bc, &vault, "s", 250).await;
+        let (target, version, since) = assign(&pool, &keys, &bc, "tenant").await;
+        let tenant = Some("vault-transit:transit/tenant".to_string());
+        let default = Some("vault-transit:transit/skilj".to_string());
+        let run = || db::rewrap_data_keys(&pool, &bc, &keys, target.as_ref(), version, since, None);
+
+        // No answer at all to the second batch's decrypt: the client's
+        // timeout, an outage like a 503, and no verdict on any row.
+        fake.lock().unwrap().hang = Some(("decrypt", 1));
+        let err = run().await.unwrap_err();
+        assert_eq!(err.code(), "encryption_key_provider_unavailable", "{err}");
+        assert_eq!(
+            providers_of(&pool, &bc).await,
+            (vec![(default, 50), (tenant.clone(), 200)], 0)
+        );
+        assert!(events_about(&pool, "EncryptionDataKeysRewrapped", &bc)
+            .await
+            .is_empty());
+
+        let outcome = run().await.unwrap();
+        assert_eq!((outcome.rewrapped, outcome.unreadable), (50, 0));
+        assert_eq!(providers_of(&pool, &bc).await, (vec![(tenant, 250)], 0));
+    });
+}
+
 /// A provider with only the single operations, as one written before the
 /// batch ones is: it records its calls and how many ran at once, can wait
 /// at a gate before wrapping, and its keys share all of that.
@@ -3134,6 +3413,45 @@ impl KeyProvider for Asked {
             }
         })
     }
+    /// A rotation's rewrap of the key's own data keys: Transit's batch
+    /// `rewrap`, the trait's default (§250: the batch unwrap, then the
+    /// batch wrap, here from single calls a few at a time), or one data
+    /// key after the other, as the default did before §250.
+    fn rewrap<'a>(
+        &'a self,
+        wrapped: &'a [WrappedDataKey],
+    ) -> skilj::BoxFuture<
+        'a,
+        Result<Vec<Result<WrappedDataKey, encryption::Error>>, encryption::Error>,
+    > {
+        Box::pin(async move {
+            match self.asking {
+                Asking::Batches => self.inner.rewrap(wrapped).await,
+                Asking::Defaults => {
+                    let unwrapped = self.unwrap_batch(wrapped).await?;
+                    let data_keys: Vec<[u8; 32]> = unwrapped
+                        .iter()
+                        .filter_map(|r| r.as_ref().ok().copied())
+                        .collect();
+                    let mut rewrapped = self.wrap_batch(&data_keys).await?.into_iter();
+                    Ok(unwrapped
+                        .into_iter()
+                        .map(|r| r.map(|_| rewrapped.next().unwrap()))
+                        .collect())
+                }
+                Asking::RowByRow => {
+                    let mut out = Vec::with_capacity(wrapped.len());
+                    for one in wrapped {
+                        out.push(match self.inner.unwrap(one).await {
+                            Ok(data_key) => self.inner.wrap(&data_key).await,
+                            Err(err) => Err(err),
+                        });
+                    }
+                    Ok(out)
+                }
+            }
+        })
+    }
     fn versions(&self) -> skilj::BoxFuture<'_, Result<skilj::KeyVersions, encryption::Error>> {
         self.inner.versions()
     }
@@ -3292,6 +3610,53 @@ fn move_measurement() {
                     longest_transaction.load(std::sync::atomic::Ordering::SeqCst) as f64 / 1000.0,
                     status_kib("VmRSS:"),
                     status_kib("VmHWM:"),
+                );
+            }
+        }
+
+        // A rotation's rewrap of the default key's own data keys (§250),
+        // which §246 left as it was: the same 1,000 data keys, wrapped
+        // under the default key, then the key rotated.
+        println!();
+        println!("| Request latency | Same-key rewrap | Requests | Elapsed | Per data key |");
+        println!("| ---: | --- | ---: | ---: | ---: |");
+        for latency in [0u64, 1, 5, 20] {
+            for (label, asking) in [
+                ("row by row (before)", Asking::RowByRow),
+                ("trait default", Asking::Defaults),
+                ("Vault rewrap", Asking::Batches),
+            ] {
+                let keys = KeyService::new(Asked {
+                    inner: Arc::new(vault.clone()),
+                    asking,
+                })
+                .with_cache(Duration::ZERO, 0);
+                let bc = insert_bounded_context(&setup).await;
+                fake.lock().unwrap().delay = Duration::ZERO;
+                seed(&setup, &bc, &vault, "s", DATA_KEYS).await;
+                let version = vault.rotate().await.unwrap();
+                let target = keys.default_provider();
+                fake.lock().unwrap().delay = Duration::from_millis(latency);
+                fake.lock().unwrap().requests.clear();
+                let started = std::time::Instant::now();
+                let outcome = db::rewrap_data_keys(
+                    &pool,
+                    &bc,
+                    &keys,
+                    target.as_ref(),
+                    version,
+                    chrono::Utc::now(),
+                    None,
+                )
+                .await
+                .unwrap();
+                let elapsed = started.elapsed();
+                assert_eq!(outcome.rewrapped, DATA_KEYS as u64);
+                let requests = fake.lock().unwrap().requests.len();
+                println!(
+                    "| {latency} ms | {label} | {requests} | {:.0} ms | {:.3} ms |",
+                    elapsed.as_secs_f64() * 1000.0,
+                    elapsed.as_secs_f64() * 1000.0 / DATA_KEYS as f64,
                 );
             }
         }

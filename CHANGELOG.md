@@ -112,6 +112,12 @@ README.md, "Status and stability").
   key. `VaultTransitProvider` uses Transit's batch `decrypt` and `encrypt`:
   1,000 data keys at 5 ms a request move in 0.12 s instead of 13 s
   (docs/architecture.md §246).
+- The shipped key providers answer a single `wrap` or `unwrap` as a batch of
+  one: `VaultTransitProvider`'s single unwrap is Transit's batch `decrypt`
+  with one item. `KeyProvider::rewrap`'s default is now `unwrap_batch` then
+  `wrap_batch` instead of one data key after the other, so a provider of your
+  own without a `rewrap` rotates in batches too; a failed wrap now fails its
+  rewrap batch rather than each item (docs/architecture.md §250, issue #176).
 - Command batch preparation moves resolved histories and snapshot states into
   the queue instead of deep-copying them (issue #172, ownership stage).
   `CommandBatcher::prepare_command` returns an opaque `PreparedCommand` consumed
@@ -119,6 +125,18 @@ README.md, "Status and stability").
   Conflict checks and failed set-write replay are unchanged.
 
 ### Fixed
+
+- `VaultTransitProvider` no longer marks a whole batch of data keys
+  unreadable when Vault refuses the request itself - a 400 without per-item
+  results that isn't `encryption key not found`, or a 404 such as a mount
+  that isn't there. It fails the batch as `encryption_key_provider_refused`,
+  and the rewrap stops to be retried; a single unwrap answers the same
+  (docs/architecture.md §250).
+- A rewrap dropped mid-run - `Skilj::shutdown` aborting its loop - gave its
+  connection back to the pool still holding the rewrap's advisory lock, so
+  later rewraps of that key and bounded context were skipped for as long as
+  the pool kept the connection. The connection is now closed instead
+  (docs/architecture.md §250).
 
 - Two instances starting at the same time against a bounded context from an
   older release could fail with a duplicate-key error on Postgres's catalog.

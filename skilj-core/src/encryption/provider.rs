@@ -78,23 +78,53 @@ pub trait KeyProvider: Send + Sync + 'static {
     fn unwrap<'a>(&'a self, wrapped: &'a WrappedDataKey) -> BoxFuture<'a, Result<[u8; 32], Error>>;
 
     /// Each of `wrapped` wrapped anew under the latest version, one result
-    /// per input, in order: one that fails doesn't fail the rest. The
-    /// default unwraps and wraps; a remote provider can do it without the
-    /// data key leaving it.
+    /// per input, in order: one the key refuses doesn't fail the rest. A
+    /// remote provider can do it without the data key leaving it.
+    ///
+    /// The default is [`unwrap_batch`](Self::unwrap_batch), then
+    /// [`wrap_batch`](Self::wrap_batch) of the data keys that unwrapped:
+    /// two batch requests for a provider with batch operations, and
+    /// [`batch_concurrency`](Self::batch_concurrency) single calls at a
+    /// time for one without. A failed wrap fails the whole batch, as
+    /// `wrap_batch` does (docs/architecture.md §250).
     fn rewrap<'a>(
         &'a self,
         wrapped: &'a [WrappedDataKey],
     ) -> BoxFuture<'a, Result<Vec<Result<WrappedDataKey, Error>>, Error>> {
         Box::pin(async move {
-            let mut out = Vec::with_capacity(wrapped.len());
-            for one in wrapped {
-                let rewrapped = match self.unwrap(one).await {
-                    Ok(data_key) => self.wrap(&data_key).await,
-                    Err(err) => Err(err),
-                };
-                out.push(rewrapped);
+            let unwrapped = sized(
+                self.name(),
+                wrapped.len(),
+                self.unwrap_batch(wrapped).await?,
+            )?;
+            let mut data_keys = Vec::with_capacity(unwrapped.len());
+            let mut out: Vec<Option<Result<WrappedDataKey, Error>>> =
+                Vec::with_capacity(unwrapped.len());
+            for result in unwrapped {
+                match result {
+                    Ok(data_key) => {
+                        data_keys.push(data_key);
+                        out.push(None);
+                    }
+                    Err(err) => out.push(Some(Err(err))),
+                }
             }
-            Ok(out)
+            let mut rewrapped = sized(
+                self.name(),
+                data_keys.len(),
+                self.wrap_batch(&data_keys).await?,
+            )?
+            .into_iter();
+            Ok(out
+                .into_iter()
+                .map(|one| match one {
+                    Some(refused) => refused,
+                    None => rewrapped.next().ok_or_else(|| Error::ProviderRefused {
+                        provider: self.name().to_string(),
+                        message: "wrap_batch answered too few wraps".into(),
+                    }),
+                })
+                .collect())
         })
     }
 
@@ -180,6 +210,31 @@ pub trait KeyProvider: Send + Sync + 'static {
     /// Deletes this key at the provider, every version of it: whatever it
     /// wrapped can never be unwrapped again.
     fn delete(&self) -> BoxFuture<'_, Result<(), Error>>;
+}
+
+/// `batch` when it holds `expected` answers, and otherwise the provider's
+/// refusal: a batch operation answering the wrong number is not trusted
+/// with any of them.
+pub(crate) fn sized<T>(provider: &str, expected: usize, batch: Vec<T>) -> Result<Vec<T>, Error> {
+    if batch.len() == expected {
+        Ok(batch)
+    } else {
+        Err(Error::ProviderRefused {
+            provider: provider.to_string(),
+            message: format!("answered {} results for {expected} inputs", batch.len()),
+        })
+    }
+}
+
+/// The one answer of a batch of one: how a provider whose batch operation
+/// is the real one answers a single [`KeyProvider::wrap`] or
+/// [`KeyProvider::unwrap`] (docs/architecture.md §250).
+pub(crate) fn single<T>(provider: &str, batch: Vec<T>) -> Result<T, Error> {
+    let mut batch = sized(provider, 1, batch)?.into_iter();
+    batch.next().ok_or_else(|| Error::ProviderRefused {
+        provider: provider.to_string(),
+        message: "answered no result for one input".into(),
+    })
 }
 
 /// Refuses a key name that isn't 1 to 64 ASCII letters, digits, `-` and
@@ -398,12 +453,37 @@ impl KeyProvider for InMemoryKeyProvider {
         &self.name
     }
 
+    /// A batch of one.
     fn wrap<'a>(&'a self, data_key: &'a [u8; 32]) -> BoxFuture<'a, Result<WrappedDataKey, Error>> {
-        Box::pin(async move { self.with(|k| k.wrap(data_key))? })
+        Box::pin(async move {
+            single(
+                &self.name,
+                self.wrap_batch(std::slice::from_ref(data_key)).await?,
+            )
+        })
     }
 
+    /// A batch of one.
     fn unwrap<'a>(&'a self, wrapped: &'a WrappedDataKey) -> BoxFuture<'a, Result<[u8; 32], Error>> {
-        Box::pin(async move { self.with(|k| k.unwrap(wrapped))? })
+        Box::pin(async move {
+            single(
+                &self.name,
+                self.unwrap_batch(std::slice::from_ref(wrapped)).await?,
+            )?
+        })
+    }
+
+    /// The keyring locked once for the batch.
+    fn unwrap_batch<'a>(&'a self, wrapped: &'a [WrappedDataKey]) -> BoxFuture<'a, UnwrappedBatch> {
+        Box::pin(async move { self.with(|k| wrapped.iter().map(|one| k.unwrap(one)).collect()) })
+    }
+
+    /// The keyring locked once for the batch.
+    fn wrap_batch<'a>(
+        &'a self,
+        data_keys: &'a [[u8; 32]],
+    ) -> BoxFuture<'a, Result<Vec<WrappedDataKey>, Error>> {
+        Box::pin(async move { self.with(|k| data_keys.iter().map(|one| k.wrap(one)).collect())? })
     }
 
     fn versions(&self) -> BoxFuture<'_, Result<KeyVersions, Error>> {
@@ -543,12 +623,24 @@ impl KeyProvider for KeyFileProvider {
         &self.name
     }
 
+    /// A batch of one.
     fn wrap<'a>(&'a self, data_key: &'a [u8; 32]) -> BoxFuture<'a, Result<WrappedDataKey, Error>> {
-        Box::pin(async move { self.read()?.wrap(data_key) })
+        Box::pin(async move {
+            single(
+                &self.name,
+                self.wrap_batch(std::slice::from_ref(data_key)).await?,
+            )
+        })
     }
 
+    /// A batch of one.
     fn unwrap<'a>(&'a self, wrapped: &'a WrappedDataKey) -> BoxFuture<'a, Result<[u8; 32], Error>> {
-        Box::pin(async move { self.read()?.unwrap(wrapped) })
+        Box::pin(async move {
+            single(
+                &self.name,
+                self.unwrap_batch(std::slice::from_ref(wrapped)).await?,
+            )?
+        })
     }
 
     /// The key file read once for the batch.
@@ -705,6 +797,169 @@ mod tests {
                     min_decryption: 2
                 }
             );
+        });
+    }
+
+    /// A provider of one's own with only the single operations, failing
+    /// the wraps it is told to: what the trait's defaults are for.
+    struct Scalar {
+        inner: InMemoryKeyProvider,
+        unwraps: std::sync::atomic::AtomicUsize,
+        wraps: std::sync::atomic::AtomicUsize,
+        fail_wraps: bool,
+    }
+
+    impl Scalar {
+        fn new(inner: InMemoryKeyProvider, fail_wraps: bool) -> Self {
+            Self {
+                inner,
+                unwraps: Default::default(),
+                wraps: Default::default(),
+                fail_wraps,
+            }
+        }
+    }
+
+    impl KeyProvider for Scalar {
+        fn name(&self) -> &str {
+            "scalar"
+        }
+        fn wrap<'a>(
+            &'a self,
+            data_key: &'a [u8; 32],
+        ) -> BoxFuture<'a, Result<WrappedDataKey, Error>> {
+            self.wraps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_wraps {
+                return Box::pin(async {
+                    Err(Error::ProviderUnavailable {
+                        provider: "scalar".into(),
+                        message: "down".into(),
+                    })
+                });
+            }
+            self.inner.wrap(data_key)
+        }
+        fn unwrap<'a>(
+            &'a self,
+            wrapped: &'a WrappedDataKey,
+        ) -> BoxFuture<'a, Result<[u8; 32], Error>> {
+            self.unwraps
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.unwrap(wrapped)
+        }
+        fn versions(&self) -> BoxFuture<'_, Result<KeyVersions, Error>> {
+            self.inner.versions()
+        }
+        fn rotate(&self) -> BoxFuture<'_, Result<u32, Error>> {
+            self.inner.rotate()
+        }
+        fn retire_below(&self, version: u32) -> BoxFuture<'_, Result<(), Error>> {
+            self.inner.retire_below(version)
+        }
+        fn key(&self, key: &str) -> Result<Arc<dyn KeyProvider>, Error> {
+            self.inner.key(key)
+        }
+        fn create(&self) -> BoxFuture<'_, Result<bool, Error>> {
+            self.inner.create()
+        }
+        fn delete(&self) -> BoxFuture<'_, Result<(), Error>> {
+            self.inner.delete()
+        }
+    }
+
+    #[test]
+    fn the_default_rewrap_unwraps_and_wraps_in_batches_and_keeps_a_refusal_per_item() {
+        block_on(async {
+            let inner = InMemoryKeyProvider::new();
+            let provider = Scalar::new(inner.clone(), false);
+            let a = inner.wrap(&[1; 32]).await.unwrap();
+            let b = inner.wrap(&[2; 32]).await.unwrap();
+            let bad = WrappedDataKey {
+                version: 1,
+                ciphertext: vec![0; 40],
+            };
+            inner.rotate().await.unwrap();
+
+            let results = provider.rewrap(&[a, bad, b]).await.unwrap();
+            assert_eq!(results.len(), 3);
+            let first = results[0].as_ref().unwrap();
+            assert_eq!(first.version, 2);
+            assert_eq!(inner.unwrap(first).await.unwrap(), [1; 32]);
+            assert!(
+                matches!(results[1], Err(Error::DecryptFailed)),
+                "{:?}",
+                results[1]
+            );
+            let third = results[2].as_ref().unwrap();
+            assert_eq!(inner.unwrap(third).await.unwrap(), [2; 32]);
+            // Three unwraps and only the two readable ones wrapped.
+            assert_eq!(
+                provider.unwraps.load(std::sync::atomic::Ordering::SeqCst),
+                3
+            );
+            assert_eq!(provider.wraps.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(provider.rewrap(&[]).await.unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_failed_wrap_fails_the_default_rewrap_as_a_batch() {
+        block_on(async {
+            let inner = InMemoryKeyProvider::new();
+            let provider = Scalar::new(inner.clone(), true);
+            let a = inner.wrap(&[1; 32]).await.unwrap();
+            assert!(matches!(
+                provider.rewrap(&[a.clone(), a]).await,
+                Err(Error::ProviderUnavailable { .. })
+            ));
+            // Nothing to wrap: the refusals come back without a wrap asked.
+            let bad = WrappedDataKey {
+                version: 1,
+                ciphertext: vec![0; 40],
+            };
+            let results = provider.rewrap(std::slice::from_ref(&bad)).await.unwrap();
+            assert!(matches!(results[..], [Err(Error::DecryptFailed)]));
+        });
+    }
+
+    #[test]
+    fn a_batch_of_the_wrong_size_is_refused_whole() {
+        assert_eq!(single("p", vec![7]).unwrap(), 7);
+        assert!(matches!(
+            single::<u8>("p", vec![]),
+            Err(Error::ProviderRefused { .. })
+        ));
+        assert!(matches!(
+            single("p", vec![1, 2]),
+            Err(Error::ProviderRefused { .. })
+        ));
+        assert!(matches!(
+            sized("p", 3, vec![1, 2]),
+            Err(Error::ProviderRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn single_calls_of_the_shipped_providers_answer_as_their_batches() {
+        block_on(async {
+            let provider = InMemoryKeyProvider::new();
+            let wrapped = provider.wrap(&[5; 32]).await.unwrap();
+            let batch = provider
+                .unwrap_batch(&[wrapped.clone(), wrapped.clone()])
+                .await
+                .unwrap();
+            assert!(batch.iter().all(|r| r.as_ref().unwrap() == &[5; 32]));
+            assert_eq!(provider.unwrap(&wrapped).await.unwrap(), [5; 32]);
+            // A key that doesn't exist: the batch's error, for one too.
+            let missing = provider.key("missing").unwrap();
+            assert!(matches!(
+                missing.unwrap(&wrapped).await,
+                Err(Error::ProviderRefused { .. })
+            ));
+            assert!(matches!(
+                missing.wrap(&[5; 32]).await,
+                Err(Error::ProviderRefused { .. })
+            ));
         });
     }
 

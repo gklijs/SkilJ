@@ -274,6 +274,19 @@ async fn check_provider(server: &Server) {
             refused.iter().map(|r| r.as_ref().err()).collect::<Vec<_>>()
         );
     }
+    // A mount that isn't there is the server refusing the request (404),
+    // not the key refusing the data keys: no verdict, for one or a batch
+    // (docs/architecture.md §250).
+    let unmounted =
+        VaultTransitProvider::new(&server.address, "skilj", ROOT_TOKEN).mount("not-mounted");
+    assert!(matches!(
+        unmounted.unwrap(&v2).await,
+        Err(encryption::Error::ProviderRefused { .. })
+    ));
+    assert!(matches!(
+        unmounted.unwrap_batch(&[v2.clone(), v2.clone()]).await,
+        Err(encryption::Error::ProviderRefused { .. })
+    ));
     other.delete().await.unwrap();
     assert!(other.versions().await.is_err(), "deleted");
 

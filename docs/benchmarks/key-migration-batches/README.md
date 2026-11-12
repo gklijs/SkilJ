@@ -76,3 +76,65 @@ real Vault's throughput. The container suite
 answers against real Vault and OpenBao, without timing them. A rotation's
 rewrap of a key's own data keys already used Transit's batch `rewrap` and
 is not changed or measured here.
+
+## Same-key rotation and batches of one (§250)
+
+The same experiment now ends with a second table: 1,000 data keys wrapped
+under the default key, the key rotated, and `db::rewrap_data_keys` run for
+that key, as the background task does after a rotation. The three ways:
+
+- **row by row (before)**: unwrap then wrap, one data key after the other,
+  which is what `KeyProvider::rewrap`'s default did before §250.
+- **trait default**: the default as §250 has it, `unwrap_batch` then
+  `wrap_batch`, here with single calls eight at a time: what a provider of
+  one's own with neither batch operations nor `rewrap` gets.
+- **Vault rewrap**: `VaultTransitProvider`'s Transit batch `rewrap`, one
+  request per rewrap batch of 200, unchanged by §246 and §250.
+
+The imitation's `rewrap` now waits the set latency too, as its `encrypt` and
+`decrypt` do. The single `wrap` and `unwrap` of every shipped provider are
+batches of one since §250, so the move table's "trait defaults" and "row by
+row" rows now send one-item batch requests where they sent single ones: the
+same number of requests.
+
+One release run ([run-250.log](run-250.log)), rustc 1.97.0 on 2 vCPUs
+(Intel Xeon, 2.30 GHz) - another machine and compiler than the first run,
+so compare rows within a run, not across the two.
+
+| Request latency | Same-key rewrap | Requests | Elapsed | Per data key |
+| ---: | --- | ---: | ---: | ---: |
+| 0 ms | row by row (before) | 2,000 | 2,616 ms | 2.616 ms |
+| 0 ms | trait default | 2,000 | 394 ms | 0.394 ms |
+| 0 ms | Vault rewrap | 5 | 36 ms | 0.036 ms |
+| 1 ms | row by row (before) | 2,000 | 4,643 ms | 4.643 ms |
+| 1 ms | trait default | 2,000 | 667 ms | 0.667 ms |
+| 1 ms | Vault rewrap | 5 | 45 ms | 0.045 ms |
+| 5 ms | row by row (before) | 2,000 | 12,766 ms | 12.766 ms |
+| 5 ms | trait default | 2,000 | 1,698 ms | 1.698 ms |
+| 5 ms | Vault rewrap | 5 | 72 ms | 0.072 ms |
+| 20 ms | row by row (before) | 2,000 | 43,168 ms | 43.168 ms |
+| 20 ms | trait default | 2,000 | 5,515 ms | 5.515 ms |
+| 20 ms | Vault rewrap | 5 | 147 ms | 0.147 ms |
+
+The move table of the same run has the first run's request counts in every
+row (2,000 requests become 10) and elapsed times within 20% of it on this
+other machine: 12.8 s become 0.12 s at 5 ms, as before.
+
+- **Vault's rotation is unchanged:** five requests for 1,000 data keys, as
+  before §250; its time grows with the set latency only because the
+  imitation's `rewrap` now waits it.
+- **A provider without batch operations rotates 6.6 to 7.8 times faster:**
+  the same requests as before, eight in flight.
+- **Connections.** The move table shows at most two connections out in a
+  few rows where the first run saw one. Nothing between a batch's read and
+  its transaction changed; sqlx gives a released connection back to the
+  pool from a spawned task, so the sampler can see the previous one still
+  out as the next is taken. The longest transactions stay under 10 ms in
+  every row the code under test runs; the 25 and 44 ms rows are the
+  emulated "before" path on a busy 2-vCPU machine.
+
+Command reads don't go through the rewrap. Their only change in §250 is
+that the shipped providers' single `unwrap` builds a one-item batch;
+`scripts/bench/compare.mjs` compares the representative benchmarks of the
+commit before §250 and this one (docs/performance.md, "Comparing two
+commits").

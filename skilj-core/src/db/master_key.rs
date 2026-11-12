@@ -15,6 +15,7 @@ use crate::encryption::trail::{
 use crate::encryption::{self, KeyService, StoredWrap};
 use crate::event_store::BoundedContext;
 use chrono::{DateTime, Utc};
+use sqlx::pool::PoolConnection;
 use sqlx::{Postgres, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1068,6 +1069,11 @@ fn definitively_unreadable(err: &encryption::Error) -> bool {
 /// calls - and each record an `EncryptionDataKeysRewrapped` with part of
 /// the counts. A session-level advisory lock on one connection, held for
 /// the run: one connection per running rewrap, not one per batch.
+///
+/// Dropped mid-run - `Skilj::shutdown` aborting the loop that runs it -
+/// the lock's connection is closed rather than given back to the pool
+/// (docs/architecture.md §250); the batches already committed stay, and the next
+/// run carries on from where the rows stand.
 pub async fn rewrap_data_keys_once(
     pool: &Pool,
     bounded_context: &str,
@@ -1077,13 +1083,19 @@ pub async fn rewrap_data_keys_once(
     since: DateTime<Utc>,
     retiring: Option<&str>,
 ) -> crate::error::Result<Option<RewrapOutcome>> {
-    let mut lock = pool.acquire().await?;
+    let mut lock = HeldLock(Some(pool.acquire().await?));
     let name = format!("skilj_rewrap:{}:{bounded_context}", target.name());
-    let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
-        .bind(&name)
-        .fetch_one(&mut *lock)
-        .await?;
+    let held: bool = match lock.0.as_deref_mut() {
+        Some(conn) => {
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+                .bind(&name)
+                .fetch_one(conn)
+                .await?
+        }
+        None => false,
+    };
     if !held {
+        lock.give_back();
         return Ok(None);
     }
     let outcome = rewrap_data_keys(
@@ -1096,15 +1108,47 @@ pub async fn rewrap_data_keys_once(
         retiring,
     )
     .await;
-    let released = sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-        .bind(&name)
-        .execute(&mut *lock)
-        .await;
-    if released.is_err() {
-        // Not given back to the pool holding the lock.
-        lock.detach();
-    }
+    lock.release(&name).await;
     outcome.map(Some)
+}
+
+/// The pooled connection a session-level advisory lock was taken on. A
+/// session's lock lasts as long as the session, and a pooled connection
+/// outlives the task that took it: given back still holding the lock,
+/// every later [`rewrap_data_keys_once`] would find it held for as long
+/// as the pool keeps that connection. So unless it is given back - not
+/// locked, or unlocked - dropping it closes the connection, which ends
+/// the session and its lock (docs/architecture.md §250).
+struct HeldLock(Option<PoolConnection<Postgres>>);
+
+impl HeldLock {
+    /// Back to the pool: it holds no lock.
+    fn give_back(mut self) {
+        drop(self.0.take());
+    }
+
+    /// Unlocks `name` and gives the connection back; closes it instead
+    /// when the unlock fails or is dropped before it answers.
+    async fn release(mut self, name: &str) {
+        let Some(conn) = self.0.as_deref_mut() else {
+            return;
+        };
+        let released = sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+            .bind(name)
+            .execute(conn)
+            .await;
+        if released.is_ok() {
+            self.give_back();
+        }
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take() {
+            drop(conn.detach());
+        }
+    }
 }
 
 /// Rewraps every active data key of `bounded_context` that isn't wrapped

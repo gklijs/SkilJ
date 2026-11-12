@@ -209,6 +209,13 @@ Preserve per-item unreadable results, outage/permission errors, conditional row
 updates, subject erasure wins and the completion audit event. This improves
 maintenance and assignment latency, rather than ordinary warm command reads.
 
+*Status (2026-11-12): done in issue #176. The move is batched
+([architecture §246](architecture.md), measured in
+[benchmarks/key-migration-batches](benchmarks/key-migration-batches/README.md):
+2,000 provider requests became 10, 13 s became 0.12 s at 5 ms a request), and
+§250 builds the default `rewrap` and the shipped providers' single calls on
+the same batch operations.*
+
 ## Scope and validation
 
 The [security fixes](security-audit-2026-11-08.md) remain constraints throughout:

@@ -22,7 +22,7 @@
 //! `transit/+/skilj-*` - plus `create` and `delete` on `transit/keys/<key>`
 //! when skilj creates and deletes them.
 
-use super::provider::{BoxFuture, KeyProvider, KeyVersions, WrappedDataKey};
+use super::provider::{single, BoxFuture, KeyProvider, KeyVersions, WrappedDataKey};
 use super::Error;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -334,68 +334,44 @@ impl KeyProvider for VaultTransitProvider {
         &self.name
     }
 
+    /// A batch of one: [`wrap_batch`](Self::wrap_batch).
     fn wrap<'a>(&'a self, data_key: &'a [u8; 32]) -> BoxFuture<'a, Result<WrappedDataKey, Error>> {
         Box::pin(async move {
-            let data = self
-                .call(
-                    &format!("encrypt/{}", self.key),
-                    Some(json!({ "plaintext": crate::base64::encode(data_key) })),
-                )
-                .await?;
-            let ciphertext = str_field(&data, "ciphertext")
-                .ok_or_else(|| self.refused("encrypt answered no ciphertext"))?;
-            self.wrapped_from(ciphertext)
+            single(
+                &self.name,
+                self.wrap_batch(std::slice::from_ref(data_key)).await?,
+            )
         })
     }
 
-    /// Transit's answers are told apart: a 400 or 404 is this key refusing
-    /// this ciphertext - wrong key material, a corrupt ciphertext, or a key
-    /// that doesn't exist at this Vault - which is
-    /// [`Error::DecryptFailed`], or [`Error::KeyVersionRetired`] for a
-    /// version below `min_decryption_version`; a 403 is the token's
-    /// permissions, and no verdict on the data key
-    /// ([`Error::ProviderRefused`]); 5xx, 429 and no answer are
-    /// [`Error::ProviderUnavailable`] (docs/architecture.md §230).
+    /// A batch of one: [`unwrap_batch`](Self::unwrap_batch), which tells
+    /// Transit's answers apart.
     fn unwrap<'a>(&'a self, wrapped: &'a WrappedDataKey) -> BoxFuture<'a, Result<[u8; 32], Error>> {
         Box::pin(async move {
-            let ciphertext =
-                std::str::from_utf8(&wrapped.ciphertext).map_err(|_| Error::DecryptFailed)?;
-            let data = match self
-                .request_with_status(
-                    reqwest::Method::POST,
-                    &format!("decrypt/{}", self.key),
-                    Some(json!({ "ciphertext": ciphertext })),
-                )
-                .await
-            {
-                Ok(data) => data,
-                Err((Some(400 | 404), err)) => {
-                    let retired = matches!(&err, Error::ProviderRefused { message, .. }
-                        if message.contains("disallowed by policy") || message.contains("too old"));
-                    return Err(if retired {
-                        Error::KeyVersionRetired {
-                            version: wrapped.version,
-                        }
-                    } else {
-                        Error::DecryptFailed
-                    });
-                }
-                Err((_, err)) => return Err(err),
-            };
-            let plaintext = str_field(&data, "plaintext")
-                .and_then(crate::base64::decode)
-                .ok_or_else(|| self.refused("decrypt answered no plaintext"))?;
-            plaintext.try_into().map_err(|_| Error::DecryptFailed)
+            single(
+                &self.name,
+                self.unwrap_batch(std::slice::from_ref(wrapped)).await?,
+            )?
         })
     }
 
-    /// Transit's batch `decrypt`: one request for the batch. Read as
-    /// [`rewrap`](Self::rewrap) reads its batch - per item, from a 400 too -
-    /// with a failed item the key refusing that ciphertext
-    /// ([`Error::DecryptFailed`], or [`Error::KeyVersionRetired`] for "too
-    /// old"). A 400 or 404 without per-item results is the key refusing all
-    /// of them, as it is for [`unwrap`](Self::unwrap): a key this Vault
-    /// doesn't have. A 403 is the token's permissions and fails the batch.
+    /// Transit's batch `decrypt`: one request for the batch, and for a
+    /// single [`unwrap`](Self::unwrap) too. Transit's answers are told
+    /// apart (docs/architecture.md §230, §250):
+    ///
+    /// - per-item results, from a 200 or a 400, are read item by item, as
+    ///   [`rewrap`](Self::rewrap) reads its batch: a failed item is this
+    ///   key refusing that ciphertext - wrong key material or a corrupt
+    ///   ciphertext - which is [`Error::DecryptFailed`], or
+    ///   [`Error::KeyVersionRetired`] for a version below
+    ///   `min_decryption_version`;
+    /// - a 400 without them saying `encryption key not found` is a key this
+    ///   Vault doesn't have, refusing every item the same way;
+    /// - any other 400, and a 404 (a mount that isn't there), is Vault
+    ///   refusing the request, no verdict on the data keys: it fails the
+    ///   batch as [`Error::ProviderRefused`], so nothing is marked
+    ///   unreadable on a guess, and so is a 403, the token's permissions;
+    /// - 5xx, 429 and no answer are [`Error::ProviderUnavailable`].
     fn unwrap_batch<'a>(
         &'a self,
         wrapped: &'a [WrappedDataKey],
@@ -413,7 +389,7 @@ impl KeyProvider for VaultTransitProvider {
             let (status, body) = self
                 .request_with_body(reqwest::Method::POST, &path, Some(body))
                 .await?;
-            if !matches!(status, 200 | 400 | 404) {
+            if !matches!(status, 200 | 400) {
                 return Err(self.refused(format!("{path}: {status} {}", errors_of(&body))));
             }
             let refusal = |error: &str, input: &WrappedDataKey| {
@@ -430,11 +406,11 @@ impl KeyProvider for VaultTransitProvider {
                 .and_then(|data| data.get("batch_results"))
                 .and_then(Value::as_array);
             let Some(results) = results else {
-                if status == 200 {
-                    return Err(self.refused("decrypt answered no batch"));
-                }
                 let error = errors_of(&body);
-                return Ok(wrapped.iter().map(|w| Err(refusal(&error, w))).collect());
+                if status == 400 && error.contains("encryption key not found") {
+                    return Ok(wrapped.iter().map(|_| Err(Error::DecryptFailed)).collect());
+                }
+                return Err(self.refused(format!("{path}: {status} {error}")));
             };
             if results.len() != wrapped.len() {
                 return Err(self.refused("decrypt answered no batch of the right size"));
