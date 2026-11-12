@@ -13653,12 +13653,6 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to drop of `sqlx::pool::PoolConnection<sqlx::Postgres>` which can panic",
-      "source": "}",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".bind(Utc::now())",
       "count": 4
@@ -14021,7 +14015,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, bool, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 4
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -25719,18 +25713,6 @@
     },
     {
       "file": "skilj-core/src/encryption/provider.rs",
-      "message": "call to drop of `futures_util::stream::Collect<futures_util::stream::Buffered<futures_util::stream::Iter<std::vec::IntoIter<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<[u8; 32], encryption::Error>> + std::marker::Send>>>>>, std::vec::Vec<std::result::Result<[u8; 32], encryption::Error>>>` which can panic",
-      "source": ".await)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/encryption/provider.rs",
-      "message": "call to drop of `futures_util::stream::TryCollect<futures_util::stream::Buffered<futures_util::stream::Iter<std::vec::IntoIter<std::pin::Pin<std::boxed::Box<dyn futures_util::Future<Output = std::result::Result<encryption::provider::WrappedDataKey, encryption::Error>> + std::marker::Send>>>>>, std::vec::Vec<encryption::provider::WrappedDataKey>>` which can panic",
-      "source": ".await",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/encryption/provider.rs",
       "message": "call to drop of `std::path::PathBuf` which can panic",
       "source": "}))",
       "count": 1
@@ -25774,12 +25756,6 @@
     {
       "file": "skilj-core/src/encryption/provider.rs",
       "message": "call to drop of `std::vec::Vec<std::option::Option<std::result::Result<encryption::provider::WrappedDataKey, encryption::Error>>>` which can panic",
-      "source": "})",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/encryption/provider.rs",
-      "message": "call to drop of `std::vec::Vec<std::result::Result<encryption::provider::WrappedDataKey, encryption::Error>>` which can panic",
       "source": "})",
       "count": 1
     },
@@ -26417,7 +26393,7 @@
       "file": "skilj-core/src/encryption/vault.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": ".await?;",
-      "count": 7
+      "count": 6
     },
     {
       "file": "skilj-core/src/encryption/vault.rs",

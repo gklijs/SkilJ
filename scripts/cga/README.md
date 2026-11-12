@@ -65,7 +65,7 @@ vector in the default `rewrap` and the shipped providers' batch-of-one `wrap`
 and `unwrap`, and the SQLx calls, `Option::as_deref_mut` and drops of
 `HeldLock`, the advisory-lock connection that closes itself when a rewrap is
 dropped mid-run. Gone: the same SQLx calls on the old bare `PoolConnection` and
-the default `rewrap`'s per-item loop. Two `tracing::instrument` identities carry
+the default `rewrap`'s per-item loop, and the default batch operations' buffered streams for `InMemoryKeyProvider`, which now has batch operations of its own. Two `tracing::instrument` identities carry
 closure line numbers and move with an added import. No `unwrap`, `expect` or
 indexing outside tests; this accepts additional analyzed code, not fewer
 potential panics.
