@@ -57,6 +57,19 @@ and uploaded by CI even when comparison fails.
 
 ## Reducing findings
 
+The issue #176 batch-of-one change updates the baseline from CI's report after
+review (the pinned nightly couldn't be fetched where it was written; the
+comparison now lists gone findings as well as new ones, so such an update can be
+made from the log). New: drops of the boxed provider futures and of the result
+vector in the default `rewrap` and the shipped providers' batch-of-one `wrap`
+and `unwrap`, and the SQLx calls, `Option::as_deref_mut` and drops of
+`HeldLock`, the advisory-lock connection that closes itself when a rewrap is
+dropped mid-run. Gone: the same SQLx calls on the old bare `PoolConnection` and
+the default `rewrap`'s per-item loop. Two `tracing::instrument` identities carry
+closure line numbers and move with an added import. No `unwrap`, `expect` or
+indexing outside tests; this accepts additional analyzed code, not fewer
+potential panics.
+
 The issue #175 data-key cache change explicitly re-records the baseline after
 review. The new paths include clock queue cleanup, inline SHA-256 digest
 copying, cache and flight map operations, generation `Arc`s, shared futures
