@@ -85,7 +85,8 @@ server. Run `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs` after
 changing the CI scripts.
 
 Coverage is informational and runs on pushes to `main` and manual workflow
-dispatch, rather than repeating the instrumented full run on every PR.
+dispatch, in its own workflow (`.github/workflows/coverage.yml`) so it does not
+hold up the CI result on `main`, rather than repeating the instrumented full run on every PR.
 Clippy and rustdoc stay together; MSRV and CGA keep their own toolchains.
 Most dependency caches are saved on `main`; the PR-only semver job saves a
 PR-scoped cache for subsequent updates. The native template uses a stable
