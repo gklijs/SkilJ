@@ -7,7 +7,7 @@
     "package": "skilj-core",
     "patch_sha256": "b771644542d9176e189cb0006ff956c615a788a31ab3077579cf8e25d9cb1be8",
     "config_sha256": "7267bd5509507f1fe263118c0f32535c62dec160edc37040119646219f90e469",
-    "lock_sha256": "eacc0f41e82dfeac0fb0008aff0ed60cf666e46e11bcd5680fe44420ceccd0f6"
+    "lock_sha256": "058266004d52ec81f417efd1b94f99c8dd918606b05fa5366b60326bfc7ca288"
   },
   "skipped_generic_targets": {
     "<jsonschema::keywords::additional_items::AdditionalItemsBooleanValidator as jsonschema::validator::Validate<F>>::is_valid": 1,
