@@ -106,7 +106,10 @@ README.md, "Status and stability").
 - Two instances starting at the same time against a bounded context from an
   older release could fail with a duplicate-key error on Postgres's catalog.
   Both found a table, column or function missing and both created it. The
-  loser now runs the idempotent patches again (docs/architecture.md §249).
+  loser now runs the idempotent patches again under an advisory lock for that
+  bounded context, so it waits for the winner instead of racing it to the
+  next missing object (docs/architecture.md §249). An up-to-date bounded
+  context still takes no lock.
 
 - A master key's retirement no longer waits on data keys that a bounded
   context left under it when it moved to a key of its own - marked unreadable

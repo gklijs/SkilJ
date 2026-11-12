@@ -784,9 +784,49 @@ pub(crate) async fn inspect(
 /// EXISTS`, `ADD COLUMN` after a catalog check and `CREATE OR REPLACE
 /// FUNCTION` are not safe against a concurrent creator, and the loser
 /// fails with a duplicate-object error. Every patch is idempotent, so the
-/// loser runs the sequence again, which finds the winner's objects.
+/// loser runs the sequence again - but on a schema missing many objects it
+/// caught up with the winner and lost again on the next one, until it ran
+/// out of attempts. So a loser runs it again under a session-level
+/// advisory lock keyed by the bounded context, on a connection of its own
+/// outside the pool (the patches may need every pooled one): a second
+/// loser waits for it, then finds its objects. The first pass takes no
+/// lock, so an up-to-date bounded context still costs only catalog reads
+/// (docs/architecture.md §158). `lock_timeout` applies to waiting for it.
 pub async fn upgrade_bounded_context(pool: &Pool, bc: &BoundedContext) -> crate::error::Result<()> {
-    const ATTEMPTS: usize = 5;
+    match upgrade_bounded_context_once(pool, bc).await {
+        Err(err) if lost_a_concurrent_creation(&err) => {
+            tracing::debug!(
+                bounded_context = %bc.name,
+                error = %err,
+                "another process patched the same object at the same time; patching again under a lock"
+            );
+        }
+        other => return other,
+    }
+    // Dropped - closed - when this returns or is cancelled, which releases
+    // the lock.
+    let mut lock =
+        <sqlx::postgres::PgConnection as sqlx::Connection>::connect_with(&pool.connect_options())
+            .await?;
+    sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
+        .bind(format!("skilj_upgrade_bounded_context:{}", bc.name))
+        .execute(&mut lock)
+        .await?;
+    let outcome = upgrade_bounded_context_retrying(pool, bc).await;
+    // Errors closing are not the upgrade's: the server releases the lock
+    // with the session either way.
+    let _ = sqlx::Connection::close(lock).await;
+    outcome
+}
+
+/// The sequence, again while it loses to a process that holds no lock -
+/// one still on its first pass - which can happen only so often before
+/// that process loses too and waits for the lock.
+async fn upgrade_bounded_context_retrying(
+    pool: &Pool,
+    bc: &BoundedContext,
+) -> crate::error::Result<()> {
+    const ATTEMPTS: usize = 10;
     let mut attempt = 1;
     loop {
         match upgrade_bounded_context_once(pool, bc).await {
