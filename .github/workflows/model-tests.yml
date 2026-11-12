@@ -1,0 +1,78 @@
+## The model-based tests of the unique-email domain (issue #189) at depth,
+## weekly and on demand.
+##
+## On every pull request `skilj/tests/model_unique_value.rs` runs a small
+## budget: 32 histories per tag of at most 20 operations. This runs
+## PROPTEST_CASES histories of at most SKILJ_MODEL_MAX_OPS operations, to
+## find what a small budget rarely reaches. A failure is shrunk and printed
+## as the operations reproducing it, to paste into a `replay` test, and its
+## seed is uploaded as the `model-regressions` artifact: committed next to
+## the test, it runs first next time.
+
+name: Model tests
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: Histories per tag
+        default: "1000"
+      max_ops:
+        description: Operations per history, at most
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    container:
+      image: rust:1-bookworm
+    services:
+      skilj-postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://postgres:postgres@skilj-postgres:5432/postgres
+      PROPTEST_CASES: ${{ inputs.cases || '1000' }}
+      SKILJ_MODEL_MAX_OPS: ${{ inputs.max_ops || '60' }}
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v5
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test -p skilj --test model_unique_value --no-run
+      # A test with no database returns early; fail on its skip line, as
+      # scripts/ci-test.sh does.
+      - name: Histories
+        run: |
+          set -o pipefail
+          cargo test -p skilj --test model_unique_value histories_match -- --nocapture 2>&1 | tee model.log
+          if grep -q '^skipping:' model.log; then
+            echo 'a test skipped: no database' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: model-regressions
+          path: |
+            skilj/tests/*.regressions
+            model.log
+          if-no-files-found: ignore
