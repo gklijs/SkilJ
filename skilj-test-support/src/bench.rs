@@ -16,7 +16,10 @@
 //! - `SKILJ_BENCH_SLOWDOWN_US=<n>` adds a fixed delay of at least `n`
 //!   microseconds inside every measured operation ([`slowdown`],
 //!   [`slowdown_blocking`]). It exists to show that a known slowdown is
-//!   visible in a comparison, never to model anything real.
+//!   visible in a comparison, never to model anything real. It lands
+//!   before skilj handles a request, so a scenario bound by the bounded
+//!   context's lock absorbs it; `command_throughput`'s
+//!   `SKILJ_BENCH_LATENCY_MS` delays Postgres round trips instead.
 //!
 //! [`FORMAT`] is the layout of a record. Each benchmark carries a version
 //! of its own as well, which it raises when what a scenario measures

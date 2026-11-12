@@ -210,7 +210,9 @@ function runOnce({ side, benchmark, trial, prepared, options, work }) {
   if (result.error) throw new Error(`${label}: ${result.error.message} after ${seconds} s (see logs/${label}.log)`);
   if (result.status !== 0) throw new Error(`${label}: exited ${result.status ?? result.signal} (see logs/${label}.log)`);
   if (/^skipping:/m.test(log)) throw new Error(`${label}: the benchmark skipped (see logs/${label}.log)`);
-  if (!/^test \S+ \.\.\. ok$/m.test(result.stdout ?? '')) {
+  // With --nocapture the benchmark's own output splits `test <name> ...`
+  // from its `ok`, so the harness's summary line is what says it ran.
+  if (!/^test result: ok\. 1 passed;/m.test(result.stdout ?? '')) {
     throw new Error(`${label}: the benchmark test did not run (see logs/${label}.log)`);
   }
   const records = existsSync(record) ? parseRecords(readFileSync(record, 'utf8')) : [];
