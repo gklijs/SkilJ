@@ -15419,7 +15419,13 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `error::Error` which can panic",
       "source": "}",
-      "count": 4
+      "count": 5
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `error::Error` which can panic",
+      "source": "Err(err) if lost_a_concurrent_creation(&err) => {}",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
@@ -15623,7 +15629,7 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
@@ -15741,6 +15747,12 @@
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `db::preflight::lost_a_concurrent_creation` which can panic",
+      "source": "Err(err) if lost_a_concurrent_creation(&err) => {}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
       "message": "call to function `encryption::trail::master_key_event_type` which can panic",
       "source": ".map(|kind| master_key_event_type(&admin, *kind)),",
       "count": 1
@@ -15851,6 +15863,12 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(\"SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(\"SELECT pg_advisory_lock(hashtext('skilj_upgrade_bounded_context:' || $1))\")",
       "count": 1
     },
     {
@@ -16227,6 +16245,12 @@
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query(\"SELECT pg_advisory_lock(hashtext('skilj_upgrade_bounded_context:' || $1))\") .bind(&bc.name)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", ) .bind(&raw)",
       "count": 1
@@ -16505,6 +16529,42 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
       "source": "unknown.push(Unknown { check: \"access_trail_baseline\".into(), reason: \"the admin context's tag index is patched first; the grants to baseline \\ can't be read until then\" .into(), });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::result::Result<(), error::Error>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::result::Result<(), sqlx::Error>` which can panic",
+      "source": "let _ = sqlx::Connection::close(lock).await;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::sync::Arc<sqlx::sqlx_postgres::PgConnectOptions>` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of <sqlx::PgConnection as sqlx::Connection>::close()}` which can panic",
+      "source": "let _ = sqlx::Connection::close(lock).await;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `{async fn body of sqlx::sqlx_postgres::connection::establish::<impl sqlx::PgConnection>::establish()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::Pool::<DB>::connect_options` which can panic",
+      "source": "<sqlx::postgres::PgConnection as sqlx::Connection>::connect_with(&pool.connect_options())",
       "count": 1
     },
     {
