@@ -6401,7 +6401,7 @@
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": ")));",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/commands.rs",
@@ -6663,7 +6663,7 @@
     },
     {
       "file": "skilj-core/src/db/commands.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/commands.rs:1947:1: 1947:67}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/commands.rs:1989:1: 1989:67}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(batch_size = batch.len()))]",
       "count": 1
     },
@@ -27947,6 +27947,78 @@
       "file": "skilj-core/src/template_cache.rs",
       "message": "call to method `std::sync::RwLock::<T>::read` which can panic",
       "source": "match self .current .read()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "(format!(\"not a doubt: {error}\"), \"invalid_doubt\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "(format!(\"not a retraction: {error}\"), \"invalid_retraction\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "format!(\"the doubt requires a {key} tag the command doesn't have\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "format!(\"the event at position {position} has another {key} than the command\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "format!(\"the retraction requires a {key} tag the command doesn't have\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to drop of `serde_json::Error` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to function `retraction::required_target_tags` which can panic",
+      "source": "let required = match crate::retraction::required_target_tags(spec) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for key in &required {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to method `std::iter::Iterator::any` which can panic",
+      "source": "if !own.any(|tag| target_tags.contains(tag)) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to method `std::iter::Peekable::<I>::peek` which can panic",
+      "source": "if own.peek().is_none() {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/retraction/mod.rs",
+      "message": "call to method `<serde_json::Value as std::clone::Clone>::clone` which can panic",
+      "source": "Some(keys) => serde_json::from_value(keys.clone()),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/retraction/mod.rs",
+      "message": "call to method `serde_json::Value::get` which can panic",
+      "source": "match stance.payload.get(TARGET_TAGS_FIELD) {",
       "count": 1
     }
   ]
