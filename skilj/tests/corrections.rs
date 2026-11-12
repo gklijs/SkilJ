@@ -315,21 +315,10 @@ impl Crm {
         .await
     }
 
-    async fn retract_release(
-        &self,
-        customer_id: &str,
-        email: &str,
-        position: i64,
-        reinstate: bool,
-    ) -> String {
+    async fn retract_release(&self, customer_id: &str, email: &str, position: i64) -> String {
         self.submit(
             "RetractRelease",
-            serde_json::json!({
-                "customer_id": customer_id,
-                "email": email,
-                "position": position,
-                "reinstate": reinstate,
-            }),
+            serde_json::json!({ "customer_id": customer_id, "email": email, "position": position }),
         )
         .await
     }
@@ -553,10 +542,11 @@ fn a_reused_key_with_another_payload_answers_with_the_first_submissions_events()
     });
 }
 
-/// A retracted release gives the address back when nobody claimed it since,
-/// and nothing else: the holder is the latest standing claim or release.
+/// A retracted release gives the address back, so it is refused once another
+/// customer has claimed the address since, even when that customer released it
+/// again: the release's customer would otherwise see the old claim standing.
 #[test]
-fn a_retracted_release_gives_the_address_back_only_while_it_is_free() {
+fn a_release_is_retracted_only_while_nobody_else_has_claimed_the_address() {
     runtime().block_on(async {
         let Some(crm) = crm().await else {
             return;
@@ -566,7 +556,7 @@ fn a_retracted_release_gives_the_address_back_only_while_it_is_free() {
         assert_eq!(crm.release(&alice, "kept@example.com").await, "accepted");
         let release = crm.latest_position().await;
         assert_eq!(
-            crm.retract_release(&alice, "kept@example.com", release, false)
+            crm.retract_release(&alice, "kept@example.com", release)
                 .await,
             "accepted"
         );
@@ -576,42 +566,31 @@ fn a_retracted_release_gives_the_address_back_only_while_it_is_free() {
             "alice holds it again"
         );
         assert_eq!(
-            crm.retract_release(&alice, "kept@example.com", release, false)
+            crm.retract_release(&alice, "kept@example.com", release)
                 .await,
-            "already_retracted",
-            "the store's own check"
+            "not_a_release",
+            "the release no longer stands"
         );
 
-        assert_eq!(
-            crm.register(&alice, "lost@example.com").await,
-            "already_holds_a_value"
-        );
-        assert_eq!(crm.release(&alice, "kept@example.com").await, "accepted");
-        assert_eq!(crm.register(&alice, "lost@example.com").await, "accepted");
-        assert_eq!(crm.release(&alice, "lost@example.com").await, "accepted");
+        let (carol, dave) = (id("c"), id("c"));
+        assert_eq!(crm.register(&carol, "lost@example.com").await, "accepted");
+        assert_eq!(crm.release(&carol, "lost@example.com").await, "accepted");
         let lost = crm.latest_position().await;
-        assert_eq!(crm.register(&bob, "lost@example.com").await, "accepted");
+        assert_eq!(crm.register(&dave, "lost@example.com").await, "accepted");
         assert_eq!(
-            crm.retract_release(&alice, "lost@example.com", lost, true)
-                .await,
+            crm.retract_release(&carol, "lost@example.com", lost).await,
+            "value_taken_since"
+        );
+        assert_eq!(crm.release(&dave, "lost@example.com").await, "accepted");
+        assert_eq!(
+            crm.retract_release(&carol, "lost@example.com", lost).await,
             "value_taken_since",
-            "reinstating would take it from bob"
+            "the address is free again, but dave's claim still stands"
         );
         assert_eq!(
-            crm.retract_release(&alice, "lost@example.com", lost, false)
-                .await,
+            crm.register(&carol, "new@example.com").await,
             "accepted",
-            "without reinstate the release goes off the record"
-        );
-        assert_eq!(
-            crm.register(&id("c"), "lost@example.com").await,
-            "email_taken",
-            "bob still holds it"
-        );
-        assert_eq!(
-            crm.register(&alice, "new@example.com").await,
-            "accepted",
-            "and alice holds nothing"
+            "carol holds nothing"
         );
         crm.shutdown().await;
     });
@@ -629,7 +608,7 @@ fn a_release_retraction_is_refused_when_it_would_not_be_one() {
         assert_eq!(crm.register(&alice, "first@example.com").await, "accepted");
         let claim = crm.latest_position().await;
         assert_eq!(
-            crm.retract_release(&alice, "first@example.com", claim, false)
+            crm.retract_release(&alice, "first@example.com", claim)
                 .await,
             "not_a_release",
             "a claim isn't a release"
@@ -637,20 +616,14 @@ fn a_release_retraction_is_refused_when_it_would_not_be_one() {
         assert_eq!(crm.release(&alice, "first@example.com").await, "accepted");
         let release = crm.latest_position().await;
         assert_eq!(
-            crm.retract_release(&bob, "first@example.com", release, false)
+            crm.retract_release(&bob, "first@example.com", release)
                 .await,
             "not_a_release",
             "nor is someone else's release"
         );
-        assert_eq!(
-            crm.retract_release(&alice, "other@example.com", release, false)
-                .await,
-            "not_a_release",
-            "nor a release of another address"
-        );
         assert_eq!(crm.register(&alice, "second@example.com").await, "accepted");
         assert_eq!(
-            crm.retract_release(&alice, "first@example.com", release, false)
+            crm.retract_release(&alice, "first@example.com", release)
                 .await,
             "already_holds_a_value"
         );
