@@ -22,10 +22,12 @@
 //!   own retraction checks are what answer it;
 //! - [`RetractRelease`] is the operator saying a release was a mistake. It
 //!   gives the address back, and so it is refused with `value_taken_since`
-//!   once another customer has a standing claim of the address after the
-//!   release, even one released again: the customer's own read doesn't see
-//!   that claim, so the old claim would stand there while someone else held
-//!   the address. It rejects `not_a_release` for a position that isn't this
+//!   once anyone has a standing claim of the address after the release, even
+//!   one released again. Another customer's: the customer's own read doesn't
+//!   see that claim, so the old claim would stand there while someone else
+//!   held the address. The customer's own: both claims would stand, and a
+//!   correction retracting the newer would leave the older holding the
+//!   address next to the new one (found by the model, issue #189). It rejects `not_a_release` for a position that isn't this
 //!   customer's release, and `already_holds_a_value` when the customer holds
 //!   another address now; the store rejects `retraction_target_mismatch` for
 //!   a release of another address than the payload's, which the decision
@@ -191,11 +193,22 @@ pub fn claim(payload: &EmailPayload) -> EventSpec {
     }
 }
 
+/// A defect planted in a command, for checking that the model-based tests
+/// catch it (issue #189). Every command has [`NO_DEFECT`] unless a test asks.
+pub const NO_DEFECT: u8 = 0;
+/// [`RegisterCustomer`] doesn't hold a customer to one address.
+pub const IGNORES_HELD: u8 = 1;
+/// [`RegisterCustomer`]'s consistency query leaves out `EmailReleased`, so a
+/// released address stays taken.
+pub const IGNORES_RELEASES: u8 = 2;
+/// [`RetractRelease`] gives an address back after someone else claimed it.
+pub const IGNORES_CLAIMS_SINCE: u8 = 3;
+
 /// A customer claims an address nobody holds. It reads the customer's own
 /// claims as well as the address's, so a customer holds at most one.
-pub struct RegisterCustomer<V>(PhantomData<V>);
+pub struct RegisterCustomer<V, const DEFECT: u8 = NO_DEFECT>(PhantomData<V>);
 
-impl<V: EmailTagging> CommandType for RegisterCustomer<V> {
+impl<V: EmailTagging, const DEFECT: u8> CommandType for RegisterCustomer<V, DEFECT> {
     type Payload = EmailPayload;
     type Event = Retractable<CustomerEvent>;
     const NAME: &'static str = "RegisterCustomer";
@@ -206,6 +219,9 @@ impl<V: EmailTagging> CommandType for RegisterCustomer<V> {
         V::sensitive_fields()
     }
     fn consistency_query() -> Vec<QueryItemMapping> {
+        if DEFECT == IGNORES_RELEASES {
+            return correction_query(&["EmailClaimed"], customer(), V::email());
+        }
         correction_query(&CLAIMS_AND_RELEASES, customer(), V::email())
     }
     fn decide(payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
@@ -216,7 +232,7 @@ impl<V: EmailTagging> CommandType for RegisterCustomer<V> {
         {
             return taken();
         }
-        if claims.held_by("customer", &payload.customer_id).is_some() {
+        if DEFECT != IGNORES_HELD && claims.held_by("customer", &payload.customer_id).is_some() {
             return CommandDecision::Rejected {
                 reason: "this customer holds an address already; correct it instead".into(),
                 kind: "already_holds_a_value".into(),
@@ -342,9 +358,9 @@ pub struct RetractReleasePayload {
 
 /// An operator retracting a release that should not have happened, giving the
 /// address back; see the module doc for when it is refused.
-pub struct RetractRelease<V>(PhantomData<V>);
+pub struct RetractRelease<V, const DEFECT: u8 = NO_DEFECT>(PhantomData<V>);
 
-impl<V: EmailTagging> CommandType for RetractRelease<V> {
+impl<V: EmailTagging, const DEFECT: u8> CommandType for RetractRelease<V, DEFECT> {
     type Payload = RetractReleasePayload;
     type Event = Retractable<CustomerEvent>;
     const NAME: &'static str = "RetractRelease";
@@ -377,15 +393,18 @@ impl<V: EmailTagging> CommandType for RetractRelease<V> {
                 kind: "not_a_release".into(),
             };
         };
-        // Another customer's events are read only through this address, so a
-        // claim of another customer's is a claim of it.
-        if standing.iter().any(|event| {
-            event.position > payload.position
-                && matches!(event.event, CustomerEvent::Claimed)
-                && !own(event.tags)
-        }) {
+        // A claim of this address after the release, the customer's own too.
+        // Another customer's events are read only through the payload's
+        // address, which the store checks is the release's.
+        if DEFECT != IGNORES_CLAIMS_SINCE
+            && standing.iter().any(|event| {
+                event.position > payload.position
+                    && matches!(event.event, CustomerEvent::Claimed)
+                    && email_value(event.tags) == Some(address)
+            })
+        {
             return CommandDecision::Rejected {
-                reason: "another customer claimed this address after it was released".into(),
+                reason: "this address was claimed again after it was released".into(),
                 kind: "value_taken_since".into(),
             };
         }
@@ -482,19 +501,36 @@ pub async fn bounded_context(pool: &Pool) -> (String, String) {
 
 /// The domain's types for `bc`, in variant `V`.
 pub fn builder<V: EmailTagging>(database_url: &str, bc: &str, subject: &str) -> SkiljBuilder {
+    builder_with_defect::<V>(database_url, bc, subject, NO_DEFECT)
+}
+
+/// [`builder`] with `defect` planted in the command it names.
+pub fn builder_with_defect<V: EmailTagging>(
+    database_url: &str,
+    bc: &str,
+    subject: &str,
+    defect: u8,
+) -> SkiljBuilder {
     let builder = Skilj::builder(database_url)
         .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
         .bounded_context(bc);
-    V::configure(builder)
+    let builder = V::configure(builder)
         .key_service(master_key())
         .reconciliation_role(subject)
         .event_type::<EmailClaimed<V>>()
         .event_type::<EmailReleased<V>>()
-        .command_type::<RegisterCustomer<V>>()
         .command_type::<CorrectEmail<V>>()
         .command_type::<ReleaseEmail<V>>()
-        .command_type::<RetractAny>()
-        .command_type::<RetractRelease<V>>()
+        .command_type::<RetractAny>();
+    let builder = match defect {
+        IGNORES_HELD => builder.command_type::<RegisterCustomer<V, IGNORES_HELD>>(),
+        IGNORES_RELEASES => builder.command_type::<RegisterCustomer<V, IGNORES_RELEASES>>(),
+        _ => builder.command_type::<RegisterCustomer<V>>(),
+    };
+    match defect {
+        IGNORES_CLAIMS_SINCE => builder.command_type::<RetractRelease<V, IGNORES_CLAIMS_SINCE>>(),
+        _ => builder.command_type::<RetractRelease<V>>(),
+    }
 }
 
 /// What a submission goes to: one built deployment of one bounded context.
