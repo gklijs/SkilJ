@@ -144,8 +144,38 @@ far as a test exercises them, and some aren't checked at all
   (CI) upgrades a real database written by the previous release, as
   separate processes.
 - **Known races**: a targeted test each, often using a trigger to force
-  the interleaving. There is one property test,
-  `UniqueReadCursorPerToken` in `skilj-core/tests/event_fetch_surface.rs`.
+  the interleaving. A property test checks `UniqueReadCursorPerToken` in
+  `skilj-core/tests/event_fetch_surface.rs`.
+- **Uniqueness, corrections and idempotency, by model** (issue #189):
+  `skilj/tests/model_unique_value.rs` generates histories of the unique-email
+  domain in `skilj/tests/unique_crm` (registrations, corrections, releases,
+  release retractions and raw retractions, from two callers under three
+  idempotency keys) and checks every step against a model of the domain,
+  written from its rules and the spec rather than from `ValueClaims` or the
+  query helpers. Each answer, each appended event's type, customer, address
+  tag and retraction target, and for a blind tag one hash per address and no
+  plaintext, for both a blind and a plain tag. Each history runs in a
+  bounded context of its own. A pull request runs 32 histories per tag of at
+  most 20 operations (`PROPTEST_CASES`, `SKILJ_MODEL_MAX_OPS`), about a
+  minute and a half; `.github/workflows/model-tests.yml` runs 1000 of at most
+  60 weekly. A failure prints the operations that reproduce it, which
+  `replay` takes, and keeps its seed in `model_unique_value.regressions`.
+  That the property can fail is tested too: the generated histories reach
+  each of the twelve answers several times, and four planted defects (a
+  registration ignoring what the customer holds, a query missing releases, a
+  release retraction ignoring later claims, a retry losing its key) are each
+  caught within the pull request's budget. The weekly mutants workflow
+  mutates the idempotency lookup and the retraction checks against it. The
+  model found one hole, fixed: a release retracted after its own customer
+  claimed the address again.
+- **Selected concurrent histories** (issue #189): the same binary submits
+  groups of two or three operations contending for one address or one key
+  at once, after a generated history, and checks that some serial order of
+  them answers what the store answered and appends their events in that
+  order (`SKILJ_MODEL_CONCURRENT_CASES`, 16 a run). Fixed histories pin two
+  claims of one address at once, one key twice at once, and a release
+  retraction racing a claim. The interleavings are whatever the run
+  produces, not forced.
 - **Blind tags** (§205): `skilj/tests/blind_tags.rs` checks that a blind
   value appears in no stored tag, query or payload, that racing claims
   accept one, and that erasure removes the hash from the database and
@@ -207,10 +237,22 @@ far as a test exercises them, and some aren't checked at all
   versions in one build.
 - **Spec against code.** No test is generated from `specs/skilj.allium`.
   Their alignment is checked by periodic drift audits.
-- **Interleavings in general.** Races someone thought of have tests.
-  Nothing explores interleavings systematically (no `loom`, no model
-  checking), and nothing tests separate processes or a network partition
-  between an instance and its database.
+- **Interleavings in general.** Races someone thought of have tests, and
+  groups of up to three commands contending for one address or key are
+  checked against every serial order (above). Nothing explores
+  interleavings systematically (no `loom`, no model checking of the store
+  itself): not more than three commands at once, not forced orders within a
+  group, not commands across several instances, and nothing tests separate
+  processes or a network partition between an instance and its database.
+- **Model coverage gaps** (issue #189). The model of the unique-email domain
+  leaves out: idempotency-key retention and expiry, whose sweeper reaches
+  every bounded context and has a binary of its own
+  (`idempotency_key_retention.rs`); doubts; a raw retraction of a release,
+  which can leave a customer's own read showing a claim another customer
+  holds and is the operator's escape hatch rather than a modelled operation;
+  and the bridges' and external events' dedupe, which has idempotency of its
+  own. Mutants in the doubt branches of `resolve_stances` are expected to
+  survive the model.
 
 ## Where things live
 

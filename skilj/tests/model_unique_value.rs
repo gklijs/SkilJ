@@ -14,16 +14,26 @@
 //! hard-deleted after it, so a history and every attempt to shrink one start
 //! from nothing. Both the blind and the plain email tag are tested.
 //!
-//! What it doesn't cover: interleavings; idempotency-key retention, which sweeps every bounded context
-//! and has a binary of its own; and a raw retraction of a release, which can
-//! leave a customer's own read showing a claim another customer holds and is
-//! documented as the operator's escape hatch rather than modelled.
+//! A history can also submit two or three ops contending for one address at
+//! once, after a sequential part; some serial order of them must answer what
+//! the store answered (`concurrent_histories_match_some_serial_order`). The
+//! interleavings are whatever the run produces, not forced.
+//!
+//! What it doesn't cover: interleavings beyond that; idempotency-key
+//! retention, which sweeps every bounded context and has a binary of its own;
+//! doubts; and a raw retraction of a release, which can leave a customer's own
+//! read showing a claim another customer holds and is documented as the
+//! operator's escape hatch rather than modelled (CONTRIBUTING.md, "What the
+//! tests do and don't verify").
 //!
 //! Bounds: `PROPTEST_CASES` histories per variant (32 by default) of at most
-//! `SKILJ_MODEL_MAX_OPS` operations (20 by default). A failure is shrunk and
-//! printed as the operations that reproduce it, which `replay` takes as they
-//! are, and its seed is kept in `model_unique_value.regressions` next to this
-//! file, which runs first next time.
+//! `SKILJ_MODEL_MAX_OPS` operations (20 by default), and
+//! `SKILJ_MODEL_CONCURRENT_CASES` concurrent groups (16), about a minute and a
+//! half in all. A failure is shrunk and printed as the operations that
+//! reproduce it, which `replay` and `replay_together` take as they are, and
+//! its seed is kept in `model_unique_value.regressions` next to this file,
+//! which runs first next time. `.github/workflows/model-tests.yml` runs it at
+//! depth weekly.
 
 mod unique_crm;
 
