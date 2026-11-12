@@ -20,15 +20,14 @@
 //!   `not_held` when the customer doesn't hold that address;
 //! - [`RetractAny`] retracts whatever position it is given, so the store's
 //!   own retraction checks are what answer it;
-//! - [`RetractRelease`] is the operator saying a release was a mistake. A
-//!   value's holder is its latest standing claim or release, so retracting
-//!   the release gives the address back only if nobody claimed it since.
-//!   When someone has, the retraction is accepted with no effect on who
-//!   holds it, unless `reinstate` asks for the address back, which rejects
-//!   `value_taken_since`. It rejects `not_a_release` for a position that
-//!   isn't this customer's release of this address, and
-//!   `already_holds_a_value` when giving the address back would leave the
-//!   customer holding two.
+//! - [`RetractRelease`] is the operator saying a release was a mistake. It
+//!   gives the address back, and so it is refused with `value_taken_since`
+//!   once another customer has a standing claim of the address after the
+//!   release, even one released again: the customer's own read doesn't see
+//!   that claim, so the old claim would stand there while someone else held
+//!   the address. It rejects `not_a_release` for a position that isn't this
+//!   customer's release, and `already_holds_a_value` when the customer holds
+//!   another address now.
 
 // Each test binary that includes this module uses a different part of it.
 #![allow(dead_code)]
@@ -38,8 +37,8 @@ use std::marker::PhantomData;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::retraction::{
-    claim_query, corrected, correction_query, retract, Retractable, RetractionGround, ValueClaims,
-    ValueEffect,
+    claim_query, corrected, correction_query, retract, standing, Retractable, RetractionGround,
+    ValueClaims, ValueEffect,
 };
 use skilj::{
     normalize, BlindErasure, BlindIndexKey, BlindTag, CommandType, EventType, KeyService, Skilj,
@@ -333,15 +332,12 @@ impl CommandType for RetractAny {
 pub struct RetractReleasePayload {
     pub position: i64,
     pub customer_id: String,
+    /// The released address, which the decision reads the history of.
     pub email: String,
-    /// The operator wants the address back for the customer, not just the
-    /// release off the record: refuse when someone else holds it now.
-    #[serde(default)]
-    pub reinstate: bool,
 }
 
-/// An operator retracting a release that should not have happened; see the
-/// module doc for what that does to who holds the address.
+/// An operator retracting a release that should not have happened, giving the
+/// address back; see the module doc for when it is refused.
 pub struct RetractRelease<V>(PhantomData<V>);
 
 impl<V: EmailTagging> CommandType for RetractRelease<V> {
@@ -358,38 +354,38 @@ impl<V: EmailTagging> CommandType for RetractRelease<V> {
         correction_query(&CLAIMS_AND_RELEASES, customer(), V::email())
     }
     fn decide(payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
-        let customer_tag = |tags: &[Tag]| {
+        let own = |tags: &[Tag]| {
             tags.iter().any(|tag| {
                 tag.key == "customer" && tag.value.as_deref() == Some(&payload.customer_id)
             })
         };
-        let Some(address) = events.iter().find_map(|event| match event {
-            Retractable::Event {
-                position,
-                tags,
-                event: CustomerEvent::Released,
-            } if *position == payload.position && customer_tag(tags) => email_value(tags),
-            _ => None,
+        let standing = standing(events);
+        let Some(address) = standing.iter().find_map(|event| {
+            (event.position == payload.position
+                && matches!(event.event, CustomerEvent::Released)
+                && own(event.tags))
+            .then(|| email_value(event.tags))
+            .flatten()
         }) else {
             return CommandDecision::Rejected {
-                reason: "no release of this address by this customer at that position".into(),
+                reason: "no standing release of an address by this customer at that position"
+                    .into(),
                 kind: "not_a_release".into(),
             };
         };
-        let claims = claims(events);
         // Another customer's events are read only through this address, so a
-        // claim another customer holds is a claim of it.
-        if claims
-            .held_by_another("customer", &payload.customer_id)
-            .is_some()
-        {
-            if payload.reinstate {
-                return CommandDecision::Rejected {
-                    reason: "someone claimed this address after it was released".into(),
-                    kind: "value_taken_since".into(),
-                };
-            }
-        } else if let Some(current) = claims.held_by("customer", &payload.customer_id) {
+        // claim of another customer's is a claim of it.
+        if standing.iter().any(|event| {
+            event.position > payload.position
+                && matches!(event.event, CustomerEvent::Claimed)
+                && !own(event.tags)
+        }) {
+            return CommandDecision::Rejected {
+                reason: "another customer claimed this address after it was released".into(),
+                kind: "value_taken_since".into(),
+            };
+        }
+        if let Some(current) = claims(events).held_by("customer", &payload.customer_id) {
             if email_value(current.tags) != Some(address) {
                 return CommandDecision::Rejected {
                     reason: "this customer holds another address now; release it first".into(),
