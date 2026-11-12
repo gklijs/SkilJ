@@ -157,6 +157,11 @@ README.md, "Status and stability").
   `POST /v1/commands/trigger` allows REST triggering. The README points to it,
   and the `skilj-event-modeling` skill can write its summary as an `.em.hcl`
   model following it.
+- The spec's `ProcessCommand` states what was already the behaviour: an
+  idempotency key is matched without comparing payloads, so a submission
+  reusing an accepted key for a different payload is answered `Deduplicated`
+  with the first submission's events, and its own payload is never decided
+  (issue #189).
 
 ## [0.3.0] - 2026-11-04
 
