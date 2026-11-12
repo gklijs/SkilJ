@@ -736,6 +736,48 @@ async fn resolve_stances(
                 )));
             }
         }
+        // What the decision assumed about the target, checked against the
+        // command's own tags, which the store derived and hashed itself: a
+        // decision can't compare a blind value with the target's hash.
+        let required = match crate::retraction::required_target_tags(spec) {
+            Ok(required) => required,
+            Err(error) => {
+                return Ok(Err(if stance.is_retraction() {
+                    (format!("not a retraction: {error}"), "invalid_retraction")
+                } else {
+                    (format!("not a doubt: {error}"), "invalid_doubt")
+                }))
+            }
+        };
+        for key in &required {
+            let mut own = consistency_tags
+                .iter()
+                .filter(|tag| &tag.key == key)
+                .peekable();
+            if own.peek().is_none() {
+                return Ok(Err(if stance.is_retraction() {
+                    (
+                        format!("the retraction requires a {key} tag the command doesn't have"),
+                        "invalid_retraction",
+                    )
+                } else {
+                    (
+                        format!("the doubt requires a {key} tag the command doesn't have"),
+                        "invalid_doubt",
+                    )
+                }));
+            }
+            if !own.any(|tag| target_tags.contains(tag)) {
+                return Ok(Err((
+                    format!("the event at position {position} has another {key} than the command"),
+                    if stance.is_retraction() {
+                        "retraction_target_mismatch"
+                    } else {
+                        "doubt_target_mismatch"
+                    },
+                )));
+            }
+        }
         let retracted = is_retracted(
             &mut *conn,
             &schema,

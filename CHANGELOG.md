@@ -27,6 +27,14 @@ README.md, "Status and stability").
 
 ### Added
 
+- `retraction::requiring_target_tags`: a retraction, doubt or lift on the
+  condition that its target carries the command's own value of the tag keys
+  named, or the store refuses it with `retraction_target_mismatch` or
+  `doubt_target_mismatch` (docs/architecture.md §235, issue #189). For a
+  decision that names its target by position and reads the target's history
+  through a tag of its payload. The store compares the command's own tags, so a
+  blind tag by its hash, which a decision can't compute. Nothing is registered
+  or stored: the keys are a condition on that append.
 - Reproducible benchmark comparisons (issue #190, docs/performance.md
   "Comparing two commits"). `node scripts/bench/compare.mjs --baseline <rev>
   --candidate <rev>` builds both commits' benchmark binaries, runs a
