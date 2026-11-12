@@ -13,6 +13,12 @@ export const FORMAT = 1;
 /** Trials a side needs before the report calls a difference anything but noise. */
 export const MIN_TRIALS_FOR_VERDICT = 3;
 
+/** The smallest change in median throughput the report calls slower or faster. */
+export const MIN_EFFECT = 0.10;
+
+/** How many times the noisier side's coefficient of variation a change must exceed. */
+export const NOISE_MULTIPLE = 2;
+
 /** Parses one run's JSON lines. Blank lines are ignored. */
 export function parseRecords(text) {
   return text.split('\n').filter(line => line.trim() !== '').map((line, i) => {
@@ -128,15 +134,22 @@ export function summarizeSide(runs, scenario) {
 }
 
 /**
- * What a difference amounts to. A single trial, or ranges that overlap,
- * say nothing about a regression; only when every candidate trial is
- * below (or above) every baseline trial, over enough trials, does the
- * report call it slower (or faster). Informational either way.
+ * What a difference amounts to. Informational either way. A single trial
+ * says nothing, and neither do ranges that overlap. Separate ranges alone
+ * are not enough either: with 3 trials a side, chance puts every candidate
+ * trial below every baseline trial 1 time in 20, so across a dozen
+ * scenarios a commit compared with itself would usually get a verdict
+ * somewhere. The report therefore also requires the medians to differ by
+ * at least MIN_EFFECT and by NOISE_MULTIPLE times the noisier side's
+ * coefficient of variation.
  */
 export function verdict(baseline, candidate) {
   if (Math.min(baseline.trials.length, candidate.trials.length) < MIN_TRIALS_FOR_VERDICT) {
     return 'insufficient trials';
   }
+  const delta = (candidate.throughput.median - baseline.throughput.median) / baseline.throughput.median;
+  const noise = NOISE_MULTIPLE * Math.max(baseline.throughput.cv, candidate.throughput.cv);
+  if (Math.abs(delta) < Math.max(MIN_EFFECT, noise)) return 'within noise';
   if (candidate.throughput.max < baseline.throughput.min) return 'slower';
   if (candidate.throughput.min > baseline.throughput.max) return 'faster';
   return 'within noise';
@@ -205,7 +218,8 @@ export function toMarkdown(report) {
   lines.push(`Baseline \`${report.baseline?.commit ?? '?'}\` → candidate \`${report.candidate?.commit ?? '?'}\`, ` +
     `${report.trials} trial(s) × ${report.rounds} round(s), alternating order.`);
   lines.push('', '_Informational: a delta never fails this job. A verdict needs at least ' +
-    `${MIN_TRIALS_FOR_VERDICT} trials and ranges that do not overlap; anything else is reported as noise._`, '');
+    `${MIN_TRIALS_FOR_VERDICT} trials, ranges that do not overlap, and a change in the median of at least ` +
+    `${MIN_EFFECT * 100}% and ${NOISE_MULTIPLE}× the noisier side's CV; anything else is reported as noise._`, '');
   if (report.baseline?.env && Object.keys(report.baseline.env).length) {
     lines.push(`Baseline environment overrides: \`${JSON.stringify(report.baseline.env)}\``);
   }

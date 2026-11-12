@@ -25,6 +25,11 @@
 //! of its own as well, which it raises when what a scenario measures
 //! changes; the comparison refuses to compare records of different
 //! versions.
+//!
+//! The lines are written by hand rather than through `serde_json`: a new
+//! dependency here would change the workspace lock that the CGA panic
+//! analysis pins (`scripts/cga/workspace.lock`). The benchmarks build
+//! their settings with `serde_json` themselves and pass the JSON text.
 
 use std::io::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,8 +60,8 @@ pub struct Scenario<'a> {
     /// when the scenario has no per-operation latency.
     pub samples: &'a [Duration],
     /// The settings the scenario ran with (workers, batch, partitions,
-    /// projections, ...).
-    pub settings: serde_json::Value,
+    /// projections, ...), as the text of a JSON object.
+    pub settings: String,
 }
 
 /// Writes one benchmark's records to `SKILJ_BENCH_RECORD`, when set.
@@ -110,52 +115,76 @@ impl Recorder {
             return;
         }
         self.scenarios.fetch_add(1, Ordering::Relaxed);
-        let samples: Vec<u64> = scenario.samples.iter().map(micros).collect();
-        self.write(serde_json::json!({
-            "format": FORMAT,
-            "kind": "scenario",
-            "benchmark": self.benchmark,
-            "benchmark_version": self.version,
-            "scenario": scenario.name,
-            "round": scenario.round,
-            "unit": scenario.unit,
-            "operations": scenario.operations,
-            "expected_operations": scenario.expected_operations,
-            "elapsed_us": micros(&scenario.elapsed),
-            "samples_us": samples,
-            "settings": scenario.settings,
-            "slowdown_us": slowdown_duration().map(|d| micros(&d)),
-            "peak_rss_kb": peak_rss_kb(),
-        }));
+        let samples: Vec<String> = scenario
+            .samples
+            .iter()
+            .map(|sample| micros(sample).to_string())
+            .collect();
+        self.write(format!(
+            "{{\"format\":{FORMAT},\"kind\":\"scenario\",\"benchmark\":{},\"benchmark_version\":{},\
+             \"scenario\":{},\"round\":{},\"unit\":{},\"operations\":{},\"expected_operations\":{},\
+             \"elapsed_us\":{},\"samples_us\":[{}],\"settings\":{},\"slowdown_us\":{},\"peak_rss_kb\":{}}}",
+            json_string(self.benchmark),
+            self.version,
+            json_string(&scenario.name),
+            scenario.round,
+            json_string(scenario.unit),
+            scenario.operations,
+            scenario.expected_operations,
+            micros(&scenario.elapsed),
+            samples.join(","),
+            scenario.settings,
+            json_number(slowdown_duration().map(|d| micros(&d))),
+            json_number(peak_rss_kb()),
+        ));
     }
 
-    /// Records that the benchmark finished, with `environment`: what it
-    /// knows about where it ran (Postgres settings, for one). The
-    /// comparison treats a run without this line as failed.
-    pub fn complete(&self, environment: serde_json::Value) {
+    /// Records that the benchmark finished, with `environment`, the text
+    /// of a JSON object: what it knows about where it ran (Postgres
+    /// settings, for one). The comparison treats a run without this line
+    /// as failed.
+    pub fn complete(&self, environment: String) {
         if !self.is_recording() {
             return;
         }
-        self.write(serde_json::json!({
-            "format": FORMAT,
-            "kind": "complete",
-            "benchmark": self.benchmark,
-            "benchmark_version": self.version,
-            "scenarios": self.scenarios.load(Ordering::Relaxed),
-            "environment": environment,
-            "peak_rss_kb": peak_rss_kb(),
-        }));
+        self.write(format!(
+            "{{\"format\":{FORMAT},\"kind\":\"complete\",\"benchmark\":{},\"benchmark_version\":{},\
+             \"scenarios\":{},\"environment\":{environment},\"peak_rss_kb\":{}}}",
+            json_string(self.benchmark),
+            self.version,
+            self.scenarios.load(Ordering::Relaxed),
+            json_number(peak_rss_kb()),
+        ));
     }
 
-    fn write(&self, record: serde_json::Value) {
+    fn write(&self, mut line: String) {
         let Some(file) = &self.file else { return };
         let mut file = file.lock().unwrap();
-        let mut line = record.to_string();
         line.push('\n');
         file.write_all(line.as_bytes())
             .and_then(|()| file.flush())
             .expect("writing a benchmark record");
     }
+}
+
+/// `value` as a JSON string literal.
+pub fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_number(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_string(), |n| n.to_string())
 }
 
 fn micros(duration: &Duration) -> u64 {
@@ -201,10 +230,10 @@ pub fn slowdown_blocking() {
     }
 }
 
-/// The server settings a measurement depends on, as a JSON object for a
-/// [`Recorder::complete`] environment: the version and the durability
-/// settings, which an embedded or tuned-down server changes.
-pub async fn postgres_settings(pool: &sqlx::PgPool) -> serde_json::Value {
+/// The server settings a measurement depends on, as the text of a JSON
+/// object for a [`Recorder::complete`] environment: the version and the
+/// durability settings, which an embedded or tuned-down server changes.
+pub async fn postgres_settings(pool: &sqlx::PgPool) -> String {
     let settings: Vec<(String, String)> = sqlx::query_as(
         "SELECT name, setting FROM pg_settings WHERE name IN \
          ('fsync', 'synchronous_commit', 'full_page_writes', 'server_version', \
@@ -213,11 +242,11 @@ pub async fn postgres_settings(pool: &sqlx::PgPool) -> serde_json::Value {
     .fetch_all(pool)
     .await
     .expect("reading pg_settings");
-    settings
-        .into_iter()
-        .map(|(name, value)| (name, serde_json::Value::String(value)))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
+    let fields: Vec<String> = settings
+        .iter()
+        .map(|(name, value)| format!("{}:{}", json_string(name), json_string(value)))
+        .collect();
+    format!("{{{}}}", fields.join(","))
 }
 
 /// The benchmark process's own peak resident memory so far (`VmHWM`), in
@@ -263,22 +292,34 @@ mod tests {
             expected_operations: 2,
             elapsed: Duration::from_millis(3),
             samples: &[Duration::from_micros(1500), Duration::from_micros(1400)],
-            settings: serde_json::json!({ "workers": 1 }),
+            settings: r#"{"workers":1}"#.to_string(),
         });
-        recorder.complete(serde_json::json!({}));
-        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        recorder.complete(r#"{"postgres":{}}"#.to_string());
+        let text = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0]["kind"], "scenario");
-        assert_eq!(lines[0]["benchmark_version"], 3);
-        assert_eq!(lines[0]["samples_us"], serde_json::json!([1500, 1400]));
-        assert_eq!(lines[0]["elapsed_us"], 3000);
-        assert_eq!(lines[1]["kind"], "complete");
-        assert_eq!(lines[1]["scenarios"], 1);
+        assert!(
+            lines[0].starts_with(
+                r#"{"format":1,"kind":"scenario","benchmark":"example","benchmark_version":3,"scenario":"one/1w","round":1,"unit":"command","operations":2,"expected_operations":2,"elapsed_us":3000,"samples_us":[1500,1400],"settings":{"workers":1},"slowdown_us":null,"peak_rss_kb":"#
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with(
+                r#"{"format":1,"kind":"complete","benchmark":"example","benchmark_version":3,"scenarios":1,"environment":{"postgres":{}},"peak_rss_kb":"#
+            ),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn escapes_json_strings() {
+        assert_eq!(json_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(json_string("tab\there"), r#""tab\u0009here""#);
+        assert_eq!(json_string("16.15 (Ubuntu)"), r#""16.15 (Ubuntu)""#);
     }
 
     #[test]

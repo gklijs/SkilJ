@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { BENCHMARKS, parseArgs } from './compare.mjs';
-import { compare, median, percentile, toMarkdown, validateRun, verdict } from './report.mjs';
+import { coefficientOfVariation, compare, median, percentile, toMarkdown, validateRun, verdict } from './report.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -22,7 +22,7 @@ const env = process.env;
 if (env.FAKE_SKIP === benchmark) { console.error('skipping: no test database'); console.log('test result: ok. 1 passed; 0 failed'); process.exit(0); }
 if (env.FAKE_FILTERED === benchmark) { console.log('test result: ok. 0 passed; 0 failed; 1 filtered out'); process.exit(0); }
 if (env.FAKE_CRASH === benchmark) { console.error('thread panicked'); process.exit(101); }
-let seed = [...env.SKILJ_BENCH_RECORD].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
+let seed = [...env.SKILJ_BENCH_RECORD.split('/').pop()].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
 const noise = () => { seed = (seed * 1103515245 + 12345) >>> 0; return 1 + ((seed % 1000) / 1000 - 0.5) * 0.04; };
 const slowdown = Number(env.SKILJ_BENCH_SLOWDOWN_US ?? 0);
 const version = Number(env.FAKE_VERSION ?? 1);
@@ -98,7 +98,7 @@ test('the same commit twice compares as noise, not as a regression', t => {
   const result = compareRun(dir, ['--trials', '3']);
   assert.equal(result.status, 0, result.stderr);
   for (const s of scenariosOf(result.summary)) {
-    assert.notEqual(s.verdict, 'slower', s.scenario);
+    assert.equal(s.verdict, 'within noise', s.scenario);
     assert.ok(Math.abs(s.delta) < 0.05, `${s.scenario}: ${s.delta}`);
   }
 });
@@ -173,11 +173,18 @@ test('statistics and verdicts', () => {
   assert.equal(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.5), 5);
   assert.equal(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.99), 9);
   const side = values => ({ trials: values.map(v => ({ throughput: v })),
-    throughput: { min: Math.min(...values), max: Math.max(...values) } });
-  assert.equal(verdict(side([100, 101, 102]), side([90, 91, 92])), 'slower');
-  assert.equal(verdict(side([100, 101, 102]), side([110, 111, 112])), 'faster');
+    throughput: { median: median(values), min: Math.min(...values), max: Math.max(...values),
+      cv: coefficientOfVariation(values) } });
+  assert.equal(verdict(side([100, 101, 102]), side([80, 81, 82])), 'slower');
+  assert.equal(verdict(side([100, 101, 102]), side([120, 121, 122])), 'faster');
   assert.equal(verdict(side([100, 101, 102]), side([95, 101, 104])), 'within noise');
-  assert.equal(verdict(side([100, 101]), side([90, 91])), 'insufficient trials');
+  assert.equal(verdict(side([100, 101]), side([80, 81])), 'insufficient trials');
+  // Separate ranges, but a change too small to call: what chance alone
+  // produces for 1 scenario in 20.
+  assert.equal(verdict(side([100, 101, 102]), side([96, 97, 98])), 'within noise');
+  // Separate ranges and a 20% drop, but trials spread so widely (CV ~ 15%)
+  // that a 20% difference is within twice the noise.
+  assert.equal(verdict(side([100, 130, 135]), side([80, 90, 95])), 'within noise');
 });
 
 test('a run without records is not usable', () => {
