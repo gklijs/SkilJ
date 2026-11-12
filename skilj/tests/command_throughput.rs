@@ -344,7 +344,8 @@ async fn scenario(
                 "added_round_trip_ms": run_settings.latency_ms,
                 "batches": s.batches,
                 "commands_in_batches": s.commands,
-            }),
+            })
+            .to_string(),
         });
     }
 }
@@ -466,11 +467,11 @@ fn command_throughput() {
         }
         setup.shutdown().await;
         recorder.complete(serde_json::json!({
-            "postgres": bench::postgres_settings(&pool).await,
+            "postgres": serde_json::from_str::<serde_json::Value>(&bench::postgres_settings(&pool).await).unwrap(),
             "rounds": rounds,
             "warmup": "one unrecorded spread scenario with 8 callers",
             "require_durable": std::env::var("SKILJ_BENCH_REQUIRE_DURABLE").as_deref() == Ok("1"),
             "boundary": "in-process POST /v1/commands/trigger on Skilj::rest_router(), no network",
-        }));
+        }).to_string());
     });
 }

@@ -258,7 +258,8 @@ async fn scenario(
             "events": EVENTS,
             "accounts": ACCOUNTS,
             "ticks": ticks,
-        }),
+        })
+        .to_string(),
     });
 }
 
@@ -287,10 +288,10 @@ fn async_projection_catch_up_throughput() {
             scenario(r, round, &pool, "partitioned", &["Partitioned"]).await;
         }
         recorder.complete(serde_json::json!({
-            "postgres": bench::postgres_settings(&pool).await,
+            "postgres": serde_json::from_str::<serde_json::Value>(&bench::postgres_settings(&pool).await).unwrap(),
             "rounds": rounds,
             "warmup": "none: each scenario seeds a fresh bounded context; the first round warms caches",
             "boundary": "db::catch_up_bounded_context called back to back, no background task",
-        }));
+        }).to_string());
     });
 }

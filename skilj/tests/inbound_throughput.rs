@@ -318,7 +318,8 @@ async fn scenario(
                 "kind": kind,
                 "partitions": partitions,
                 "messages": MESSAGES,
-            }),
+            })
+            .to_string(),
         });
     }
 }
@@ -356,10 +357,10 @@ fn inbound_throughput() {
             scenario(recorder, measured, &setup, Kind::Trigger, PARTITIONS, &label).await;
         }
         recorder.complete(serde_json::json!({
-            "postgres": bench::postgres_settings(&pool).await,
+            "postgres": serde_json::from_str::<serde_json::Value>(&bench::postgres_settings(&pool).await).unwrap(),
             "rounds": rounds,
             "warmup": "one unrecorded scenario per kind, 8 partitions",
             "boundary": "in-process POST /v1/events/external and /v1/commands/trigger on Skilj::rest_router(), no network",
-        }));
+        }).to_string());
     });
 }

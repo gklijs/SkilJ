@@ -307,9 +307,13 @@ How a comparison runs:
    median of the trials' throughputs (each the median of its rounds), their
    range and coefficient of variation, median p50/p99 latencies, and the
    delta between the medians. A scenario is called **slower** or
-   **faster** only with at least 3 trials and when every candidate trial is
-   below (or above) every baseline trial; otherwise it is "within noise" or
-   "insufficient trials". Benchmarks whose versions differ between the two
+   **faster** only with at least 3 trials, when every candidate trial is
+   below (or above) every baseline trial, and when the medians differ by
+   at least 10% and by twice the noisier side's coefficient of variation;
+   otherwise it is "within noise" or "insufficient trials". Separate
+   ranges alone are not enough: with 3 trials a side, chance alone
+   separates them for 1 scenario in 20, so a commit compared with itself
+   would usually get a verdict somewhere among a dozen scenarios. Benchmarks whose versions differ between the two
    commits are reported as non-comparable, and the script exits 2.
 
 Each benchmark has a `BENCH_VERSION`; raise it when what a scenario measures
