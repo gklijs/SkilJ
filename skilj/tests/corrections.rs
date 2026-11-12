@@ -6,15 +6,11 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::retraction::{
-    claim_query, corrected, correction_query, doubt, lift_doubt, open_doubts, retract,
-    DoubtPayload, Retractable, RetractionGround, RetractionPayload, ValueClaims, ValueEffect,
-    DOUBTED_EVENT_TYPE, DOUBTS_TAG_KEY, DOUBT_EVENT_TYPES, DOUBT_LIFTED_EVENT_TYPE,
-    RETRACTED_EVENT_TYPE, RETRACTS_TAG_KEY,
+    claim_query, doubt, lift_doubt, open_doubts, retract, DoubtPayload, Retractable,
+    RetractionGround, RetractionPayload, DOUBTED_EVENT_TYPE, DOUBTS_TAG_KEY, DOUBT_EVENT_TYPES,
+    DOUBT_LIFTED_EVENT_TYPE, RETRACTED_EVENT_TYPE, RETRACTS_TAG_KEY,
 };
-use skilj::{
-    normalize, BlindErasure, BlindIndexKey, BlindTag, CommandType, EventType, KeyService,
-    Projection, Skilj, SkiljBuilder, Snapshot,
-};
+use skilj::{BlindIndexKey, CommandType, EventType, Projection, Skilj, SkiljBuilder, Snapshot};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::command_batcher::{CommandBatchItem, CommandBatcher};
@@ -35,13 +31,8 @@ use unique_crm::{
     EmailPayload, EmailTagging, RetractAny, RetractPayload, CLAIMS_AND_RELEASES,
 };
 
-// This file's tests are of the blind variant, under the names they had before
-// the domain moved to `unique_crm`.
+// This file's tests are of the blind variant.
 type EmailClaimed = unique_crm::EmailClaimed<Blind>;
-type EmailReleased = unique_crm::EmailReleased<Blind>;
-type RegisterCustomer = unique_crm::RegisterCustomer<Blind>;
-type CorrectEmail = unique_crm::CorrectEmail<Blind>;
-type ReleaseEmail = unique_crm::ReleaseEmail<Blind>;
 use unique_crm::CustomerEvent;
 
 fn email() -> TagMapping {
@@ -221,6 +212,8 @@ impl Projection for CurrentClaims {
     }
 }
 
+static TEST_DB: tokio::sync::OnceCell<Option<(String, Pool)>> = tokio::sync::OnceCell::const_new();
+
 async fn test_db() -> Option<(String, Pool)> {
     TEST_DB
         .get_or_init(|| async {
@@ -288,16 +281,13 @@ impl Crm {
         payload: serde_json::Value,
         idempotency_key: Option<&str>,
     ) -> SubmitCommandOutcome {
-        unique_crm::submit(
-            &self.skilj,
-            &self.pool,
-            &self.bc,
-            &self.cache,
-            name,
-            payload,
-            "client",
-            idempotency_key,
-        )
+        unique_crm::Target {
+            skilj: &self.skilj,
+            pool: &self.pool,
+            bc: &self.bc,
+            cache: &self.cache,
+        }
+        .submit(name, payload, "client", idempotency_key)
         .await
     }
 
@@ -564,11 +554,13 @@ fn the_plain_variant_keeps_the_rules_and_stores_the_address() {
             let (skilj, pool, bc, cache) = (&skilj, &pool, &bc, &cache);
             async move {
                 kind(
-                    &unique_crm::submit(
+                    &unique_crm::Target {
                         skilj,
                         pool,
                         bc,
                         cache,
+                    }
+                    .submit(
                         command,
                         serde_json::json!({ "customer_id": customer, "email": email }),
                         "client",
@@ -882,6 +874,15 @@ fn a_projection_takes_a_retracted_claim_out_itself() {
 }
 
 impl Crm {
+    /// One more address for `customer`, however many it holds.
+    async fn import(&self, customer: &str, email: &str) -> String {
+        self.submit(
+            "ImportClaim",
+            serde_json::json!({ "customer_id": customer, "email": email }),
+        )
+        .await
+    }
+
     /// Imports `count` addresses for a new customer, returning it and their
     /// positions.
     async fn customer_with_claims(&self, count: usize) -> (String, Vec<i64>) {
@@ -889,13 +890,7 @@ impl Crm {
         let mut positions = Vec::new();
         for _ in 0..count {
             let email = format!("{}@example.com", id("e"));
-            let outcome = self
-                .submit(
-                    "ImportClaim",
-                    serde_json::json!({ "customer_id": customer, "email": email }),
-                )
-                .await;
-            assert_eq!(outcome, "accepted");
+            assert_eq!(self.import(&customer, &email).await, "accepted");
             positions.push(self.latest_position().await);
         }
         (customer, positions)
@@ -955,7 +950,7 @@ fn catch_up_takes_a_retracted_event_out_of_a_stored_row() {
 
         // And it stays out when a later event folds on top.
         let email = format!("{}@example.com", id("e"));
-        assert_eq!(crm.register(&alice, &email).await, "accepted");
+        assert_eq!(crm.import(&alice, &email).await, "accepted");
         crm.catch_up_snapshots().await;
         for snapshot in ["ClaimCount", "PartitionedClaimCount"] {
             assert_eq!(crm.stored_count(snapshot, &alice).await.0, 3, "{snapshot}");
@@ -1002,7 +997,7 @@ fn a_command_never_decides_on_a_retracted_event_in_a_stored_row() {
 
         // Both the event and its retraction past the row.
         let email = format!("{}@example.com", id("e"));
-        assert_eq!(crm.register(&alice, &email).await, "accepted");
+        assert_eq!(crm.import(&alice, &email).await, "accepted");
         let unfolded = crm.latest_position().await;
         assert_eq!(crm.reported_count(&alice).await, "count_3");
         assert_eq!(crm.retract(unfolded).await, "accepted");
@@ -1088,7 +1083,7 @@ fn a_retraction_of_an_event_past_the_state_stays_under_the_lock() {
         let (alice, _) = crm.customer_with_claims(1).await;
         crm.catch_up_snapshots().await;
         let email = format!("{}@example.com", id("e"));
-        assert_eq!(crm.register(&alice, &email).await, "accepted");
+        assert_eq!(crm.import(&alice, &email).await, "accepted");
         let unfolded = crm.latest_position().await;
 
         let command_type = db::get_command_type(&crm.pool, &crm.bc, "ReportClaimCount")

@@ -395,39 +395,47 @@ pub fn builder<V: EmailTagging>(database_url: &str, bc: &str, subject: &str) -> 
         .command_type::<RetractAny>()
 }
 
-/// A submission as an application makes one: `decide()` then the store, with
-/// the caller's `client_id` and idempotency key.
-pub async fn submit(
-    skilj: &Skilj,
-    pool: &Pool,
-    bc: &str,
-    cache: &EventCache,
-    command_type: &str,
-    payload: serde_json::Value,
-    client_id: &str,
-    idempotency_key: Option<&str>,
-) -> SubmitCommandOutcome {
-    let command_type = db::get_command_type(pool, bc, command_type)
+/// What a submission goes to: one built deployment of one bounded context.
+#[derive(Clone, Copy)]
+pub struct Target<'a> {
+    pub skilj: &'a Skilj,
+    pub pool: &'a Pool,
+    pub bc: &'a str,
+    pub cache: &'a EventCache,
+}
+
+impl Target<'_> {
+    /// A submission as an application makes one: `decide()` then the store,
+    /// with the caller's `client_id` and idempotency key.
+    pub async fn submit(
+        self,
+        command_type: &str,
+        payload: serde_json::Value,
+        client_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> SubmitCommandOutcome {
+        let command_type = db::get_command_type(self.pool, self.bc, command_type)
+            .await
+            .unwrap()
+            .unwrap();
+        db::decide_and_submit_command(
+            self.pool,
+            &*self.skilj.command_dispatcher(),
+            &*self.skilj.projection_dispatcher(),
+            &*self.skilj.snapshot_dispatcher(),
+            &EventBroadcaster::new(16),
+            self.cache,
+            &command_type,
+            &payload.to_string(),
+            client_id,
+            None,
+            None,
+            Some(&master_key()),
+            now(),
+            idempotency_key,
+            None,
+        )
         .await
         .unwrap()
-        .unwrap();
-    db::decide_and_submit_command(
-        pool,
-        &*skilj.command_dispatcher(),
-        &*skilj.projection_dispatcher(),
-        &*skilj.snapshot_dispatcher(),
-        &EventBroadcaster::new(16),
-        cache,
-        &command_type,
-        &payload.to_string(),
-        client_id,
-        None,
-        None,
-        Some(&master_key()),
-        now(),
-        idempotency_key,
-        None,
-    )
-    .await
-    .unwrap()
+    }
 }
