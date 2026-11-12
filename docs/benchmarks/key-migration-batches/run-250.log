@@ -1,0 +1,29 @@
+| Request latency | Asked | Requests | Elapsed | Per data key | Connections in use, most | Longest transaction seen | RSS after | Peak RSS |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 ms | row by row (before) | 2000 | 2722 ms | 2.722 ms | 1 | 25.5 ms | 33320 KiB | 33320 KiB |
+| 0 ms | trait defaults | 2000 | 469 ms | 0.469 ms | 1 | 7.7 ms | 34892 KiB | 34892 KiB |
+| 0 ms | Vault batches | 10 | 51 ms | 0.051 ms | 1 | 4.3 ms | 37596 KiB | 37596 KiB |
+| 1 ms | row by row (before) | 2000 | 4915 ms | 4.915 ms | 1 | 8.2 ms | 37624 KiB | 37624 KiB |
+| 1 ms | trait defaults | 2000 | 711 ms | 0.711 ms | 2 | 5.1 ms | 38020 KiB | 38020 KiB |
+| 1 ms | Vault batches | 10 | 56 ms | 0.056 ms | 1 | 4.6 ms | 38060 KiB | 38060 KiB |
+| 5 ms | row by row (before) | 2000 | 12804 ms | 12.804 ms | 1 | 7.7 ms | 38140 KiB | 38140 KiB |
+| 5 ms | trait defaults | 2000 | 1675 ms | 1.675 ms | 2 | 6.4 ms | 38688 KiB | 38688 KiB |
+| 5 ms | Vault batches | 10 | 123 ms | 0.123 ms | 2 | 9.2 ms | 38704 KiB | 38704 KiB |
+| 20 ms | row by row (before) | 2000 | 42884 ms | 42.884 ms | 1 | 44.3 ms | 38872 KiB | 38872 KiB |
+| 20 ms | trait defaults | 2000 | 5438 ms | 5.438 ms | 1 | 6.2 ms | 38980 KiB | 38980 KiB |
+| 20 ms | Vault batches | 10 | 251 ms | 0.251 ms | 2 | 5.0 ms | 38996 KiB | 38996 KiB |
+| Request latency | Same-key rewrap | Requests | Elapsed | Per data key |
+| ---: | --- | ---: | ---: | ---: |
+| 0 ms | row by row (before) | 2000 | 2616 ms | 2.616 ms |
+| 0 ms | trait default | 2000 | 394 ms | 0.394 ms |
+| 0 ms | Vault rewrap | 5 | 36 ms | 0.036 ms |
+| 1 ms | row by row (before) | 2000 | 4643 ms | 4.643 ms |
+| 1 ms | trait default | 2000 | 667 ms | 0.667 ms |
+| 1 ms | Vault rewrap | 5 | 45 ms | 0.045 ms |
+| 5 ms | row by row (before) | 2000 | 12766 ms | 12.766 ms |
+| 5 ms | trait default | 2000 | 1698 ms | 1.698 ms |
+| 5 ms | Vault rewrap | 5 | 72 ms | 0.072 ms |
+| 20 ms | row by row (before) | 2000 | 43168 ms | 43.168 ms |
+| 20 ms | trait default | 2000 | 5515 ms | 5.515 ms |
+| 20 ms | Vault rewrap | 5 | 147 ms | 0.147 ms |
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 146.16s
