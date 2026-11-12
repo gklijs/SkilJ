@@ -40,7 +40,7 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - run: node --test scripts/ci.test.mjs scripts/agent-guides/check.test.mjs
+      - run: node --test scripts/ci.test.mjs scripts/agent-guides/check.test.mjs scripts/bench/compare.test.mjs
       # Validates every "§N" citation of docs/architecture.md's own section
       # headings (a past renumbering silently broke ~600 of them).
       - run: scripts/check-section-refs.sh

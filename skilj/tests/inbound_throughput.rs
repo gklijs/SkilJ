@@ -18,6 +18,10 @@
 //! network latency: a real bridge is slower per message, which only makes
 //! one-in-flight cost more. See docs/architecture.md §172 for the numbers
 //! and what was concluded from them.
+//!
+//! `SKILJ_BENCH_RECORD`, `SKILJ_BENCH_ROUNDS` and
+//! `SKILJ_BENCH_SLOWDOWN_US` are `skilj_test_support::bench`'s
+//! (docs/performance.md, "Comparing two commits").
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -34,6 +38,7 @@ use skilj_core::plugin::BoundedContextEvent;
 use skilj_core::shared::{
     generate_token_id, generate_token_secret, CommandDecision, EventSpec, TagMapping,
 };
+use skilj_test_support::bench;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
@@ -41,6 +46,10 @@ use tower::ServiceExt;
 const MESSAGES: usize = 400;
 /// Partitions in the concurrent scenarios.
 const PARTITIONS: usize = 8;
+
+/// Raised when what a scenario measures changes, so
+/// `scripts/bench/compare.mjs` stops comparing it with an older commit's.
+const BENCH_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct OrderPlacedPayload {
@@ -241,6 +250,8 @@ async fn send(setup: &Setup, kind: Kind, partition: usize, offset: usize, run: &
     }
     let request = request.body(Body::from(body.to_string())).unwrap();
     let started = Instant::now();
+    // `SKILJ_BENCH_SLOWDOWN_US`: a known delay a comparison must show.
+    bench::slowdown().await;
     let response = setup.router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -253,8 +264,16 @@ async fn send(setup: &Setup, kind: Kind, partition: usize, offset: usize, run: &
 }
 
 /// `MESSAGES` messages over `partitions` partitions, one in flight per
-/// partition. Prints throughput and latency percentiles.
-async fn scenario(setup: &Setup, kind: Kind, partitions: usize, label: &str) {
+/// partition. Prints throughput and latency percentiles, and records them
+/// in `round` (`None`: the warm-up, not recorded).
+async fn scenario(
+    recorder: &bench::Recorder,
+    round: Option<usize>,
+    setup: &Setup,
+    kind: Kind,
+    partitions: usize,
+    label: &str,
+) {
     let run = generate_token_id();
     let per_partition = MESSAGES / partitions;
     let started = Instant::now();
@@ -282,16 +301,38 @@ async fn scenario(setup: &Setup, kind: Kind, partitions: usize, label: &str) {
         pct(0.50).as_secs_f64() * 1000.0,
         pct(0.99).as_secs_f64() * 1000.0,
     );
+    if let Some(round) = round {
+        let kind = match kind {
+            Kind::External => "external",
+            Kind::Trigger => "trigger",
+        };
+        recorder.scenario(bench::Scenario {
+            name: format!("{kind}/{partitions}p"),
+            round,
+            unit: "message",
+            operations: latencies.len(),
+            expected_operations: per_partition * partitions,
+            elapsed,
+            samples: &latencies,
+            settings: serde_json::json!({
+                "kind": kind,
+                "partitions": partitions,
+                "messages": MESSAGES,
+            }),
+        });
+    }
 }
 
 #[test]
 #[ignore = "benchmark - run explicitly, see the module docs"]
 fn inbound_throughput() {
+    let recorder = bench::Recorder::from_env("inbound_throughput", BENCH_VERSION);
+    let recorder = &recorder;
     runtime().block_on(async {
         let Some(database_url) =
             skilj_test_support::database_url("skilj_inbound_throughput_bench").await
         else {
-            eprintln!("skipping: no test database");
+            recorder.skip("no test database");
             return;
         };
         let pool = db::connect(&database_url).await.unwrap();
@@ -299,27 +340,26 @@ fn inbound_throughput() {
         let setup = setup(database_url, &pool).await;
 
         // Warm-up: caches, prepared statements, pool connections.
-        scenario(&setup, Kind::External, PARTITIONS, "(warm-up, external)").await;
-        scenario(&setup, Kind::Trigger, PARTITIONS, "(warm-up, trigger)").await;
+        let warm_up = |kind, label| scenario(recorder, None, &setup, kind, PARTITIONS, label);
+        warm_up(Kind::External, "(warm-up, external)").await;
+        warm_up(Kind::Trigger, "(warm-up, trigger)").await;
 
-        for round in 1..=2 {
+        let rounds = bench::rounds(2);
+        for round in 1..=rounds {
             println!("--- round {round} ({MESSAGES} messages each) ---");
-            scenario(&setup, Kind::External, 1, "external event, 1 in flight").await;
-            scenario(
-                &setup,
-                Kind::External,
-                PARTITIONS,
-                &format!("external event, {PARTITIONS} partitions in flight"),
-            )
-            .await;
-            scenario(&setup, Kind::Trigger, 1, "command trigger, 1 in flight").await;
-            scenario(
-                &setup,
-                Kind::Trigger,
-                PARTITIONS,
-                &format!("command trigger, {PARTITIONS} partitions in flight"),
-            )
-            .await;
+            let measured = Some(round);
+            let label = format!("external event, {PARTITIONS} partitions in flight");
+            scenario(recorder, measured, &setup, Kind::External, 1, "external event, 1 in flight").await;
+            scenario(recorder, measured, &setup, Kind::External, PARTITIONS, &label).await;
+            let label = format!("command trigger, {PARTITIONS} partitions in flight");
+            scenario(recorder, measured, &setup, Kind::Trigger, 1, "command trigger, 1 in flight").await;
+            scenario(recorder, measured, &setup, Kind::Trigger, PARTITIONS, &label).await;
         }
+        recorder.complete(serde_json::json!({
+            "postgres": bench::postgres_settings(&pool).await,
+            "rounds": rounds,
+            "warmup": "one unrecorded scenario per kind, 8 partitions",
+            "boundary": "in-process POST /v1/events/external and /v1/commands/trigger on Skilj::rest_router(), no network",
+        }));
     });
 }

@@ -10,5 +10,6 @@ publish = false
 
 [dependencies]
 postgresql_embedded = "0.22"
+serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

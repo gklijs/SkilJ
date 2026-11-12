@@ -44,6 +44,12 @@
 //!
 //! `SKILJ_BENCH_REQUIRE_DURABLE=1` refuses skipped database setup and
 //! requires fsync, synchronous_commit and full_page_writes to be on.
+//!
+//! `SKILJ_BENCH_RECORD`, `SKILJ_BENCH_ROUNDS` and
+//! `SKILJ_BENCH_SLOWDOWN_US` are `skilj_test_support::bench`'s: one JSON
+//! line per row for `scripts/bench/compare.mjs`, the number of measured
+//! rounds (2), and a known delay inside every request
+//! (docs/performance.md, "Comparing two commits").
 //! See docs/disjoint-consistency-boundaries.md for issue #158's analysis
 //! and the remaining measurement work.
 
@@ -55,6 +61,7 @@ use deposit_bench::{
 };
 use skilj_core::db;
 use skilj_core::shared::generate_token_id;
+use skilj_test_support::bench;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing_subscriber::layer::SubscriberExt;
@@ -62,6 +69,10 @@ use tracing_subscriber::Layer as _;
 
 /// Commands per scenario, unless `SKILJ_BENCH_COMMANDS` says otherwise.
 const COMMANDS: usize = 800;
+
+/// Raised when what a row measures changes, so `scripts/bench/compare.mjs`
+/// stops comparing it with an older commit's.
+const BENCH_VERSION: u32 = 1;
 
 /// A whole-number environment setting, or `default`.
 fn env_setting(name: &str, default: usize) -> usize {
@@ -182,8 +193,33 @@ enum Workload {
     HotNothing,
 }
 
-/// `COMMANDS` deposits from `workers` concurrent callers. Prints one row.
+impl Workload {
+    fn name(self) -> &'static str {
+        match self {
+            Workload::Spread => "spread",
+            Workload::IndependentHot => "ind-hot",
+            Workload::CrossTag => "cross",
+            Workload::Hot => "hot",
+            Workload::HotSnapshot => "hot-snap",
+            Workload::HotNothing => "hot-none",
+        }
+    }
+}
+
+/// What the measured scenarios share: where they record, and the run's
+/// settings their records repeat.
+struct Run<'a> {
+    recorder: &'a bench::Recorder,
+    /// `None` for the warm-up, which is not recorded.
+    round: Option<usize>,
+    instances: usize,
+    latency_ms: usize,
+}
+
+/// `COMMANDS` deposits from `workers` concurrent callers. Prints one row
+/// and, unless it is the warm-up, records it.
 async fn scenario(
+    run_settings: &Run<'_>,
     setup: &Setup,
     stats: &BatchStatsLayer,
     workload: Workload,
@@ -264,14 +300,7 @@ async fn scenario(
          seq {:>4.0} us  persist {:>5.0} us  commit {:>5.0} us | before lock: read {:>5.0} us \
          ({:>5.0} events)  decide {:>5.0} us  slowest read {:>6.1} ms  slowest decide {:>6.2} ms | \
          decided again under lock {:>4} times, slowest {:>6.2} ms",
-        match workload {
-            Workload::Spread => "spread",
-            Workload::IndependentHot => "ind-hot",
-            Workload::CrossTag => "cross",
-            Workload::Hot => "hot",
-            Workload::HotSnapshot => "hot-snap",
-            Workload::HotNothing => "hot-none",
-        },
+        workload.name(),
         workers,
         batch.max(1),
         latencies.len() as f64 / elapsed.as_secs_f64(),
@@ -293,11 +322,37 @@ async fn scenario(
         s.redecides,
         s.redecide_max_us as f64 / 1000.0,
     );
+    if let Some(round) = run_settings.round {
+        let mut name = format!("{}/{workers}w", workload.name());
+        if batch > 1 {
+            name.push_str(&format!("/{batch}c"));
+        }
+        run_settings.recorder.scenario(bench::Scenario {
+            name,
+            round,
+            unit: "command",
+            operations: latencies.len(),
+            expected_operations: per_worker * workers,
+            elapsed,
+            samples: &latencies,
+            settings: serde_json::json!({
+                "workload": workload.name(),
+                "workers": workers,
+                "commands_per_call": batch.max(1),
+                "commands": commands,
+                "instances": run_settings.instances,
+                "added_round_trip_ms": run_settings.latency_ms,
+                "batches": s.batches,
+                "commands_in_batches": s.commands,
+            }),
+        });
+    }
 }
 
 #[test]
 #[ignore = "benchmark - run explicitly, see the module docs"]
 fn command_throughput() {
+    let recorder = bench::Recorder::from_env("command_throughput", BENCH_VERSION);
     let stats = BatchStatsLayer::default();
     let subscriber = tracing_subscriber::registry().with(
         stats
@@ -316,7 +371,7 @@ fn command_throughput() {
                 Ok("1"),
                 "durable benchmark requires a working database; it cannot skip"
             );
-            eprintln!("skipping: no test database");
+            recorder.skip("no test database");
             return;
         };
         let pool = db::connect(&database_url).await.unwrap();
@@ -363,10 +418,19 @@ fn command_throughput() {
              {commands} commands per scenario"
         );
 
-        // Warm-up: caches, prepared statements, pool connections.
-        scenario(&setup, &stats, Workload::Spread, 8, commands, 1).await;
+        let rounds = bench::rounds(2);
+        let mut run = Run {
+            recorder: &recorder,
+            round: None,
+            instances,
+            latency_ms,
+        };
 
-        for round in 1..=2 {
+        // Warm-up: caches, prepared statements, pool connections.
+        scenario(&run, &setup, &stats, Workload::Spread, 8, commands, 1).await;
+
+        for round in 1..=rounds {
+            run.round = Some(round);
             println!("--- round {round} ---");
             for workload in [
                 Workload::Spread,
@@ -376,14 +440,7 @@ fn command_throughput() {
                 Workload::HotSnapshot,
                 Workload::HotNothing,
             ] {
-                let workload_name = match workload {
-                    Workload::Spread => "spread",
-                    Workload::IndependentHot => "ind-hot",
-                    Workload::CrossTag => "cross",
-                    Workload::Hot => "hot",
-                    Workload::HotSnapshot => "hot-snap",
-                    Workload::HotNothing => "hot-none",
-                };
+                let workload_name = workload.name();
                 if let Ok(selected) = std::env::var("SKILJ_BENCH_WORKLOADS") {
                     if !selected.split(',').any(|name| name == workload_name) {
                         continue;
@@ -398,15 +455,22 @@ fn command_throughput() {
                             continue;
                         }
                     }
-                    scenario(&setup, &stats, workload, workers, commands, 1).await;
+                    scenario(&run, &setup, &stats, workload, workers, commands, 1).await;
                 }
                 if batch > 1 && !matches!(workload, Workload::CrossTag) {
                     for workers in [1, 8] {
-                        scenario(&setup, &stats, workload, workers, commands, batch).await;
+                        scenario(&run, &setup, &stats, workload, workers, commands, batch).await;
                     }
                 }
             }
         }
         setup.shutdown().await;
+        recorder.complete(serde_json::json!({
+            "postgres": bench::postgres_settings(&pool).await,
+            "rounds": rounds,
+            "warmup": "one unrecorded spread scenario with 8 callers",
+            "require_durable": std::env::var("SKILJ_BENCH_REQUIRE_DURABLE").as_deref() == Ok("1"),
+            "boundary": "in-process POST /v1/commands/trigger on Skilj::rest_router(), no network",
+        }));
     });
 }

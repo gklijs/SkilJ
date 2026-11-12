@@ -27,6 +27,15 @@ README.md, "Status and stability").
 
 ### Added
 
+- Reproducible benchmark comparisons (issue #190, docs/performance.md
+  "Comparing two commits"). `node scripts/bench/compare.mjs --baseline <rev>
+  --candidate <rev>` builds both commits' benchmark binaries, runs a
+  representative set of `command_throughput`, `inbound_throughput` and
+  `projection_catch_up_throughput` scenarios for several alternating trials,
+  and reports raw samples, dispersion and environment metadata. The
+  benchmarks write versioned JSON records through `SKILJ_BENCH_RECORD`; a
+  weekly workflow runs the comparison against a durable Postgres. Broken
+  runs fail it; throughput deltas are informational.
 - An upgrade preflight (issue #188, docs/architecture.md §249,
   docs/upgrade-preflight-design.md). `skilj::preflight::inspect` reports
   what starting this release would change in a database without changing it:

@@ -20,6 +20,11 @@
 //! - **partitioned**: per-account, with `PARTITION_COUNT` 4.
 //!
 //! See docs/architecture.md §182 and §197 for the numbers.
+//!
+//! `SKILJ_BENCH_RECORD`, `SKILJ_BENCH_ROUNDS` and
+//! `SKILJ_BENCH_SLOWDOWN_US` are `skilj_test_support::bench`'s; the
+//! slowdown is added to every event a projection folds
+//! (docs/performance.md, "Comparing two commits").
 
 use chrono::{SubsecRound, Utc};
 use skilj_core::bootstrap::ContextCreator;
@@ -30,12 +35,16 @@ use skilj_core::event_store::{
 use skilj_core::plugin::ProjectionDispatcher;
 use skilj_core::projections::Projection;
 use skilj_core::shared::{generate_token_id, Metadata};
+use skilj_test_support::bench;
 use std::time::Instant;
 
 /// Events per scenario.
 const EVENTS: i64 = 5000;
 /// Distinct accounts the per-account projections are keyed by.
 const ACCOUNTS: i64 = 500;
+/// Raised when what a scenario measures changes, so
+/// `scripts/bench/compare.mjs` stops comparing it with an older commit's.
+const BENCH_VERSION: u32 = 1;
 
 struct BenchDispatcher;
 
@@ -60,6 +69,8 @@ impl ProjectionDispatcher for BenchDispatcher {
         _key: &str,
     ) -> Option<skilj_core::error::Result<String>> {
         self.default_state(_bc, projection_name)?;
+        // `SKILJ_BENCH_SLOWDOWN_US`: a known delay a comparison must show.
+        bench::slowdown_blocking();
         let current: i64 = state_json.parse().unwrap_or(0);
         let payload: serde_json::Value =
             serde_json::from_str(&event.payload).expect("bench payload is JSON");
@@ -161,7 +172,13 @@ async fn seed(pool: &Pool) -> (BoundedContext, EventType) {
     (bc, et)
 }
 
-async fn scenario(pool: &Pool, label: &str, projections: &[&str]) {
+async fn scenario(
+    recorder: &bench::Recorder,
+    round: usize,
+    pool: &Pool,
+    label: &str,
+    projections: &[&str],
+) {
     let (bc, et) = seed(pool).await;
     for name in projections {
         db::upsert_projection(
@@ -226,26 +243,54 @@ async fn scenario(pool: &Pool, label: &str, projections: &[&str]) {
         elapsed.as_secs_f64() * 1000.0,
         EVENTS as f64 / elapsed.as_secs_f64(),
     );
+    recorder.scenario(bench::Scenario {
+        name: label.to_string(),
+        round,
+        unit: "event",
+        // Every projection asserted above folded every event once.
+        operations: EVENTS as usize,
+        expected_operations: EVENTS as usize,
+        elapsed,
+        // One catch-up per scenario: its time is the only sample.
+        samples: &[elapsed],
+        settings: serde_json::json!({
+            "projections": projections,
+            "events": EVENTS,
+            "accounts": ACCOUNTS,
+            "ticks": ticks,
+        }),
+    });
 }
 
 #[test]
 #[ignore = "benchmark - run explicitly, see the module doc comment"]
 fn async_projection_catch_up_throughput() {
+    let recorder = bench::Recorder::from_env("projection_catch_up_throughput", BENCH_VERSION);
     runtime().block_on(async {
         let Some(pool) = pool().await else {
-            eprintln!("skipping: no Postgres available");
+            recorder.skip("no Postgres available");
             return;
         };
-        for _ in 0..2 {
-            scenario(&pool, "total", &["Total"]).await;
-            scenario(&pool, "per-account", &["PerAccount"]).await;
+        let rounds = bench::rounds(2);
+        for round in 1..=rounds {
+            let r = &recorder;
+            scenario(r, round, &pool, "total", &["Total"]).await;
+            scenario(r, round, &pool, "per-account", &["PerAccount"]).await;
             scenario(
+                r,
+                round,
                 &pool,
                 "both",
                 &["Total", "TotalCopy", "PerAccount", "PerAccountCopy"],
             )
             .await;
-            scenario(&pool, "partitioned", &["Partitioned"]).await;
+            scenario(r, round, &pool, "partitioned", &["Partitioned"]).await;
         }
+        recorder.complete(serde_json::json!({
+            "postgres": bench::postgres_settings(&pool).await,
+            "rounds": rounds,
+            "warmup": "none: each scenario seeds a fresh bounded context; the first round warms caches",
+            "boundary": "db::catch_up_bounded_context called back to back, no background task",
+        }));
     });
 }
