@@ -103,7 +103,8 @@ impl Call {
 /// Which event an operator names, resolved against the history so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
-    /// The nth release in the history, or the nth event when there is none.
+    /// The nth release still standing, or the nth release when none stands,
+    /// or the nth event when there is none.
     Release(u16),
     /// The nth event in the history that may be retracted without changing
     /// who holds what: a claim, a retraction, anything but a release.
@@ -114,9 +115,11 @@ pub enum Target {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
+    /// No address: the one released last, as someone taking up an address
+    /// that just came free would give it.
     Register {
         customer: u8,
-        addr: Addr,
+        addr: Option<Addr>,
         call: Call,
     },
     Correct {
@@ -124,9 +127,10 @@ pub enum Op {
         addr: Addr,
         call: Call,
     },
+    /// No address: the one the customer holds, spelled as it was claimed.
     Release {
         customer: u8,
-        addr: Addr,
+        addr: Option<Addr>,
         call: Call,
     },
     /// The customer and address default to the target's own, as an
@@ -208,8 +212,9 @@ pub struct Step {
     pub expected: Expected,
     /// The event an operator op names, resolved.
     pub target: Option<Position>,
-    /// The customer and address a [`Op::RetractRelease`] submits, resolved.
-    pub release_args: Option<(u8, Addr)>,
+    /// The customer and address the op submits, resolved; none for a raw
+    /// retraction.
+    pub args: Option<(u8, Addr)>,
 }
 
 #[derive(Debug)]
@@ -309,13 +314,21 @@ impl Model {
         match target {
             Target::PastEnd => Position::PastEnd,
             Target::Release(nth) => {
+                let retracted = self.retracted();
                 let releases: Vec<usize> = (0..self.log.len())
                     .filter(|index| self.log[*index].kind == Kind::Released)
                     .collect();
-                if releases.is_empty() {
-                    pick((0..self.log.len()).collect(), nth)
-                } else {
+                let standing: Vec<usize> = releases
+                    .iter()
+                    .copied()
+                    .filter(|index| !retracted.contains(index))
+                    .collect();
+                if !standing.is_empty() {
+                    pick(standing, nth)
+                } else if !releases.is_empty() {
                     pick(releases, nth)
+                } else {
+                    pick((0..self.log.len()).collect(), nth)
                 }
             }
             Target::NotARelease(nth) => pick(
@@ -335,7 +348,33 @@ impl Model {
             }
             _ => None,
         };
-        let release_args = match op {
+        let as_addr = |value: Value| Addr {
+            base: value.base,
+            spelling: value.spelling,
+        };
+        let first = Addr {
+            base: 0,
+            spelling: 0,
+        };
+        let args = match op {
+            Op::Register { customer, addr, .. } => Some((
+                customer % CUSTOMERS,
+                addr.unwrap_or_else(|| {
+                    self.log
+                        .iter()
+                        .rev()
+                        .find(|event| event.kind == Kind::Released)
+                        .map_or(first, |event| as_addr(event.value))
+                }),
+            )),
+            Op::Correct { customer, addr, .. } => Some((customer % CUSTOMERS, addr)),
+            Op::Release { customer, addr, .. } => Some((
+                customer % CUSTOMERS,
+                addr.unwrap_or_else(|| {
+                    self.held_by(customer % CUSTOMERS)
+                        .map_or(first, |(value, _)| as_addr(value))
+                }),
+            )),
             Op::RetractRelease { customer, addr, .. } => {
                 let named = match target {
                     Some(Position::Index(index)) => Some(self.log[index]),
@@ -347,13 +386,10 @@ impl Model {
                         base: event.value.base,
                         spelling: event.value.spelling,
                     }))
-                    .unwrap_or(Addr {
-                        base: 0,
-                        spelling: 0,
-                    }),
+                    .unwrap_or(first),
                 ))
             }
-            _ => None,
+            Op::RetractAny { .. } => None,
         };
         let call = op.call();
         let scope = call
@@ -365,10 +401,10 @@ impl Model {
             return Step {
                 expected: Expected::Deduplicated(recorded.clone()),
                 target,
-                release_args,
+                args,
             };
         }
-        let expected = self.decide(op, target, release_args);
+        let expected = self.decide(op, target, args);
         if let Expected::Accepted(events) = &expected {
             let first = self.log.len();
             self.log.extend(events.iter().copied());
@@ -380,19 +416,20 @@ impl Model {
         Step {
             expected,
             target,
-            release_args,
+            args,
         }
     }
 
-    fn decide(
-        &self,
-        op: Op,
-        target: Option<Position>,
-        release_args: Option<(u8, Addr)>,
-    ) -> Expected {
+    fn decide(&self, op: Op, target: Option<Position>, args: Option<(u8, Addr)>) -> Expected {
+        let (customer, addr) = args.unwrap_or((
+            0,
+            Addr {
+                base: 0,
+                spelling: 0,
+            },
+        ));
         match op {
-            Op::Register { customer, addr, .. } => {
-                let customer = customer % CUSTOMERS;
+            Op::Register { .. } => {
                 let value = self.value(addr);
                 if matches!(self.holder(value), Some((holder, _)) if holder != customer) {
                     return Expected::Rejected("email_taken");
@@ -406,8 +443,7 @@ impl Model {
                     value,
                 }])
             }
-            Op::Correct { customer, addr, .. } => {
-                let customer = customer % CUSTOMERS;
+            Op::Correct { .. } => {
                 let value = self.value(addr);
                 if matches!(self.holder(value), Some((holder, _)) if holder != customer) {
                     return Expected::Rejected("email_taken");
@@ -428,8 +464,7 @@ impl Model {
                     },
                 ])
             }
-            Op::Release { customer, addr, .. } => {
-                let customer = customer % CUSTOMERS;
+            Op::Release { .. } => {
                 let value = self.value(addr);
                 if !matches!(self.holder(value), Some((holder, _)) if holder == customer) {
                     return Expected::Rejected("not_held");
@@ -441,7 +476,6 @@ impl Model {
                 }])
             }
             Op::RetractRelease { .. } => {
-                let (customer, addr) = release_args.expect("resolved in apply");
                 let payload_value = self.value(addr);
                 let retracted = self.retracted();
                 let release = match target {
@@ -454,17 +488,18 @@ impl Model {
                     }
                     _ => return Expected::Rejected("not_a_release"),
                 };
-                // What the decision reads of other customers is the payload
-                // address's history, so that is what this is about.
+                // Any claim of the released address since, the customer's own
+                // too. The decision sees another customer's events only
+                // through the payload's address.
+                let released = self.log[release];
                 if self.standing().any(|(index, event)| {
                     index > release
                         && event.kind == Kind::Claimed
-                        && event.customer != customer
-                        && event.value == payload_value
+                        && event.value == released.value
+                        && (event.customer == customer || event.value == payload_value)
                 }) {
                     return Expected::Rejected("value_taken_since");
                 }
-                let released = self.log[release];
                 if matches!(self.held_by(customer), Some((held, _)) if held != released.value) {
                     return Expected::Rejected("already_holds_a_value");
                 }

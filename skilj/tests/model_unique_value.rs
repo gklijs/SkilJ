@@ -30,7 +30,8 @@ mod unique_crm;
 use std::collections::HashMap;
 
 use proptest::prelude::*;
-use proptest::test_runner::FileFailurePersistence;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::{FileFailurePersistence, TestRng, TestRunner};
 use skilj::SkiljBuilder;
 use skilj_core::db::{self, Pool, SubmitCommandOutcome};
 use skilj_core::event_cache::EventCache;
@@ -39,7 +40,10 @@ use unique_crm::model::{
     customer_id, Addr, Call, Expected, Kind, Logged, Model, Op, Position, Target, Value, Variant,
     BASES, CLIENTS, CUSTOMERS, KEYS, SPELLINGS,
 };
-use unique_crm::{bounded_context, runtime, Blind, EmailTagging, Plain};
+use unique_crm::{
+    bounded_context, runtime, Blind, EmailTagging, Plain, IGNORES_CLAIMS_SINCE, IGNORES_HELD,
+    IGNORES_RELEASES, NO_DEFECT,
+};
 
 static TEST_DB: tokio::sync::OnceCell<Option<(String, Pool)>> = tokio::sync::OnceCell::const_new();
 
@@ -68,18 +72,43 @@ fn env_number(name: &str, default: u32) -> u32 {
 /// model. `Err` says which step disagreed and how; `Ok` also when there is no
 /// database, after `skipping:` was printed for CI's guard.
 async fn run_history(variant: Variant, ops: &[Op]) -> Result<(), String> {
+    run_planted(variant, ops, Plant::NONE).await
+}
+
+/// A defect planted for a run, to check that the comparison catches it.
+#[derive(Clone, Copy, Debug)]
+struct Plant {
+    /// One of `unique_crm`'s defects, planted in the command it names.
+    defect: u8,
+    /// Submit without the idempotency key, as a retry layer losing it would.
+    drop_keys: bool,
+}
+
+impl Plant {
+    const NONE: Plant = Plant {
+        defect: NO_DEFECT,
+        drop_keys: false,
+    };
+}
+
+async fn run_planted(variant: Variant, ops: &[Op], plant: Plant) -> Result<(), String> {
     match variant {
-        Variant::Blind => run_history_as::<Blind>(variant, ops).await,
-        Variant::Plain => run_history_as::<Plain>(variant, ops).await,
+        Variant::Blind => run_history_as::<Blind>(variant, ops, plant).await,
+        Variant::Plain => run_history_as::<Plain>(variant, ops, plant).await,
     }
 }
 
-async fn run_history_as<V: EmailTagging>(variant: Variant, ops: &[Op]) -> Result<(), String> {
+async fn run_history_as<V: EmailTagging>(
+    variant: Variant,
+    ops: &[Op],
+    plant: Plant,
+) -> Result<(), String> {
     let Some((database_url, pool)) = test_db().await else {
         return Ok(());
     };
     let (bc, subject) = bounded_context(&pool).await;
-    let builder: SkiljBuilder = unique_crm::builder::<V>(&database_url, &bc, &subject);
+    let builder: SkiljBuilder =
+        unique_crm::builder_with_defect::<V>(&database_url, &bc, &subject, plant.defect);
     let (skilj, _) = builder.retractions().build().await.unwrap();
     let cache = EventCache::new(1000);
     let target = unique_crm::Target {
@@ -88,7 +117,9 @@ async fn run_history_as<V: EmailTagging>(variant: Variant, ops: &[Op]) -> Result
         bc: &bc,
         cache: &cache,
     };
-    let result = Checker::new(variant, &pool, &bc).run(target, ops).await;
+    let mut checker = Checker::new(variant, &pool, &bc);
+    checker.drop_keys = plant.drop_keys;
+    let result = checker.run(target, ops).await;
     skilj.shutdown(std::time::Duration::from_secs(10)).await;
     db::hard_delete_bounded_context(&pool, &bc).await.unwrap();
     result
@@ -103,6 +134,8 @@ struct Checker<'a> {
     sequences: Vec<i64>,
     /// The hash a blind tag gave each address.
     hashes: HashMap<Value, String>,
+    /// A planted defect: submit every command without its key.
+    drop_keys: bool,
 }
 
 impl<'a> Checker<'a> {
@@ -114,6 +147,7 @@ impl<'a> Checker<'a> {
             model: Model::new(variant),
             sequences: Vec::new(),
             hashes: HashMap::new(),
+            drop_keys: false,
         }
     }
 
@@ -141,13 +175,12 @@ impl<'a> Checker<'a> {
     async fn step(&mut self, target: unique_crm::Target<'_>, op: Op) -> Result<(), String> {
         let step = self.model.apply(op);
         let payload = match op {
-            Op::Register { customer, addr, .. }
-            | Op::Correct { customer, addr, .. }
-            | Op::Release { customer, addr, .. } => {
+            Op::Register { .. } | Op::Correct { .. } | Op::Release { .. } => {
+                let (customer, addr) = step.args.expect("resolved");
                 serde_json::json!({ "customer_id": customer_id(customer), "email": addr.text() })
             }
             Op::RetractRelease { .. } => {
-                let (customer, addr) = step.release_args.expect("resolved");
+                let (customer, addr) = step.args.expect("resolved");
                 serde_json::json!({
                     "customer_id": customer_id(customer),
                     "email": addr.text(),
@@ -164,7 +197,7 @@ impl<'a> Checker<'a> {
                 op.command_type(),
                 payload.clone(),
                 &call.client_id(),
-                call.key().as_deref(),
+                call.key().filter(|_| !self.drop_keys).as_deref(),
             )
             .await;
         let mismatch = |why: String| {
@@ -338,8 +371,11 @@ fn replay(variant: Variant, ops: Vec<Op>) {
 
 // ---- Generating histories --------------------------------------------------
 
+/// Mostly the canonical spelling, so a plain tag's histories meet the same
+/// address often enough to contend for it; the others a third of the time.
 fn addr() -> impl Strategy<Value = Addr> {
-    (0..BASES, 0..SPELLINGS).prop_map(|(base, spelling)| Addr { base, spelling })
+    let spelling = prop_oneof![4 => Just(0), 1 => Just(1), 1 => Just(SPELLINGS - 1)];
+    (0..BASES, spelling).prop_map(|(base, spelling)| Addr { base, spelling })
 }
 
 fn call() -> impl Strategy<Value = Call> {
@@ -350,11 +386,11 @@ fn call() -> impl Strategy<Value = Call> {
 fn op() -> impl Strategy<Value = Op> {
     let customer = 0..CUSTOMERS;
     prop_oneof![
-        4 => (customer.clone(), addr(), call())
+        4 => (customer.clone(), prop_oneof![1 => addr().prop_map(Some), 1 => Just(None)], call())
             .prop_map(|(customer, addr, call)| Op::Register { customer, addr, call }),
         2 => (customer.clone(), addr(), call())
             .prop_map(|(customer, addr, call)| Op::Correct { customer, addr, call }),
-        3 => (customer.clone(), addr(), call())
+        3 => (customer.clone(), prop_oneof![1 => addr().prop_map(Some), 3 => Just(None)], call())
             .prop_map(|(customer, addr, call)| Op::Release { customer, addr, call }),
         3 => (
             prop_oneof![3 => Just(None), 1 => customer.clone().prop_map(Some)],
@@ -423,7 +459,7 @@ fn at(base: u8, spelling: u8) -> Addr {
 fn register(customer: u8, addr: Addr) -> Op {
     Op::Register {
         customer,
-        addr,
+        addr: Some(addr),
         call: UNKEYED,
     }
 }
@@ -439,7 +475,7 @@ fn correct(customer: u8, addr: Addr) -> Op {
 fn release(customer: u8, addr: Addr) -> Op {
     Op::Release {
         customer,
-        addr,
+        addr: Some(addr),
         call: UNKEYED,
     }
 }
@@ -585,11 +621,11 @@ fn the_model_retracts_a_release_only_while_nobody_else_claimed_since() {
         release(0, at(0, 0)),
         register(1, at(0, 1)),
         release(1, at(0, 0)),
-        // The releases: customer 0's retracted one, customer 0's second, which
-        // customer 1 claimed the address after, and customer 1's.
-        retract_release(1),
+        // The releases still standing: customer 0's second, which customer 1
+        // claimed the address after, and customer 1's.
+        retract_release(0),
         register(1, at(1, 0)),
-        retract_release(2),
+        retract_release(1),
     ];
     assert_eq!(
         answers(Variant::Blind, &ops),
@@ -726,6 +762,143 @@ fn a_fixed_history_of_every_operation_matches_the_model() {
         keyed(correct(2, at(3, 0)), 1, 2),
         keyed(correct(2, at(3, 0)), 1, 2),
     ];
+    replay(Variant::Blind, ops.clone());
+    replay(Variant::Plain, ops);
+}
+
+// ---- Whether the property can fail -----------------------------------------
+
+/// `count` histories as the property generates them, the same every run.
+fn sample_histories(count: usize) -> Vec<Vec<Op>> {
+    let mut runner = TestRunner::new_with_rng(
+        ProptestConfig::default(),
+        TestRng::deterministic_rng(proptest::test_runner::RngAlgorithm::ChaCha),
+    );
+    let strategy = history();
+    (0..count)
+        .map(|_| strategy.new_tree(&mut runner).unwrap().current())
+        .collect()
+}
+
+/// The generated histories reach every answer the domain and the store can
+/// give, each a few times, so the property is never about the easy cases only.
+#[test]
+fn generated_histories_reach_every_outcome() {
+    for variant in [Variant::Blind, Variant::Plain] {
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        for ops in sample_histories(300) {
+            for answer in answers(variant, &ops) {
+                *seen
+                    .entry(answer.split(' ').next().unwrap().to_string())
+                    .or_default() += 1;
+            }
+        }
+        eprintln!("{variant:?}: {seen:?}");
+        for expected in [
+            "accepted",
+            "deduplicated",
+            "email_taken",
+            "already_holds_a_value",
+            "nothing_to_correct",
+            "not_held",
+            "not_a_release",
+            "value_taken_since",
+            "retraction_target_mismatch",
+            "retraction_target_not_found",
+            "retraction_of_retraction",
+            "already_retracted",
+        ] {
+            let count = seen.get(expected).copied().unwrap_or(0);
+            assert!(
+                count >= 5,
+                "{variant:?}: generated histories answer {expected} {count} times; seen {seen:?}"
+            );
+        }
+    }
+}
+
+/// Runs the property itself with `plant`, and says whether it failed within
+/// the PR budget of histories. Shrinking is skipped: finding it is the point.
+fn property_catches(plant: Plant) -> bool {
+    let config = ProptestConfig {
+        cases: 32,
+        max_shrink_iters: 0,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    };
+    let mut runner = TestRunner::new_with_rng(
+        config.clone(),
+        TestRng::deterministic_rng(config.rng_algorithm),
+    );
+    // No database: `skipping:` was printed, which CI fails on.
+    if runtime().block_on(test_db()).is_none() {
+        return true;
+    }
+    runner
+        .run(&history(), |ops| {
+            let result = runtime().block_on(run_planted(Variant::Blind, &ops, plant));
+            prop_assert!(result.is_ok(), "{}", result.unwrap_err());
+            Ok(())
+        })
+        .is_err()
+}
+
+#[test]
+fn the_property_catches_a_registration_ignoring_what_the_customer_holds() {
+    assert!(property_catches(Plant {
+        defect: IGNORES_HELD,
+        drop_keys: false,
+    }));
+}
+
+#[test]
+fn the_property_catches_a_registration_query_missing_releases() {
+    assert!(property_catches(Plant {
+        defect: IGNORES_RELEASES,
+        drop_keys: false,
+    }));
+}
+
+#[test]
+fn the_property_catches_a_release_retraction_ignoring_later_claims() {
+    assert!(property_catches(Plant {
+        defect: IGNORES_CLAIMS_SINCE,
+        drop_keys: false,
+    }));
+}
+
+#[test]
+fn the_property_catches_a_retry_that_drops_its_key() {
+    assert!(property_catches(Plant {
+        defect: NO_DEFECT,
+        drop_keys: true,
+    }));
+}
+
+/// Found by the model: a release retracted after its customer claimed the
+/// address again left two standing claims of it, and a correction retracting
+/// the newer one left the customer holding the old address and the new.
+#[test]
+fn a_release_retracted_after_its_customer_reclaimed_the_address() {
+    let ops = vec![
+        register(2, at(0, 0)),
+        release(2, at(0, 0)),
+        register(2, at(0, 0)),
+        retract_release(0),
+        correct(2, at(2, 0)),
+        register(0, at(0, 0)),
+    ];
+    assert_eq!(
+        answers(Variant::Blind, &ops),
+        [
+            "accepted",
+            "accepted",
+            "accepted",
+            "value_taken_since",
+            "accepted",
+            "accepted",
+        ]
+    );
     replay(Variant::Blind, ops.clone());
     replay(Variant::Plain, ops);
 }

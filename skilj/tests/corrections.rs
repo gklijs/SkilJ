@@ -543,11 +543,12 @@ fn a_reused_key_with_another_payload_answers_with_the_first_submissions_events()
     });
 }
 
-/// A retracted release gives the address back, so it is refused once another
-/// customer has claimed the address since, even when that customer released it
-/// again: the release's customer would otherwise see the old claim standing.
+/// A retracted release gives the address back, so it is refused once anyone
+/// has claimed the address since, even when that claim was released again:
+/// the release's customer would otherwise see the old claim standing, next to
+/// another's or next to their own.
 #[test]
-fn a_release_is_retracted_only_while_nobody_else_has_claimed_the_address() {
+fn a_release_is_retracted_only_while_nobody_has_claimed_the_address_since() {
     runtime().block_on(async {
         let Some(crm) = crm().await else {
             return;
@@ -571,6 +572,14 @@ fn a_release_is_retracted_only_while_nobody_else_has_claimed_the_address() {
                 .await,
             "not_a_release",
             "the release no longer stands"
+        );
+        assert_eq!(crm.release(&alice, "kept@example.com").await, "accepted");
+        let again = crm.latest_position().await;
+        assert_eq!(crm.register(&alice, "kept@example.com").await, "accepted");
+        assert_eq!(
+            crm.retract_release(&alice, "kept@example.com", again).await,
+            "value_taken_since",
+            "alice claimed it again herself: two claims would stand"
         );
 
         let (carol, dave) = (id("c"), id("c"));
