@@ -5,7 +5,8 @@
 ## so the scripts they call (scripts/ci-test.sh and the Postgres scripts
 ## behind it) see the same Debian container, running as root, that they
 ## were written against. The independent checks are separate jobs and run
-## in parallel. Each test shard and the coverage job has its own database.
+## in parallel. Each test shard has its own database. Line coverage runs
+## in its own workflow, coverage.yml, so a main push isn't held up by it.
 ##
 ## Most Rust caches are saved on main and read by PRs. Semver is PR-only
 ## and saves a PR-scoped cache so subsequent updates can reuse it.
@@ -453,91 +454,3 @@ jobs:
           RESULT: ${{ needs.test-suites.result }}
           POSTGRES_RESULT: ${{ needs.postgres-compatibility.result }}
         run: test "$RESULT" = success && test "$POSTGRES_RESULT" = success
-
-  # Line coverage of the same run as `test`, reported in the job summary
-  # and attached as lcov. Informational: it never fails the build, and
-  # there is no threshold until there is a baseline to hold.
-  coverage:
-    # Instrumented builds run separately on main and on explicit dispatch.
-    # Every PR still runs the full uninstrumented suite through test-suites.
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
-    continue-on-error: true
-    container:
-      image: rust:1-bookworm
-      # The runner's preinstalled SDKs, mounted so the first step can
-      # delete them: the workspace's ~110 integration-test binaries ran a
-      # CI disk full before (see CARGO_PROFILE_DEV_DEBUG below), and these
-      # directories are most of the runner's used space.
-      volumes:
-        - /usr/share/dotnet:/host/dotnet
-        - /usr/local/lib/android:/host/android
-        - /opt/ghc:/host/ghc
-        - /opt/hostedtoolcache/CodeQL:/host/codeql
-    # The Postgres the tests run against. A service's name is its
-    # hostname from inside a container job, and the health check makes
-    # the job wait until it accepts connections.
-    services:
-      skilj-postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          # Trust removes any client/server password mismatch, which is
-          # invisible from the job's side. Safe for what this is: a
-          # per-job container on a private network with no published
-          # ports, holding throwaway test databases.
-          POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    env:
-      # ci-test.sh reads this to find the service; its credentials default
-      # to postgres/postgres/postgres, which is also what the service gets.
-      CI_POSTGRES_HOST: skilj-postgres
-      # Disk, not speed: no run reuses the incremental cache, and line
-      # tables keep file:line in panic backtraces while dropping the
-      # variable/type debug info that is most of each binary's size.
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
-    steps:
-      - name: Free runner disk space
-        run: rm -rf /host/dotnet/* /host/android/* /host/ghc/* /host/codeql/* && df -h /
-      - uses: actions/checkout@v5
-      # cmake: skilj-kafka's rdkafka vendors librdkafka via cmake.
-      # `postgresql` is the server: the
-      # failover test (skilj_test_support::FailoverServer, docs/architecture.md
-      # §176) runs a primary and a standby of its own, as the `postgres`
-      # user this package creates, since Postgres refuses to run as root.
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake postgresql-client postgresql
-      # Settle the database first, so a missing one shows in seconds
-      # rather than after the whole workspace is built. Prefers the
-      # service and falls back to a Postgres inside this container.
-      - run: bash scripts/ci-test.sh --setup-only
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov@0.6.16
-      - run: rustup component add llvm-tools-preview
-      - name: Test with coverage
-        env:
-          CI_CARGO_TEST: cargo llvm-cov --no-report
-        run: bash scripts/ci-test.sh
-      - name: Report
-        run: |
-          cargo llvm-cov report --lcov --output-path lcov.info
-          {
-            echo '### Line coverage'
-            echo '```'
-            cargo llvm-cov report --summary-only --ignore-filename-regex '(/tests/|skilj-demo|skilj-test)'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v6
-        with:
-          name: lcov
-          path: lcov.info
