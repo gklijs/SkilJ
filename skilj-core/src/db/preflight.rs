@@ -794,13 +794,9 @@ pub(crate) async fn inspect(
 /// (docs/architecture.md §158). `lock_timeout` applies to waiting for it.
 pub async fn upgrade_bounded_context(pool: &Pool, bc: &BoundedContext) -> crate::error::Result<()> {
     match upgrade_bounded_context_once(pool, bc).await {
-        Err(err) if lost_a_concurrent_creation(&err) => {
-            tracing::debug!(
-                bounded_context = %bc.name,
-                error = %err,
-                "another process patched the same object at the same time; patching again under a lock"
-            );
-        }
+        // Lost to another process patching the same object: again under
+        // the lock, below.
+        Err(err) if lost_a_concurrent_creation(&err) => {}
         other => return other,
     }
     // Dropped - closed - when this returns or is cancelled, which releases
@@ -808,8 +804,8 @@ pub async fn upgrade_bounded_context(pool: &Pool, bc: &BoundedContext) -> crate:
     let mut lock =
         <sqlx::postgres::PgConnection as sqlx::Connection>::connect_with(&pool.connect_options())
             .await?;
-    sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
-        .bind(format!("skilj_upgrade_bounded_context:{}", bc.name))
+    sqlx::query("SELECT pg_advisory_lock(hashtext('skilj_upgrade_bounded_context:' || $1))")
+        .bind(&bc.name)
         .execute(&mut lock)
         .await?;
     let outcome = upgrade_bounded_context_retrying(pool, bc).await;
