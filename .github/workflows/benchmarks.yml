@@ -36,7 +36,7 @@ on:
         required: false
         default: "3"
       candidate_env:
-        description: "Space-separated K=V for the candidate's runs, e.g. SKILJ_BENCH_SLOWDOWN_US=1000"
+        description: "Space-separated K=V for the candidate's runs, e.g. SKILJ_BENCH_SLOWDOWN_US=1000 SKILJ_BENCH_LATENCY_MS=2"
         required: false
         default: ""
 

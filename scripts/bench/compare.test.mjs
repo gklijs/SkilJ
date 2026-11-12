@@ -19,7 +19,8 @@ const FAKE = `
 import { appendFileSync } from 'node:fs';
 const [benchmark, scenarios] = [process.env.FAKE_BENCHMARK, process.env.FAKE_SCENARIOS.split(',')];
 const env = process.env;
-if (env.FAKE_SKIP === benchmark) { console.error('skipping: no test database'); console.log('test x ... ok'); process.exit(0); }
+if (env.FAKE_SKIP === benchmark) { console.error('skipping: no test database'); console.log('test result: ok. 1 passed; 0 failed'); process.exit(0); }
+if (env.FAKE_FILTERED === benchmark) { console.log('test result: ok. 0 passed; 0 failed; 1 filtered out'); process.exit(0); }
 if (env.FAKE_CRASH === benchmark) { console.error('thread panicked'); process.exit(101); }
 let seed = [...env.SKILJ_BENCH_RECORD].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
 const noise = () => { seed = (seed * 1103515245 + 12345) >>> 0; return 1 + ((seed % 1000) / 1000 - 0.5) * 0.04; };
@@ -43,7 +44,7 @@ if (env.FAKE_INCOMPLETE !== benchmark) {
   write({ kind: 'complete', scenarios: count, peak_rss_kb: 51200,
     environment: { postgres: { fsync: env.FAKE_FSYNC ?? 'on', synchronous_commit: 'on', full_page_writes: 'on', server_version: '17.6' } } });
 }
-console.log('test x ... ok');
+console.log('test result: ok. 1 passed; 0 failed');
 `;
 
 function fakeBinaries(t) {
@@ -126,6 +127,7 @@ for (const [name, env, message] of [
   ['a missing workload', { FAKE_DROP: 'hot/8w' }, /scenario hot\/8w recorded 0 times/],
   ['a short sample count', { FAKE_SHORT: 'trigger/8p' }, /49 of 50 operations/],
   ['a run that did not finish', { FAKE_INCOMPLETE: 'command_throughput' }, /did not finish/],
+  ['a binary whose test was filtered out', { FAKE_FILTERED: 'inbound_throughput' }, /test did not run/],
 ]) {
   test(`${name} fails the comparison`, t => {
     const dir = fakeBinaries(t);

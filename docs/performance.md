@@ -318,14 +318,30 @@ commit from before these records existed cannot be a baseline: its runs
 write nothing, which fails the comparison.
 
 To check that the report can see a regression at all, slow the candidate
-down by a known amount: `SKILJ_BENCH_SLOWDOWN_US` adds at least that many
-microseconds inside every measured request (and to every event a projection
-folds).
+down by a known amount. Where the delay lands decides whether it shows:
+
+- `SKILJ_BENCH_SLOWDOWN_US` adds at least that many microseconds to every
+  measured request, before skilj handles it, and to every event a
+  projection folds. It shows in the inbound and projection scenarios. The
+  8-caller command scenarios absorb it: they are bound by the bounded
+  context's lock, and a caller delayed outside the lock just queues less.
+- `SKILJ_BENCH_LATENCY_MS` (command_throughput's existing network
+  round trip, above) delays every Postgres round trip, including those
+  under the lock, and shows in every command scenario.
 
 ```sh
 node scripts/bench/compare.mjs --baseline HEAD --candidate HEAD \
-  --candidate-env SKILJ_BENCH_SLOWDOWN_US=1000
+  --candidate-env SKILJ_BENCH_SLOWDOWN_US=1000 --candidate-env SKILJ_BENCH_LATENCY_MS=2
 ```
+
+On a 2-vCPU machine against Postgres 16 with durable settings (3 trials, 1
+round, 400 commands), 1 ms of `SKILJ_BENCH_SLOWDOWN_US` was reported as
+slower for `external/1p`, `trigger/1p`, `trigger/8p` and all four projection
+scenarios, and as within noise for `external/8p` and the command scenarios;
+2 ms of `SKILJ_BENCH_LATENCY_MS` was reported as slower for all four command
+scenarios (-51% to -78%). The same commit against itself varied by up to 36%
+(coefficient of variation) per scenario there, which is the noise a verdict
+has to clear.
 
 `.github/workflows/benchmarks.yml` runs the same comparison weekly, main
 against main as it was 7 days earlier, and on manual dispatch with any two
