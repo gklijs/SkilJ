@@ -180,7 +180,11 @@ far as a test exercises them, and some aren't checked at all
   ways assert the exact count, and the free race must overlap in the store
   at least once in 20 groups (it did in 20 of 20 locally). Fixed histories
   pin two claims of one address at once, one key twice at once, and a
-  release retraction racing a claim, each all three ways.
+  release retraction racing a claim, each all three ways. The sequential
+  steps go through `db::decide_and_submit_command`, the direct path
+  internal callers use; the groups go through it when racing and through
+  `CommandBatcher`, the path GraphQL and REST use, when prepared. Making a
+  single command a batch of one would leave one path to test.
 - **Blind tags** (§205): `skilj/tests/blind_tags.rs` checks that a blind
   value appears in no stored tag, query or payload, that racing claims
   accept one, and that erasure removes the hash from the database and
