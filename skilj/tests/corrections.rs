@@ -28,105 +28,44 @@ use skilj_core::shared::{
 };
 use skilj_test_fixture::corrections::{all_races, UniqueValueCommands};
 
-struct Email;
+mod unique_crm;
 
-impl BlindTag for Email {
-    const TAG_KEY: &'static str = "email";
-    const ERASURE: BlindErasure = BlindErasure::with_subject("customer");
-    fn normalize(value: &str) -> String {
-        normalize::email(value)
-    }
-}
+use unique_crm::{
+    bounded_context, claim, claims, customer, master_key, now, runtime, taken, Blind, Email,
+    EmailPayload, EmailTagging, RetractAny, RetractPayload, CLAIMS_AND_RELEASES,
+};
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct EmailPayload {
-    customer_id: String,
-    email: String,
-}
-
-fn customer() -> TagMapping {
-    TagMapping::new("customer", "customer_id")
-}
+// This file's tests are of the blind variant, under the names they had before
+// the domain moved to `unique_crm`.
+type EmailClaimed = unique_crm::EmailClaimed<Blind>;
+type EmailReleased = unique_crm::EmailReleased<Blind>;
+type RegisterCustomer = unique_crm::RegisterCustomer<Blind>;
+type CorrectEmail = unique_crm::CorrectEmail<Blind>;
+type ReleaseEmail = unique_crm::ReleaseEmail<Blind>;
+use unique_crm::CustomerEvent;
 
 fn email() -> TagMapping {
-    TagMapping::blind::<Email>("email")
+    Blind::email()
 }
 
 fn encrypted_email() -> Vec<SensitiveField> {
-    vec![SensitiveField::new("email", "customer", "customer_id")]
+    Blind::sensitive_fields()
 }
 
-struct EmailClaimed;
-
-impl EventType for EmailClaimed {
-    type Payload = EmailPayload;
-    const NAME: &'static str = "EmailClaimed";
-    fn tag_mappings() -> Vec<TagMapping> {
-        vec![customer(), email()]
-    }
-    fn sensitive_fields() -> Vec<SensitiveField> {
-        encrypted_email()
-    }
+fn builder(database_url: &str, bc: &str, subject: &str) -> SkiljBuilder {
+    unique_crm::builder::<Blind>(database_url, bc, subject).command_type::<ImportClaim>()
 }
 
-struct EmailReleased;
+/// Claims an address with only the address's own rule, so one customer can
+/// hold several: a history imported from elsewhere, for the snapshot tests
+/// below, which count a customer's claims. [`RegisterCustomer`] holds a
+/// customer to one.
+struct ImportClaim;
 
-impl EventType for EmailReleased {
-    type Payload = EmailPayload;
-    const NAME: &'static str = "EmailReleased";
-    fn tag_mappings() -> Vec<TagMapping> {
-        vec![customer(), email()]
-    }
-    fn sensitive_fields() -> Vec<SensitiveField> {
-        encrypted_email()
-    }
-}
-
-/// Which of the two it is; a decision goes by tags, not by the address.
-enum CustomerEvent {
-    Claimed,
-    Released,
-}
-
-impl BoundedContextEvent for CustomerEvent {
-    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
-        match event.event_type.name.as_str() {
-            "EmailClaimed" => Some(Ok(CustomerEvent::Claimed)),
-            "EmailReleased" => Some(Ok(CustomerEvent::Released)),
-            _ => None,
-        }
-    }
-}
-
-fn claims(events: &[Retractable<CustomerEvent>]) -> ValueClaims<'_, CustomerEvent> {
-    ValueClaims::fold(events, "email", |event| match event {
-        CustomerEvent::Claimed => ValueEffect::Claims,
-        CustomerEvent::Released => ValueEffect::Releases,
-    })
-}
-
-fn taken() -> CommandDecision {
-    CommandDecision::Rejected {
-        reason: "this email address is taken".into(),
-        kind: "email_taken".into(),
-    }
-}
-
-fn claim(payload: &EmailPayload) -> EventSpec {
-    EventSpec {
-        event_type: "EmailClaimed".into(),
-        payload: serde_json::to_value(payload).unwrap(),
-    }
-}
-
-const CLAIMS_AND_RELEASES: [&str; 2] = ["EmailClaimed", "EmailReleased"];
-
-struct RegisterCustomer;
-
-impl CommandType for RegisterCustomer {
+impl CommandType for ImportClaim {
     type Payload = EmailPayload;
     type Event = Retractable<CustomerEvent>;
-    const NAME: &'static str = "RegisterCustomer";
+    const NAME: &'static str = "ImportClaim";
     fn tag_mappings() -> Vec<TagMapping> {
         vec![customer(), email()]
     }
@@ -142,99 +81,6 @@ impl CommandType for RegisterCustomer {
         }
         CommandDecision::Accepted {
             events: vec![claim(payload)],
-        }
-    }
-}
-
-struct CorrectEmail;
-
-impl CommandType for CorrectEmail {
-    type Payload = EmailPayload;
-    type Event = Retractable<CustomerEvent>;
-    const NAME: &'static str = "CorrectEmail";
-    fn tag_mappings() -> Vec<TagMapping> {
-        vec![customer(), email()]
-    }
-    fn sensitive_fields() -> Vec<SensitiveField> {
-        encrypted_email()
-    }
-    fn consistency_query() -> Vec<QueryItemMapping> {
-        correction_query(&CLAIMS_AND_RELEASES, customer(), email())
-    }
-    fn decide(payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
-        let claims = claims(events);
-        if claims
-            .held_by_another("customer", &payload.customer_id)
-            .is_some()
-        {
-            return taken();
-        }
-        let Some(current) = claims.held_by("customer", &payload.customer_id) else {
-            return CommandDecision::Rejected {
-                reason: "this customer holds no address to correct".into(),
-                kind: "nothing_to_correct".into(),
-            };
-        };
-        corrected(
-            current.position,
-            RetractionGround::WrongDataSubmitted,
-            "typo",
-            [claim(payload)],
-        )
-    }
-}
-
-/// An ordinary release, not a correction: the address was right, and now
-/// isn't the customer's any more.
-struct ReleaseEmail;
-
-impl CommandType for ReleaseEmail {
-    type Payload = EmailPayload;
-    type Event = Retractable<CustomerEvent>;
-    const NAME: &'static str = "ReleaseEmail";
-    fn tag_mappings() -> Vec<TagMapping> {
-        vec![customer(), email()]
-    }
-    fn sensitive_fields() -> Vec<SensitiveField> {
-        encrypted_email()
-    }
-    fn consistency_query() -> Vec<QueryItemMapping> {
-        claim_query(&CLAIMS_AND_RELEASES, email())
-    }
-    fn decide(payload: &Self::Payload, _events: &[Self::Event]) -> CommandDecision {
-        CommandDecision::Accepted {
-            events: vec![EventSpec {
-                event_type: "EmailReleased".into(),
-                payload: serde_json::to_value(payload).unwrap(),
-            }],
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct RetractPayload {
-    position: i64,
-    #[serde(default)]
-    customer_id: Option<String>,
-}
-
-/// Retracts whatever position it is given, the store being what checks it.
-struct RetractAny;
-
-impl CommandType for RetractAny {
-    type Payload = RetractPayload;
-    type Event = Retractable<CustomerEvent>;
-    const NAME: &'static str = "RetractAny";
-    fn consistency_query() -> Vec<QueryItemMapping> {
-        vec![QueryItemMapping::nothing()]
-    }
-    fn decide(payload: &Self::Payload, _events: &[Self::Event]) -> CommandDecision {
-        CommandDecision::Accepted {
-            events: vec![retract(
-                payload.position,
-                RetractionGround::ProcessedWrongly,
-                "duplicate import",
-            )],
         }
     }
 }
@@ -375,24 +221,6 @@ impl Projection for CurrentClaims {
     }
 }
 
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
-}
-
-fn now() -> chrono::DateTime<chrono::Utc> {
-    use chrono::SubsecRound;
-    chrono::Utc::now().trunc_subsecs(6)
-}
-
-fn master_key() -> KeyService {
-    KeyService::new(skilj_core::encryption::InMemoryKeyProvider::from_bytes(
-        [7; 32],
-    ))
-}
-
-static TEST_DB: tokio::sync::OnceCell<Option<(String, Pool)>> = tokio::sync::OnceCell::const_new();
-
 async fn test_db() -> Option<(String, Pool)> {
     TEST_DB
         .get_or_init(|| async {
@@ -403,64 +231,6 @@ async fn test_db() -> Option<(String, Pool)> {
         })
         .await
         .clone()
-}
-
-/// A fresh bounded context, and the subject of a role with admin access to it.
-async fn bounded_context(pool: &Pool) -> (String, String) {
-    let subject = format!("subject_{}", generate_token_id());
-    let role = Role {
-        id: generate_token_id(),
-        external_subject: subject.clone(),
-        name: "Reconciliation Role".to_string(),
-        superadmin: false,
-        status: RoleStatus::Active,
-        created_at: now(),
-        revoked_at: None,
-    };
-    db::insert_role(pool, &role).await.unwrap();
-    let name = format!("crm_{}", generate_token_id());
-    let bc = BoundedContext {
-        name: name.clone(),
-        status: BoundedContextStatus::Active,
-        created_at: now(),
-        created_by: ContextCreator::SystemCreator,
-        template: None,
-    };
-    db::insert_bounded_context(pool, &bc).await.unwrap();
-    db::insert_role_access_mapping(
-        pool,
-        &RoleAccessMapping {
-            role,
-            bounded_context: bc,
-            level: AccessLevel::Admin,
-            can_read_sensitive: false,
-            scope: None,
-            capabilities: Default::default(),
-            delegable: Default::default(),
-            status: RoleStatus::Active,
-            created_at: now(),
-            revoked_at: None,
-        },
-    )
-    .await
-    .unwrap();
-    (name, subject)
-}
-
-fn builder(database_url: &str, bc: &str, subject: &str) -> SkiljBuilder {
-    Skilj::builder(database_url)
-        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
-        .bounded_context(bc)
-        .blind_tag::<Email>()
-        .blind_index_key(BlindIndexKey::from_bytes([11; 32]))
-        .key_service(master_key())
-        .reconciliation_role(subject)
-        .event_type::<EmailClaimed>()
-        .event_type::<EmailReleased>()
-        .command_type::<RegisterCustomer>()
-        .command_type::<CorrectEmail>()
-        .command_type::<ReleaseEmail>()
-        .command_type::<RetractAny>()
 }
 
 struct Crm {
@@ -509,30 +279,26 @@ fn id(prefix: &str) -> String {
 
 impl Crm {
     async fn submit(&self, name: &str, payload: serde_json::Value) -> String {
-        let command_type = db::get_command_type(&self.pool, &self.bc, name)
-            .await
-            .unwrap()
-            .unwrap();
-        let outcome = db::decide_and_submit_command(
+        kind(&self.submit_keyed(name, payload, None).await)
+    }
+
+    async fn submit_keyed(
+        &self,
+        name: &str,
+        payload: serde_json::Value,
+        idempotency_key: Option<&str>,
+    ) -> SubmitCommandOutcome {
+        unique_crm::submit(
+            &self.skilj,
             &self.pool,
-            &*self.skilj.command_dispatcher(),
-            &*self.skilj.projection_dispatcher(),
-            &*self.skilj.snapshot_dispatcher(),
-            &EventBroadcaster::new(16),
+            &self.bc,
             &self.cache,
-            &command_type,
-            &payload.to_string(),
+            name,
+            payload,
             "client",
-            None,
-            None,
-            Some(&master_key()),
-            now(),
-            None,
-            None,
+            idempotency_key,
         )
         .await
-        .unwrap();
-        kind(&outcome)
     }
 
     async fn register(&self, customer_id: &str, email: &str) -> String {
@@ -546,6 +312,14 @@ impl Crm {
     async fn correct(&self, customer_id: &str, email: &str) -> String {
         self.submit(
             "CorrectEmail",
+            serde_json::json!({ "customer_id": customer_id, "email": email }),
+        )
+        .await
+    }
+
+    async fn release(&self, customer_id: &str, email: &str) -> String {
+        self.submit(
+            "ReleaseEmail",
             serde_json::json!({ "customer_id": customer_id, "email": email }),
         )
         .await
@@ -668,6 +442,169 @@ fn a_correction_to_a_value_someone_holds_is_rejected() {
             "nothing_to_correct"
         );
         crm.shutdown().await;
+    });
+}
+
+/// A customer holds one address: a second registration is refused, and once
+/// the first is released or retracted the customer can register again.
+#[test]
+fn a_customer_holds_at_most_one_address() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let alice = id("c");
+        assert_eq!(crm.register(&alice, "first@example.com").await, "accepted");
+        assert_eq!(
+            crm.register(&alice, "second@example.com").await,
+            "already_holds_a_value"
+        );
+        assert_eq!(
+            crm.register(&alice, "first@example.com").await,
+            "already_holds_a_value",
+            "the customer's own address is held, but not by another"
+        );
+        assert_eq!(crm.release(&alice, "first@example.com").await, "accepted");
+        assert_eq!(crm.register(&alice, "second@example.com").await, "accepted");
+        let second = crm.latest_position().await;
+        assert_eq!(crm.retract(second).await, "accepted");
+        assert_eq!(crm.register(&alice, "third@example.com").await, "accepted");
+        crm.shutdown().await;
+    });
+}
+
+/// Only the holder releases an address, and only the one it holds.
+#[test]
+fn a_release_of_an_address_the_customer_does_not_hold_is_rejected() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (alice, bob) = (id("c"), id("c"));
+        assert_eq!(crm.register(&alice, "alice@example.com").await, "accepted");
+        assert_eq!(crm.release(&bob, "alice@example.com").await, "not_held");
+        assert_eq!(crm.release(&alice, "other@example.com").await, "not_held");
+        assert_eq!(
+            crm.release(&alice, "Alice@Example.com").await,
+            "accepted",
+            "the same address once normalized"
+        );
+        assert_eq!(crm.release(&alice, "alice@example.com").await, "not_held");
+        assert_eq!(crm.register(&bob, "alice@example.com").await, "accepted");
+        crm.shutdown().await;
+    });
+}
+
+/// `ProcessCommand`: a key is matched on its scope alone, the payload is not
+/// compared. A second submission under a key carrying another payload is
+/// answered with the first's events, and what it asked for doesn't happen.
+#[test]
+fn a_reused_key_with_another_payload_answers_with_the_first_submissions_events() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let (alice, bob) = (id("c"), id("c"));
+        let register = |customer: &str, email: &str| {
+            serde_json::json!({ "customer_id": customer, "email": email })
+        };
+        let SubmitCommandOutcome::Accepted { events, .. } = crm
+            .submit_keyed(
+                "RegisterCustomer",
+                register(&alice, "alice@example.com"),
+                Some("signup-1"),
+            )
+            .await
+        else {
+            panic!("a first registration is accepted");
+        };
+        let first: Vec<i64> = events.iter().map(|event| event.sequence).collect();
+
+        let second = crm
+            .submit_keyed(
+                "RegisterCustomer",
+                register(&bob, "bob@example.com"),
+                Some("signup-1"),
+            )
+            .await;
+        let SubmitCommandOutcome::Deduplicated {
+            triggered_event_sequences,
+        } = second
+        else {
+            panic!("the key was accepted before, so this is a duplicate: {second:?}");
+        };
+        assert_eq!(triggered_event_sequences, first);
+        assert_eq!(crm.events().await.len(), 1, "nothing was appended");
+        assert_eq!(
+            crm.register(&id("c"), "bob@example.com").await,
+            "accepted",
+            "bob's address was never claimed"
+        );
+        crm.shutdown().await;
+    });
+}
+
+/// The same domain with an ordinary email tag: the rules hold as they do for
+/// a blind one, the address is stored as given, and since nothing normalizes
+/// it, another spelling is another address.
+#[test]
+fn the_plain_variant_keeps_the_rules_and_stores_the_address() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc, subject) = bounded_context(&pool).await;
+        let (skilj, _) = unique_crm::builder::<unique_crm::Plain>(&database_url, &bc, &subject)
+            .retractions()
+            .build()
+            .await
+            .unwrap();
+        let cache = EventCache::new(1000);
+        let submit = |command: &'static str, customer: String, email: &'static str| {
+            let (skilj, pool, bc, cache) = (&skilj, &pool, &bc, &cache);
+            async move {
+                kind(
+                    &unique_crm::submit(
+                        skilj,
+                        pool,
+                        bc,
+                        cache,
+                        command,
+                        serde_json::json!({ "customer_id": customer, "email": email }),
+                        "client",
+                        None,
+                    )
+                    .await,
+                )
+            }
+        };
+        let (alice, bob) = (id("c"), id("c"));
+        assert_eq!(
+            submit("RegisterCustomer", alice.clone(), "alice@example.com").await,
+            "accepted"
+        );
+        assert_eq!(
+            submit("RegisterCustomer", bob.clone(), "alice@example.com").await,
+            "email_taken"
+        );
+        assert_eq!(
+            submit("RegisterCustomer", bob.clone(), "Alice@example.com").await,
+            "accepted"
+        );
+        assert_eq!(
+            submit("CorrectEmail", alice.clone(), "alice@example.org").await,
+            "accepted"
+        );
+        assert_eq!(
+            submit("ReleaseEmail", alice.clone(), "alice@example.com").await,
+            "not_held"
+        );
+        let events = db::list_events_for_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 4, "two claims, a retraction and a claim");
+        assert_eq!(email_tag(&events[3]), Some("alice@example.org"));
+        skilj.shutdown(std::time::Duration::from_secs(10)).await;
     });
 }
 
@@ -945,14 +882,20 @@ fn a_projection_takes_a_retracted_claim_out_itself() {
 }
 
 impl Crm {
-    /// Registers `count` addresses for a new customer, returning it and their
+    /// Imports `count` addresses for a new customer, returning it and their
     /// positions.
     async fn customer_with_claims(&self, count: usize) -> (String, Vec<i64>) {
         let customer = id("c");
         let mut positions = Vec::new();
         for _ in 0..count {
             let email = format!("{}@example.com", id("e"));
-            assert_eq!(self.register(&customer, &email).await, "accepted");
+            let outcome = self
+                .submit(
+                    "ImportClaim",
+                    serde_json::json!({ "customer_id": customer, "email": email }),
+                )
+                .await;
+            assert_eq!(outcome, "accepted");
             positions.push(self.latest_position().await);
         }
         (customer, positions)

@@ -1,0 +1,433 @@
+//! The unique-email domain of `corrections.rs`, shared with the tests that run
+//! generated histories against it (issue #189): customers claiming an email
+//! address that only one of them may hold, correcting it, releasing it, and an
+//! operator retracting any event by position (docs/architecture.md §235).
+//!
+//! The domain comes in two variants with the same commands and events:
+//! [`Blind`], where the email tag is a blind tag (§205), the address is an
+//! encrypted field, and `decide()` sees only hashes; and [`Plain`], where the
+//! tag carries the address itself. A variant is a type parameter, because a
+//! command's tag mappings are associated functions with no instance to ask.
+//!
+//! The rules, which a generated history is checked against:
+//! - a customer holds at most one address: [`RegisterCustomer`] rejects
+//!   `email_taken` when someone else holds the address, and
+//!   `already_holds_a_value` when the customer holds one already;
+//! - [`CorrectEmail`] replaces the customer's address in one append, a
+//!   retraction and a new claim, and rejects `email_taken` or
+//!   `nothing_to_correct`;
+//! - [`ReleaseEmail`] gives up the address the customer holds, and rejects
+//!   `not_held` when the customer doesn't hold that address;
+//! - [`RetractAny`] retracts whatever position it is given, so the store's
+//!   own retraction checks are what answer it.
+
+// Each test binary that includes this module uses a different part of it.
+#![allow(dead_code)]
+
+use std::marker::PhantomData;
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use skilj::retraction::{
+    claim_query, corrected, correction_query, retract, Retractable, RetractionGround, ValueClaims,
+    ValueEffect,
+};
+use skilj::{
+    normalize, BlindErasure, BlindIndexKey, BlindTag, CommandType, EventType, KeyService, Skilj,
+    SkiljBuilder,
+};
+use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
+use skilj_core::bootstrap::ContextCreator;
+use skilj_core::db::{self, Pool, SubmitCommandOutcome};
+use skilj_core::event_cache::EventCache;
+use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event, EventBroadcaster};
+use skilj_core::plugin::BoundedContextEvent;
+use skilj_core::shared::{
+    generate_token_id, CommandDecision, EventSpec, QueryItemMapping, SensitiveField, TagMapping,
+};
+
+/// The blind tag of the [`Blind`] variant.
+pub struct Email;
+
+impl BlindTag for Email {
+    const TAG_KEY: &'static str = "email";
+    const ERASURE: BlindErasure = BlindErasure::with_subject("customer");
+    fn normalize(value: &str) -> String {
+        normalize::email(value)
+    }
+}
+
+/// How the email tag is stored: the one thing the two variants differ in.
+pub trait EmailTagging: 'static {
+    /// Whether the tag is blind, for a test that checks what was stored.
+    const BLIND: bool;
+    /// The email tag mapping every event and command of the domain uses.
+    fn email() -> TagMapping;
+    /// The domain's sensitive fields.
+    fn sensitive_fields() -> Vec<SensitiveField>;
+    /// What the builder needs for the tag beyond the domain's types.
+    fn configure(builder: SkiljBuilder) -> SkiljBuilder;
+}
+
+/// The email tag is blind and the address encrypted (§205).
+pub struct Blind;
+
+impl EmailTagging for Blind {
+    const BLIND: bool = true;
+    fn email() -> TagMapping {
+        TagMapping::blind::<Email>("email")
+    }
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        vec![SensitiveField::new("email", "customer", "customer_id")]
+    }
+    fn configure(builder: SkiljBuilder) -> SkiljBuilder {
+        builder
+            .blind_tag::<Email>()
+            .blind_index_key(BlindIndexKey::from_bytes([11; 32]))
+    }
+}
+
+/// The email tag carries the address as given, so nothing normalizes it.
+pub struct Plain;
+
+impl EmailTagging for Plain {
+    const BLIND: bool = false;
+    fn email() -> TagMapping {
+        TagMapping::new("email", "email")
+    }
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        Vec::new()
+    }
+    fn configure(builder: SkiljBuilder) -> SkiljBuilder {
+        builder
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EmailPayload {
+    pub customer_id: String,
+    pub email: String,
+}
+
+pub fn customer() -> TagMapping {
+    TagMapping::new("customer", "customer_id")
+}
+
+pub struct EmailClaimed<V>(PhantomData<V>);
+
+impl<V: EmailTagging> EventType for EmailClaimed<V> {
+    type Payload = EmailPayload;
+    const NAME: &'static str = "EmailClaimed";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![customer(), V::email()]
+    }
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        V::sensitive_fields()
+    }
+}
+
+pub struct EmailReleased<V>(PhantomData<V>);
+
+impl<V: EmailTagging> EventType for EmailReleased<V> {
+    type Payload = EmailPayload;
+    const NAME: &'static str = "EmailReleased";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![customer(), V::email()]
+    }
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        V::sensitive_fields()
+    }
+}
+
+/// Which of the two it is; a decision goes by tags, not by the address.
+pub enum CustomerEvent {
+    Claimed,
+    Released,
+}
+
+impl BoundedContextEvent for CustomerEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "EmailClaimed" => Some(Ok(CustomerEvent::Claimed)),
+            "EmailReleased" => Some(Ok(CustomerEvent::Released)),
+            _ => None,
+        }
+    }
+}
+
+pub const CLAIMS_AND_RELEASES: [&str; 2] = ["EmailClaimed", "EmailReleased"];
+
+pub fn claims(events: &[Retractable<CustomerEvent>]) -> ValueClaims<'_, CustomerEvent> {
+    ValueClaims::fold(events, "email", |event| match event {
+        CustomerEvent::Claimed => ValueEffect::Claims,
+        CustomerEvent::Released => ValueEffect::Releases,
+    })
+}
+
+pub fn taken() -> CommandDecision {
+    CommandDecision::Rejected {
+        reason: "this email address is taken".into(),
+        kind: "email_taken".into(),
+    }
+}
+
+pub fn claim(payload: &EmailPayload) -> EventSpec {
+    EventSpec {
+        event_type: "EmailClaimed".into(),
+        payload: serde_json::to_value(payload).unwrap(),
+    }
+}
+
+/// A customer claims an address nobody holds. It reads the customer's own
+/// claims as well as the address's, so a customer holds at most one.
+pub struct RegisterCustomer<V>(PhantomData<V>);
+
+impl<V: EmailTagging> CommandType for RegisterCustomer<V> {
+    type Payload = EmailPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "RegisterCustomer";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![customer(), V::email()]
+    }
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        V::sensitive_fields()
+    }
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        correction_query(&CLAIMS_AND_RELEASES, customer(), V::email())
+    }
+    fn decide(payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
+        let claims = claims(events);
+        if claims
+            .held_by_another("customer", &payload.customer_id)
+            .is_some()
+        {
+            return taken();
+        }
+        if claims.held_by("customer", &payload.customer_id).is_some() {
+            return CommandDecision::Rejected {
+                reason: "this customer holds an address already; correct it instead".into(),
+                kind: "already_holds_a_value".into(),
+            };
+        }
+        CommandDecision::Accepted {
+            events: vec![claim(payload)],
+        }
+    }
+}
+
+pub struct CorrectEmail<V>(PhantomData<V>);
+
+impl<V: EmailTagging> CommandType for CorrectEmail<V> {
+    type Payload = EmailPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "CorrectEmail";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![customer(), V::email()]
+    }
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        V::sensitive_fields()
+    }
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        correction_query(&CLAIMS_AND_RELEASES, customer(), V::email())
+    }
+    fn decide(payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
+        let claims = claims(events);
+        if claims
+            .held_by_another("customer", &payload.customer_id)
+            .is_some()
+        {
+            return taken();
+        }
+        let Some(current) = claims.held_by("customer", &payload.customer_id) else {
+            return CommandDecision::Rejected {
+                reason: "this customer holds no address to correct".into(),
+                kind: "nothing_to_correct".into(),
+            };
+        };
+        corrected(
+            current.position,
+            RetractionGround::WrongDataSubmitted,
+            "typo",
+            [claim(payload)],
+        )
+    }
+}
+
+/// An ordinary release, not a correction: the address was right, and now
+/// isn't the customer's any more. Only the holder can release it.
+pub struct ReleaseEmail<V>(PhantomData<V>);
+
+impl<V: EmailTagging> CommandType for ReleaseEmail<V> {
+    type Payload = EmailPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "ReleaseEmail";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![customer(), V::email()]
+    }
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        V::sensitive_fields()
+    }
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        claim_query(&CLAIMS_AND_RELEASES, V::email())
+    }
+    fn decide(payload: &Self::Payload, events: &[Self::Event]) -> CommandDecision {
+        // The read holds only this address's events, so a claim the customer
+        // holds among them is a claim of this address.
+        if claims(events)
+            .held_by("customer", &payload.customer_id)
+            .is_none()
+        {
+            return CommandDecision::Rejected {
+                reason: "this customer doesn't hold this address".into(),
+                kind: "not_held".into(),
+            };
+        }
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "EmailReleased".into(),
+                payload: serde_json::to_value(payload).unwrap(),
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RetractPayload {
+    pub position: i64,
+    #[serde(default)]
+    pub customer_id: Option<String>,
+}
+
+/// Retracts whatever position it is given, the store being what checks it.
+pub struct RetractAny;
+
+impl CommandType for RetractAny {
+    type Payload = RetractPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "RetractAny";
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::nothing()]
+    }
+    fn decide(payload: &Self::Payload, _events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![retract(
+                payload.position,
+                RetractionGround::ProcessedWrongly,
+                "duplicate import",
+            )],
+        }
+    }
+}
+
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+}
+
+pub fn now() -> chrono::DateTime<chrono::Utc> {
+    use chrono::SubsecRound;
+    chrono::Utc::now().trunc_subsecs(6)
+}
+
+pub fn master_key() -> KeyService {
+    KeyService::new(skilj_core::encryption::InMemoryKeyProvider::from_bytes(
+        [7; 32],
+    ))
+}
+
+/// A fresh bounded context, and the subject of a role with admin access to it.
+/// Every bounded context has a schema of its own, so its events, its recorded
+/// idempotency keys and its blind index are those of nothing else.
+pub async fn bounded_context(pool: &Pool) -> (String, String) {
+    let subject = format!("subject_{}", generate_token_id());
+    let role = Role {
+        id: generate_token_id(),
+        external_subject: subject.clone(),
+        name: "Reconciliation Role".to_string(),
+        superadmin: false,
+        status: RoleStatus::Active,
+        created_at: now(),
+        revoked_at: None,
+    };
+    db::insert_role(pool, &role).await.unwrap();
+    let name = format!("crm_{}", generate_token_id());
+    let bc = BoundedContext {
+        name: name.clone(),
+        status: BoundedContextStatus::Active,
+        created_at: now(),
+        created_by: ContextCreator::SystemCreator,
+        template: None,
+    };
+    db::insert_bounded_context(pool, &bc).await.unwrap();
+    db::insert_role_access_mapping(
+        pool,
+        &RoleAccessMapping {
+            role,
+            bounded_context: bc,
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
+            status: RoleStatus::Active,
+            created_at: now(),
+            revoked_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    (name, subject)
+}
+
+/// The domain's types for `bc`, in variant `V`.
+pub fn builder<V: EmailTagging>(database_url: &str, bc: &str, subject: &str) -> SkiljBuilder {
+    let builder = Skilj::builder(database_url)
+        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+        .bounded_context(bc);
+    V::configure(builder)
+        .key_service(master_key())
+        .reconciliation_role(subject)
+        .event_type::<EmailClaimed<V>>()
+        .event_type::<EmailReleased<V>>()
+        .command_type::<RegisterCustomer<V>>()
+        .command_type::<CorrectEmail<V>>()
+        .command_type::<ReleaseEmail<V>>()
+        .command_type::<RetractAny>()
+}
+
+/// A submission as an application makes one: `decide()` then the store, with
+/// the caller's `client_id` and idempotency key.
+pub async fn submit(
+    skilj: &Skilj,
+    pool: &Pool,
+    bc: &str,
+    cache: &EventCache,
+    command_type: &str,
+    payload: serde_json::Value,
+    client_id: &str,
+    idempotency_key: Option<&str>,
+) -> SubmitCommandOutcome {
+    let command_type = db::get_command_type(pool, bc, command_type)
+        .await
+        .unwrap()
+        .unwrap();
+    db::decide_and_submit_command(
+        pool,
+        &*skilj.command_dispatcher(),
+        &*skilj.projection_dispatcher(),
+        &*skilj.snapshot_dispatcher(),
+        &EventBroadcaster::new(16),
+        cache,
+        &command_type,
+        &payload.to_string(),
+        client_id,
+        None,
+        None,
+        Some(&master_key()),
+        now(),
+        idempotency_key,
+        None,
+    )
+    .await
+    .unwrap()
+}

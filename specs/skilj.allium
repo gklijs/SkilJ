@@ -4841,6 +4841,15 @@ rule ProcessCommand {
     -- state whose storage shape this spec does not reach into - rather
     -- than a plugged-in decision like decide().
     --
+    -- The payload is not part of it. A key is matched on its scope alone
+    -- (see below), so a submission bearing an already-accepted key is
+    -- answered with that key's recorded outcome whatever payload it
+    -- carries, and the payload it carries is never decided: a caller
+    -- reusing a key for a different command gets the earlier command's
+    -- events back. Nothing is remembered from which to tell the two
+    -- apart, and a key is the caller's promise that the submissions are
+    -- one action.
+    --
     -- Three cases, and they are the whole of the behaviour:
     --
     --   Key absent. Nothing is looked up and nothing is recorded. The
