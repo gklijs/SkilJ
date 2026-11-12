@@ -1,11 +1,16 @@
-## Mutation testing of the access trail (docs/architecture.md §229), weekly.
+## Mutation testing of the access trail (docs/architecture.md §229) and of
+## the store's idempotency and retraction checks (issue #189), weekly.
 ##
 ## cargo-mutants changes the code one way at a time (a comparison flipped,
 ## a function body replaced) and reruns the tests; a mutant the tests
 ## survive is a behavior nothing checks. It is scoped to the access trail
 ## and the `*_with_trail` writers in db/mod.rs, run only against the
 ## `access_trail` test binary: those are the paths where a silent change
-## means a wrong audit record. Too slow for every push, and informational:
+## means a wrong audit record. The `model` job mutates the idempotency key
+## lookup and the retraction checks (`resolve_stances`, the
+## `requiring_target_tags` pair) against the model-based tests of the
+## unique-email domain, which must tell a changed answer from the right one.
+## Too slow for every push, and informational:
 ## it never fails a build. Surviving mutants are in the job summary and in
 ## the `mutants-out` artifact.
 
@@ -85,3 +90,83 @@ jobs:
           path: |
             mutants-trail
             mutants-writers
+
+  model:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    # The budget agreed in issue #189; a run cut short reports what it got to.
+    timeout-minutes: 120
+    container:
+      image: rust:1-bookworm
+    services:
+      skilj-postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://postgres:postgres@skilj-postgres:5432/postgres
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v5
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@25.3.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The code is in skilj-core, the tests that judge it in skilj; the
+      # filter keeps to the generated and fixed histories.
+      - name: Idempotency key lookup
+        # A surviving mutant exits non-zero; the next scope still runs.
+        continue-on-error: true
+        run: >-
+          cargo mutants --package skilj-core --test-package skilj
+          --file skilj-core/src/db/idempotency.rs
+          --output mutants-idempotency
+          -- --test model_unique_value histor
+      - name: Retraction checks
+        # A surviving mutant exits non-zero; the next scope still runs.
+        continue-on-error: true
+        run: >-
+          cargo mutants --package skilj-core --test-package skilj
+          --file skilj-core/src/db/commands.rs --re 'resolve_stances|is_retracted'
+          --output mutants-retraction
+          -- --test model_unique_value histor
+      - name: Target tags
+        # A surviving mutant exits non-zero; the next scope still runs.
+        continue-on-error: true
+        run: >-
+          cargo mutants --package skilj-core --test-package skilj
+          --file skilj-core/src/retraction/mod.rs --re 'target_tags'
+          --output mutants-target-tags
+          -- --test model_unique_value histor
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Surviving mutants (model)'
+            for d in mutants-idempotency mutants-retraction mutants-target-tags; do
+              echo "#### $d"
+              echo '```'
+              cat "$d/mutants.out/missed.txt" 2>/dev/null || echo 'none recorded'
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: mutants-model-out
+          path: |
+            mutants-idempotency
+            mutants-retraction
+            mutants-target-tags
