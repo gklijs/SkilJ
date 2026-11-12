@@ -200,6 +200,13 @@ pub enum Expected {
     Deduplicated(Vec<usize>),
 }
 
+/// An op's target and arguments, resolved against a state of the history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub target: Option<Position>,
+    pub args: Option<(u8, Addr)>,
+}
+
 /// Where a resolved target is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Position {
@@ -217,7 +224,7 @@ pub struct Step {
     pub args: Option<(u8, Addr)>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Model {
     pub variant: Variant,
     pub log: Vec<Logged>,
@@ -342,6 +349,14 @@ impl Model {
 
     /// What `op` must answer, applied to the model when it is accepted.
     pub fn apply(&mut self, op: Op) -> Step {
+        let resolved = self.resolve_op(op);
+        self.apply_resolved(op, resolved)
+    }
+
+    /// What `op` names in the history as it stands: its target, and the
+    /// customer and address it submits. Concurrent callers each resolve
+    /// against the state they saw, before any of them is applied.
+    pub fn resolve_op(&self, op: Op) -> Resolved {
         let target = match op {
             Op::RetractRelease { target, .. } | Op::RetractAny { target, .. } => {
                 Some(self.resolve(target))
@@ -391,6 +406,13 @@ impl Model {
             }
             Op::RetractAny { .. } => None,
         };
+        Resolved { target, args }
+    }
+
+    /// What `op`, resolved as `resolved`, must answer, applied to the model
+    /// when it is accepted.
+    pub fn apply_resolved(&mut self, op: Op, resolved: Resolved) -> Step {
+        let Resolved { target, args } = resolved;
         let call = op.call();
         let scope = call
             .key

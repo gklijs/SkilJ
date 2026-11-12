@@ -37,8 +37,8 @@ use skilj_core::db::{self, Pool, SubmitCommandOutcome};
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::Event;
 use unique_crm::model::{
-    customer_id, Addr, Call, Expected, Kind, Logged, Model, Op, Position, Target, Value, Variant,
-    BASES, CLIENTS, CUSTOMERS, KEYS, SPELLINGS,
+    customer_id, Addr, Call, Expected, Kind, Logged, Model, Op, Position, Resolved, Target, Value,
+    Variant, BASES, CLIENTS, CUSTOMERS, KEYS, SPELLINGS,
 };
 use unique_crm::{
     bounded_context, runtime, Blind, EmailTagging, Plain, IGNORES_CLAIMS_SINCE, IGNORES_HELD,
@@ -68,11 +68,39 @@ fn env_number(name: &str, default: u32) -> u32 {
 
 // ---- Running a history -----------------------------------------------------
 
+/// A history: operations one after another, then a group of them submitted
+/// at once, then more one after another.
+#[derive(Clone, Debug, Default)]
+struct Script {
+    before: Vec<Op>,
+    together: Vec<Op>,
+    after: Vec<Op>,
+}
+
+impl Script {
+    fn sequential(ops: &[Op]) -> Self {
+        Script {
+            before: ops.to_vec(),
+            ..Script::default()
+        }
+    }
+
+    /// As Rust, to paste into a `replay` test.
+    fn trace(&self) -> String {
+        format!(
+            "before: {}\ntogether: {}\nafter: {}",
+            trace(&self.before),
+            trace(&self.together),
+            trace(&self.after)
+        )
+    }
+}
+
 /// Runs `ops` against a fresh bounded context, step by step against the
 /// model. `Err` says which step disagreed and how; `Ok` also when there is no
 /// database, after `skipping:` was printed for CI's guard.
 async fn run_history(variant: Variant, ops: &[Op]) -> Result<(), String> {
-    run_planted(variant, ops, Plant::NONE).await
+    run_planted(variant, &Script::sequential(ops), Plant::NONE).await
 }
 
 /// A defect planted for a run, to check that the comparison catches it.
@@ -91,16 +119,16 @@ impl Plant {
     };
 }
 
-async fn run_planted(variant: Variant, ops: &[Op], plant: Plant) -> Result<(), String> {
+async fn run_planted(variant: Variant, script: &Script, plant: Plant) -> Result<(), String> {
     match variant {
-        Variant::Blind => run_history_as::<Blind>(variant, ops, plant).await,
-        Variant::Plain => run_history_as::<Plain>(variant, ops, plant).await,
+        Variant::Blind => run_history_as::<Blind>(variant, script, plant).await,
+        Variant::Plain => run_history_as::<Plain>(variant, script, plant).await,
     }
 }
 
 async fn run_history_as<V: EmailTagging>(
     variant: Variant,
-    ops: &[Op],
+    script: &Script,
     plant: Plant,
 ) -> Result<(), String> {
     let Some((database_url, pool)) = test_db().await else {
@@ -119,12 +147,13 @@ async fn run_history_as<V: EmailTagging>(
     };
     let mut checker = Checker::new(variant, &pool, &bc);
     checker.drop_keys = plant.drop_keys;
-    let result = checker.run(target, ops).await;
+    let result = checker.run(target, script).await;
     skilj.shutdown(std::time::Duration::from_secs(10)).await;
     db::hard_delete_bounded_context(&pool, &bc).await.unwrap();
     result
 }
 
+#[derive(Clone)]
 struct Checker<'a> {
     variant: Variant,
     pool: &'a Pool,
@@ -151,16 +180,28 @@ impl<'a> Checker<'a> {
         }
     }
 
-    async fn run(mut self, target: unique_crm::Target<'_>, ops: &[Op]) -> Result<(), String> {
-        for (index, op) in ops.iter().enumerate() {
-            self.step(target, *op).await.map_err(|error| {
-                format!(
-                    "step {index} of {} ({:?} tag): {op:?}\n{error}\nthe history:\n{}",
-                    ops.len(),
-                    self.variant,
-                    trace(ops)
-                )
-            })?;
+    async fn run(mut self, target: unique_crm::Target<'_>, script: &Script) -> Result<(), String> {
+        let variant = self.variant;
+        let context = |part: &str, index: usize, op: &dyn std::fmt::Debug, error: String| {
+            format!(
+                "{part} {index} ({variant:?} tag): {op:?}\n{error}\nthe history:\n{}",
+                script.trace()
+            )
+        };
+        for (index, op) in script.before.iter().enumerate() {
+            if let Err(error) = self.step(target, *op).await {
+                return Err(context("step before", index, op, error));
+            }
+        }
+        if !script.together.is_empty() {
+            if let Err(error) = self.together(target, &script.together).await {
+                return Err(context("the group of", script.together.len(), &"", error));
+            }
+        }
+        for (index, op) in script.after.iter().enumerate() {
+            if let Err(error) = self.step(target, *op).await {
+                return Err(context("step after", index, op, error));
+            }
         }
         Ok(())
     }
@@ -172,55 +213,142 @@ impl<'a> Checker<'a> {
         }
     }
 
-    async fn step(&mut self, target: unique_crm::Target<'_>, op: Op) -> Result<(), String> {
-        let step = self.model.apply(op);
-        let payload = match op {
+    fn payload(&self, op: Op, resolved: Resolved) -> serde_json::Value {
+        match op {
             Op::Register { .. } | Op::Correct { .. } | Op::Release { .. } => {
-                let (customer, addr) = step.args.expect("resolved");
+                let (customer, addr) = resolved.args.expect("resolved");
                 serde_json::json!({ "customer_id": customer_id(customer), "email": addr.text() })
             }
             Op::RetractRelease { .. } => {
-                let (customer, addr) = step.args.expect("resolved");
+                let (customer, addr) = resolved.args.expect("resolved");
                 serde_json::json!({
                     "customer_id": customer_id(customer),
                     "email": addr.text(),
-                    "position": self.position(step.target.expect("resolved")),
+                    "position": self.position(resolved.target.expect("resolved")),
                 })
             }
             Op::RetractAny { .. } => {
-                serde_json::json!({ "position": self.position(step.target.expect("resolved")) })
+                serde_json::json!({ "position": self.position(resolved.target.expect("resolved")) })
             }
-        };
+        }
+    }
+
+    async fn submit(
+        &self,
+        target: unique_crm::Target<'_>,
+        op: Op,
+        payload: serde_json::Value,
+    ) -> SubmitCommandOutcome {
         let call = op.call();
-        let outcome = target
+        target
             .submit(
                 op.command_type(),
-                payload.clone(),
+                payload,
                 &call.client_id(),
                 call.key().filter(|_| !self.drop_keys).as_deref(),
             )
-            .await;
-        let mismatch = |why: String| {
-            Err(format!(
-                "payload {payload}\nexpected {:?}\ngot {}\n{why}",
-                step.expected,
-                describe(&outcome)
-            ))
-        };
-        match (&step.expected, &outcome) {
+            .await
+    }
+
+    async fn step(&mut self, target: unique_crm::Target<'_>, op: Op) -> Result<(), String> {
+        let resolved = self.model.resolve_op(op);
+        let payload = self.payload(op, resolved);
+        let outcome = self.submit(target, op, payload.clone()).await;
+        let step = self.model.apply_resolved(op, resolved);
+        self.compare(&step.expected, &outcome)
+            .and(self.check_store().await)
+            .map_err(|why| {
+                format!(
+                    "payload {payload}\nexpected {:?}\ngot {}\n{why}",
+                    step.expected,
+                    describe(&outcome)
+                )
+            })
+    }
+
+    /// `ops` submitted at once, each resolved against the state before them,
+    /// as each caller saw it. Some serial order of them must answer what the
+    /// store answered, appending its events in that order.
+    async fn together(&mut self, target: unique_crm::Target<'_>, ops: &[Op]) -> Result<(), String> {
+        let resolved: Vec<Resolved> = ops.iter().map(|op| self.model.resolve_op(*op)).collect();
+        let payloads: Vec<serde_json::Value> = ops
+            .iter()
+            .zip(&resolved)
+            .map(|(op, resolved)| self.payload(*op, *resolved))
+            .collect();
+        let outcomes = futures_util::future::join_all(
+            ops.iter()
+                .zip(&payloads)
+                .map(|(op, payload)| self.submit(target, *op, payload.clone())),
+        )
+        .await;
+        let mut tried = Vec::new();
+        for order in orders(ops.len()) {
+            let mut trial = self.clone();
+            match trial.serially(ops, &resolved, &outcomes, &order) {
+                Ok(()) => {
+                    *self = trial;
+                    return self.check_store().await;
+                }
+                Err(why) => tried.push(format!("  in the order {order:?}: {why}")),
+            }
+        }
+        let answered: Vec<String> = outcomes.iter().map(describe).collect();
+        Err(format!(
+            "no serial order answers as the store did\npayloads {payloads:?}\ngot {answered:#?}\n{}",
+            tried.join("\n")
+        ))
+    }
+
+    /// Whether applying `ops` to the model in `order` gives `outcomes`, with
+    /// the accepted ones' events appended in that order.
+    fn serially(
+        &mut self,
+        ops: &[Op],
+        resolved: &[Resolved],
+        outcomes: &[SubmitCommandOutcome],
+        order: &[usize],
+    ) -> Result<(), String> {
+        let mut last = i64::MIN;
+        for &index in order {
+            let step = self.model.apply_resolved(ops[index], resolved[index]);
+            if let SubmitCommandOutcome::Accepted { events, .. } = &outcomes[index] {
+                let first = events.first().map_or(last, |event| event.sequence);
+                if first < last {
+                    return Err(format!(
+                        "op {index} appended before an op ordered ahead of it"
+                    ));
+                }
+                last = events.last().map_or(last, |event| event.sequence);
+            }
+            self.compare(&step.expected, &outcomes[index])
+                .map_err(|why| format!("op {index} expected {:?}: {why}", step.expected))?;
+        }
+        Ok(())
+    }
+
+    /// Whether `outcome` is `expected`, recording the sequences it appended.
+    fn compare(
+        &mut self,
+        expected: &Expected,
+        outcome: &SubmitCommandOutcome,
+    ) -> Result<(), String> {
+        match (expected, outcome) {
             (Expected::Accepted(logged), SubmitCommandOutcome::Accepted { events, .. }) => {
                 if events.len() != logged.len() {
-                    return mismatch(format!("{} events appended", events.len()));
+                    return Err(format!("{} events appended", events.len()));
                 }
                 for (event, logged) in events.iter().zip(logged) {
-                    if let Err(why) = self.check_event(event, logged) {
-                        return mismatch(why);
-                    }
+                    self.check_event(event, logged)?;
                     self.sequences.push(event.sequence);
                 }
+                Ok(())
             }
             (Expected::Rejected(expected), SubmitCommandOutcome::Rejected { kind, .. })
-                if kind == expected => {}
+                if kind == expected =>
+            {
+                Ok(())
+            }
             (
                 Expected::Deduplicated(indices),
                 SubmitCommandOutcome::Deduplicated {
@@ -229,17 +357,24 @@ impl<'a> Checker<'a> {
             ) => {
                 let expected: Vec<i64> =
                     indices.iter().map(|index| self.sequences[*index]).collect();
-                if &expected != triggered_event_sequences {
-                    return mismatch(format!("expected the sequences {expected:?}"));
+                if &expected == triggered_event_sequences {
+                    Ok(())
+                } else {
+                    Err(format!("expected the sequences {expected:?}"))
                 }
             }
-            _ => return mismatch(String::new()),
+            _ => Err(format!("got {}", describe(outcome))),
         }
+    }
+
+    /// What is stored, as a whole: as many events as the model has, and for
+    /// a blind tag no address in the clear.
+    async fn check_store(&self) -> Result<(), String> {
         let stored = db::list_events_for_bounded_context(self.pool, self.bc)
             .await
             .unwrap();
         if stored.len() != self.model.log.len() {
-            return mismatch(format!(
+            return Err(format!(
                 "{} events stored, the model has {}",
                 stored.len(),
                 self.model.log.len()
@@ -249,7 +384,7 @@ impl<'a> Checker<'a> {
             for event in &stored {
                 let stored_text = format!("{:?} {}", event.tags, event.payload).to_lowercase();
                 if stored_text.contains("@example.test") {
-                    return mismatch(format!(
+                    return Err(format!(
                         "an address is stored in the clear at {}: {stored_text}",
                         event.sequence
                     ));
@@ -362,6 +497,22 @@ fn trace(ops: &[Op]) -> String {
     out
 }
 
+/// Every order of `0..count`.
+fn orders(count: usize) -> Vec<Vec<usize>> {
+    if count == 0 {
+        return vec![Vec::new()];
+    }
+    let mut all = Vec::new();
+    for rest in orders(count - 1) {
+        for at in 0..=rest.len() {
+            let mut order = rest.clone();
+            order.insert(at, count - 1);
+            all.push(order);
+        }
+    }
+    all
+}
+
 /// Runs `ops` and fails with the step that disagreed.
 fn replay(variant: Variant, ops: Vec<Op>) {
     if let Err(error) = runtime().block_on(run_history(variant, &ops)) {
@@ -420,6 +571,52 @@ fn history() -> impl Strategy<Value = Vec<Op>> {
     proptest::collection::vec(op(), 1..=env_number("SKILJ_MODEL_MAX_OPS", 20) as usize)
 }
 
+/// An op contending for address `base` with the others of its group:
+/// claiming it, correcting to it, releasing what the customer holds, or
+/// retracting a release, under one key shared by the group half the time.
+fn contending(base: u8) -> BoxedStrategy<Op> {
+    let at = prop_oneof![4 => Just(0), 1 => Just(1), 1 => Just(SPELLINGS - 1)]
+        .prop_map(move |spelling| Addr { base, spelling })
+        .boxed();
+    let call = prop_oneof![
+        1 => Just(Call { client: 0, key: None }),
+        2 => (0..CLIENTS).prop_map(|client| Call { client, key: Some(0) }),
+    ]
+    .boxed();
+    let customer = 0..CUSTOMERS;
+    prop_oneof![
+        3 => (customer.clone(), at.clone(), call.clone()).prop_map(|(customer, addr, call)| {
+            Op::Register { customer, addr: Some(addr), call }
+        }),
+        2 => (customer.clone(), at, call.clone())
+            .prop_map(|(customer, addr, call)| Op::Correct { customer, addr, call }),
+        2 => (customer, call.clone())
+            .prop_map(|(customer, call)| Op::Release { customer, addr: None, call }),
+        2 => (any::<u16>(), call).prop_map(|(nth, call)| Op::RetractRelease {
+            customer: None,
+            addr: None,
+            target: Target::Release(nth),
+            call,
+        }),
+    ]
+    .boxed()
+}
+
+/// A short history, two or three ops contending for one address submitted
+/// at once, and a few more ops after, which see the state the group left.
+fn script() -> impl Strategy<Value = Script> {
+    (
+        proptest::collection::vec(op(), 0..=8),
+        (0..BASES).prop_flat_map(|base| proptest::collection::vec(contending(base), 2..=3)),
+        proptest::collection::vec(op(), 0..=4),
+    )
+        .prop_map(|(before, together, after)| Script {
+            before,
+            together,
+            after,
+        })
+}
+
 fn config() -> ProptestConfig {
     ProptestConfig {
         cases: env_number("PROPTEST_CASES", 32),
@@ -441,6 +638,26 @@ proptest! {
     #[test]
     fn plain_histories_match_the_model(ops in history()) {
         let result = runtime().block_on(run_history(Variant::Plain, &ops));
+        prop_assert!(result.is_ok(), "{}", result.unwrap_err());
+    }
+}
+
+fn concurrent_config() -> ProptestConfig {
+    ProptestConfig {
+        cases: env_number("SKILJ_MODEL_CONCURRENT_CASES", 16),
+        ..config()
+    }
+}
+
+proptest! {
+    #![proptest_config(concurrent_config())]
+
+    /// Linearizability of a small group: the store answers concurrent
+    /// commands as it would have answered them in some serial order.
+    #[test]
+    fn concurrent_histories_match_some_serial_order(script in script(), plain in any::<bool>()) {
+        let variant = if plain { Variant::Plain } else { Variant::Blind };
+        let result = runtime().block_on(run_planted(variant, &script, Plant::NONE));
         prop_assert!(result.is_ok(), "{}", result.unwrap_err());
     }
 }
@@ -836,7 +1053,11 @@ fn property_catches(plant: Plant) -> bool {
     }
     runner
         .run(&history(), |ops| {
-            let result = runtime().block_on(run_planted(Variant::Blind, &ops, plant));
+            let result = runtime().block_on(run_planted(
+                Variant::Blind,
+                &Script::sequential(&ops),
+                plant,
+            ));
             prop_assert!(result.is_ok(), "{}", result.unwrap_err());
             Ok(())
         })
@@ -901,4 +1122,87 @@ fn a_release_retracted_after_its_customer_reclaimed_the_address() {
     );
     replay(Variant::Blind, ops.clone());
     replay(Variant::Plain, ops);
+}
+
+// ---- Fixed concurrent histories --------------------------------------------
+
+fn replay_together(variant: Variant, script: Script) {
+    if let Err(error) = runtime().block_on(run_planted(variant, &script, Plant::NONE)) {
+        panic!("{error}");
+    }
+}
+
+#[test]
+fn orders_are_every_permutation() {
+    let mut all = orders(3);
+    all.sort();
+    assert_eq!(
+        all,
+        [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0]
+        ]
+    );
+}
+
+/// Two customers claiming one address at once: one gets it.
+#[test]
+fn two_claims_of_one_address_at_once_leave_one_holder() {
+    for variant in [Variant::Blind, Variant::Plain] {
+        replay_together(
+            variant,
+            Script {
+                before: Vec::new(),
+                together: vec![
+                    register(0, at(0, 0)),
+                    register(1, at(0, 0)),
+                    register(2, at(0, 0)),
+                ],
+                after: vec![register(0, at(1, 0)), register(1, at(1, 0))],
+            },
+        );
+    }
+}
+
+/// One caller sending one key twice at once: one decision, and the other
+/// answered with its events.
+#[test]
+fn one_key_twice_at_once_is_decided_once() {
+    for variant in [Variant::Blind, Variant::Plain] {
+        replay_together(
+            variant,
+            Script {
+                before: Vec::new(),
+                together: vec![
+                    keyed(register(0, at(0, 0)), 0, 0),
+                    keyed(register(1, at(1, 0)), 0, 0),
+                ],
+                after: vec![register(2, at(1, 0))],
+            },
+        );
+    }
+}
+
+/// A release, a claim of the address and a retraction of the release at
+/// once: the retraction can't give the address back once the claim is in.
+#[test]
+fn a_release_retraction_racing_a_claim_never_leaves_two_holders() {
+    for variant in [Variant::Blind, Variant::Plain] {
+        replay_together(
+            variant,
+            Script {
+                before: vec![register(0, at(0, 0)), release(0, at(0, 0))],
+                together: vec![register(1, at(0, 0)), retract_release(0)],
+                after: vec![
+                    register(2, at(0, 0)),
+                    correct(0, at(2, 0)),
+                    register(0, at(3, 0)),
+                ],
+            },
+        );
+    }
 }
