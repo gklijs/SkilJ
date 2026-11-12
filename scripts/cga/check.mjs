@@ -165,12 +165,18 @@ export function compare(actual, baseline, log = console.error) {
   const removed = difference(accepted, current);
   const newSkips = difference(new Map(Object.entries(actual.skipped_generic_targets)),
     new Map(Object.entries(baseline.skipped_generic_targets)));
+  // Every difference is listed, gone ones too: a baseline update reviewed
+  // from CI's log needs both sides.
+  for (const [key, count] of added) {
+    const [path, message, source] = JSON.parse(key);
+    log(`NEW (${count}) ${path}: ${message}\n  ${source}`);
+  }
+  for (const [target, count] of newSkips) log(`NEW skipped target (${count}): ${target}`);
+  for (const [key, count] of removed) {
+    const [path, message, source] = JSON.parse(key);
+    log(`GONE (${count}) ${path}: ${message}\n  ${source}`);
+  }
   if (added.length || newSkips.length) {
-    for (const [key, count] of added) {
-      const [path, message, source] = JSON.parse(key);
-      log(`NEW (${count}) ${path}: ${message}\n  ${source}`);
-    }
-    for (const [target, count] of newSkips) log(`NEW skipped target (${count}): ${target}`);
     throw new Error('new potential panics or analysis gaps; fix them or explicitly review a baseline update');
   }
   if (removed.length || !isDeepStrictEqual(actual.skipped_generic_targets, baseline.skipped_generic_targets)) {

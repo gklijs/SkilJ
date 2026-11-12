@@ -56,6 +56,15 @@ test('removed findings require a smaller baseline', t => {
   reject(actual, report(context));
 });
 
+test('both new and gone findings are listed', t => {
+  const context = fixture(t);
+  const lines = [];
+  assert.throws(() => compare(report(context, { text: 'panic!("new")' }), report(context),
+    line => lines.push(line)));
+  assert.equal(lines.filter(line => line.startsWith('NEW (1) ')).length, 1);
+  assert.equal(lines.filter(line => line.startsWith('GONE (1) ')).length, 1);
+});
+
 test('new analysis gaps fail', t => {
   const context = fixture(t);
   reject(report(context, { skipped: 'cga-skipped-generic:some::method\n' }), report(context));
