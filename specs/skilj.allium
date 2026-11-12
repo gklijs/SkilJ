@@ -4769,7 +4769,19 @@ rule AuthoriseCommandTrigger {
 --   retraction_target_out_of_scope - the command type declares owner_tag_key,
 --                                    and the target doesn't carry the command's
 --                                    own value of it
---   invalid_retraction             - the payload isn't a retraction
+--   retraction_target_mismatch     - the retraction names tag keys its target
+--                                    must share with the command, and the
+--                                    target carries none of the command's own
+--                                    values of one of them
+--   invalid_retraction             - the payload isn't a retraction, or names
+--                                    a tag key the command has no tag of
+--
+-- The tag keys a retraction names (target_tags, set by requiring_target_tags)
+-- are what its decision assumed about the target: a decision that names its
+-- target by position and reads the target's history through a tag of the
+-- payload. The store compares the command's own consistency tags, which it
+-- derived, so a blind tag by its hash, which no decision can compute. The keys
+-- are a condition on this append and are not stored with the retraction.
 --
 -- An event stays in every read. A snapshot's state is the fold of its value's
 -- standing events: the store passes over a retraction and what it retracts, and
@@ -4791,9 +4803,11 @@ rule AuthoriseCommandTrigger {
 --   doubt_of_stance           - the target is a retraction, a doubt or a lift
 --   doubt_target_retracted    - a doubt or a lift of a retracted event
 --   doubt_target_out_of_scope - as retraction_target_out_of_scope
+--   doubt_target_mismatch     - as retraction_target_mismatch
 --   already_doubted           - a doubt is open, including earlier in the batch
 --   no_open_doubt             - a lift with no open doubt
---   invalid_doubt             - the payload isn't a doubt
+--   invalid_doubt             - the payload isn't a doubt, or names a tag key
+--                               the command has no tag of
 --   retraction_of_doubt       - a retraction of a doubt or a lift; lift it instead
 -- A deployment with doubts refuses CommandType.snapshot() as well: the events
 -- past its stored row would include doubts its fold can't convert.

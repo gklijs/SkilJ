@@ -27,7 +27,9 @@
 //!   that claim, so the old claim would stand there while someone else held
 //!   the address. It rejects `not_a_release` for a position that isn't this
 //!   customer's release, and `already_holds_a_value` when the customer holds
-//!   another address now.
+//!   another address now; the store rejects `retraction_target_mismatch` for
+//!   a release of another address than the payload's, which the decision
+//!   reads the history of.
 
 // Each test binary that includes this module uses a different part of it.
 #![allow(dead_code)]
@@ -37,8 +39,8 @@ use std::marker::PhantomData;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::retraction::{
-    claim_query, corrected, correction_query, retract, standing, Retractable, RetractionGround,
-    ValueClaims, ValueEffect,
+    claim_query, corrected, correction_query, requiring_target_tags, retract, standing,
+    Retractable, RetractionGround, ValueClaims, ValueEffect,
 };
 use skilj::{
     normalize, BlindErasure, BlindIndexKey, BlindTag, CommandType, EventType, KeyService, Skilj,
@@ -393,11 +395,17 @@ impl<V: EmailTagging> CommandType for RetractRelease<V> {
                 };
             }
         }
+        // The address read is the payload's; the store checks the release is
+        // of that address, comparing hashes where a blind tag leaves this
+        // decision unable to.
         CommandDecision::Accepted {
-            events: vec![retract(
-                payload.position,
-                RetractionGround::ProcessedWrongly,
-                "released by mistake",
+            events: vec![requiring_target_tags(
+                retract(
+                    payload.position,
+                    RetractionGround::ProcessedWrongly,
+                    "released by mistake",
+                ),
+                ["email"],
             )],
         }
     }

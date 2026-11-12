@@ -196,6 +196,57 @@ fn doubt_spec(event_type: &str, position: i64, reason: String) -> EventSpec {
     }
 }
 
+/// The field of a stance's payload [`requiring_target_tags`] names the keys
+/// in. The store reads it and leaves it out of what it stores.
+const TARGET_TAGS_FIELD: &str = "target_tags";
+
+/// `stance` - a [`retract`], a [`doubt`] or a [`lift_doubt`] - on the
+/// condition that the event it is about carries the command's own value of
+/// each of `keys`; the store refuses it with `retraction_target_mismatch` or
+/// `doubt_target_mismatch` otherwise (docs/architecture.md §235).
+///
+/// For a decision that names its target by position and reads the target's
+/// history through a tag of the payload, so the store checks the two agree.
+/// The store compares tags, so a blind tag's hash too, which a decision can't
+/// compute: a correction of a blind value, `requiring_target_tags(retract(..),
+/// ["email"])` as the first event, can't retract an event of another address
+/// than the one its consistency query read. Each key must be one of the
+/// command's own tag keys, and one of the command's values of it on the target
+/// is enough, as with the owner scope check. The condition holds for this
+/// append only and isn't stored. A spec of another event type is returned as it
+/// is.
+pub fn requiring_target_tags<K: Into<String>>(
+    mut stance: EventSpec,
+    keys: impl IntoIterator<Item = K>,
+) -> EventSpec {
+    let is_stance = matches!(
+        stance.event_type.as_str(),
+        RETRACTED_EVENT_TYPE | DOUBTED_EVENT_TYPE | DOUBT_LIFTED_EVENT_TYPE
+    );
+    if let (true, serde_json::Value::Object(payload)) = (is_stance, &mut stance.payload) {
+        let mut required: Vec<String> = payload
+            .get(TARGET_TAGS_FIELD)
+            .and_then(|known| serde_json::from_value(known.clone()).ok())
+            .unwrap_or_default();
+        for key in keys {
+            let key = key.into();
+            if !required.contains(&key) {
+                required.push(key);
+            }
+        }
+        payload.insert(TARGET_TAGS_FIELD.to_string(), serde_json::json!(required));
+    }
+    stance
+}
+
+/// The keys [`requiring_target_tags`] put on `stance`, none when it put none.
+pub(crate) fn required_target_tags(stance: &EventSpec) -> Result<Vec<String>, serde_json::Error> {
+    match stance.payload.get(TARGET_TAGS_FIELD) {
+        Some(keys) => serde_json::from_value(keys.clone()),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Whether `event` is an [`EventDoubted`] or a [`DoubtLifted`]. A snapshot's fold
 /// has no use for one: it carries the tags of what it's about, so catch-up and a
 /// command's read pass it over, and a doubted event stays in the state.
@@ -227,7 +278,9 @@ pub fn retract(position: i64, ground: RetractionGround, reason: impl Into<String
 
 /// A correction: `position` retracted and `replacement` recorded, atomically.
 /// The retraction comes first, so a replacement with the same tag value as the
-/// original leaves that value claimed. Both are caused by the same command.
+/// original leaves that value claimed. Both are caused by the same command. For
+/// a retraction the store checks against the command's tags, build the events
+/// with [`requiring_target_tags`] instead.
 pub fn corrected(
     position: i64,
     ground: RetractionGround,
@@ -604,6 +657,39 @@ impl<'a, E> ValueClaims<'a, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requiring_target_tags_marks_a_stance_and_nothing_else() {
+        let stance = requiring_target_tags(
+            requiring_target_tags(
+                retract(3, RetractionGround::ProcessedWrongly, "x"),
+                ["email"],
+            ),
+            ["email", "customer"],
+        );
+        assert_eq!(
+            required_target_tags(&stance).unwrap(),
+            ["email", "customer"],
+            "keys accumulate once each"
+        );
+        assert!(
+            serde_json::from_value::<RetractionPayload>(stance.payload.clone()).is_ok(),
+            "still a retraction"
+        );
+        let doubt = requiring_target_tags(lift_doubt(3, "x"), ["email"]);
+        assert_eq!(required_target_tags(&doubt).unwrap(), ["email"]);
+        let other = EventSpec {
+            event_type: "EmailClaimed".to_string(),
+            payload: serde_json::json!({ "email": "a@example.com" }),
+        };
+        let unchanged = requiring_target_tags(other.clone(), ["email"]);
+        assert_eq!(unchanged.payload, other.payload);
+        assert!(
+            required_target_tags(&retract(3, RetractionGround::ProcessedWrongly, "x"))
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[derive(Debug, PartialEq)]
     enum Value {

@@ -199,6 +199,7 @@ would call a value held by someone else free.
 | `retraction_of_retraction` | the target is a retraction; record the event again |
 | `retraction_target_not_found` | no event at that position |
 | `retraction_target_out_of_scope` | an owner-scoped command naming another owner's event |
+| `retraction_target_mismatch`, `doubt_target_mismatch` | the target doesn't carry the command's own value of a key `requiring_target_tags` named |
 | `invalid_retraction` | a hand-built payload; use `retract` |
 | `reserved_event_type_name` | another shape registered as `EventRetracted` |
 | `already_doubted`, `no_open_doubt`, `doubt_target_retracted` | a doubt or lift that doesn't fit where the event stands (§236) |

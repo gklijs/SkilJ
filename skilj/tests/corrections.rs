@@ -6,9 +6,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::retraction::{
-    claim_query, doubt, lift_doubt, open_doubts, retract, DoubtPayload, Retractable,
-    RetractionGround, RetractionPayload, DOUBTED_EVENT_TYPE, DOUBTS_TAG_KEY, DOUBT_EVENT_TYPES,
-    DOUBT_LIFTED_EVENT_TYPE, RETRACTED_EVENT_TYPE, RETRACTS_TAG_KEY,
+    claim_query, doubt, lift_doubt, open_doubts, requiring_target_tags, retract, DoubtPayload,
+    Retractable, RetractionGround, RetractionPayload, DOUBTED_EVENT_TYPE, DOUBTS_TAG_KEY,
+    DOUBT_EVENT_TYPES, DOUBT_LIFTED_EVENT_TYPE, RETRACTED_EVENT_TYPE, RETRACTS_TAG_KEY,
 };
 use skilj::{BlindIndexKey, CommandType, EventType, Projection, Skilj, SkiljBuilder, Snapshot};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
@@ -242,6 +242,7 @@ async fn crm() -> Option<Crm> {
         .command_type::<DoubtAny>()
         .command_type::<LiftDoubt>()
         .command_type::<ReportDoubts>()
+        .command_type::<StanceRequiring>()
         .command_type::<DoubtAndRetract>()
         .snapshot::<ClaimCount>()
         .snapshot::<PartitionedClaimCount>()
@@ -621,11 +622,80 @@ fn a_release_retraction_is_refused_when_it_would_not_be_one() {
             "not_a_release",
             "nor is someone else's release"
         );
+        assert_eq!(
+            crm.retract_release(&alice, "other@example.com", release)
+                .await,
+            "retraction_target_mismatch",
+            "nor a release of another address, which the store sees by its hash"
+        );
         assert_eq!(crm.register(&alice, "second@example.com").await, "accepted");
         assert_eq!(
             crm.retract_release(&alice, "first@example.com", release)
                 .await,
             "already_holds_a_value"
+        );
+        crm.shutdown().await;
+    });
+}
+
+/// `requiring_target_tags`: the store compares the command's own tag with the
+/// target's, a blind one by its hash, which a decision can't compute.
+#[test]
+fn a_stance_requiring_target_tags_is_refused_on_another_value() {
+    runtime().block_on(async {
+        let Some(crm) = crm().await else {
+            return;
+        };
+        let alice = id("c");
+        assert_eq!(crm.register(&alice, "alice@example.com").await, "accepted");
+        let claim = crm.latest_position().await;
+        let stance = |email: &str, doubt: bool, key: &str| {
+            serde_json::json!({
+                "position": claim,
+                "customer_id": alice,
+                "email": email,
+                "doubt": doubt,
+                "key": key,
+            })
+        };
+        for (doubt, mismatch) in [
+            (true, "doubt_target_mismatch"),
+            (false, "retraction_target_mismatch"),
+        ] {
+            assert_eq!(
+                crm.submit("StanceRequiring", stance("bob@example.com", doubt, "email"))
+                    .await,
+                mismatch
+            );
+        }
+        let invalid = [(true, "invalid_doubt"), (false, "invalid_retraction")];
+        for (doubt, kind) in invalid {
+            assert_eq!(
+                crm.submit(
+                    "StanceRequiring",
+                    stance("alice@example.com", doubt, "skilj_retracts")
+                )
+                .await,
+                kind,
+                "the command has no such tag to compare"
+            );
+        }
+        assert_eq!(
+            crm.submit(
+                "StanceRequiring",
+                stance("Alice@Example.com", false, "email")
+            )
+            .await,
+            "accepted",
+            "the same address once normalized has the same hash"
+        );
+        let events = crm.events().await;
+        let retraction = events.last().unwrap();
+        assert_eq!(retraction.event_type.name, "EventRetracted");
+        assert!(
+            !retraction.payload.contains("target_tags"),
+            "the condition isn't stored: {}",
+            retraction.payload
         );
         crm.shutdown().await;
     });
@@ -2021,6 +2091,48 @@ impl CommandType for DoubtAny {
     fn decide(payload: &Self::Payload, _events: &[Self::Event]) -> CommandDecision {
         CommandDecision::Accepted {
             events: vec![doubt(payload.position, "under investigation")],
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct StanceRequiringPayload {
+    position: i64,
+    customer_id: String,
+    email: String,
+    doubt: bool,
+    key: String,
+}
+
+/// A retraction or a doubt of `position` that requires its target to carry
+/// the command's email tag, or whichever `key` names, for the store to check.
+struct StanceRequiring;
+
+impl CommandType for StanceRequiring {
+    type Payload = StanceRequiringPayload;
+    type Event = Retractable<CustomerEvent>;
+    const NAME: &'static str = "StanceRequiring";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![customer(), email()]
+    }
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        encrypted_email()
+    }
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::nothing()]
+    }
+    fn decide(payload: &Self::Payload, _events: &[Self::Event]) -> CommandDecision {
+        let stance = if payload.doubt {
+            doubt(payload.position, "is this the address?")
+        } else {
+            retract(
+                payload.position,
+                RetractionGround::WrongDataSubmitted,
+                "wrong address",
+            )
+        };
+        CommandDecision::Accepted {
+            events: vec![requiring_target_tags(stance, [payload.key.as_str()])],
         }
     }
 }
