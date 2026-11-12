@@ -13003,7 +13003,9 @@ skilj moved its primary repository from Codeberg to GitHub. Codeberg's terms of 
 **CI execution and caching.** A successful run on 2026-11-01 spent 269 seconds
 compiling test binaries and 622 seconds running them; `graphql_business_surfaces`
 accounted for 203 seconds. The full instrumented coverage job took 22 minutes.
-Coverage now runs on `main` pushes and manual dispatch. Every PR retains the
+Coverage now runs on `main` pushes and manual dispatch, in its own workflow
+(`.github/workflows/coverage.yml`), so a `main` push gets its CI result
+without waiting for the instrumented build. Every PR retains the
 full blocking test suite, split into three whole-binary jobs: the business
 surface binary, the remaining `skilj` targets (including doctests), and every
 other workspace crate. Each job has its own database and keeps the skip guard
