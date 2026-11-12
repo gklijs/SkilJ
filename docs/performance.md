@@ -257,6 +257,89 @@ These numbers are for one machine where pgbench and skilj share the CPU as
 well as Postgres. On a server where Postgres has its own cores, the CPU part
 of the cost goes away and the I/O part (WAL, commits) remains.
 
+## Comparing two commits
+
+The numbers above are one-off investigations. `scripts/bench/compare.mjs`
+repeats a representative part of them on two commits under the same
+conditions, so a change can be measured against the commit before it
+(issue #190). It is informational: nothing blocks on its deltas.
+
+```sh
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+  node scripts/bench/compare.mjs --baseline origin/main --candidate HEAD --trials 3
+```
+
+`DATABASE_URL` should point at a dedicated, disposable server: each
+benchmark drops and recreates a database of its own on it before every run,
+so trials never see each other's data. Without it the script refuses to run
+unless given `--allow-embedded`; an embedded server is not durable, and
+`--require-durable` (which CI passes) fails any run whose server does not
+report `fsync`, `synchronous_commit` and `full_page_writes` on.
+
+What it runs, by default 2 rounds per run after each benchmark's own warm-up:
+
+| benchmark | scenarios | what it measures |
+|---|---|---|
+| `command_throughput` | `spread/8w`, `ind-hot/8w`, `hot/8w`, `hot-snap/8w` | 8 concurrent callers through `POST /v1/commands/trigger` on the in-process router (no network): independent tags with empty and with growing histories, one shared hot tag, and the hot tag decided from a snapshot |
+| `inbound_throughput` | `external/1p`, `external/8p`, `trigger/1p`, `trigger/8p` | the two endpoints a broker bridge calls, one message in flight per partition, 1 and 8 partitions |
+| `projection_catch_up_throughput` | `total`, `per-account`, `both`, `partitioned` | catching four projection shapes up on 5,000 committed events, back to back with no background task |
+
+How a comparison runs:
+
+1. Both commits are checked out as git worktrees (sharing the root's
+   `Cargo.lock` when there is one) and their benchmark binaries are built
+   with `--release`. Build time is reported, never mixed into a
+   measurement; the same commit twice is built once.
+2. Every trial runs each benchmark once per commit, alternating which
+   commit goes first, so warm caches and runner drift fall on both.
+3. Each benchmark writes one JSON line per scenario through
+   `skilj_test_support::bench` (`SKILJ_BENCH_RECORD`): its benchmark
+   version, settings, raw latency samples in microseconds, elapsed time,
+   and the benchmark process's peak resident memory (`VmHWM`, Linux only;
+   `null` elsewhere). Postgres runs in its own process and its memory is
+   recorded as not measured rather than estimated. A final `complete`
+   line carries the server's version and settings.
+4. A run fails the comparison when it exits non-zero, prints `skipping:`,
+   has no `complete` line, misses a scenario or a round, or completed fewer
+   operations than it meant to. A recorded benchmark panics rather than
+   skip.
+5. `summary.json` and `summary.md` give, per scenario and commit, the
+   median of the trials' throughputs (each the median of its rounds), their
+   range and coefficient of variation, median p50/p99 latencies, and the
+   delta between the medians. A scenario is called **slower** or
+   **faster** only with at least 3 trials and when every candidate trial is
+   below (or above) every baseline trial; otherwise it is "within noise" or
+   "insufficient trials". Benchmarks whose versions differ between the two
+   commits are reported as non-comparable, and the script exits 2.
+
+Each benchmark has a `BENCH_VERSION`; raise it when what a scenario measures
+changes, so an old commit's numbers are not compared with the new ones. A
+commit from before these records existed cannot be a baseline: its runs
+write nothing, which fails the comparison.
+
+To check that the report can see a regression at all, slow the candidate
+down by a known amount: `SKILJ_BENCH_SLOWDOWN_US` adds at least that many
+microseconds inside every measured request (and to every event a projection
+folds).
+
+```sh
+node scripts/bench/compare.mjs --baseline HEAD --candidate HEAD \
+  --candidate-env SKILJ_BENCH_SLOWDOWN_US=1000
+```
+
+`.github/workflows/benchmarks.yml` runs the same comparison weekly, main
+against main as it was 7 days earlier, and on manual dispatch with any two
+commits, a trial count and extra candidate environment. It runs against a
+Postgres 17.6 container with fixed, durable settings, caps each benchmark
+run at 20 minutes and the job at 150, and keeps raw records, logs and
+summaries as an artifact for 30 days. Shared runners are noisy: before any
+threshold is proposed, the same commit's spread over several weekly runs
+needs to be known.
+
+Other options: `--rounds`, `--commands`, `--benchmarks`, `--baseline-env`,
+`--out` and `--binaries` (prebuilt binaries, which `compare.test.mjs` uses);
+`node scripts/bench/compare.mjs --help` lists them.
+
 ## Knobs
 
 All on `SkiljBuilder`:

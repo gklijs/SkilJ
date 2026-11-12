@@ -436,6 +436,8 @@ async fn command_through(
         .body(Body::from(body.to_string()))
         .unwrap();
     let started = Instant::now();
+    // `SKILJ_BENCH_SLOWDOWN_US`: a known delay a comparison must show.
+    skilj_test_support::bench::slowdown().await;
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -473,6 +475,8 @@ pub async fn deposit_batch_through(
         ))
         .unwrap();
     let started = Instant::now();
+    // `SKILJ_BENCH_SLOWDOWN_US`: a known delay a comparison must show.
+    skilj_test_support::bench::slowdown().await;
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();

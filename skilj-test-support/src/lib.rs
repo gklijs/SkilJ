@@ -40,6 +40,8 @@
 //! containers had the same leak; [`remove_container_on_exit`] gives them
 //! the same watchdog.
 
+pub mod bench;
+
 use postgresql_embedded::PostgreSQL;
 use tokio::sync::{Mutex, OnceCell};
 

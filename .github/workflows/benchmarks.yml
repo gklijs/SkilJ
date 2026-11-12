@@ -1,0 +1,128 @@
+## Benchmark comparison (issue #190, docs/performance.md "Comparing two
+## commits"), weekly and on demand.
+##
+## scripts/bench/compare.mjs builds a baseline and a candidate commit's
+## benchmark binaries in release mode, then runs a representative set of
+## the `#[ignore]`d benchmarks on both for several trials, alternating
+## which commit goes first, against one disposable Postgres with fixed,
+## durable settings. Performance deltas are informational: the job fails
+## only when a run skipped, crashed, lost a workload or ran on a
+## non-durable server, or the two commits' benchmark versions differ. The
+## comparison is in the job summary; raw samples, logs and summary.json
+## are in the `bench-compare-*` artifact.
+##
+## The weekly run compares main with main as it was seven days earlier.
+## GitHub's runners are shared and noisy: a "slower" verdict here is a
+## reason to look, not evidence of a regression, until enough runs have
+## shown how much the same commit varies on them.
+
+name: Benchmarks
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Baseline commit, tag or branch (default: the candidate as it was 7 days ago)"
+        required: false
+        default: ""
+      candidate:
+        description: "Candidate commit, tag or branch (default: the dispatched ref)"
+        required: false
+        default: ""
+      trials:
+        description: "Trials per commit (3 or more for a verdict)"
+        required: false
+        default: "3"
+      candidate_env:
+        description: "Space-separated K=V for the candidate's runs, e.g. SKILJ_BENCH_SLOWDOWN_US=1000"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Both commits are checked out as worktrees of this clone.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Fixed and durable: a comparison is only as good as the server not
+      # changing under it. The image tag pins the minor version.
+      - name: Start Postgres
+        run: |
+          docker run -d --name bench-postgres -p 5432:5432 --shm-size=1g \
+            -e POSTGRES_PASSWORD=postgres postgres:17.6 \
+            -c fsync=on -c synchronous_commit=on -c full_page_writes=on \
+            -c shared_buffers=512MB -c max_connections=200
+          for _ in $(seq 60); do
+            if docker exec bench-postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs bench-postgres
+          exit 1
+      - name: Resolve commits
+        id: commits
+        env:
+          BASELINE: ${{ inputs.baseline }}
+          CANDIDATE: ${{ inputs.candidate }}
+        run: |
+          candidate=$(git rev-parse --verify "${CANDIDATE:-HEAD}^{commit}")
+          if [ -n "$BASELINE" ]; then
+            baseline=$(git rev-parse --verify "$BASELINE^{commit}")
+          else
+            committed=$(git show -s --format=%ct "$candidate")
+            baseline=$(git rev-list -1 --before="@$((committed - 7 * 86400))" "$candidate")
+          fi
+          if [ -z "$baseline" ]; then
+            echo "no baseline commit found" >&2
+            exit 1
+          fi
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "candidate=$candidate" >> "$GITHUB_OUTPUT"
+      - name: Compare
+        env:
+          BASELINE: ${{ steps.commits.outputs.baseline }}
+          CANDIDATE: ${{ steps.commits.outputs.candidate }}
+          TRIALS: ${{ inputs.trials || '3' }}
+          CANDIDATE_ENV: ${{ inputs.candidate_env }}
+        run: |
+          args=()
+          read -r -a pairs <<< "$CANDIDATE_ENV"
+          for pair in "${pairs[@]}"; do
+            args+=(--candidate-env "$pair")
+          done
+          node scripts/bench/compare.mjs --baseline "$BASELINE" --candidate "$CANDIDATE" \
+            --trials "$TRIALS" --require-durable --run-timeout 20 --out bench-compare "${args[@]}"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: bench-compare-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            bench-compare/raw
+            bench-compare/logs
+            bench-compare/summary.json
+            bench-compare/summary.md

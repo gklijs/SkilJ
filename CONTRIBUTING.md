@@ -16,7 +16,7 @@ For local or CI setup failures, see [environment troubleshooting](docs/troublesh
 | Code generator | `cargo test -p skilj-codegen` and `cargo test -p skilj-demo --test generated_code` | Build demo and template |
 | Federation description | `cargo test -p skilj --test graphql_federation` | `scripts/check-federation-composition.sh` |
 | Agent guides (`skilj/agent-guides`), or a trait they list | `node scripts/agent-guides/check.mjs` | `bash scripts/agent-guides/eval/check-solutions.sh --no-run --cache-dir target/template-check` (reference solutions of the evaluation tasks); [agent guidance](docs/agent-guidance.md) |
-| CI scripts | `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs scripts/agent-guides/check.test.mjs` | Run the changed script's real path |
+| CI scripts | `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs scripts/agent-guides/check.test.mjs scripts/bench/compare.test.mjs` | Run the changed script's real path |
 
 For intended fixture changes, prefix the corresponding test command with
 `SKILJ_RECORD_CONFORMANCE=1`, `SKILJ_RECORD_GENERATED=1`, or
@@ -185,7 +185,11 @@ far as a test exercises them, and some aren't checked at all
   paths outside its scenarios; see the [coverage inventory](docs/postgres-compatibility.md).
 - **Performance.** The benchmarks (`command_throughput`,
   `inbound_throughput`, `projection_catch_up_throughput`) are
-  `#[ignore]`d. A throughput regression fails nothing.
+  `#[ignore]`d. A throughput regression fails nothing. The weekly
+  benchmark workflow compares a representative set of them across two
+  commits and reports the difference, but only a broken run fails it, and
+  shared runners are too noisy for its verdicts to be evidence (see
+  [docs/performance.md](docs/performance.md#comparing-two-commits)).
 - **Mixed versions on one database.** Upgrading is tested. Two skilj
   versions running side by side during a rolling deploy are not; §164
   records one known gap, and §205 another: a version from before blind
