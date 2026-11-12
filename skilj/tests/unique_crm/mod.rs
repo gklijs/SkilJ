@@ -34,6 +34,8 @@
 // Each test binary that includes this module uses a different part of it.
 #![allow(dead_code)]
 
+pub mod model;
+
 use std::marker::PhantomData;
 
 use schemars::JsonSchema;

@@ -74,6 +74,9 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jsonwebtoken.workspace = true
 tokio-tungstenite.workspace = true
+# issue #189: generated command histories checked against a model of the
+# unique-email domain (tests/model_unique_value.rs).
+proptest.workspace = true
 # docs/architecture.md §230: the Vault Transit provider against real Vault
 # and OpenBao, in containers, as the broker crates' tests run theirs.
 testcontainers-modules = { version = "0.15", features = ["hashicorp_vault"] }
