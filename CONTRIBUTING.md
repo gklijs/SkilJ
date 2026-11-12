@@ -172,10 +172,16 @@ far as a test exercises them, and some aren't checked at all
   groups of two or three operations contending for one address or one key
   at once, after a generated history, and checks that some serial order of
   them answers what the store answered and appends their events in that
-  order (`SKILJ_MODEL_CONCURRENT_CASES`, 16 a run). Fixed histories pin two
-  claims of one address at once, one key twice at once, and a release
-  retraction racing a claim. The interleavings are whatever the run
-  produces, not forced.
+  order (`SKILJ_MODEL_CONCURRENT_CASES`, 16 a run). A group reaches the store
+  one of three ways: submitted at once, each reading as it goes; prepared on
+  the state before the group through `CommandBatcher::prepare_command` and
+  committed one by one, so every command overtaken by an earlier one is
+  re-decided under the lock; or prepared so and submitted at once, so they
+  share batches. A trace layer counts the store's re-decisions: the forced
+  ways assert the exact count, and the free race must overlap in the store
+  at least once in 20 groups (it did in 20 of 20 locally). Fixed histories
+  pin two claims of one address at once, one key twice at once, and a
+  release retraction racing a claim, each all three ways.
 - **Blind tags** (§205): `skilj/tests/blind_tags.rs` checks that a blind
   value appears in no stored tag, query or payload, that racing claims
   accept one, and that erasure removes the hash from the database and
@@ -239,10 +245,11 @@ far as a test exercises them, and some aren't checked at all
   Their alignment is checked by periodic drift audits.
 - **Interleavings in general.** Races someone thought of have tests, and
   groups of up to three commands contending for one address or key are
-  checked against every serial order (above). Nothing explores
+  checked against every serial order, with the overlap forced or counted
+  (above). Nothing explores
   interleavings systematically (no `loom`, no model checking of the store
-  itself): not more than three commands at once, not forced orders within a
-  group, not commands across several instances, and nothing tests separate
+  itself): not more than three commands at once, not every order of reads
+  and commits within a group, not commands across several instances, and nothing tests separate
   processes or a network partition between an instance and its database.
 - **Model coverage gaps** (issue #189). The model of the unique-email domain
   leaves out: idempotency-key retention and expiry, whose sweeper reaches

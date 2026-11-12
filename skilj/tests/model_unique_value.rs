@@ -16,8 +16,11 @@
 //!
 //! A history can also submit two or three ops contending for one address at
 //! once, after a sequential part; some serial order of them must answer what
-//! the store answered (`concurrent_histories_match_some_serial_order`). The
-//! interleavings are whatever the run produces, not forced.
+//! the store answered (`concurrent_histories_match_some_serial_order`). A
+//! group races freely, or is prepared on one state and committed one by one
+//! or in shared batches, which forces the store to re-decide every command
+//! an earlier one overtook. A trace layer counts those re-decisions, so the
+//! tests show the commands really overlapped (`Mode`, `redecides`).
 //!
 //! What it doesn't cover: interleavings beyond that; idempotency-key
 //! retention, which sweeps every bounded context and has a binary of its own;
@@ -43,9 +46,10 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{FileFailurePersistence, TestRng, TestRunner};
 use skilj::SkiljBuilder;
+use skilj_core::command_batcher::{CommandBatchItem, CommandBatcher, PreparedCommand};
 use skilj_core::db::{self, Pool, SubmitCommandOutcome};
 use skilj_core::event_cache::EventCache;
-use skilj_core::event_store::Event;
+use skilj_core::event_store::{Event, EventBroadcaster};
 use unique_crm::model::{
     customer_id, Addr, Call, Expected, Kind, Logged, Model, Op, Position, Resolved, Target, Value,
     Variant, BASES, CLIENTS, CUSTOMERS, KEYS, SPELLINGS,
@@ -76,15 +80,98 @@ fn env_number(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+// ---- Counting re-decisions -------------------------------------------------
+
+/// How often the store re-decided a command under the lock, per bounded
+/// context: a command whose read was overtaken by an event committed after
+/// it, which is what two commands overlapping in the store looks like. The
+/// store says so in one trace event, `command decide under lock`.
+static REDECIDES: std::sync::Mutex<std::collections::BTreeMap<String, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+struct RedecideCounter;
+
+#[derive(Default)]
+struct RedecideFields {
+    message: String,
+    bounded_context: String,
+}
+
+impl tracing::field::Visit for RedecideFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "bounded_context" => self.bounded_context = format!("{value:?}"),
+            _ => {}
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RedecideCounter {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = RedecideFields::default();
+        event.record(&mut fields);
+        if fields.message == "command decide under lock" {
+            *REDECIDES
+                .lock()
+                .unwrap()
+                .entry(fields.bounded_context)
+                .or_default() += 1;
+        }
+    }
+}
+
+/// The re-decisions in `bc` so far.
+fn redecides(bc: &str) -> usize {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(RedecideCounter),
+        )
+        .expect("this binary sets no other subscriber");
+    });
+    REDECIDES.lock().unwrap().get(bc).copied().unwrap_or(0)
+}
+
 // ---- Running a history -----------------------------------------------------
 
+/// How a group of commands reaches the store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Mode {
+    /// Submitted at once, each reading and deciding as it goes: whatever
+    /// overlap the run produces.
+    #[default]
+    Racing,
+    /// Each prepared against the state before the group, then committed one
+    /// after another in the group's order: every later command whose read the
+    /// earlier ones overtook is re-decided, deterministically.
+    Stale,
+    /// Prepared like [`Mode::Stale`], then submitted at once to one batcher,
+    /// so commands share batches and are re-decided against events earlier in
+    /// their own batch.
+    Batched,
+}
+
 /// A history: operations one after another, then a group of them submitted
-/// at once, then more one after another.
+/// together, then more one after another.
 #[derive(Clone, Debug, Default)]
 struct Script {
     before: Vec<Op>,
     together: Vec<Op>,
+    mode: Mode,
     after: Vec<Op>,
+}
+
+/// What a run saw beyond agreeing with the model.
+#[derive(Clone, Copy, Debug, Default)]
+struct Report {
+    /// Commands the store re-decided under the lock in the group.
+    redecides: usize,
 }
 
 impl Script {
@@ -98,8 +185,9 @@ impl Script {
     /// As Rust, to paste into a `replay` test.
     fn trace(&self) -> String {
         format!(
-            "before: {}\ntogether: {}\nafter: {}",
+            "before: {}\ntogether ({:?}): {}\nafter: {}",
             trace(&self.before),
+            self.mode,
             trace(&self.together),
             trace(&self.after)
         )
@@ -110,7 +198,9 @@ impl Script {
 /// model. `Err` says which step disagreed and how; `Ok` also when there is no
 /// database, after `skipping:` was printed for CI's guard.
 async fn run_history(variant: Variant, ops: &[Op]) -> Result<(), String> {
-    run_planted(variant, &Script::sequential(ops), Plant::NONE).await
+    run_planted(variant, &Script::sequential(ops), Plant::NONE)
+        .await
+        .map(|_| ())
 }
 
 /// A defect planted for a run, to check that the comparison catches it.
@@ -129,7 +219,7 @@ impl Plant {
     };
 }
 
-async fn run_planted(variant: Variant, script: &Script, plant: Plant) -> Result<(), String> {
+async fn run_planted(variant: Variant, script: &Script, plant: Plant) -> Result<Report, String> {
     match variant {
         Variant::Blind => run_history_as::<Blind>(variant, script, plant).await,
         Variant::Plain => run_history_as::<Plain>(variant, script, plant).await,
@@ -140,9 +230,9 @@ async fn run_history_as<V: EmailTagging>(
     variant: Variant,
     script: &Script,
     plant: Plant,
-) -> Result<(), String> {
+) -> Result<Report, String> {
     let Some((database_url, pool)) = test_db().await else {
-        return Ok(());
+        return Ok(Report::default());
     };
     let (bc, subject) = bounded_context(&pool).await;
     let builder: SkiljBuilder =
@@ -175,6 +265,7 @@ struct Checker<'a> {
     hashes: HashMap<Value, String>,
     /// A planted defect: submit every command without its key.
     drop_keys: bool,
+    report: Report,
 }
 
 impl<'a> Checker<'a> {
@@ -187,10 +278,15 @@ impl<'a> Checker<'a> {
             sequences: Vec::new(),
             hashes: HashMap::new(),
             drop_keys: false,
+            report: Report::default(),
         }
     }
 
-    async fn run(mut self, target: unique_crm::Target<'_>, script: &Script) -> Result<(), String> {
+    async fn run(
+        mut self,
+        target: unique_crm::Target<'_>,
+        script: &Script,
+    ) -> Result<Report, String> {
         let variant = self.variant;
         let context = |part: &str, index: usize, op: &dyn std::fmt::Debug, error: String| {
             format!(
@@ -204,7 +300,7 @@ impl<'a> Checker<'a> {
             }
         }
         if !script.together.is_empty() {
-            if let Err(error) = self.together(target, &script.together).await {
+            if let Err(error) = self.together(target, &script.together, script.mode).await {
                 return Err(context("the group of", script.together.len(), &"", error));
             }
         }
@@ -213,7 +309,7 @@ impl<'a> Checker<'a> {
                 return Err(context("step after", index, op, error));
             }
         }
-        Ok(())
+        Ok(self.report)
     }
 
     fn position(&self, position: Position) -> i64 {
@@ -249,15 +345,71 @@ impl<'a> Checker<'a> {
         op: Op,
         payload: serde_json::Value,
     ) -> SubmitCommandOutcome {
-        let call = op.call();
         target
             .submit(
                 op.command_type(),
                 payload,
-                &call.client_id(),
-                call.key().filter(|_| !self.drop_keys).as_deref(),
+                &op.call().client_id(),
+                self.idempotency_key(op).as_deref(),
             )
             .await
+    }
+
+    fn idempotency_key(&self, op: Op) -> Option<String> {
+        op.call().key().filter(|_| !self.drop_keys)
+    }
+
+    /// `op`, decided on what the store holds now, not yet committed.
+    async fn prepare(
+        &self,
+        target: unique_crm::Target<'_>,
+        batcher: &CommandBatcher,
+        op: Op,
+        payload: &serde_json::Value,
+    ) -> PreparedCommand {
+        let command_type = db::get_command_type(target.pool, target.bc, op.command_type())
+            .await
+            .unwrap()
+            .unwrap();
+        batcher
+            .prepare_command(
+                target.pool,
+                &*target.skilj.command_dispatcher(),
+                &*target.skilj.snapshot_dispatcher(),
+                target.cache,
+                CommandBatchItem {
+                    command_type,
+                    payload: payload.to_string(),
+                    client_id: op.call().client_id(),
+                    correlation_id: None,
+                    causation_id: None,
+                    idempotency_key: self.idempotency_key(op),
+                },
+                Some(&unique_crm::master_key()),
+                unique_crm::now(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn submit_prepared(
+        &self,
+        target: unique_crm::Target<'_>,
+        batcher: &CommandBatcher,
+        prepared: PreparedCommand,
+    ) -> SubmitCommandOutcome {
+        batcher
+            .submit_prepared(
+                target.pool,
+                &target.skilj.command_dispatcher(),
+                &target.skilj.projection_dispatcher(),
+                &EventBroadcaster::new(16),
+                target.cache,
+                Some(&unique_crm::master_key()),
+                prepared,
+            )
+            .await
+            .unwrap()
     }
 
     async fn step(&mut self, target: unique_crm::Target<'_>, op: Op) -> Result<(), String> {
@@ -276,24 +428,62 @@ impl<'a> Checker<'a> {
             })
     }
 
-    /// `ops` submitted at once, each resolved against the state before them,
-    /// as each caller saw it. Some serial order of them must answer what the
-    /// store answered, appending its events in that order.
-    async fn together(&mut self, target: unique_crm::Target<'_>, ops: &[Op]) -> Result<(), String> {
+    /// `ops` submitted together as `mode` says, each resolved against the
+    /// state before them, as each caller saw it. Some serial order of them
+    /// must answer what the store answered, appending its events in that
+    /// order: for [`Mode::Stale`], the group's own order.
+    async fn together(
+        &mut self,
+        target: unique_crm::Target<'_>,
+        ops: &[Op],
+        mode: Mode,
+    ) -> Result<(), String> {
         let resolved: Vec<Resolved> = ops.iter().map(|op| self.model.resolve_op(*op)).collect();
         let payloads: Vec<serde_json::Value> = ops
             .iter()
             .zip(&resolved)
             .map(|(op, resolved)| self.payload(*op, *resolved))
             .collect();
-        let outcomes = futures_util::future::join_all(
-            ops.iter()
-                .zip(&payloads)
-                .map(|(op, payload)| self.submit(target, *op, payload.clone())),
-        )
-        .await;
+        let before = redecides(self.bc);
+        let batcher = CommandBatcher::new();
+        let outcomes = match mode {
+            Mode::Racing => {
+                futures_util::future::join_all(
+                    ops.iter()
+                        .zip(&payloads)
+                        .map(|(op, payload)| self.submit(target, *op, payload.clone())),
+                )
+                .await
+            }
+            Mode::Stale | Mode::Batched => {
+                let mut prepared = Vec::new();
+                for (op, payload) in ops.iter().zip(&payloads) {
+                    prepared.push(self.prepare(target, &batcher, *op, payload).await);
+                }
+                if mode == Mode::Stale {
+                    let mut outcomes = Vec::new();
+                    for prepared in prepared {
+                        outcomes.push(self.submit_prepared(target, &batcher, prepared).await);
+                    }
+                    outcomes
+                } else {
+                    futures_util::future::join_all(
+                        prepared
+                            .into_iter()
+                            .map(|prepared| self.submit_prepared(target, &batcher, prepared)),
+                    )
+                    .await
+                }
+            }
+        };
+        self.report.redecides += redecides(self.bc) - before;
+        let candidates = if mode == Mode::Stale {
+            vec![(0..ops.len()).collect()]
+        } else {
+            orders(ops.len())
+        };
         let mut tried = Vec::new();
-        for order in orders(ops.len()) {
+        for order in candidates {
             let mut trial = self.clone();
             match trial.serially(ops, &resolved, &outcomes, &order) {
                 Ok(()) => {
@@ -618,11 +808,13 @@ fn script() -> impl Strategy<Value = Script> {
     (
         proptest::collection::vec(op(), 0..=8),
         (0..BASES).prop_flat_map(|base| proptest::collection::vec(contending(base), 2..=3)),
+        prop_oneof![Just(Mode::Racing), Just(Mode::Stale), Just(Mode::Batched)],
         proptest::collection::vec(op(), 0..=4),
     )
-        .prop_map(|(before, together, after)| Script {
+        .prop_map(|(before, together, mode, after)| Script {
             before,
             together,
+            mode,
             after,
         })
 }
@@ -1136,9 +1328,10 @@ fn a_release_retracted_after_its_customer_reclaimed_the_address() {
 
 // ---- Fixed concurrent histories --------------------------------------------
 
-fn replay_together(variant: Variant, script: Script) {
-    if let Err(error) = runtime().block_on(run_planted(variant, &script, Plant::NONE)) {
-        panic!("{error}");
+fn replay_together(variant: Variant, script: Script) -> Report {
+    match runtime().block_on(run_planted(variant, &script, Plant::NONE)) {
+        Ok(report) => report,
+        Err(error) => panic!("{error}"),
     }
 }
 
@@ -1159,22 +1352,31 @@ fn orders_are_every_permutation() {
     );
 }
 
-/// Two customers claiming one address at once: one gets it.
+const MODES: [Mode; 3] = [Mode::Racing, Mode::Stale, Mode::Batched];
+
+/// Two customers claiming one address at once: one gets it. Prepared on the
+/// same state, the second and third are each re-decided under the lock.
 #[test]
 fn two_claims_of_one_address_at_once_leave_one_holder() {
     for variant in [Variant::Blind, Variant::Plain] {
-        replay_together(
-            variant,
-            Script {
-                before: Vec::new(),
-                together: vec![
-                    register(0, at(0, 0)),
-                    register(1, at(0, 0)),
-                    register(2, at(0, 0)),
-                ],
-                after: vec![register(0, at(1, 0)), register(1, at(1, 0))],
-            },
-        );
+        for mode in MODES {
+            let report = replay_together(
+                variant,
+                Script {
+                    together: vec![
+                        register(0, at(0, 0)),
+                        register(1, at(0, 0)),
+                        register(2, at(0, 0)),
+                    ],
+                    mode,
+                    after: vec![register(0, at(1, 0)), register(1, at(1, 0))],
+                    ..Script::default()
+                },
+            );
+            if mode != Mode::Racing && test_db_available() {
+                assert_eq!(report.redecides, 2, "{variant:?} {mode:?}");
+            }
+        }
     }
 }
 
@@ -1183,36 +1385,81 @@ fn two_claims_of_one_address_at_once_leave_one_holder() {
 #[test]
 fn one_key_twice_at_once_is_decided_once() {
     for variant in [Variant::Blind, Variant::Plain] {
-        replay_together(
-            variant,
-            Script {
-                before: Vec::new(),
-                together: vec![
-                    keyed(register(0, at(0, 0)), 0, 0),
-                    keyed(register(1, at(1, 0)), 0, 0),
-                ],
-                after: vec![register(2, at(1, 0))],
-            },
-        );
+        for mode in MODES {
+            replay_together(
+                variant,
+                Script {
+                    together: vec![
+                        keyed(register(0, at(0, 0)), 0, 0),
+                        keyed(register(1, at(1, 0)), 0, 0),
+                    ],
+                    mode,
+                    after: vec![register(2, at(1, 0))],
+                    ..Script::default()
+                },
+            );
+        }
     }
 }
 
-/// A release, a claim of the address and a retraction of the release at
-/// once: the retraction can't give the address back once the claim is in.
+/// A claim of a released address and a retraction of that release at once:
+/// the retraction can't give the address back once the claim is in. Prepared
+/// on the same state, the retraction is re-decided and sees the claim.
 #[test]
 fn a_release_retraction_racing_a_claim_never_leaves_two_holders() {
     for variant in [Variant::Blind, Variant::Plain] {
-        replay_together(
-            variant,
+        for mode in MODES {
+            let report = replay_together(
+                variant,
+                Script {
+                    before: vec![register(0, at(0, 0)), release(0, at(0, 0))],
+                    together: vec![register(1, at(0, 0)), retract_release(0)],
+                    mode,
+                    after: vec![
+                        register(2, at(0, 0)),
+                        correct(0, at(2, 0)),
+                        register(0, at(3, 0)),
+                    ],
+                },
+            );
+            if mode != Mode::Racing && test_db_available() {
+                assert_eq!(report.redecides, 1, "{variant:?} {mode:?}");
+            }
+        }
+    }
+}
+
+/// How often commands submitted at once, each reading as it goes, really
+/// overlap in the store. How often depends on the machine, so only none at
+/// all fails: then [`Mode::Racing`] would be sequential in all but name. The
+/// forced modes above assert their exact count.
+#[test]
+fn racing_groups_overlap_in_the_store() {
+    let groups = env_number("SKILJ_MODEL_RACING_GROUPS", 20) as usize;
+    let mut overlapped = 0;
+    for _ in 0..groups {
+        let report = replay_together(
+            Variant::Blind,
             Script {
-                before: vec![register(0, at(0, 0)), release(0, at(0, 0))],
-                together: vec![register(1, at(0, 0)), retract_release(0)],
-                after: vec![
+                together: vec![
+                    register(0, at(0, 0)),
+                    register(1, at(0, 0)),
                     register(2, at(0, 0)),
-                    correct(0, at(2, 0)),
-                    register(0, at(3, 0)),
                 ],
+                mode: Mode::Racing,
+                ..Script::default()
             },
         );
+        if report.redecides > 0 {
+            overlapped += 1;
+        }
     }
+    eprintln!("racing groups re-decided in the store: {overlapped} of {groups}");
+    if test_db_available() {
+        assert!(overlapped > 0, "no racing group overlapped in the store");
+    }
+}
+
+fn test_db_available() -> bool {
+    runtime().block_on(test_db()).is_some()
 }
