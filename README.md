@@ -156,7 +156,7 @@ To add `skilj` to an existing project instead:
 
 ```toml
 [dependencies]
-skilj = "0.3"
+skilj = "0.4"
 ```
 
 [`skilj-demo`](skilj-demo) in this repository is a larger worked example (two bounded contexts:

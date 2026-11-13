@@ -10,6 +10,8 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-13
+
 ### Upgrading from 0.3
 
 - Stop every 0.3 instance before the first instance of this release starts,
@@ -2639,7 +2641,8 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://github.com/gklijs/SkilJ/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/gklijs/SkilJ/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/gklijs/SkilJ/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gklijs/SkilJ/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gklijs/SkilJ/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/gklijs/SkilJ/compare/v0.1.0...v0.1.1

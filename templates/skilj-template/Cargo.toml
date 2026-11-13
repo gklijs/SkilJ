@@ -1,6 +1,6 @@
 [package]
 name = "{{project-name}}"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [features]
@@ -11,8 +11,8 @@ default = ["local"]
 local = ["skilj/local"]
 
 [dependencies]
-skilj = "0.3.0"
-skilj-core = "0.3.0"
+skilj = "0.4.0"
+skilj-core = "0.4.0"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -21,7 +21,7 @@ schemars = { version = "1", features = ["chrono04"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
-skilj-test-fixture = "0.3.0"
+skilj-test-fixture = "0.4.0"
 
 [package.metadata.cargo-machete]
 # schemars's `chrono04` feature above is for the date fields a project adds.
