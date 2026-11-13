@@ -32,7 +32,7 @@
 #   --prepared           use the app --prepare-only generated
 set -euo pipefail
 
-DEFAULT_FROM=v0.3.0
+DEFAULT_FROM=v0.4.0
 
 from="$DEFAULT_FROM"
 expect_compatible=false
