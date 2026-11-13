@@ -34,9 +34,10 @@
 //! `SKILJ_MODEL_CONCURRENT_CASES` concurrent groups (16), about a minute and a
 //! half in all. A failure is shrunk and printed as the operations that
 //! reproduce it, which `replay` and `replay_together` take as they are, and
-//! its seed is kept in `model_unique_value.regressions` next to this file,
-//! which runs first next time. `.github/workflows/model-tests.yml` runs it at
-//! depth weekly.
+//! its seed is written to `model_unique_value.regressions` next to this
+//! file, which runs first next time on that machine. The file is
+//! git-ignored: a seed replays operations, not timing.
+//! `.github/workflows/model-tests.yml` runs it at depth weekly.
 
 mod unique_crm;
 

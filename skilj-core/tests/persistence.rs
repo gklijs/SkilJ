@@ -1510,6 +1510,281 @@ fn get_command_type_is_none_for_an_unknown_name() {
     });
 }
 
+/// Waits until a backend is waiting on a lock: the one with process id
+/// `pid`, or else one whose statement is exactly `query` (only short
+/// statements: `pg_stat_activity` keeps the first 1024 bytes). Gives up
+/// after about 30 seconds: the wait can sit behind another test's deletion
+/// queued on `roles`, which a loaded machine can make slow.
+async fn wait_until_blocked(pool: &Pool, pid: Option<i32>, query: Option<&str>) -> i32 {
+    for attempt in 0.. {
+        let waiting: Option<(i32,)> = sqlx::query_as(
+            "SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+             AND ($1::int IS NULL OR pid = $1) AND ($2::text IS NULL OR query = $2)",
+        )
+        .bind(pid)
+        .bind(query)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some((pid,)) = waiting {
+            return pid;
+        }
+        if attempt >= 3000 {
+            let waiting: Vec<(i32, String)> = sqlx::query_as(
+                "SELECT pid, query FROM pg_stat_activity WHERE wait_event_type = 'Lock'",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            panic!("{pid:?} / {query:?} never waited on a lock; waiting: {waiting:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    unreachable!()
+}
+
+/// A pool of one connection to the test database, and that connection's
+/// process id, so a test can tell when a call made through it waits.
+async fn single_connection_pool(pool: &Pool) -> (Pool, i32) {
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let (pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&single)
+        .await
+        .unwrap();
+    (single, pid)
+}
+
+/// `DROP SCHEMA ... CASCADE` locks the bounded context's tables, then
+/// `public.roles` for the foreign keys into it. `get_command_type` once
+/// locked `roles` before the context's `command_types`, so a command
+/// submitted while its bounded context was deleted could deadlock with the
+/// deletion (docs/architecture.md §251). The deletion's locks are taken
+/// here by hand, in the drop's order, so the cycle forms or doesn't the
+/// moment the second one is asked for, whatever the timing.
+#[test]
+fn a_command_type_lookup_does_not_deadlock_with_deleting_its_context() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let ct = seed_command_type(&pool, &bc).await;
+        let schema = format!("\"bc_{}\"", bc.name);
+
+        // Each side on a connection of its own, opened before anything is
+        // locked: while a deletion waits on `roles`, other tests' statements
+        // on `roles` queue behind it holding the shared pool's connections.
+        let (control, _) = single_connection_pool(&pool).await;
+        let (deletion_pool, _) = single_connection_pool(&pool).await;
+        let (lookup_pool, lookup_pid) = single_connection_pool(&pool).await;
+        let mut deletion = deletion_pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "LOCK TABLE {schema}.command_types IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut *deletion)
+        .await
+        .unwrap();
+
+        let lookup = tokio::spawn({
+            let bc = bc.name.clone();
+            let ct = ct.name.clone();
+            async move { db::get_command_type(&lookup_pool, &bc, &ct).await }
+        });
+        wait_until_blocked(&control, Some(lookup_pid), None).await;
+
+        sqlx::query("LOCK TABLE public.roles IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *deletion)
+            .await
+            .expect("the deletion deadlocked with the lookup");
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut *deletion)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM bounded_contexts WHERE name = $1")
+            .bind(&bc.name)
+            .execute(&mut *deletion)
+            .await
+            .unwrap();
+        deletion.commit().await.unwrap();
+
+        let loaded = lookup
+            .await
+            .unwrap()
+            .expect("the lookup deadlocked with the deletion");
+        assert_eq!(loaded, None, "a deleted context has no command type");
+    });
+}
+
+/// The same race against the real `hard_delete_bounded_context`: held at
+/// its `roles` lock (by a transaction reading `roles`) after it has the
+/// context's tables, then a lookup arrives. The lookup waits for the
+/// deletion and then reads as no such command type.
+#[test]
+fn a_command_type_lookup_during_a_deletion_reads_as_missing() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let ct = seed_command_type(&pool, &bc).await;
+        let schema = format!("\"bc_{}\"", bc.name);
+
+        // Each side on a connection of its own, as above.
+        let (control, _) = single_connection_pool(&pool).await;
+        let (reader_pool, _) = single_connection_pool(&pool).await;
+        let (deletion_pool, _) = single_connection_pool(&pool).await;
+        let (lookup_pool, lookup_pid) = single_connection_pool(&pool).await;
+        let mut reader = reader_pool.begin().await.unwrap();
+        sqlx::query("SELECT count(*) FROM public.roles")
+            .execute(&mut *reader)
+            .await
+            .unwrap();
+
+        let deletion = tokio::spawn({
+            let bc = bc.name.clone();
+            async move { db::hard_delete_bounded_context(&deletion_pool, &bc).await }
+        });
+        wait_until_blocked(
+            &control,
+            None,
+            Some(&format!("DROP SCHEMA {schema} CASCADE")),
+        )
+        .await;
+
+        let lookup = tokio::spawn({
+            let bc = bc.name.clone();
+            let ct = ct.name.clone();
+            async move { db::get_command_type(&lookup_pool, &bc, &ct).await }
+        });
+        wait_until_blocked(&control, Some(lookup_pid), None).await;
+
+        reader.commit().await.unwrap();
+        deletion.await.unwrap().expect("the deletion failed");
+        let loaded = lookup.await.unwrap().expect("the lookup failed");
+        assert_eq!(loaded, None, "a deleted context has no command type");
+    });
+}
+
+/// A transaction holding `AccessShareLock` on `public.roles` until it ends.
+async fn hold_roles(pool: &Pool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut reader = pool.begin().await.unwrap();
+    sqlx::query("SELECT count(*) FROM public.roles")
+        .execute(&mut *reader)
+        .await
+        .unwrap();
+    reader
+}
+
+/// The order `a_command_type_lookup_does_not_deadlock_with_deleting_its_context`
+/// takes by hand, checked on the real deletion: held at its `roles` lock by
+/// a transaction reading `roles`, the drop already holds the context's
+/// `command_types` and is still waiting for `public.roles`. Should Postgres
+/// or the deletion change that order, this fails, and the rule in
+/// docs/architecture.md §251 needs looking at again.
+async fn assert_the_drop_locks_the_context_before_roles(trail: bool) {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let bc = seed_bounded_context(&pool).await;
+    let actor = seed_role(&pool, true).await;
+    let schema = format!("\"bc_{}\"", bc.name);
+
+    // Each side on a connection of its own, as above.
+    let (control, _) = single_connection_pool(&pool).await;
+    let (gate_pool, _) = single_connection_pool(&pool).await;
+    let (reader_pool, _) = single_connection_pool(&pool).await;
+    let (deletion_pool, deletion_pid) = single_connection_pool(&pool).await;
+
+    // The trail variant reads `roles` (`require_admin_bounded_context`)
+    // before it locks the `bounded_contexts` row. Holding that row first
+    // keeps it there until the reader below has `roles`: had the reader
+    // taken `roles` earlier, another test's deletion waiting on it could
+    // queue that read behind itself, and this test would wait on itself.
+    let mut gate = gate_pool.begin().await.unwrap();
+    sqlx::query("SELECT name FROM bounded_contexts WHERE name = $1 FOR UPDATE")
+        .bind(&bc.name)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    // The plain variant touches nothing before its drop, so the reader takes
+    // `roles` before it starts.
+    let mut reader = None;
+    if !trail {
+        reader = Some(hold_roles(&reader_pool).await);
+    }
+
+    let deletion = tokio::spawn({
+        let bc = bc.name.clone();
+        async move {
+            if trail {
+                db::hard_delete_bounded_context_with_trail(&deletion_pool, &bc, &actor.id).await
+            } else {
+                db::hard_delete_bounded_context(&deletion_pool, &bc).await
+            }
+        }
+    });
+    if trail {
+        wait_until_blocked(&control, Some(deletion_pid), None).await;
+        reader = Some(hold_roles(&reader_pool).await);
+    }
+    gate.commit().await.unwrap();
+
+    let drop_pid = wait_until_blocked(
+        &control,
+        None,
+        Some(&format!("DROP SCHEMA {schema} CASCADE")),
+    )
+    .await;
+
+    let exclusive = |relation: String| {
+        let control = control.clone();
+        async move {
+            let granted: Option<(bool,)> = sqlx::query_as(
+                "SELECT granted FROM pg_locks WHERE pid = $1 \
+                 AND mode = 'AccessExclusiveLock' AND relation = to_regclass($2)",
+            )
+            .bind(drop_pid)
+            .bind(relation)
+            .fetch_optional(&control)
+            .await
+            .unwrap();
+            granted.map(|(granted,)| granted)
+        }
+    };
+    let command_types = exclusive(format!("{schema}.command_types")).await;
+    let roles = exclusive("public.roles".to_string()).await;
+
+    reader.unwrap().commit().await.unwrap();
+    deletion.await.unwrap().expect("the deletion failed");
+    assert_eq!(
+        command_types,
+        Some(true),
+        "the drop holds the context's command_types"
+    );
+    assert_eq!(roles, Some(false), "the drop waits for public.roles");
+    assert_eq!(
+        db::get_bounded_context(&pool, &bc.name).await.unwrap(),
+        None
+    );
+}
+
+#[test]
+fn hard_delete_locks_the_context_before_roles() {
+    runtime().block_on(assert_the_drop_locks_the_context_before_roles(false));
+}
+
+#[test]
+fn hard_delete_with_trail_locks_the_context_before_roles() {
+    runtime().block_on(assert_the_drop_locks_the_context_before_roles(true));
+}
+
 #[test]
 fn upsert_command_type_updates_in_place() {
     runtime().block_on(async {

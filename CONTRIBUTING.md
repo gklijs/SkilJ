@@ -159,7 +159,8 @@ far as a test exercises them, and some aren't checked at all
   most 20 operations (`PROPTEST_CASES`, `SKILJ_MODEL_MAX_OPS`), about a
   minute and a half; `.github/workflows/model-tests.yml` runs 1000 of at most
   60, and 200 concurrent groups, weekly. A failure prints the operations that reproduce it, which
-  `replay` takes, and keeps its seed in `model_unique_value.regressions`.
+  `replay` takes, and keeps its seed in `model_unique_value.regressions`, a
+  local, git-ignored file.
   That the property can fail is tested too: the generated histories reach
   each of the twelve answers several times, and four planted defects (a
   registration ignoring what the customer holds, a query missing releases, a

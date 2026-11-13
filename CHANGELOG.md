@@ -10,6 +10,15 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Fixed
+
+- A command submitted to a bounded context while that bounded context is
+  being deleted no longer fails with a database deadlock (`40P01`), and the
+  deletion no longer fails because of it. The command's type lookup now
+  locks the bounded context's table before `roles`, in the order the
+  deletion takes them, and the command reads as having an unknown command
+  type, as it does after the deletion (docs/architecture.md §251).
+
 ## [0.4.0] - 2026-11-13
 
 ### Upgrading from 0.3
