@@ -21,6 +21,14 @@ Cargo.lock
 # Contains mutation testing data
 **/mutants.out*/
 
+# Proptest failure seeds (skilj/tests/model_unique_value.rs writes
+# `<test>.regressions`, proptest's default is `<test>.proptest-regressions`).
+# They replay a failing case's operations, not the timing it ran with, and
+# stay local; the operations a failure prints go in a `replay` test instead
+# (issue #204).
+skilj/tests/*.regressions
+*.proptest-regressions
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

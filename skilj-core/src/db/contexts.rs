@@ -182,12 +182,31 @@ pub(super) fn hydrated_bounded_context_columns() -> String {
     .join(", ")
 }
 
+/// The joins after `bounded_contexts bc` in
+/// [`HYDRATED_BOUNDED_CONTEXT_FROM`], as a literal both constants are
+/// built from.
+macro_rules! hydrated_bounded_context_joins {
+    () => {
+        "LEFT JOIN roles r ON r.id = bc.created_by_role_id \
+         LEFT JOIN bounded_contexts t ON t.name = bc.template \
+         LEFT JOIN roles tr ON tr.id = t.created_by_role_id"
+    };
+}
+
 /// The joins [`hydrated_bounded_context_columns`] reads from; `bc` is the
 /// bounded context itself.
-pub(super) const HYDRATED_BOUNDED_CONTEXT_FROM: &str = "bounded_contexts bc \
-     LEFT JOIN roles r ON r.id = bc.created_by_role_id \
-     LEFT JOIN bounded_contexts t ON t.name = bc.template \
-     LEFT JOIN roles tr ON tr.id = t.created_by_role_id";
+pub(super) const HYDRATED_BOUNDED_CONTEXT_FROM: &str =
+    concat!("bounded_contexts bc ", hydrated_bounded_context_joins!());
+
+/// [`HYDRATED_BOUNDED_CONTEXT_FROM`] without its first relation, for a
+/// statement that also reads a bounded context's own table: that table
+/// goes first in `FROM`, then `bounded_contexts bc`, then these joins.
+/// Postgres locks a statement's relations in the order it names them,
+/// and `DROP SCHEMA ... CASCADE` locks the bounded context's tables before
+/// `roles` (for the foreign keys into it), so naming `roles` first
+/// deadlocks with deleting that bounded context (docs/architecture.md
+/// §251).
+pub(super) const HYDRATED_BOUNDED_CONTEXT_JOINS: &str = hydrated_bounded_context_joins!();
 
 /// The [`BoundedContext`] a [`hydrated_bounded_context_columns`] row holds.
 pub(super) fn hydrated_bounded_context(

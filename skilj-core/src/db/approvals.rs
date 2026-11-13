@@ -1157,11 +1157,15 @@ pub async fn get_command_type(
     use sqlx::FromRow;
     // The command type with its bounded context, hydrated, in one
     // statement (docs/architecture.md §196, §199): every command resolves
-    // its type this way before the lock.
+    // its type this way before the lock. `command_types` is named first so
+    // it is locked before `roles`, in the order `DROP SCHEMA ... CASCADE`
+    // takes them; the other order deadlocked with deleting this bounded
+    // context (§251).
     let schema = schema_ident(bounded_context);
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT {}, {} FROM {HYDRATED_BOUNDED_CONTEXT_FROM} \
-         JOIN {schema}.command_types ct ON ct.name = $2 WHERE bc.name = $1",
+        "SELECT {}, {} FROM {schema}.command_types ct \
+         JOIN bounded_contexts bc ON bc.name = $1 {HYDRATED_BOUNDED_CONTEXT_JOINS} \
+         WHERE ct.name = $2",
         hydrated_bounded_context_columns(),
         COMMAND_TYPE_COLUMNS
             .split(", ")

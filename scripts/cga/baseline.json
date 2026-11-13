@@ -627,7 +627,7 @@
     },
     {
       "file": "<rust>/library/core/src/option.rs",
-      "message": "call to drop of `{closure@skilj-core/src/db/contexts.rs:229:14: 229:24}` which can panic",
+      "message": "call to drop of `{closure@skilj-core/src/db/contexts.rs:248:14: 248:24}` which can panic",
       "source": "}",
       "count": 1
     },
@@ -3436,7 +3436,7 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "let row = sqlx::query(sqlx::AssertSqlSafe(format!( \"SELECT {}, {} FROM {HYDRATED_BOUNDED_CONTEXT_FROM} \\ JOIN {schema}.command_types ct ON ct.name = $2 WHERE bc.name = $1\", hydrated_bounded_context_columns(), COMMAND_TYPE_COLUMNS .split(\", \") .map(|column| format!(\"ct.{}\", column.trim())) .collect::<Vec<_>>() .join(\", \") )))",
+      "source": "let row = sqlx::query(sqlx::AssertSqlSafe(format!( \"SELECT {}, {} FROM {schema}.command_types ct \\ JOIN bounded_contexts bc ON bc.name = $1 {HYDRATED_BOUNDED_CONTEXT_JOINS} \\ WHERE ct.name = $2\", hydrated_bounded_context_columns(), COMMAND_TYPE_COLUMNS .split(\", \") .map(|column| format!(\"ct.{}\", column.trim())) .collect::<Vec<_>>() .join(\", \") )))",
       "count": 1
     },
     {
@@ -3622,13 +3622,13 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let row = sqlx::query(sqlx::AssertSqlSafe(format!( \"SELECT {}, {} FROM {HYDRATED_BOUNDED_CONTEXT_FROM} \\ JOIN {schema}.command_types ct ON ct.name = $2 WHERE bc.name = $1\", hydrated_bounded_context_columns(), COMMAND_TYPE_COLUMNS .split(\", \") .map(|column| format!(\"ct.{}\", column.trim())) .collect::<Vec<_>>() .join(\", \") ))) .bind(bounded_context)",
+      "source": "let row = sqlx::query(sqlx::AssertSqlSafe(format!( \"SELECT {}, {} FROM {schema}.command_types ct \\ JOIN bounded_contexts bc ON bc.name = $1 {HYDRATED_BOUNDED_CONTEXT_JOINS} \\ WHERE ct.name = $2\", hydrated_bounded_context_columns(), COMMAND_TYPE_COLUMNS .split(\", \") .map(|column| format!(\"ct.{}\", column.trim())) .collect::<Vec<_>>() .join(\", \") ))) .bind(bounded_context)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let row = sqlx::query(sqlx::AssertSqlSafe(format!( \"SELECT {}, {} FROM {HYDRATED_BOUNDED_CONTEXT_FROM} \\ JOIN {schema}.command_types ct ON ct.name = $2 WHERE bc.name = $1\", hydrated_bounded_context_columns(), COMMAND_TYPE_COLUMNS .split(\", \") .map(|column| format!(\"ct.{}\", column.trim())) .collect::<Vec<_>>() .join(\", \") ))) .bind(bounded_context) .bind(name)",
+      "source": "let row = sqlx::query(sqlx::AssertSqlSafe(format!( \"SELECT {}, {} FROM {schema}.command_types ct \\ JOIN bounded_contexts bc ON bc.name = $1 {HYDRATED_BOUNDED_CONTEXT_JOINS} \\ WHERE ct.name = $2\", hydrated_bounded_context_columns(), COMMAND_TYPE_COLUMNS .split(\", \") .map(|column| format!(\"ct.{}\", column.trim())) .collect::<Vec<_>>() .join(\", \") ))) .bind(bounded_context) .bind(name)",
       "count": 1
     },
     {
@@ -8721,13 +8721,13 @@
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:234:1: 234:55}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:253:1: 253:55}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(name = %name))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:262:1: 262:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:281:1: 281:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -22521,7 +22521,7 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3523:1: 3523:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3532:1: 3532:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },

@@ -907,7 +907,9 @@ any other statement. `hard_delete_bounded_context` is the same shape in
 reverse: `DROP SCHEMA ... CASCADE` then `DELETE FROM bounded_contexts`,
 one transaction — whose own `ON DELETE CASCADE` FK cleans up that
 context's `role_access_mappings` rows automatically, no separate cleanup
-query needed.
+query needed. The drop locks the context's tables and then `public.roles`,
+which three of them reference, so a statement that reads both names the
+context's table first (§251).
 
 One consequence needed its own small global table: `access_tokens` moving
 into each context's own schema breaks `skilj-rest`'s bearer-credential
@@ -13938,3 +13940,26 @@ Closing #176 after §246 left three things: the trait's default `rewrap` still w
 | 20 ms | 43,168 ms | 5,515 ms | 147 ms |
 
 Vault's rotation still makes five requests for 1,000 data keys; a provider with only the single operations makes the same 2,000 requests as before, eight in flight, and rotates 6.6 to 7.8 times faster. The move's numbers are unchanged.
+
+## 251. A command-type lookup no longer deadlocks with deleting its bounded context (issue #204)
+
+A local run of `skilj/tests/model_unique_value.rs` failed in its teardown: `hard_delete_bounded_context` returned `40P01 deadlock detected`. A second run on the same checkout passed.
+
+**The cycle.** Three tables of every bounded context have foreign keys into `public.roles`: `private_field_grants` (grantor and grantee), `command_proposals` (`decided_by_role_id`) and `secret_grants` (grantee). Dropping a table with a foreign key drops the key's triggers on the table it references, and that takes an `AccessExclusiveLock` on `roles`. `DROP SCHEMA ... CASCADE` takes it last, after it has locked the context's own tables. `get_command_type`, which every command submission runs before its lock (§196, §199), read the command type and its bounded context in one statement: `FROM bounded_contexts bc LEFT JOIN roles r ... JOIN "bc_<name>".command_types ct`. Postgres locks a statement's relations in the order it names them, so the lookup held `roles` and then asked for `command_types`, while the drop held `command_types` and asked for `roles`. Running the test against a Postgres with `log_lock_waits` on showed this cycle five times in one 70-second run, each time the drop and this statement. The issue's report, two drops and a reader, was the same cycle with a second drop queued on `roles`.
+
+**The fix.** The lookup names `"bc_<name>".command_types` first: `FROM "bc_<name>".command_types ct JOIN bounded_contexts bc ON bc.name = $1 LEFT JOIN roles r ...`. It now takes the drop's order. A lookup that meets a deletion waits for it, and then finds the table gone (`42P01`), which it already read as no such command type. The columns and rows are unchanged. `HYDRATED_BOUNDED_CONTEXT_JOINS` holds the joins after `bounded_contexts bc`, and `HYDRATED_BOUNDED_CONTEXT_FROM` is built from the same literal.
+
+**The rule.** A statement or transaction that reads a deletable bounded context's tables and `roles` names the context's table first. The admin context is never deleted, so the access trail's writers are not affected. The other writers that touch both, inserting a private-field grant or a secret grant and deciding a proposal, write the context's table first and reach `roles` through its foreign key, so they already take the drop's order. When this was written, `get_command_type` was the only statement or transaction in the workspace that took `roles` before a deletable context's table.
+
+**Why not change the deletion.** Four alternatives were tested on Postgres 17:
+
+- Locking `roles` first in the deletion removes this cycle but makes a new one with the writers above: a private-field grant inserted between the deletion's `roles` lock and its lock on `private_field_grants` deadlocks, where it now waits and then fails cleanly. It also makes every read of `roles`, authentication included, wait for the whole deletion.
+- Dropping the foreign keys before `DROP SCHEMA`, as the issue suggested, does not help: `ALTER TABLE ... DROP CONSTRAINT` locks the context's table before `roles`, like the drop.
+- Dropping them in a separate transaction that locks `roles` first has the same new cycle in that transaction, and splits the deletion in two. A failure between the two transactions would leave an archived context without its foreign keys, which preflight reports (§249).
+- A short `lock_timeout` and a retry in the deletion only makes the deletion the side that gives up when its timeout is below the server's `deadlock_timeout`.
+
+**Tests.** `skilj-core/tests/persistence.rs`: `a_command_type_lookup_does_not_deadlock_with_deleting_its_context` takes the drop's locks by hand in its order: `command_types`, waits until the lookup is blocked on it, then `roles`. With the old statement the second lock deadlocks every time. Now it succeeds and the lookup reads `None`. Each side runs on a pool of one connection of its own. The test waits for the lookup's connection by process id, because `pg_stat_activity` keeps only the first 1024 bytes of a statement, which cuts this one off before the context's name. The shared pool is not used once something is locked: while a deletion waits on `roles`, the other tests' statements on `roles` queue behind it and hold the shared pool's connections. `a_command_type_lookup_during_a_deletion_reads_as_missing` runs the lookup against the real `hard_delete_bounded_context`, held at its `roles` lock. It passes with either statement and guards the `42P01` handling. `hard_delete_locks_the_context_before_roles` and `hard_delete_with_trail_locks_the_context_before_roles` check the order the first test takes by hand on the real functions: held at `roles` by a reader, the drop holds the context's `command_types` exclusively and is still waiting for `public.roles` (`pg_locks`). Should Postgres or the deletion change that order, they fail and the rule above needs looking at again. The trail variant reads `roles` before its drop, so the test holds its `bounded_contexts` row until the reader has `roles`; otherwise another test's deletion waiting on that reader could queue the read behind itself.
+
+The reported test, against a Postgres 17 with `log_lock_waits` on and `deadlock_timeout` at 100 ms: one run with the old statement logged five deadlocks, all this cycle. Five runs with the new one logged none, and each took about 48 seconds instead of 69.
+
+Proptest's seed files are git-ignored (`skilj/tests/*.regressions`, `*.proptest-regressions`). A seed replays a failing case's operations, not the timing it ran with, and the operations a failure prints go in a `replay` test.

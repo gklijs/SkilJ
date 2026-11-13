@@ -3360,6 +3360,13 @@ pub async fn ensure_event_read_token_start_from_column(
 /// `bootstrap::delete_bounded_context` check (superadmin, `archived`,
 /// not `admin`) is the caller's job to run first - this function trusts
 /// it already has.
+///
+/// The drop locks the context's tables first and `public.roles` last:
+/// `private_field_grants`, `command_proposals` and `secret_grants` have
+/// foreign keys into `roles`, and dropping them takes an exclusive lock on
+/// it. A statement or transaction that locks `roles` and then one of the
+/// context's tables deadlocks with this; one that reads both names the
+/// context's table first (docs/architecture.md §251).
 #[tracing::instrument(skip_all, fields(name = %name))]
 pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::error::Result<()> {
     let schema = schema_ident(name);
@@ -3389,7 +3396,9 @@ pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::erro
 /// the `bounded_contexts` row first, which also holds off a new mapping
 /// (its foreign key needs that row), then the active mapping rows, then
 /// the private-field grants table, so what is read here is everything
-/// there is and nothing can be added before the drop. The schema is
+/// there is and nothing can be added before the drop. The drop itself
+/// takes the context's tables and then `public.roles`, as in
+/// [`hard_delete_bounded_context`] (§251). The schema is
 /// dropped before the events are recorded, so the admin sequence lock is
 /// held only for those inserts and the commit, not across a large drop.
 #[tracing::instrument(skip_all, fields(name = %name))]

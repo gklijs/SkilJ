@@ -7,8 +7,9 @@
 ## SKILJ_MODEL_CONCURRENT_CASES concurrent groups, to find what a small
 ## budget rarely reaches. A failure is shrunk and printed
 ## as the operations reproducing it, to paste into a `replay` test, and its
-## seed is uploaded as the `model-regressions` artifact: committed next to
-## the test, it runs first next time.
+## seed is uploaded as the `model-regressions` artifact: placed next to the
+## test locally, it runs first next time there. Seed files are git-ignored
+## (issue #204); the printed operations go in a `replay` test.
 
 name: Model tests
 

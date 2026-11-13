@@ -57,6 +57,16 @@ and uploaded by CI even when comparison fails.
 
 ## Reducing findings
 
+The issue #204 change re-records the baseline after review: 7 identities
+new, 7 gone, one for one. Three are `get_command_type`'s `sqlx::query` and its
+two binds, whose source span is the statement it now builds with the context's
+`command_types` first. The other four are the same diagnostics with closure
+and `tracing::instrument` line numbers moved by the new
+`HYDRATED_BOUNDED_CONTEXT_JOINS` and the doc comments in `contexts.rs` and
+`schema.rs`. No new kind of path, no `unwrap`, `expect` or indexing outside
+tests; tool, configuration, dependencies and the skipped generic target
+multiset are unchanged.
+
 The issue #176 batch-of-one change updates the baseline from CI's report after
 review (the pinned nightly couldn't be fetched where it was written; the
 comparison now lists gone findings as well as new ones, so such an update can be
