@@ -43,8 +43,17 @@ fn encrypted_email() -> Vec<SensitiveField> {
     Blind::sensitive_fields()
 }
 
+/// Snapshot catch-up runs only when a test calls it: an hour between the
+/// background task's ticks, as `deadlines.rs` does for its poller. With
+/// the default half second the background tick raced the tests' own
+/// `catch_up_snapshots` - a partition the tick held was skipped
+/// (`pg_try_advisory_xact_lock`), so the call returned before the row was
+/// committed and `stored_count` found none - and caught up a row a test
+/// meant to read stale.
 fn builder(database_url: &str, bc: &str, subject: &str) -> SkiljBuilder {
-    unique_crm::builder::<Blind>(database_url, bc, subject).command_type::<ImportClaim>()
+    unique_crm::builder::<Blind>(database_url, bc, subject)
+        .command_type::<ImportClaim>()
+        .snapshot_poll_interval(std::time::Duration::from_secs(3600))
 }
 
 /// Claims an address with only the address's own rule, so one customer can
