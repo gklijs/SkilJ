@@ -9,9 +9,11 @@
 #      the upgrade. A withdrawal of 350 is accepted - it can only be, if the
 #      older release's deposits came through - and one of 500 is rejected as
 #      insufficient_funds;
-#   3. it stops, and the older release starts again. For a pair not declared
-#      compatible (the default), it must refuse the upgraded database; with
-#      --expect-compatible it must start and take a deposit;
+#   3. it stops, and the older release starts again. When the older release's
+#      SCHEMA_LEVEL is below this workspace's MIN_COMPATIBLE_SCHEMA_LEVEL
+#      (skilj_core::preflight), it must refuse the upgraded database;
+#      otherwise the pair is compatible, and it must start and take a deposit.
+#      A tag without skilj-core/src/preflight.rs (0.3.0 and older) is level 0;
 #   4. this workspace starts once more.
 #
 # Both templates use local mode's embedded Postgres, with one data directory:
@@ -20,7 +22,7 @@
 # tag's template against the crates it names on crates.io, so the tag has to
 # be present locally (CI fetches it).
 #
-# Usage: scripts/check-upgrade-pair.sh [--from TAG] [--expect-compatible]
+# Usage: scripts/check-upgrade-pair.sh [--from TAG]
 #        [--cache-dir DIR [--prepare-only | --prepared]] [--new-cache DIR]
 #   --from TAG           the older release (default: $DEFAULT_FROM below; raise
 #                        it with each release, see RELEASING.md)
@@ -35,7 +37,6 @@ set -euo pipefail
 DEFAULT_FROM=v0.4.0
 
 from="$DEFAULT_FROM"
-expect_compatible=false
 cache_dir=
 new_cache=
 prepare_only=false
@@ -45,7 +46,6 @@ while [[ $# -gt 0 ]]; do
         --from)
             [[ $# -ge 2 && -n "$2" ]] || { echo 'check-upgrade-pair: --from needs a tag' >&2; exit 2; }
             from="$2"; shift ;;
-        --expect-compatible) expect_compatible=true ;;
         --prepare-only) prepare_only=true ;;
         --prepared) prepared=true ;;
         --cache-dir)
@@ -65,6 +65,19 @@ if { $prepare_only || $prepared; } && [[ -z "$cache_dir" ]]; then
 fi
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Whether the older release may keep running against what this workspace
+# upgrades, from the two releases' own levels rather than a flag to keep in
+# step with them.
+schema_constant() { sed -n "s/^pub const $1: i64 = \([0-9]*\);$/\1/p"; }
+old_level="$(git -C "$root" show "$from:skilj-core/src/preflight.rs" 2>/dev/null |
+    schema_constant SCHEMA_LEVEL || true)"
+old_level="${old_level:-0}"
+new_min="$(schema_constant MIN_COMPATIBLE_SCHEMA_LEVEL < "$root/skilj-core/src/preflight.rs")"
+[[ -n "$new_min" ]] || { echo 'check-upgrade-pair: no MIN_COMPATIBLE_SCHEMA_LEVEL in skilj-core/src/preflight.rs' >&2; exit 2; }
+git -C "$root" rev-parse -q --verify "refs/tags/$from" >/dev/null ||
+    { echo "check-upgrade-pair: tag $from isn't present locally" >&2; exit 2; }
+if (( old_level >= new_min )); then expect_compatible=true; else expect_compatible=false; fi
 work="$(mktemp -d)"
 server_pid=
 cleanup() {
@@ -221,15 +234,15 @@ reply="$(send WITHDRAW 500)"
 stop
 
 if $expect_compatible; then
-    echo "check-upgrade-pair: $from starts again (declared compatible)"
+    echo "check-upgrade-pair: $from starts again (level $old_level, compatible from $new_min)"
     start "$old_server" old-again || fail "$from didn't start on the upgraded database"
     reply="$(send DEPOSIT 100)"
     [[ "$reply" == *'"accepted":true'* ]] || fail "$from rejected a deposit after the upgrade: $reply"
     stop
 else
-    echo "check-upgrade-pair: $from refuses the upgraded database"
+    echo "check-upgrade-pair: $from refuses the upgraded database (level $old_level, compatible from $new_min)"
     if start "$old_server" old-again; then
-        fail "$from started on a database this workspace upgraded; the pair isn't declared compatible"
+        fail "$from started on a database this workspace upgraded; its level $old_level is below $new_min"
     fi
     # An older release recording no compatibility level fails on the global
     # migration it doesn't know (sqlx's VersionMissing); a later one with

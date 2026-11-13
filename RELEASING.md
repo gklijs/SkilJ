@@ -59,8 +59,23 @@ the same reason `skilj-tui`/`skilj-inspector` need no entry).
    `skilj_core::preflight::SCHEMA_LEVEL` by one. Leave
    `MIN_COMPATIBLE_SCHEMA_LEVEL` equal to it, unless the previous release
    is declared able to keep running against the upgraded database: then
-   set it to the previous release's level, say so in the CHANGELOG, and
-   make CI's `scripts/check-upgrade-pair.sh` run with `--expect-compatible`.
+   set it to the previous release's level and say so in the CHANGELOG.
+   `scripts/check-upgrade-pair.sh` reads both levels - the previous
+   release's `SCHEMA_LEVEL` from its tag, this one's
+   `MIN_COMPATIBLE_SCHEMA_LEVEL` - and expects the previous release to
+   refuse the upgraded database when the first is below the second, and to
+   keep running otherwise. A release that leaves the schema alone keeps
+   both levels, so CI checks that the previous release still runs.
+6. The CGA baseline (AGENTS.md, "Panic analysis"). The check analyzes
+   against `scripts/cga/workspace.lock`, which names the workspace crates'
+   versions, and the version also enters the symbol hashes, which moves
+   some findings to another instance of the same call. With the bumped
+   versions, after setting your own `Cargo.lock` aside: `cp
+   scripts/cga/workspace.lock Cargo.lock && cargo update
+   --workspace` (only the workspace members' versions may change), then
+   `node scripts/cga/check.mjs --record`. The totals of findings and
+   skipped generic targets should stay as they were; 0.4.0 moved findings
+   between ten files and kept 6449 and 186.
 
 ### Doing this with `cargo-release`
 
@@ -182,8 +197,7 @@ root available; wherever the publish actually runs needs this too,
 
 - Tag the release: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 - Point `DEFAULT_FROM` in `scripts/check-upgrade-pair.sh` at the new tag,
-  so the next release's CI upgrades from this one, and drop
-  `--expect-compatible` from its CI step if it was set.
+  so the next release's CI upgrades from this one.
 - The first release of a crate (`skilj-blob-s3` in 0.3.0) gives
   `cargo semver-checks` a baseline: drop it from the `--exclude` list of
   the semver step in `.github/workflows/ci.yml`.
