@@ -1,0 +1,44 @@
+# Imported from Event Modeling JSON by skilj-codegen import --from em-json.
+# Command decisions stay hand-written: one decide_<name> function per command.
+
+bounded_context = "banking"
+
+[[event_type]]
+# From Money Deposited (3458764600000000012)
+name = "MoneyDeposited"
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account_id = "account_id" }
+
+[[event_type]]
+# From Money Withdrawn (3458764600000000022)
+name = "MoneyWithdrawn"
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account_id = "account_id" }
+
+# Rejected as: invalid_amount
+[[command_type]]
+# From Deposit Money (3458764600000000011)
+name = "DepositMoney"
+rest_trigger_allowed = true
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account_id = "account_id" }
+
+# Rejected as: insufficient_funds, invalid_amount
+[[command_type]]
+# From Withdraw Money (3458764600000000021)
+name = "WithdrawMoney"
+rest_trigger_allowed = true
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account_id = "account_id" }

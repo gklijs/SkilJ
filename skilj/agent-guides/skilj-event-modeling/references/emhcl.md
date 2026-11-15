@@ -33,6 +33,7 @@ Keep these to the convention, because the import reads nothing else:
 
 Validate before handing it over, with `emhcl validate --profile strict` where
 `emhcl` is installed. To import: `emhcl export model/ -o model.json`, then
-`cargo run -p skilj-codegen --example emhcl_import -- model.json <context>`.
+`skilj-codegen import --from emhcl model.json <context> --output src/<context>.skilj.toml`
+([modeling-tools.md](modeling-tools.md) covers the notes it prints).
 `skilj-codegen/tests/fixtures/banking.em.hcl` is a complete example, the
 banking summary of `output-format.md` as a model.

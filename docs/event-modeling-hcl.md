@@ -136,10 +136,11 @@ Validate and export the model with `emhcl`, then import one bounded context:
 ```sh
 emhcl validate --profile strict model/
 emhcl export model/ -o model.json
-cargo run -p skilj-codegen --example emhcl_import -- model.json banking > src/banking.skilj.toml
+skilj-codegen import --from emhcl model.json banking --output src/banking.skilj.toml
 ```
 
-Or call `skilj_codegen::emhcl::import(&json, "banking")` from your own tool or
+(`cargo install skilj-codegen` installs the binary; in this workspace,
+`cargo run -p skilj-codegen --` stands in for it.) Or call `skilj_codegen::emhcl::import(&json, "banking")` from your own tool or
 test. The result is a `.skilj.toml` for `skilj_codegen::generate`, with a
 comment naming the model element each type came from and the rejection kinds
 each command's scenarios use. The import:
@@ -155,6 +156,10 @@ each command's scenarios use. The import:
   `rejected`;
 - notes an event or command without an `id_attribute` field, which has no
   tags.
+
+The notes go to stderr, and head the file as comments. Other tools import the
+same way, with the same rules after reading: see
+[Bring your modeling tool](modeling-tools.md).
 
 It doesn't write projections, automations, tests or `decide()` bodies; those
 stay hand-written Rust. After importing, add what the model can't say:

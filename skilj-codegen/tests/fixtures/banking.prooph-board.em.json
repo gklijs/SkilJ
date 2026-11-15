@@ -1,0 +1,236 @@
+{
+  "slices": [
+    {
+      "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d01",
+      "index": 0,
+      "title": "Deposit money",
+      "sliceType": "STATE_CHANGE",
+      "commands": [
+        {
+          "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d11",
+          "title": "Deposit Money",
+          "type": "COMMAND",
+          "apiEndpoint": "POST /v1/commands/trigger",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d12",
+              "type": "OUTBOUND",
+              "title": "Money Deposited",
+              "elementType": "EVENT"
+            }
+          ]
+        }
+      ],
+      "events": [
+        {
+          "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d12",
+          "title": "Money Deposited",
+          "type": "EVENT",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d11",
+              "type": "INBOUND",
+              "title": "Deposit Money",
+              "elementType": "COMMAND"
+            }
+          ],
+          "modelContext": "Banking"
+        }
+      ],
+      "readmodels": [],
+      "screens": [],
+      "processors": [],
+      "tables": [],
+      "specifications": [
+        {
+          "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d11-rejection-1",
+          "title": "Deposit Money: invalid_amount",
+          "linkedId": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d11",
+          "given": [],
+          "when": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d11-rejection-1-when",
+              "title": "Deposit Money",
+              "type": "SPEC_COMMAND",
+              "linkedId": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d11"
+            }
+          ],
+          "then": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d11-rejection-1-then",
+              "title": "invalid_amount: the amount must be positive",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d02",
+      "index": 1,
+      "title": "Account balance",
+      "sliceType": "STATE_VIEW",
+      "commands": [],
+      "events": [],
+      "readmodels": [
+        {
+          "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d21",
+          "title": "Account Balance",
+          "type": "READMODEL",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String"
+            },
+            {
+              "name": "balance",
+              "type": "Int"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d12",
+              "type": "INBOUND",
+              "title": "Money Deposited",
+              "elementType": "EVENT"
+            }
+          ]
+        }
+      ],
+      "screens": [],
+      "processors": [],
+      "tables": [],
+      "specifications": []
+    },
+    {
+      "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d03",
+      "index": 2,
+      "title": "Withdraw money",
+      "sliceType": "STATE_CHANGE",
+      "commands": [
+        {
+          "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31",
+          "title": "Withdraw Money",
+          "type": "COMMAND",
+          "apiEndpoint": "POST /v1/commands/trigger",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d32",
+              "type": "OUTBOUND",
+              "title": "Money Withdrawn",
+              "elementType": "EVENT"
+            }
+          ]
+        }
+      ],
+      "events": [
+        {
+          "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d32",
+          "title": "Money Withdrawn",
+          "type": "EVENT",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31",
+              "type": "INBOUND",
+              "title": "Withdraw Money",
+              "elementType": "COMMAND"
+            }
+          ],
+          "modelContext": "Banking"
+        }
+      ],
+      "readmodels": [],
+      "screens": [],
+      "processors": [],
+      "tables": [],
+      "specifications": [
+        {
+          "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31-rejection-1",
+          "title": "Withdraw Money: insufficient_funds",
+          "linkedId": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31",
+          "given": [],
+          "when": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31-rejection-1-when",
+              "title": "Withdraw Money",
+              "type": "SPEC_COMMAND",
+              "linkedId": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31"
+            }
+          ],
+          "then": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31-rejection-1-then",
+              "title": "insufficient_funds: withdrawal exceeds the balance",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        },
+        {
+          "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31-rejection-2",
+          "title": "Withdraw Money: invalid_amount",
+          "linkedId": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31",
+          "given": [],
+          "when": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31-rejection-2-when",
+              "title": "Withdraw Money",
+              "type": "SPEC_COMMAND",
+              "linkedId": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31"
+            }
+          ],
+          "then": [
+            {
+              "id": "9b1f6c1e-0a39-4c0e-9d0e-3b8f2a6c1d31-rejection-2-then",
+              "title": "invalid_amount: the amount must be positive",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

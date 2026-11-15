@@ -108,9 +108,14 @@ Tell the user, briefly:
   and that `AGENTS.md` points to them either way;
 - three good next requests, in their own words:
   - "Help me design the events and commands for <their domain>": the
-    `skilj-event-modeling` guide. If they already model in Event Modeling
-    HCL, that guide imports the model into a `.skilj.toml`.
+    `skilj-event-modeling` guide. If they already model in an Event Modeling
+    tool (Event Modeling HCL, Nebulit's Miro app, prooph board, an `.evml`
+    file), that guide imports the model into a `.skilj.toml`.
   - "Add a command that <does something> to the wallet, with tests": the
     `skilj` guide.
   - "Make the email address of a customer unique": the `skilj-uniqueness`
     guide.
+
+If the user keeps an [Allium](https://juxt.github.io/allium) specification,
+the `skilj-event-modeling` guide also says how to keep one next to the
+model. It is optional; nothing in the project needs it.

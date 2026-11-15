@@ -12,6 +12,7 @@ Git tag matching your dependency when working with an older release.
    a student's course limit, with a consistency boundary spanning both.
 3. [Design with Event Modeling](event-modeling-hcl.md): map a model to types,
    tags and given/when/then scenarios before implementing domain functions.
+   [Bring your modeling tool](modeling-tools.md) imports from other tools.
 
 ## Build an application
 
@@ -19,6 +20,7 @@ Git tag matching your dependency when working with an older release.
 | --- | --- |
 | Generate a working project | [Wallet tutorial](wallet-tutorial.md), [template README](../templates/skilj-template/README.md) |
 | Work with a coding agent (Claude Code, Codex) | [Agent guidance](agent-guidance.md), the generated project's `AGENTS.md` |
+| Import a model from an Event Modeling tool | [Bring your modeling tool](modeling-tools.md) |
 | Write and test domain rules | [Wallet tests](../templates/skilj-template/tests/wallet_fixture.rs), [fixture API](https://docs.rs/skilj-test-fixture) |
 | Implement traits or configure a server | [skilj API](https://docs.rs/skilj), [domain API](https://docs.rs/skilj-core) |
 | Configure roles, tokens and protected fields | [Authorization flows](authorization.md) |

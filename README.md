@@ -190,10 +190,12 @@ A model written that way imports straight into a `.skilj.toml`:
 
 ```sh
 emhcl export model/ -o model.json
-cargo run -p skilj-codegen --example emhcl_import -- model.json banking > src/banking.skilj.toml
+skilj-codegen import --from emhcl model.json banking --output src/banking.skilj.toml
 ```
 
-See [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) for the full mapping.
+See [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) for the full mapping. Models from
+Nebulit's Event Modeling app for Miro, prooph board and the `.evml` text language import the same
+way, as experimental sources: see [Bring your modeling tool](docs/modeling-tools.md).
 
 ## Status and stability
 
@@ -261,6 +263,8 @@ See [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) for the full mapp
   token authentication, grants, scopes, capabilities, field-level protection and the access trail.
 - [`docs/event-modeling-hcl.md`](docs/event-modeling-hcl.md) - how an Event Modeling HCL model
   maps onto skilj, the naming convention, and importing a model into a `.skilj.toml`.
+- [`docs/modeling-tools.md`](docs/modeling-tools.md) - importing from other Event Modeling tools
+  (Nebulit's Miro app, prooph board, `.evml`), each source's naming convention and support level.
 - [`docs/large-payloads.md`](docs/large-payloads.md) - payload size limits, and blobs for the
   bytes that don't belong in a payload.
 - [`docs/disjoint-consistency-boundaries.md`](docs/disjoint-consistency-boundaries.md) and
