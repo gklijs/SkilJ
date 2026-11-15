@@ -135,6 +135,11 @@ jobs:
       # nothing else notices when a change breaks it (docs/architecture.md §105) -
       # and runs the quickstart: deposit accepted, overdraft rejected.
       - run: scripts/check-template.sh --prepared --cache-dir target/template-check
+      # What the plugin's skilj-new-project skill tells an agent to run,
+      # run as written on that generated project: the guides linked, the
+      # domain tests, the server and its printed commands; and the plugin's
+      # manifests in step with the workspace (docs/architecture.md §252).
+      - run: scripts/check-new-project-skill.sh --cache-dir target/template-check
       # The previous release on an empty database, this workspace upgrading
       # it with the previous release's data intact, and the previous release
       # then refusing the upgraded database - as separate processes, on one

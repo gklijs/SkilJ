@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "skilj",
+  "version": "0.4.0",
+  "description": "Start a skilj project: generate it from the template, link skilj's guides as skills, and run its quickstart.",
+  "author": {
+    "name": "Gerard Klijs",
+    "url": "https://github.com/gklijs"
+  },
+  "homepage": "https://github.com/gklijs/SkilJ",
+  "repository": "https://github.com/gklijs/SkilJ",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["event-sourcing", "rust", "postgres", "dcb", "skilj"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "skilj",
+        "category": "Coding",
+        "shortDescription": "Start an event-sourced Rust application with skilj",
+        "defaultPrompt": "Start a skilj project"
+      }
+    }
+  }
+}

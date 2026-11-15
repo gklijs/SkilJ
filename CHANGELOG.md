@@ -10,6 +10,13 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Added
+
+- A `skilj` plugin for Claude Code and Codex, from this repository's marketplace (`claude plugin
+  marketplace add gklijs/SkilJ`, `codex plugin marketplace add gklijs/SkilJ`). Its
+  `skilj-new-project` skill generates a project from the template, links the guides of its skilj
+  version as skills, runs the quickstart and says what to ask for next. CI runs the skill's
+  commands against the generated template (docs/architecture.md §252).
 ### Fixed
 
 - A command submitted to a bounded context while that bounded context is

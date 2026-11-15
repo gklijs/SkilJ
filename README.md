@@ -24,6 +24,18 @@ cargo generate --git https://github.com/gklijs/SkilJ.git templates/skilj-templat
 cd my-wallet && cargo run --bin server
 ```
 
+Or let a coding agent do it: install the `skilj` plugin and ask it to "start a skilj project".
+It generates the project, links skilj's guides as skills and runs the quickstart.
+
+```sh
+# Claude Code
+claude plugin marketplace add gklijs/SkilJ
+claude plugin install skilj@skilj
+# Codex
+codex plugin marketplace add gklijs/SkilJ
+codex plugin add skilj@skilj
+```
+
 ![A generated skilj project starting with its own embedded Postgres, then accepting a deposit, rejecting a withdrawal larger than the balance, and accepting a smaller one](https://raw.githubusercontent.com/gklijs/SkilJ/main/docs/quickstart.gif)
 
 ## Why not classic aggregates?
@@ -150,7 +162,8 @@ between runs (docs/architecture.md §216); set `DATABASE_URL` to use your own Po
 See its own README for more.
 
 The project comes with an `AGENTS.md` for coding agents, and the `skilj` crate ships task guides
-that Claude Code and Codex load as skills: see [agent guidance](docs/agent-guidance.md).
+that Claude Code and Codex load as skills: see [agent guidance](docs/agent-guidance.md). The `skilj`
+plugin (install lines above) starts a project from inside the agent, before any project exists.
 
 To add `skilj` to an existing project instead:
 

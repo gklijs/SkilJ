@@ -7,12 +7,12 @@
 # With --published it builds against the versions the template's
 # Cargo.toml names on crates.io instead: the check to run after publishing.
 #
-# The run is the quickstart as a reader does it: the server started with
-# no DATABASE_URL, so it starts an embedded Postgres of its own (downloaded
-# on first use), then the curl commands it prints - a deposit accepted, a
-# larger withdrawal rejected - and a clean shutdown on Ctrl-C. Its data
-# directory is a temporary one, never the user's own. --no-run skips the
-# run, for a machine that can't start the embedded Postgres.
+# The run is the quickstart as a reader does it (scripts/template-quickstart.sh):
+# the server started with no DATABASE_URL, so it starts an embedded Postgres
+# of its own (downloaded on first use), then the curl commands it prints - a
+# deposit accepted, a larger withdrawal rejected - and a clean shutdown on
+# Ctrl-C. Its data directory is a temporary one, never the user's own.
+# --no-run skips the run, for a machine that can't start the embedded Postgres.
 #
 # Usage: scripts/check-template.sh [--published] [--no-run]
 #        [--cache-dir DIR [--prepare-only | --prepared]]
@@ -43,13 +43,7 @@ fi
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
-server_pid=
 cleanup() {
-    if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
-        kill -INT "$server_pid" 2>/dev/null || true
-        sleep 5
-        kill -KILL "$server_pid" 2>/dev/null || true
-    fi
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -111,63 +105,6 @@ if ! $run; then
 fi
 
 cargo build --bin server
-port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-log="$work/server.log"
-
-fail() {
-    echo "check-template: $*" >&2
-    echo "--- server output ---" >&2
-    cat "$log" >&2
-    exit 1
-}
-
-# Retry only a failed embedded-Postgres download's HTTP 5xx response.
-# Application, initialization and quickstart failures must still fail immediately.
-for attempt in 1 2 3; do
-    env -u DATABASE_URL PORT="$port" SKILJ_LOCAL_DATA_DIR="$work/postgres" \
-        "$CARGO_TARGET_DIR/debug/server" >"$log" 2>&1 &
-    server_pid=$!
-    # Long enough for the first run's Postgres download and initdb.
-    for _ in $(seq 1 300); do
-        # shellcheck disable=SC2016 # Match the literal variable in printed commands.
-        grep -q '^  curl .*\$WITHDRAW' "$log" && break
-        if ! kill -0 "$server_pid" 2>/dev/null; then
-            wait "$server_pid" || true
-            server_pid=
-            break
-        fi
-        sleep 1
-    done
-    [[ -n "$server_pid" ]] && break
-    if [[ $attempt -eq 3 ]] || ! grep -Eq '^error: local Postgres: HTTP status server error \(5[0-9]{2} ' "$log"; then
-        fail "the server exited before it was ready"
-    fi
-    cat "$log" >&2
-    echo "check-template: retrying Postgres download (attempt $((attempt + 1))/3)" >&2
-    sleep 2
-done
-# shellcheck disable=SC2016 # Match the literal variable in printed commands.
-grep -q '^  curl .*\$WITHDRAW' "$log" || fail "the server didn't print its try-it commands within 300s"
-
-# The commands exactly as the server prints them, as a reader pastes them.
-eval "$(grep -o 'export DEPOSIT=.*' "$log")"
-mapfile -t commands < <(grep '^  curl ' "$log")
-[[ ${#commands[@]} -eq 2 ]] || fail "expected two printed curl commands, got ${#commands[@]}"
-deposit="$(eval "${commands[0]} -sS")"
-withdraw="$(eval "${commands[1]} -sS")"
-[[ "$deposit" == *'"accepted":true'* ]] || fail "the deposit wasn't accepted: $deposit"
-[[ "$withdraw" == *'"rejectionKind":"insufficient_funds"'* ]] ||
-    fail "the withdrawal of more than the balance wasn't rejected as insufficient_funds: $withdraw"
-
-kill -INT "$server_pid"
-status=0
-for _ in $(seq 1 30); do
-    kill -0 "$server_pid" 2>/dev/null || break
-    sleep 1
-done
-kill -0 "$server_pid" 2>/dev/null && fail "the server didn't stop within 30s of Ctrl-C"
-wait "$server_pid" || status=$?
-server_pid=
-[[ $status -eq 0 ]] || fail "the server exited with status $status on Ctrl-C"
+"$root/scripts/template-quickstart.sh" "$work/quickstart" "$CARGO_TARGET_DIR/debug/server"
 
 echo "check-template: OK (quickstart ran: deposit accepted, overdraft rejected)"
