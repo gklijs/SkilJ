@@ -1,0 +1,428 @@
+{
+  "slices": [
+    {
+      "id": "3458764600000000001",
+      "status": "Planned",
+      "index": 0,
+      "title": "Deposit money",
+      "context": "Banking",
+      "sliceType": "STATE_CHANGE",
+      "commands": [
+        {
+          "id": "3458764600000000011",
+          "title": "Deposit Money",
+          "type": "COMMAND",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String",
+              "example": "acc-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "3458764600000000010",
+              "type": "INBOUND",
+              "title": "Deposit Money Request",
+              "elementType": "SCREEN"
+            },
+            {
+              "id": "3458764600000000012",
+              "type": "OUTBOUND",
+              "title": "Money Deposited",
+              "elementType": "EVENT"
+            }
+          ],
+          "aggregate": "Account"
+        }
+      ],
+      "events": [
+        {
+          "id": "3458764600000000012",
+          "title": "Money Deposited",
+          "type": "EVENT",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String",
+              "example": "acc-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "3458764600000000011",
+              "type": "INBOUND",
+              "title": "Deposit Money",
+              "elementType": "COMMAND"
+            }
+          ],
+          "aggregate": "Account"
+        }
+      ],
+      "screens": [
+        {
+          "id": "3458764600000000010",
+          "title": "Deposit Money Request",
+          "type": "SCREEN",
+          "fields": [],
+          "apiEndpoint": "POST /v1/commands/trigger",
+          "dependencies": [
+            {
+              "id": "3458764600000000011",
+              "type": "OUTBOUND",
+              "title": "Deposit Money",
+              "elementType": "COMMAND"
+            }
+          ]
+        }
+      ],
+      "specifications": [
+        {
+          "id": "3458764600000000013",
+          "title": "deposit accepted",
+          "linkedId": "3458764600000000011",
+          "given": [],
+          "when": [
+            {
+              "id": "3458764600000000013-w",
+              "title": "Deposit Money",
+              "type": "SPEC_COMMAND",
+              "linkedId": "3458764600000000011"
+            }
+          ],
+          "then": [
+            {
+              "id": "t1",
+              "title": "Money Deposited",
+              "type": "SPEC_EVENT",
+              "linkedId": "3458764600000000012"
+            }
+          ]
+        },
+        {
+          "id": "3458764600000000014",
+          "title": "non-positive amount",
+          "linkedId": "3458764600000000011",
+          "given": [],
+          "when": [
+            {
+              "id": "3458764600000000014-w",
+              "title": "Deposit Money",
+              "type": "SPEC_COMMAND",
+              "linkedId": "3458764600000000011"
+            }
+          ],
+          "then": [
+            {
+              "id": "t2",
+              "title": "invalid_amount: the amount must be positive",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        }
+      ],
+      "actors": [
+        {
+          "name": "Account Holder",
+          "authRequired": true
+        }
+      ],
+      "aggregates": [
+        "Account"
+      ],
+      "readmodels": [],
+      "processors": [],
+      "tables": [],
+      "screenImages": []
+    },
+    {
+      "id": "3458764600000000002",
+      "status": "Planned",
+      "index": 1,
+      "title": "Withdraw money",
+      "context": "Banking",
+      "sliceType": "STATE_CHANGE",
+      "commands": [
+        {
+          "id": "3458764600000000021",
+          "title": "Withdraw Money",
+          "type": "COMMAND",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String",
+              "example": "acc-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "150",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "3458764600000000020",
+              "type": "INBOUND",
+              "title": "Withdraw Money Request",
+              "elementType": "SCREEN"
+            },
+            {
+              "id": "3458764600000000022",
+              "type": "OUTBOUND",
+              "title": "Money Withdrawn",
+              "elementType": "EVENT"
+            }
+          ],
+          "aggregate": "Account"
+        }
+      ],
+      "events": [
+        {
+          "id": "3458764600000000022",
+          "title": "Money Withdrawn",
+          "type": "EVENT",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String",
+              "example": "acc-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "100",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "3458764600000000021",
+              "type": "INBOUND",
+              "title": "Withdraw Money",
+              "elementType": "COMMAND"
+            }
+          ],
+          "aggregate": "Account"
+        }
+      ],
+      "screens": [
+        {
+          "id": "3458764600000000020",
+          "title": "Withdraw Money Request",
+          "type": "SCREEN",
+          "fields": [],
+          "apiEndpoint": "POST /v1/commands/trigger",
+          "dependencies": [
+            {
+              "id": "3458764600000000021",
+              "type": "OUTBOUND",
+              "title": "Withdraw Money",
+              "elementType": "COMMAND"
+            }
+          ]
+        }
+      ],
+      "specifications": [
+        {
+          "id": "3458764600000000023",
+          "title": "withdrawal over the balance",
+          "linkedId": "3458764600000000021",
+          "given": [
+            {
+              "id": "g1",
+              "title": "Money Deposited",
+              "type": "SPEC_EVENT",
+              "linkedId": "3458764600000000012"
+            }
+          ],
+          "when": [
+            {
+              "id": "3458764600000000023-w",
+              "title": "Withdraw Money",
+              "type": "SPEC_COMMAND",
+              "linkedId": "3458764600000000021"
+            }
+          ],
+          "then": [
+            {
+              "id": "t3",
+              "title": "insufficient_funds: withdrawal exceeds the balance",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        },
+        {
+          "id": "3458764600000000024",
+          "title": "non-positive amount",
+          "linkedId": "3458764600000000021",
+          "given": [],
+          "when": [
+            {
+              "id": "3458764600000000024-w",
+              "title": "Withdraw Money",
+              "type": "SPEC_COMMAND",
+              "linkedId": "3458764600000000021"
+            }
+          ],
+          "then": [
+            {
+              "id": "t4",
+              "title": "invalid_amount: the amount must be positive",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        }
+      ],
+      "actors": [
+        {
+          "name": "Account Holder",
+          "authRequired": true
+        }
+      ],
+      "aggregates": [
+        "Account"
+      ],
+      "readmodels": [],
+      "processors": [],
+      "tables": [],
+      "screenImages": []
+    },
+    {
+      "id": "3458764600000000003",
+      "status": "Planned",
+      "index": 2,
+      "title": "Account balance",
+      "context": "Banking",
+      "sliceType": "STATE_VIEW",
+      "commands": [],
+      "events": [
+        {
+          "id": "3458764600000000031",
+          "title": "Money Deposited",
+          "type": "EVENT",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "fields": [],
+          "elementCopy": true,
+          "linkedId": "3458764600000000012",
+          "dependencies": [
+            {
+              "id": "3458764600000000033",
+              "type": "OUTBOUND",
+              "title": "Account Balance",
+              "elementType": "READMODEL"
+            }
+          ]
+        },
+        {
+          "id": "3458764600000000032",
+          "title": "Money Withdrawn",
+          "type": "EVENT",
+          "modelContext": "Banking",
+          "context": "INTERNAL",
+          "fields": [],
+          "elementCopy": true,
+          "linkedId": "3458764600000000022",
+          "dependencies": [
+            {
+              "id": "3458764600000000033",
+              "type": "OUTBOUND",
+              "title": "Account Balance",
+              "elementType": "READMODEL"
+            }
+          ]
+        }
+      ],
+      "readmodels": [
+        {
+          "id": "3458764600000000033",
+          "title": "Account Balance",
+          "type": "READMODEL",
+          "modelContext": "Banking",
+          "fields": [
+            {
+              "name": "accountId",
+              "type": "String",
+              "example": "acc-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            },
+            {
+              "name": "balance",
+              "type": "Int",
+              "example": "100",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "3458764600000000031",
+              "type": "INBOUND",
+              "title": "Money Deposited",
+              "elementType": "EVENT"
+            },
+            {
+              "id": "3458764600000000032",
+              "type": "INBOUND",
+              "title": "Money Withdrawn",
+              "elementType": "EVENT"
+            }
+          ]
+        }
+      ],
+      "screens": [],
+      "processors": [],
+      "tables": [],
+      "specifications": []
+    }
+  ]
+}

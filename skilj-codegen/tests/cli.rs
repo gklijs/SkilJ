@@ -170,3 +170,111 @@ fn parse_io_and_usage_failures_have_distinct_statuses_and_json() {
     ]);
     diagnostics(&result, 3);
 }
+
+#[test]
+fn import_writes_the_skilj_toml_and_the_notes_apart() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    // The subcommand gives what the emhcl_import example gave, which the
+    // checked-in import recorded.
+    let output = run(&[
+        "import",
+        "--from",
+        "emhcl",
+        path(&fixtures.join("banking.emhcl.json")),
+        "banking",
+    ]);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        std::fs::read(fixtures.join("banking.imported.skilj.toml")).unwrap()
+    );
+
+    // Every source's banking fixture, to a file `check` accepts.
+    let dir = tempfile::tempdir().unwrap();
+    for (from, input) in [
+        ("em-json", "banking.em.json"),
+        ("em-json", "banking.prooph-board.em.json"),
+        ("evml", "banking.evml"),
+    ] {
+        let model = dir.path().join(format!("{input}.skilj.toml"));
+        let output = run(&[
+            "import",
+            "--from",
+            from,
+            path(&fixtures.join(input)),
+            "banking",
+            "--output",
+            path(&model),
+        ]);
+        assert!(output.status.success(), "{input}");
+        assert!(
+            output.stdout.is_empty() && output.stderr.is_empty(),
+            "{input}"
+        );
+        let checked = run(&["check", path(&model)]);
+        assert!(checked.status.success(), "{input}");
+    }
+
+    // Notes go to stderr, as lines or as one JSON object.
+    let model = dir.path().join("orders.evml");
+    std::fs::write(
+        &model,
+        "eventmodeling\ntf 01 cmd PlaceOrder { id: 'o-1' }\ntf 02 evt orders.OrderPlaced { id: 'o-1' }\n",
+    )
+    .unwrap();
+    let output = run(&["import", "--from", "evml", path(&model), "orders"]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("note: orders.OrderPlaced (frame 02): no field has `tag`"),
+        "{stderr}"
+    );
+    let output = run(&[
+        "import",
+        "--from",
+        "evml",
+        path(&model),
+        "orders",
+        "--diagnostic-format",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["version"], 1);
+    assert_eq!(json["notes"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn import_failures_have_the_statuses_of_the_other_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = dir.path().join("broken.evml");
+    std::fs::write(&model, "eventmodeling\n\ntf 01 widget X\n").unwrap();
+    let args = |from: &'static str, input: &Path, context: &'static str| {
+        run(&[
+            "import",
+            "--from",
+            from,
+            path(input),
+            context,
+            "--diagnostic-format",
+            "json",
+        ])
+    };
+    let json = diagnostics(&args("evml", &model, "orders"), 1);
+    assert_eq!(json["diagnostics"][0]["code"], "parse");
+    assert_eq!(json["diagnostics"][0]["line"], 3);
+
+    let json = diagnostics(&args("em-json", &model, "orders"), 1);
+    assert_eq!(json["diagnostics"][0]["code"], "parse");
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/banking.evml");
+    let json = diagnostics(&args("evml", &fixture, "shipping"), 1);
+    assert_eq!(json["diagnostics"][0]["code"], "semantic");
+
+    let json = diagnostics(&args("evml", &dir.path().join("missing.evml"), "orders"), 3);
+    assert_eq!(json["diagnostics"][0]["code"], "io");
+
+    let json = diagnostics(&args("qlerify", &fixture, "banking"), 2);
+    assert_eq!(json["diagnostics"][0]["code"], "usage");
+}

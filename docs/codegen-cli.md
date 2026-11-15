@@ -69,5 +69,28 @@ usage errors use an empty path. Paths are JSON strings (non-Unicode OS paths
 are represented lossily). JSON format can be selected before or after the
 subcommand, including for argument errors.
 
-Event Modeling import remains available through the existing
-[`emhcl_import` example](event-modeling-hcl.md#from-a-model-to-a-skiljtoml).
+## Import a model from an Event Modeling tool
+
+`import` writes one bounded context of a model made with an Event Modeling
+tool as a `.skilj.toml` ([Bring your modeling tool](modeling-tools.md) lists
+the tools and their naming conventions):
+
+```sh
+skilj-codegen import --from emhcl model.json banking
+skilj-codegen import --from em-json board-export.json banking --output src/banking.skilj.toml
+skilj-codegen import --from evml model.evml banking --output src/banking.skilj.toml
+```
+
+`--from` is `emhcl` (`emhcl export` JSON), `em-json` (Event Modeling
+Specification JSON) or `evml` (the event-modeling-tools text language). The
+`.skilj.toml` goes to stdout, or to `--output`, which is replaced only after a
+successful import, as for `generate`. What the import left out or couldn't
+decide goes to stderr as `note: ...` lines, or with `--diagnostic-format json`
+as one object, `{"version":1,"notes":["..."]}`; a successful import without
+notes writes nothing to stderr. The same notes head the file as comments.
+
+A model that isn't in the source's format is a `parse` failure (exit 1; an
+`.evml` error has its line), a bounded context the model has no events of or
+an import that wouldn't generate is `semantic` (exit 1), and a file that can't
+be read is `io` (exit 3). The `emhcl_import` example this replaces wrote the
+same file.

@@ -1,0 +1,53 @@
+eventmodeling
+
+%% skilj-demo's banking context, written with the naming convention of
+%% docs/modeling-tools.md: the events' namespace is the bounded context, a
+%% `ui` in the `api` namespace marks a command as REST-triggered, `tag` marks
+%% a DCB tag, and a note on a command's frame names its rejections.
+
+tf 01 ui api.DepositMoneyRequest
+tf 02 cmd DepositMoney [[DepositMoney]]
+tf 03 evt banking.MoneyDeposited [[MoneyDeposited]]
+
+rf 04 ui api.WithdrawMoneyRequest
+tf 05 cmd WithdrawMoney [[WithdrawMoney]]
+tf 06 evt banking.MoneyWithdrawn [[MoneyWithdrawn]]
+
+rf 07 rmo AccountBalance ->> 03 ->> 06
+
+data DepositMoney {
+  account_id: string tag
+  amount: integer
+}
+
+data MoneyDeposited {
+  account_id: string tag
+  amount: integer
+}
+
+data WithdrawMoney {
+  account_id: string tag
+  amount: integer
+}
+
+data MoneyWithdrawn {
+  account_id: string tag
+  amount: integer
+}
+
+note 02 {
+  reject invalid_amount: the amount must be positive
+}
+
+note 05 {
+  reject insufficient_funds: withdrawal exceeds the balance
+  reject invalid_amount: the amount must be positive
+}
+
+gwt 05 "withdrawal over the balance"
+  given
+    evt banking.MoneyDeposited { account_id: 'acc-1', amount: 100 }
+  when
+    cmd WithdrawMoney { account_id: 'acc-1', amount: 150 }
+  then
+    rmo AccountBalance { account_id: 'acc-1', balance: 100 }

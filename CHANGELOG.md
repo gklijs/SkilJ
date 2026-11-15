@@ -17,6 +17,17 @@ README.md, "Status and stability").
   `skilj-new-project` skill generates a project from the template, links the guides of its skilj
   version as skills, runs the quickstart and says what to ask for next. CI runs the skill's
   commands against the generated template (docs/architecture.md §252).
+- `skilj-codegen import --from <source> <model> <bounded_context>` writes a `.skilj.toml` from a
+  model made with an Event Modeling tool: `emhcl` (`emhcl export` JSON, replacing the
+  `emhcl_import` example, with the same output), and, as experimental sources, `em-json` (Event
+  Modeling Specification JSON: Nebulit's Event Modeling app for Miro, and what the prooph board
+  route writes) and `evml` (the event-modeling-tools text language). `skilj_codegen::import` is
+  the library side; `skilj_codegen::Error` gains an `Evml` variant. See
+  [`docs/modeling-tools.md`](docs/modeling-tools.md) (docs/architecture.md §253).
+- The `skilj-event-modeling` guide finds a model in the project and imports it, reads a prooph
+  board over its MCP server, and shows how to keep an application's rules in an optional Allium
+  file beside the model.
+
 ### Fixed
 
 - A command submitted to a bounded context while that bounded context is

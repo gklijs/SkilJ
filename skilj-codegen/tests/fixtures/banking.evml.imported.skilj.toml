@@ -1,0 +1,44 @@
+# Imported from an .evml model by skilj-codegen import --from evml.
+# Command decisions stay hand-written: one decide_<name> function per command.
+
+bounded_context = "banking"
+
+[[event_type]]
+# From banking.MoneyDeposited (frame 03)
+name = "MoneyDeposited"
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account_id = "account_id" }
+
+[[event_type]]
+# From banking.MoneyWithdrawn (frame 06)
+name = "MoneyWithdrawn"
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account_id = "account_id" }
+
+# Rejected as: invalid_amount
+[[command_type]]
+# From DepositMoney (frame 02)
+name = "DepositMoney"
+rest_trigger_allowed = true
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account_id = "account_id" }
+
+# Rejected as: insufficient_funds, invalid_amount
+[[command_type]]
+# From WithdrawMoney (frame 05)
+name = "WithdrawMoney"
+rest_trigger_allowed = true
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account_id = "account_id" }

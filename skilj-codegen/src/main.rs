@@ -3,7 +3,10 @@ use serde::Serialize;
 use std::{io::Write, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
-#[command(version, about = "Validate skilj models and preview generated Rust")]
+#[command(
+    version,
+    about = "Validate skilj models, preview generated Rust, and import models from Event Modeling tools"
+)]
 struct Cli {
     /// Diagnostic format on stderr (stdout is reserved for generated Rust).
     #[arg(long, global = true, value_enum, default_value = "text")]
@@ -32,6 +35,43 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         check: Option<PathBuf>,
     },
+    /// Import one bounded context from an Event Modeling tool's model into a
+    /// .skilj.toml, to stdout or a file; what it left out goes to stderr.
+    Import {
+        /// The model's format (docs/modeling-tools.md).
+        #[arg(long, value_enum)]
+        from: SourceArg,
+        /// The model: an `emhcl export` JSON file, an Event Modeling JSON
+        /// file, or an .evml file.
+        input: PathBuf,
+        /// The skilj bounded context to import, lowercase snake_case.
+        bounded_context: String,
+        /// Replace this file only after a successful import.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
+
+/// `skilj_codegen::import::Source`, as `--from` names it.
+#[derive(Clone, Copy, ValueEnum)]
+enum SourceArg {
+    /// `emhcl export` JSON of an Event Modeling HCL model.
+    Emhcl,
+    /// Event Modeling Specification JSON: Nebulit's Miro app, the prooph board route.
+    EmJson,
+    /// The text language of event-modeling-tools (.evml, Mermaid eventmodeling).
+    Evml,
+}
+
+impl SourceArg {
+    fn source(self) -> skilj_codegen::import::Source {
+        use skilj_codegen::import::Source;
+        match self {
+            SourceArg::Emhcl => Source::Emhcl,
+            SourceArg::EmJson => Source::EmJson,
+            SourceArg::Evml => Source::Evml,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -60,12 +100,101 @@ impl Diagnostic {
 
 type Failure = (u8, Vec<Diagnostic>);
 
+fn io_error(path: &std::path::Path, error: std::io::Error) -> Failure {
+    (3, vec![Diagnostic::new("io", path, error)])
+}
+
+/// Writes beside the destination and renames only after the complete
+/// artifact has been written. Failure leaves existing output intact.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), Failure> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| io_error(path, e))?;
+    temporary.write_all(bytes).map_err(|e| io_error(path, e))?;
+    temporary
+        .persist(path)
+        .map_err(|e| io_error(path, e.error))?;
+    Ok(())
+}
+
+/// `import`: the `.skilj.toml` to stdout or `output`, the notes to stderr.
+fn run_import(
+    format: Format,
+    from: SourceArg,
+    input: &std::path::Path,
+    bounded_context: &str,
+    output: Option<&std::path::Path>,
+) -> Result<(), Failure> {
+    let source = std::fs::read_to_string(input).map_err(|e| io_error(input, e))?;
+    let import = skilj_codegen::import::import(from.source(), &source, bounded_context).map_err(
+        |error| {
+            let mut diagnostic = Diagnostic::new("generation", input, &error);
+            let status = match &error {
+                skilj_codegen::Error::Json(_) => {
+                    diagnostic.code = "parse";
+                    1
+                }
+                skilj_codegen::Error::Evml { line, .. } => {
+                    diagnostic.code = "parse";
+                    diagnostic.line = Some(*line);
+                    1
+                }
+                skilj_codegen::Error::Invalid(problems) => {
+                    return (
+                        1,
+                        problems
+                            .iter()
+                            .map(|problem| Diagnostic::new("semantic", input, problem))
+                            .collect(),
+                    );
+                }
+                _ => 3,
+            };
+            (status, vec![diagnostic])
+        },
+    )?;
+    match output {
+        Some(path) => write_atomically(path, import.skilj_toml.as_bytes())?,
+        None => std::io::stdout()
+            .lock()
+            .write_all(import.skilj_toml.as_bytes())
+            .map_err(|e| io_error(input, e))?,
+    }
+    if !import.notes.is_empty() {
+        match format {
+            Format::Json => eprintln!(
+                "{}",
+                serde_json::json!({"version": 1, "notes": import.notes})
+            ),
+            Format::Text => {
+                for note in &import.notes {
+                    eprintln!("note: {note}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run(cli: &Cli) -> Result<(), Failure> {
     let input = match &cli.command {
         Command::Check { input } | Command::Generate { input, .. } => input,
-    };
-    let io_error = |path: &std::path::Path, error: std::io::Error| {
-        (3, vec![Diagnostic::new("io", path, error)])
+        Command::Import {
+            from,
+            input,
+            bounded_context,
+            output,
+        } => {
+            return run_import(
+                cli.diagnostic_format,
+                *from,
+                input,
+                bounded_context,
+                output.as_deref(),
+            )
+        }
     };
     let source = std::fs::read_to_string(input).map_err(|e| io_error(input, e))?;
     let generation_error = |error: skilj_codegen::Error| {
@@ -113,20 +242,7 @@ fn run(cli: &Cli) -> Result<(), Failure> {
                 ));
             }
         } else if let Some(path) = output {
-            // Write beside the destination and rename only after the complete
-            // artifact has been written. Failure leaves existing output intact.
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let mut temporary =
-                tempfile::NamedTempFile::new_in(parent).map_err(|e| io_error(path, e))?;
-            temporary
-                .write_all(generated.as_bytes())
-                .map_err(|e| io_error(path, e))?;
-            temporary
-                .persist(path)
-                .map_err(|e| io_error(path, e.error))?;
+            write_atomically(path, generated.as_bytes())?;
         } else {
             std::io::stdout()
                 .lock()

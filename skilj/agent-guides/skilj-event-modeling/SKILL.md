@@ -9,7 +9,10 @@ description: >
   a reviewable markdown summary, not code. Triggers on "help me design
   the events for X", "what events/commands does my domain need", "model
   this as event storming", or describing a domain process and asking how
-  it maps to skilj. Do NOT use once the event/command shape is already
+  it maps to skilj. Also imports a model the team already has in an Event
+  Modeling tool (Event Modeling HCL, Nebulit's Miro app, prooph board, an
+  .evml file) into a .skilj.toml, and keeps an optional Allium file of the
+  rules beside it. Do NOT use once the event/command shape is already
   decided and you're implementing it in Rust - use the `skilj` skill for
   that instead.
 ---
@@ -24,6 +27,16 @@ is a markdown document (see
 by a human, not code and not a registration call. Once the shape is
 settled, the `skilj` skill covers turning it into real
 `EventType`/`CommandType`/`Projection` impls.
+
+## If the team already has a model
+
+Before the first question, look for a model: `.em.hcl` files, an Event
+Modeling JSON export, an `.evml` file, or prooph board tools in this session.
+Don't ask the user which tool they use; [references/modeling-tools.md](references/modeling-tools.md)
+says what to look for, in which order, and how to import each into a
+`.skilj.toml` with `skilj-codegen import`. Then use the three questions
+below on what the import couldn't decide (its notes), rather than on
+everything. With no model, start the conversation from nothing.
 
 This is domain-shape discovery only - narrower than a full specification
 elicitation. If the conversation grows into needing access-control
@@ -119,6 +132,13 @@ If the team models with Event Modeling HCL (`.em.hcl` files, `emhcl`, or the
 event-modeling-hcl plugin), also write the summary as an `.em.hcl` model,
 following [references/emhcl.md](references/emhcl.md): it then validates,
 renders as a diagram, and imports straight into a `.skilj.toml`.
+
+If the user keeps the rules in [Allium](https://juxt.github.io/allium), or
+wants a checked place for them, write each command's accept/reject conditions
+as a rule in an `.allium` file next to the model, following
+[references/allium.md](references/allium.md): the model says which commands
+and events exist, the Allium file what each decision requires. It is
+optional; don't suggest installing anything for it unprompted.
 
 Leave genuinely undecided things as open questions in the document
 rather than guessing - a domain expert correcting a stated assumption is

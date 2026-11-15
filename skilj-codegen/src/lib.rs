@@ -47,10 +47,13 @@
 //! `generate`, JSON diagnostics and `generate --check FILE` for drift checks.
 //! See [the CLI guide](../../docs/codegen-cli.md) for examples and exit statuses.
 //!
-//! **Importing from an Event Modeling model.** [`emhcl::import`] writes a
-//! `.skilj.toml` from an [Event Modeling HCL](https://event-modeling-hcl.github.io)
-//! model's `emhcl export` JSON, by the naming convention of
-//! `docs/event-modeling-hcl.md` (docs/architecture.md §243).
+//! **Importing from an Event Modeling model.** [`import::import`] writes a
+//! `.skilj.toml` from a model made with an Event Modeling tool, one
+//! [`import::Source`] per format: an [Event Modeling HCL](https://event-modeling-hcl.github.io)
+//! model's `emhcl export` JSON (also [`emhcl::import`]), Event Modeling
+//! Specification JSON, and the `.evml` text language. Each has a naming
+//! convention, in `docs/event-modeling-hcl.md` and `docs/modeling-tools.md`
+//! (docs/architecture.md §243, §253). `skilj-codegen import` runs it.
 //!
 //! **Reviewing what it generates.** Code written to `$OUT_DIR` never
 //! shows up in a diff. `skilj-demo/tests/generated_code.rs` compares the
@@ -61,6 +64,7 @@
 
 pub mod emhcl;
 mod emit;
+pub mod import;
 mod spec;
 
 pub use spec::{
@@ -85,10 +89,19 @@ pub enum Error {
     /// user error; nothing about a well-formed `.skilj.toml` file
     /// should be able to trigger this.
     Generated(syn::Error),
-    /// [`emhcl::import`]'s input isn't the JSON `emhcl export` writes; the
-    /// parser's message. A `String`, not `serde_json::Error`, which would
-    /// make this enum lose `UnwindSafe`/`RefUnwindSafe`.
+    /// [`import::import`]'s input isn't the JSON its source writes (an
+    /// `emhcl export`, Event Modeling Specification JSON); the parser's
+    /// message. A `String`, not `serde_json::Error`, which would make this
+    /// enum lose `UnwindSafe`/`RefUnwindSafe`.
     Json(String),
+    /// [`import::import`]'s `.evml` input doesn't parse: the one-based line
+    /// and what was wrong there.
+    Evml {
+        /// One-based line of the input.
+        line: usize,
+        /// What was expected or found.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -102,7 +115,10 @@ impl std::fmt::Display for Error {
                 }
                 Ok(())
             }
-            Error::Json(e) => write!(f, "invalid emhcl export JSON: {e}"),
+            Error::Json(e) => write!(f, "invalid model JSON: {e}"),
+            Error::Evml { line, message } => {
+                write!(f, "invalid .evml model, line {line}: {message}")
+            }
             Error::Generated(e) => {
                 write!(f, "skilj-codegen generated code that failed to parse - this is a bug in skilj-codegen itself, not in your .skilj.toml: {e}")
             }
