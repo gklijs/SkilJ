@@ -402,6 +402,11 @@ jobs:
       # --all-targets`: `cargo test` recompiled the workspace crates after
       # it (1m43s on the first GitHub run).
       - run: bash scripts/ci-test.sh --build-only
+      # The images the container tests start, from Google's mirror of
+      # Docker Hub: unauthenticated Docker Hub pulls are rate limited, and
+      # an image that can't be pulled skips its test, which fails the run.
+      # Only warns: a test whose image is missing still pulls it itself.
+      - run: bash scripts/ci-pull-images.sh
       # Every Postgres-backed test runs against a real server, and the
       # broker suites against containers on the runner's Docker, which
       # this container job reaches through its mounted socket. ci-test.sh
