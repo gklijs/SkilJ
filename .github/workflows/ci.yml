@@ -112,9 +112,26 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      # The embedded Postgres looks its release up through GitHub's API.
+      # Unauthenticated, that is 60 requests an hour for the runner's IP
+      # address, which other jobs share: a lookup refused with 403 failed
+      # the quickstart. postgresql_archive sends this token when it is set.
+      # The workflow's token can only read (`permissions` above).
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # The embedded Postgres installs into ~/.theseus/postgresql/<version>
+      # and looks nothing up once the version skilj pins is there, so a
+      # restored cache makes the job's Postgres starts independent of
+      # GitHub's API. The key follows skilj/src/local.rs, which pins the
+      # version, and the previous release the upgrade check starts; an
+      # older cache restores too, its versions sit in their own directories.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.theseus/postgresql
+          key: postgres-embedded-${{ runner.os }}-${{ hashFiles('skilj/src/local.rs', 'scripts/check-upgrade-pair.sh') }}
+          restore-keys: postgres-embedded-${{ runner.os }}-
       - name: Prepare template at a stable path
         run: scripts/check-template.sh --prepare-only --cache-dir target/template-check
       # docs/architecture.md §249: the previous release's template, from its
