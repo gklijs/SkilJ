@@ -1,0 +1,20 @@
+{
+  "name": "skilj",
+  "interface": {
+    "displayName": "skilj"
+  },
+  "plugins": [
+    {
+      "name": "skilj",
+      "source": {
+        "source": "local",
+        "path": "./plugins/skilj"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Coding"
+    }
+  ]
+}

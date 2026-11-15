@@ -30,6 +30,13 @@ therefore:
    `skilj-tui`/`skilj-inspector` have no internal dependents and need no
    such entry.
 
+3. Set `version` in the plugin's two manifests,
+   `plugins/skilj/.claude-plugin/plugin.json` (Claude Code) and
+   `plugins/skilj/plugin.json` (Codex), to the new version: an installed
+   plugin updates when its version changes, and
+   `scripts/check-new-project-skill.sh` fails until both match the
+   workspace (docs/architecture.md §252). `cargo-release` doesn't do this one.
+
 Not 16 separate per-crate edits - one field plus 10 matching version
 strings (`skilj-temporal`/`skilj-kafka`/`skilj-amqp`/`skilj-nats` have
 no internal dependents either - `skilj-retry` is a dependency of

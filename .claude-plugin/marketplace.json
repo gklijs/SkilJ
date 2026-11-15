@@ -1,0 +1,15 @@
+{
+  "name": "skilj",
+  "description": "Start an event-sourced Rust application with skilj from Claude Code.",
+  "owner": {
+    "name": "Gerard Klijs",
+    "url": "https://github.com/gklijs"
+  },
+  "plugins": [
+    {
+      "name": "skilj",
+      "source": "./plugins/skilj",
+      "description": "Start a skilj project: generate it from the template, link skilj's guides as skills, and run its quickstart."
+    }
+  ]
+}

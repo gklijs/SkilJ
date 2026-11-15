@@ -16,12 +16,37 @@ repository's own [AGENTS.md](../AGENTS.md).
 | Task guides | `agent-guides/` inside the `skilj` crate ([in this repository](../skilj/agent-guides/README.md)) | How to add a type, bootstrap a bounded context, make a value unique, store a large value, model a domain, pair with Temporal |
 | Project instructions | `AGENTS.md` in a project generated from [skilj-template](../templates/skilj-template) | Where the domain code is, the rules that hold everywhere, the checks to run, and which guide a task needs |
 | `scripts/skilj-guides.sh` | The same generated project | Prints where the guides of the project's skilj version are; `--link` makes them skills |
+| The `skilj` plugin | This repository's marketplace ([plugins/skilj](../plugins/skilj)), for Claude Code and Codex | Starting a project from inside the agent, before one exists |
 
 There is one copy of the guides. Each is a directory with a `SKILL.md`,
 the format Claude Code and Codex both load, and a `references/` directory
 it sends the agent to. Nothing in a guide requires reading
 `docs/architecture.md`: a `§N` there says where a decision is reasoned
 out, and the guides' `README.md` shows how to read one section of it.
+
+## Before a project exists: the plugin
+
+Nothing above reaches an agent until a project exists. The `skilj` plugin
+fills that gap. It has one skill, `skilj-new-project`: asked to "start a
+skilj project", the agent generates one from the template, runs
+`scripts/skilj-guides.sh --link`, runs the quickstart (the domain tests, then
+the server and the two commands it prints), and says what to ask for next.
+
+```sh
+# Claude Code
+claude plugin marketplace add gklijs/SkilJ
+claude plugin install skilj@skilj
+# Codex
+codex plugin marketplace add gklijs/SkilJ
+codex plugin add skilj@skilj
+```
+
+The plugin carries no copy of the guides: those keep coming from the crate,
+so they follow the project's skilj version and not the plugin's. Start a new
+session inside the generated project and they load as skills.
+`scripts/check-new-project-skill.sh` runs what the skill tells the agent to
+run against the generated template, in CI, so the two can't drift
+(architecture.md §252).
 
 ## How an agent finds them
 
