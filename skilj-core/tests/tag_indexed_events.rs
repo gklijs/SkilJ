@@ -451,15 +451,20 @@ fn event(bc: &BoundedContext, et: &EventType, sequence: i64, tags: Vec<Tag>) -> 
     }
 }
 
-/// How often `event_tag_values` of `schema` has been read front to back, as
-/// the statistics of `conn`'s own session have it once they are flushed.
+/// How often `event_tag_values` of `schema` has been read front to back by
+/// the current transaction of `conn`, and by nothing else.
+///
+/// `pg_stat_user_tables` would count every session, and other sessions
+/// report their counts late: a backend flushes its statistics at most once a
+/// second, and an idle one after up to ten seconds, while
+/// `pg_stat_force_next_flush()` flushes only the session calling it. The
+/// seeding statements, run on other connections of the pool, then land
+/// between two readings at random and read as scans by the trigger.
+/// `pg_stat_xact_user_tables` has only the counts of the calling
+/// transaction, which are never flushed before it ends.
 async fn dictionary_scans(conn: &mut sqlx::PgConnection, schema_name: &str) -> i64 {
-    sqlx::query("SELECT pg_stat_force_next_flush()")
-        .execute(&mut *conn)
-        .await
-        .unwrap();
     sqlx::query_scalar(
-        "SELECT seq_scan FROM pg_stat_user_tables \
+        "SELECT seq_scan FROM pg_stat_xact_user_tables \
          WHERE schemaname = $1 AND relname = 'event_tag_values'",
     )
     .bind(schema_name)
@@ -508,8 +513,8 @@ fn appending_an_event_does_not_scan_the_tag_dictionary() {
         .await
         .unwrap();
 
-        // One session throughout, so that the counts read are its own.
-        let mut conn = pool.acquire().await.unwrap();
+        // One transaction throughout, so that the counts read are its own.
+        let mut conn = pool.begin().await.unwrap();
         let before = dictionary_scans(&mut conn, &schema_name).await;
         let mut sequences = Vec::new();
         for n in 0..20 {
@@ -529,6 +534,7 @@ fn appending_an_event_does_not_scan_the_tag_dictionary() {
             sequences.push(sequence);
         }
         let after = dictionary_scans(&mut conn, &schema_name).await;
+        conn.commit().await.unwrap();
         assert_eq!(
             after, before,
             "appending 20 events read the whole tag dictionary"
