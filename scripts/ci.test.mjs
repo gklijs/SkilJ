@@ -274,3 +274,30 @@ if [[ "$1" == deposit ]]; then echo '{"accepted":true}'; else echo '{"rejectionK
     else assert.match(result.stderr, /the server exited before it was ready/);
   });
 }
+
+test('every image a container test names is pulled before the test run', () => {
+  const listed = new Set(readFileSync(join(HERE, 'ci-pull-images.sh'), 'utf8')
+    .match(/^IMAGES=\(\n([\s\S]*?)^\)/m)[1].split('\n')
+    .map(line => line.trim()).filter(line => line && !line.startsWith('#')));
+  const sources = spawnSync('git', ['grep', '-l', 'GenericImage::new', '--', '*.rs'],
+    { cwd: ROOT, encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean);
+  assert.ok(sources.length > 0, 'no test names an image with GenericImage::new');
+  const named = [];
+  for (const file of sources) {
+    const source = readFileSync(join(ROOT, file), 'utf8');
+    for (const [, name, tag] of source.matchAll(/GenericImage::new\(\s*"([^"]+)",\s*([^)\s]+)\s*\)/g)) {
+      // A tag given as a constant of the same file: `const S3MOCK_VERSION: &str = "4.11.0";`.
+      const value = tag.startsWith('"') ? tag.slice(1, -1)
+        : source.match(new RegExp(`const ${tag}: &str = "([^"]+)"`))?.[1];
+      assert.ok(value, `${file}: can't read the tag ${tag} of ${name}`);
+      named.push(`${name}:${value}`);
+    }
+  }
+  for (const image of named) assert.ok(listed.has(image), `${image} isn't in scripts/ci-pull-images.sh`);
+
+  const workflow = readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8');
+  const suites = workflow.slice(workflow.indexOf('\n  test-suites:'), workflow.indexOf('\n  postgres-compatibility:'));
+  const pull = suites.indexOf('run: bash scripts/ci-pull-images.sh');
+  assert.ok(pull > 0, 'the test-suites job no longer pulls the images');
+  assert.ok(pull < suites.indexOf('run: bash scripts/ci-test.sh\n'), 'the images are pulled after the tests ran');
+});

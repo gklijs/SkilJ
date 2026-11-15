@@ -93,7 +93,7 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 6. `cargo deny check` — RustSec advisories, licenses, banned crates and sources, per `deny.toml`
 7. `cargo +1.95 check --workspace --lib --bins` — the declared minimum supported Rust version (`rust-version` in `Cargo.toml`) still builds
 8. `scripts/ci-test.sh --setup-only` — settles the CI job's Postgres before the long build, preferring the `services:` container and falling back to one inside the job's own container
-9. `CI_TEST_GROUP=<group> bash scripts/ci-test.sh --build-only`, then `scripts/ci-test.sh` with the same group — `cargo test --workspace -- --nocapture` against that database, plus the guard that fails the build if any test skipped (Postgres, brokers or Temporal)
+9. `CI_TEST_GROUP=<group> bash scripts/ci-test.sh --build-only`, then `scripts/ci-pull-images.sh` (the container tests' images, from Google's mirror of Docker Hub, so Docker Hub's pull limit can't skip them; a new image a test names goes in its list, which `scripts/ci.test.mjs` checks), then `scripts/ci-test.sh` with the same group — `cargo test --workspace -- --nocapture` against that database, plus the guard that fails the build if any test skipped (Postgres, brokers or Temporal)
 10. `cargo clippy --workspace --all-targets -- -D warnings`
 11. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 12. `scripts/check-spec.sh` — `allium check` on `specs/skilj.allium`: fails on an error, or on more warnings than the script's `MAX_WARNINGS` (a ratchet; lower it when a warning is fixed)
