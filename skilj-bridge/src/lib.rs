@@ -22,7 +22,7 @@
 // Every public item is documented; CI fails on a gap (`-D warnings`).
 #![warn(missing_docs)]
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 
 /// How long one HTTP request to skilj may take, end to end, before it
@@ -784,7 +784,7 @@ pub async fn report_parked_delivery(
     idempotency_key: Option<&str>,
     error: &str,
     attempt_count: u32,
-    first_failed_at: DateTime<Utc>,
+    first_failed_at: Timestamp,
 ) -> Result<(), SkiljError> {
     let response = http
         .post(format!("{skilj_base_url}/v1/parked-deliveries"))
@@ -795,7 +795,7 @@ pub async fn report_parked_delivery(
             "identifier": identifier,
             "error": error,
             "attemptCount": attempt_count,
-            "firstFailedAt": first_failed_at.to_rfc3339(),
+            "firstFailedAt": first_failed_at.to_string(),
             "request": request,
             "idempotencyKey": idempotency_key.map(wire_idempotency_key),
         }))
@@ -861,8 +861,8 @@ pub struct OutboundRetryState {
     /// now-passed event is never mistaken for the current head's.
     sequence: i64,
     attempt: u32,
-    first_failed_at: DateTime<Utc>,
-    next_attempt_at: DateTime<Utc>,
+    first_failed_at: Timestamp,
+    next_attempt_at: Timestamp,
 }
 
 /// The broker-specific half of one outbound mapping: hands one event to
@@ -953,7 +953,7 @@ pub async fn outbound_cycle<S: OutboundSink>(
     retry_state: &mut Option<OutboundRetryState>,
 ) -> Result<usize, S::Error> {
     if let Some(state) = retry_state {
-        if Utc::now() < state.next_attempt_at {
+        if Timestamp::now() < state.next_attempt_at {
             return Ok(0);
         }
     }
@@ -1213,7 +1213,7 @@ fn record_failure(
     retry_policy: &skilj_retry::RetryPolicy,
     retry_state: &mut Option<OutboundRetryState>,
 ) -> FailureOutcome {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let state = match retry_state {
         Some(state) if state.sequence == sequence => {
             state.attempt += 1;
@@ -1227,7 +1227,8 @@ fn record_failure(
         }),
     };
     let attempt = state.attempt;
-    let elapsed = (now - state.first_failed_at).to_std().unwrap_or_default();
+    let elapsed = std::time::Duration::try_from(now.duration_since(state.first_failed_at))
+        .unwrap_or_default();
     if retry_policy.is_exhausted(attempt, elapsed) {
         tracing::error!(
             event_type = %target.event_type,

@@ -15,8 +15,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, SubsecRound, Utc};
 use http_body_util::BodyExt;
+use jiff::Timestamp;
 use serde::de::DeserializeOwned;
 use skilj::Skilj;
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
@@ -77,8 +77,14 @@ pub fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-pub fn test_now() -> DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+pub fn test_now() -> Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 // --- bootstrap: seed an admin Role with access to both bounded contexts ---

@@ -57,6 +57,21 @@ and uploaded by CI even when comparison fails.
 
 ## Reducing findings
 
+The chrono → jiff switch (RUSTSEC-2026-0543, docs/architecture.md §254)
+re-records the baseline after review because the dependency snapshot changed:
+466 identities new, 389 gone, 6,449 → 6,565 occurrences. Most of the churn is
+the same SQLx calls with `jiff::Timestamp`/`jiff_sqlx` in place of
+`chrono::DateTime` in their types or spans. The net growth is mostly drops of a
+partly built `sqlx::Query` (86 new, 8 gone): each `.bind(ts.to_sqlx())` adds a
+call in the chain that the analyzer treats as one that can unwind. The two
+`expect`s on `ANOTHER_INSTANCE_RETRY_DELAY` in `deadlines.rs` and `routes.rs`
+already existed with chrono (only the message changed), and
+`Timestamp::new(..).unwrap_or(Timestamp::now())` and
+`Duration::try_from(..).unwrap_or_default()` take over from their chrono
+equivalents. `cron::Schedule` and `chrono` registry findings make way for
+`jiff-cron` and `jiff`. Tool, configuration and the skipped generic target
+multiset are unchanged.
+
 The issue #204 change re-records the baseline after review: 7 identities
 new, 7 gone, one for one. Three are `get_command_type`'s `sqlx::query` and its
 two binds, whose source span is the statement it now builds with the context's

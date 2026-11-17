@@ -8,8 +8,10 @@ use super::*;
 pub(super) struct ReadCursorRow {
     pub(super) ack_mode: String,
     pub(super) sequence: i64,
-    pub(super) updated_at: DateTime<Utc>,
-    pub(super) checked_out_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) updated_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) checked_out_at: Option<Timestamp>,
 }
 
 /// Unlike `access_tokens`, no index/bounded-context-resolution step is
@@ -95,8 +97,8 @@ pub(super) async fn upsert_read_cursor(
     .bind(&cursor.token.id)
     .bind(ack_mode_to_str(cursor.ack_mode))
     .bind(cursor.sequence)
-    .bind(cursor.updated_at)
-    .bind(cursor.checked_out_at)
+    .bind(cursor.updated_at.to_sqlx())
+    .bind(cursor.checked_out_at.map(|t| t.to_sqlx()))
     .execute(executor)
     .await?;
     Ok(())
@@ -131,7 +133,7 @@ pub async fn apply_cursor_update(
                 "UPDATE {schema}.read_cursors SET sequence = $1, updated_at = $2 WHERE token_id = $3"
             )))
             .bind(sequence)
-            .bind(updated_at)
+            .bind(updated_at.to_sqlx())
             .bind(&token.id)
             .execute(executor)
             .await?;
@@ -146,7 +148,7 @@ pub async fn apply_cursor_update(
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.read_cursors SET checked_out_at = $1 WHERE token_id = $2"
             )))
-            .bind(checked_out_at)
+            .bind(checked_out_at.to_sqlx())
             .bind(&token.id)
             .execute(executor)
             .await?;
@@ -169,7 +171,7 @@ pub async fn record_acknowledgement(
     executor: impl sqlx::PgExecutor<'_>,
     token: &EventReadToken,
     sequence: i64,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(&token.event_type.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -177,7 +179,7 @@ pub async fn record_acknowledgement(
          WHERE token_id = $3"
     )))
     .bind(sequence)
-    .bind(updated_at)
+    .bind(updated_at.to_sqlx())
     .bind(&token.id)
     .execute(executor)
     .await?;

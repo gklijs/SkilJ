@@ -239,7 +239,7 @@ fn bounded_context() -> BoundedContext {
     BoundedContext {
         name: "customers".into(),
         status: BoundedContextStatus::Active,
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
         created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
         template: None,
     }
@@ -254,7 +254,7 @@ fn protect_sensitive_fields_encrypts_a_dotted_path_leaf() {
         subject_key: "user".into(),
         subject_value: "42".into(),
         status: EncryptionKeyStatus::Active,
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
         destroyed_at: None,
     };
 

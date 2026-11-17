@@ -11,7 +11,7 @@
 //! with explicit `bounded_context`/`command_type` fields rather than the
 //! mechanical `skip_all` every `skilj-core::db` function otherwise gets.
 
-use chrono::Utc;
+use jiff::Timestamp;
 use skilj_core::event_store::{self, BoundedContext, BoundedContextStatus, CommandType};
 use skilj_core::shared::{CommandDecision, EventSpec};
 use std::sync::{Arc, Mutex};
@@ -76,7 +76,7 @@ fn bounded_context() -> BoundedContext {
     BoundedContext {
         name: "accounts".into(),
         status: BoundedContextStatus::Active,
-        created_at: Utc.timestamp_opt(0, 0).unwrap(),
+        created_at: Timestamp::new(0, 0).unwrap(),
         created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
         template: None,
     }
@@ -96,8 +96,6 @@ fn command_type() -> CommandType {
         rest_trigger_allowed: true,
     }
 }
-
-use chrono::TimeZone;
 
 #[test]
 fn process_command_emits_a_span_with_bounded_context_and_command_type_fields() {
@@ -119,7 +117,7 @@ fn process_command_emits_a_span_with_bounded_context_and_command_type_fields() {
             },
             |_| None,
             || 1,
-            Utc.timestamp_opt(1000, 0).unwrap(),
+            Timestamp::new(1000, 0).unwrap(),
             |_, _| unreachable!("no sensitive fields in this test"),
             &skilj_core::blind::BlindIndex::default(),
         );

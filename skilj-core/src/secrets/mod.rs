@@ -35,7 +35,7 @@
 //! out - so a secret reaching a payload, an error or a log is always a
 //! visible, reviewable choice, never an accident.
 
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -118,19 +118,19 @@ pub struct Secret {
     /// When this version stops being valid and the adapter should refresh
     /// it. `None` for a secret that does not expire. Common for a secret,
     /// unlike personal data - an OAuth refresh token has a real lifetime.
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// When this version was stored.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Set when a later `put_secret_value` superseded this version.
-    pub rotated_at: Option<DateTime<Utc>>,
+    pub rotated_at: Option<Timestamp>,
     /// Set when this version was explicitly revoked.
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<Timestamp>,
     /// A **summary**, not an event per read (docs/architecture.md §SecretReadAudit):
     /// the last time an adapter fetched this secret, and by which Role. A
     /// per-fetch event table would grow without bound for a credential an
     /// adapter refreshes on a timer; "who last read it, when" is what an
     /// audit actually needs.
-    pub last_read_at: Option<DateTime<Utc>>,
+    pub last_read_at: Option<Timestamp>,
     /// The id of the role that last fetched it; see `last_read_at`.
     pub last_read_by: Option<String>,
 }
@@ -162,9 +162,9 @@ pub struct SecretGrant {
     /// Whether the grant is in force.
     pub status: SecretGrantStatus,
     /// When it was granted.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When it was revoked; `None` while active.
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,7 +303,7 @@ pub fn validate_secret_name(name: &str) -> Result<(), Error> {
 /// `Rotated`. Its `DataKey` is destroyed by the caller
 /// (`db::put_secret_value`), which is what actually shreds it - this only
 /// computes the status transition.
-pub fn rotate_secret(current: &Secret, now: DateTime<Utc>) -> Result<Secret, Error> {
+pub fn rotate_secret(current: &Secret, now: Timestamp) -> Result<Secret, Error> {
     if !current.is_active() {
         return Err(Error::NotActive {
             name: current.name.clone(),
@@ -317,7 +317,7 @@ pub fn rotate_secret(current: &Secret, now: DateTime<Utc>) -> Result<Secret, Err
 
 /// The pure half of revoking a version: an active version becomes
 /// `Revoked`. Like [`rotate_secret`], the crypto-shredding is the caller's.
-pub fn revoke_secret(current: &Secret, now: DateTime<Utc>) -> Result<Secret, Error> {
+pub fn revoke_secret(current: &Secret, now: Timestamp) -> Result<Secret, Error> {
     if !current.is_active() {
         return Err(Error::NotActive {
             name: current.name.clone(),
@@ -336,7 +336,7 @@ pub fn grant_secret_access(
     bounded_context: &BoundedContext,
     name: &str,
     grantee_role_id: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<SecretGrant, Error> {
     validate_secret_name(name)?;
     if grantee_role_id.is_empty() {
@@ -354,7 +354,7 @@ pub fn grant_secret_access(
 }
 
 /// The pure half of ending a grant - the caller persists the transition.
-pub fn revoke_secret_access(grant: &SecretGrant, now: DateTime<Utc>) -> SecretGrant {
+pub fn revoke_secret_access(grant: &SecretGrant, now: Timestamp) -> SecretGrant {
     let mut revoked = grant.clone();
     revoked.status = SecretGrantStatus::Revoked;
     revoked.revoked_at = Some(now);
@@ -400,13 +400,13 @@ pub fn require_secret_access(
 /// version with no `expires_at` never needs one.
 ///
 /// Compared as a signed difference rather than `expires_at - lead_time`, so
-/// an out-of-range `lead_time` (e.g. `Duration::MAX`) reads as "due" instead
+/// an out-of-range `lead_time` (e.g. `SignedDuration::MAX`) reads as "due" instead
 /// of panicking on overflow - the safe direction for a refresh check.
-pub fn secret_needs_refresh(secret: &Secret, now: DateTime<Utc>, lead_time: Duration) -> bool {
+pub fn secret_needs_refresh(secret: &Secret, now: Timestamp, lead_time: SignedDuration) -> bool {
     secret.is_active()
         && secret
             .expires_at
-            .is_some_and(|expires| expires.signed_duration_since(now) <= lead_time)
+            .is_some_and(|expires| expires.duration_since(now) <= lead_time)
 }
 
 #[cfg(test)]
@@ -419,7 +419,7 @@ mod unit_tests {
         BoundedContext {
             name: "banking".into(),
             status: BoundedContextStatus::Active,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             created_by: ContextCreator::SystemCreator,
             template: None,
         }
@@ -432,7 +432,7 @@ mod unit_tests {
             version: 1,
             status: SecretStatus::Active,
             expires_at: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             rotated_at: None,
             revoked_at: None,
             last_read_at: None,
@@ -458,7 +458,7 @@ mod unit_tests {
 
     #[test]
     fn rotate_only_accepts_an_active_version() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let rotated = rotate_secret(&active_secret(), now).unwrap();
         assert_eq!(rotated.status, SecretStatus::Rotated);
         assert_eq!(rotated.rotated_at, Some(now));
@@ -467,7 +467,7 @@ mod unit_tests {
 
     #[test]
     fn revoke_only_accepts_an_active_version() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let revoked = revoke_secret(&active_secret(), now).unwrap();
         assert_eq!(revoked.status, SecretStatus::Revoked);
         assert_eq!(revoked.revoked_at, Some(now));
@@ -476,7 +476,7 @@ mod unit_tests {
 
     #[test]
     fn a_fresh_adapter_with_no_grant_is_refused() {
-        let grants = vec![grant_secret_access(&bc(), "oauth", "role-1", Utc::now()).unwrap()];
+        let grants = vec![grant_secret_access(&bc(), "oauth", "role-1", Timestamp::now()).unwrap()];
         assert!(!secret_is_readable_by("oauth", "role-2", &grants));
         assert_eq!(
             require_secret_access("oauth", "role-2", &grants)
@@ -490,51 +490,51 @@ mod unit_tests {
 
     #[test]
     fn a_revoked_grant_stops_being_readable() {
-        let grant = grant_secret_access(&bc(), "oauth", "role-1", Utc::now()).unwrap();
+        let grant = grant_secret_access(&bc(), "oauth", "role-1", Timestamp::now()).unwrap();
         assert!(secret_is_readable_by(
             "oauth",
             "role-1",
             std::slice::from_ref(&grant)
         ));
-        let revoked = revoke_secret_access(&grant, Utc::now());
+        let revoked = revoke_secret_access(&grant, Timestamp::now());
         assert!(!secret_is_readable_by("oauth", "role-1", &[revoked]));
     }
 
     #[test]
     fn refresh_is_due_within_the_lead_time_of_expiry() {
-        let now = Utc::now();
-        let lead = Duration::minutes(5);
+        let now = Timestamp::now();
+        let lead = SignedDuration::from_mins(5);
         let mut secret = active_secret();
         assert!(!secret_needs_refresh(&secret, now, lead));
-        secret.expires_at = Some(now + Duration::minutes(6));
+        secret.expires_at = Some(now + SignedDuration::from_mins(6));
         assert!(!secret_needs_refresh(&secret, now, lead));
         // Still valid, but inside the margin: due now, not at expiry.
-        secret.expires_at = Some(now + Duration::minutes(4));
+        secret.expires_at = Some(now + SignedDuration::from_mins(4));
         assert!(secret_needs_refresh(&secret, now, lead));
-        secret.expires_at = Some(now - Duration::seconds(1));
+        secret.expires_at = Some(now - SignedDuration::from_secs(1));
         assert!(secret_needs_refresh(&secret, now, lead));
         // A zero lead time is the old "only once expired" behaviour.
-        secret.expires_at = Some(now + Duration::seconds(1));
-        assert!(!secret_needs_refresh(&secret, now, Duration::zero()));
+        secret.expires_at = Some(now + SignedDuration::from_secs(1));
+        assert!(!secret_needs_refresh(&secret, now, SignedDuration::ZERO));
         // An out-of-range lead time is due, not a panic (compared as a
         // signed difference, not `expires_at - lead_time`).
-        secret.expires_at = Some(now + Duration::days(365));
-        assert!(secret_needs_refresh(&secret, now, Duration::MAX));
+        secret.expires_at = Some(now + SignedDuration::from_hours(8760));
+        assert!(secret_needs_refresh(&secret, now, SignedDuration::MAX));
     }
 
     #[test]
     fn a_rotated_version_never_needs_a_refresh() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut secret = active_secret();
-        secret.expires_at = Some(now - Duration::seconds(1));
+        secret.expires_at = Some(now - SignedDuration::from_secs(1));
         let rotated = rotate_secret(&secret, now).unwrap();
-        assert!(!secret_needs_refresh(&rotated, now, Duration::zero()));
+        assert!(!secret_needs_refresh(&rotated, now, SignedDuration::ZERO));
     }
 
     #[test]
     fn an_empty_grantee_is_its_own_error() {
         assert_eq!(
-            grant_secret_access(&bc(), "oauth", "", Utc::now())
+            grant_secret_access(&bc(), "oauth", "", Timestamp::now())
                 .unwrap_err()
                 .code(),
             "secret_grantee_invalid"

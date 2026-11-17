@@ -8,15 +8,15 @@
 //! locking the EventType row for multi-instance safety) is `db`/`skilj`
 //! layer, tested separately.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{
     self, BoundedContext, BoundedContextStatus, EventType, MissedOccurrencePolicy,
 };
 use skilj_core::shared::Tag;
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 fn bounded_context(status: BoundedContextStatus) -> BoundedContext {
@@ -41,8 +41,8 @@ fn every_second() -> String {
 
 fn scheduled_event_type(
     policy: MissedOccurrencePolicy,
-    schedule_position: chrono::DateTime<Utc>,
-    last_fired_at: Option<chrono::DateTime<Utc>>,
+    schedule_position: jiff::Timestamp,
+    last_fired_at: Option<jiff::Timestamp>,
 ) -> EventType {
     EventType {
         bounded_context: bounded_context(BoundedContextStatus::Active),
@@ -106,7 +106,7 @@ fn latest_occurrence_at_or_before_includes_an_instant_on_the_schedule() {
 
 #[test]
 fn latest_occurrence_at_or_before_rounds_a_sub_second_instant_down() {
-    let instant = timestamp(1000) + chrono::Duration::milliseconds(500);
+    let instant = timestamp(1000) + jiff::SignedDuration::from_millis(500);
     assert_eq!(
         event_store::latest_occurrence_at_or_before(&every_second(), instant),
         Some(timestamp(1000))

@@ -74,7 +74,7 @@ pub fn grant_private_field_access_for_event_field(n: &Naming) -> Field {
                     field,
                     skilj_core::shared::try_generate_token_id()
                         .map_err(crate::error::to_graphql_error)?,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
                 skilj_core::db::grant_private_field_access_with_trail(&state.pool, &grant)
@@ -153,7 +153,7 @@ pub fn grant_private_field_access_for_command_field(n: &Naming) -> Field {
                     field,
                     skilj_core::shared::try_generate_token_id()
                         .map_err(crate::error::to_graphql_error)?,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
                 skilj_core::db::grant_private_field_access_with_trail(&state.pool, &grant)
@@ -205,7 +205,7 @@ pub fn revoke_private_field_access_field(n: &Naming) -> Field {
                 let revoked = skilj_core::access_control::revoke_private_field_access(
                     &access_mapping,
                     &grant,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
                 // False when a concurrent revoke got there first.

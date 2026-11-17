@@ -5,7 +5,7 @@
 //! created a moment later and fired regardless. Here the two catch-ups are
 //! driven by hand in exactly that order.
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{
@@ -42,8 +42,14 @@ async fn test_pool() -> Option<Pool> {
         .map(|db| db.pool.clone())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
@@ -125,13 +131,16 @@ impl ScheduleDeadlineDispatcher for Schedules {
         _schedule_name: &str,
         source_payload_json: &str,
     ) -> Option<Result<Option<ErasedDeadlineSpec>, serde_json::Error>> {
-        Schedules::at(Utc::now() + chrono::Duration::hours(1), source_payload_json)
+        Schedules::at(
+            Timestamp::now() + jiff::SignedDuration::from_hours(1),
+            source_payload_json,
+        )
     }
 }
 
 impl Schedules {
     fn at(
-        fire_at: chrono::DateTime<Utc>,
+        fire_at: jiff::Timestamp,
         source_payload_json: &str,
     ) -> Option<Result<Option<ErasedDeadlineSpec>, serde_json::Error>> {
         Some(Ok(Some(ErasedDeadlineSpec {
@@ -145,7 +154,7 @@ impl Schedules {
 }
 
 /// Schedules every deadline at one fixed `fire_at`.
-struct SchedulesAt(ScheduleDeadlineInfo, chrono::DateTime<Utc>);
+struct SchedulesAt(ScheduleDeadlineInfo, jiff::Timestamp);
 
 impl ScheduleDeadlineDispatcher for SchedulesAt {
     fn schedules(&self) -> Vec<ScheduleDeadlineInfo> {
@@ -360,7 +369,7 @@ impl skilj_core::plugin::SnapshotDispatcher for NoSnapshots {
 /// then after the cancel catches up.
 async fn fire_with_a_lagging_cancel(
     pool: &Pool,
-    fire_in: chrono::Duration,
+    fire_in: jiff::SignedDuration,
     pay_after: std::time::Duration,
 ) -> (String, String) {
     let bc = seed_bounded_context(pool).await;
@@ -394,7 +403,8 @@ async fn fire_with_a_lagging_cancel(
     tokio::time::sleep(pay_after).await;
     append(pool, &paid, "o-1").await;
     // Due now, whichever way the payment fell.
-    let until_due = (fire_at - Utc::now()).to_std().unwrap_or_default();
+    let until_due =
+        std::time::Duration::try_from(fire_at.duration_since(Timestamp::now())).unwrap_or_default();
     tokio::time::sleep(until_due + std::time::Duration::from_millis(20)).await;
 
     db::fire_due_deadlines(
@@ -405,7 +415,7 @@ async fn fire_with_a_lagging_cancel(
         &skilj_core::event_store::EventBroadcaster::new(16),
         &cache,
         &bc.name,
-        Utc::now(),
+        Timestamp::now(),
         None,
         &skilj_retry::RetryPolicy::default(),
         &[cancel],
@@ -430,7 +440,7 @@ fn a_deadline_waits_for_a_cancel_committed_before_it_came_due() {
         };
         let statuses = fire_with_a_lagging_cancel(
             &pool,
-            chrono::Duration::milliseconds(300),
+            jiff::SignedDuration::from_millis(300),
             std::time::Duration::ZERO,
         )
         .await;
@@ -448,7 +458,7 @@ fn a_deadline_does_not_wait_for_a_cancel_after_it_came_due() {
         };
         let statuses = fire_with_a_lagging_cancel(
             &pool,
-            chrono::Duration::milliseconds(50),
+            jiff::SignedDuration::from_millis(50),
             std::time::Duration::from_millis(200),
         )
         .await;
@@ -492,7 +502,7 @@ fn a_cancel_whose_source_is_gone_does_not_stop_deadlines_firing() {
         db::catch_up_schedule_deadline(
             &pool,
             &schedule,
-            &SchedulesAt(schedule, test_now() - chrono::Duration::seconds(1)),
+            &SchedulesAt(schedule, test_now() - jiff::SignedDuration::from_secs(1)),
             &cache,
         )
         .await
@@ -506,7 +516,7 @@ fn a_cancel_whose_source_is_gone_does_not_stop_deadlines_firing() {
             &skilj_core::event_store::EventBroadcaster::new(16),
             &cache,
             &bc.name,
-            Utc::now(),
+            Timestamp::now(),
             None,
             &skilj_retry::RetryPolicy::default(),
             &[cancel],

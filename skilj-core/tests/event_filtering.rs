@@ -5,14 +5,14 @@
 //! `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`). Pure logic
 //! only, no DB.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::event_store::{
     self, BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType,
 };
 use skilj_core::shared::{Filter, FilterOperator, Metadata, SensitiveField, TagMapping};
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 fn bounded_context() -> BoundedContext {
@@ -614,11 +614,11 @@ fn matches_filters_every_filter_must_match_and_semantics() {
     assert!(!event_store::matches_filters(&e, &one_fails));
 }
 
-// --- string_ordering, including the exact chrono trimming bug found ---
+// --- string_ordering, including the exact fraction-trimming bug found ---
 
 #[test]
-fn matches_filters_date_time_ordering_uses_real_chrono_parsing_not_string_ord() {
-    // "when" is exactly on the second (no fractional part, per chrono's
+fn matches_filters_date_time_ordering_uses_real_parsing_not_string_ord() {
+    // "when" is exactly on the second (no fractional part, per serde's
     // own trimming) - a naive lexicographic string comparison against a
     // value with a `.500` fraction gets this backwards ('Z' > '.'), the
     // real bug this design was corrected for. The chronologically correct

@@ -183,9 +183,14 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
 }
 
-fn now() -> chrono::DateTime<chrono::Utc> {
-    use chrono::SubsecRound;
-    chrono::Utc::now().trunc_subsecs(6)
+fn now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 struct Ledger {
@@ -410,7 +415,7 @@ fn an_event_committed_after_the_read_is_folded_in_before_deciding_again() {
             &l.cache,
             &transfer_type,
             &payload,
-            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+            &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
         )
         .await
         .unwrap();
@@ -443,7 +448,7 @@ fn an_event_committed_after_the_read_is_folded_in_before_deciding_again() {
             &resolved.snapshot_states,
             None,
             Some(resolved.covered_through),
-            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+            &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
         )
         .await
         .unwrap();

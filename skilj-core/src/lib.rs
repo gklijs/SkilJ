@@ -17,7 +17,7 @@
 //! links application tutorials, deployment guidance and contribution checks.
 //!
 //! `db`, `command_batcher`, `cross_instance`, `event_cache`,
-//! `template_cache` and `slow_command` are `#[doc(hidden)]`: public only
+//! `template_cache`, `slow_command` and `wire_time` are `#[doc(hidden)]`: public only
 //! because `skilj`, `skilj-graphql`, `skilj-rest` and the tools call
 //! them, and not covered by the patch-release compatibility promise
 //! (docs/architecture.md §220). Go through `skilj` instead.
@@ -56,5 +56,7 @@ pub mod shared;
 pub mod slow_command;
 #[doc(hidden)]
 pub mod template_cache;
+#[doc(hidden)]
+pub mod wire_time;
 
 pub use error::Error;

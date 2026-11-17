@@ -13,7 +13,7 @@ categories = ["development-tools::testing"]
 [dependencies]
 skilj-core.workspace = true
 serde_json.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

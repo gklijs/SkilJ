@@ -14,8 +14,10 @@ pub(super) struct RoleAccessMappingRow {
     pub(super) capabilities: Vec<String>,
     pub(super) delegable: Vec<String>,
     pub(super) status: String,
-    pub(super) created_at: DateTime<Utc>,
-    pub(super) revoked_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) created_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) revoked_at: Option<Timestamp>,
 }
 
 impl RoleAccessMappingRow {
@@ -85,8 +87,8 @@ pub async fn insert_role_access_mapping<'e>(
     .bind(mapping.capabilities.iter().collect::<Vec<_>>())
     .bind(mapping.delegable.iter().collect::<Vec<_>>())
     .bind(role_status_to_str(mapping.status))
-    .bind(mapping.created_at)
-    .bind(mapping.revoked_at)
+    .bind(mapping.created_at.to_sqlx())
+    .bind(mapping.revoked_at.map(|t| t.to_sqlx()))
     .execute(executor)
     .await?;
     Ok(())
@@ -222,7 +224,7 @@ pub async fn record_access_event(
     change: AccessChange,
 ) -> crate::error::Result<()> {
     let sequence = next_sequence(&mut **tx, &admin.name).await?;
-    let event = change.try_into_event(admin, sequence, Utc::now())?;
+    let event = change.try_into_event(admin, sequence, Timestamp::now())?;
     insert_event(&mut **tx, &event, None).await
 }
 
@@ -260,7 +262,7 @@ pub async fn revoke_role_access_mapping_with_trail(
     pool: &Pool,
     role_id: &str,
     bounded_context: &str,
-    revoked_at: DateTime<Utc>,
+    revoked_at: Timestamp,
     actor_role_id: &str,
 ) -> crate::error::Result<bool> {
     let admin = require_admin_bounded_context(pool).await?;
@@ -481,7 +483,7 @@ pub async fn baseline_access_events(pool: &Pool) -> crate::error::Result<usize> 
         // one raw-re-granted after an `AccessRevoked` folds to not held.
         let records =
             access_event_records(&mut *tx, &mapping.role.id, &mapping.bounded_context.name).await?;
-        if fold_access_events(&records, DateTime::<Utc>::MAX_UTC).held {
+        if fold_access_events(&records, Timestamp::MAX).held {
             continue;
         }
         record_access_event(&mut tx, &admin, AccessChange::baselined(&mapping)).await?;
@@ -515,25 +517,26 @@ pub(super) async fn access_event_records<'e>(
     bounded_context: &str,
 ) -> crate::error::Result<Vec<AccessEventRecord>> {
     let schema = schema_ident(crate::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME);
-    let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT e.event_type_name, e.payload, e.metadata_created_at FROM {schema}.events e \
+    let rows: Vec<(String, String, jiff_sqlx::Timestamp)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT e.event_type_name, e.payload, e.metadata_created_at FROM {schema}.events e \
          WHERE e.sequence IN (SELECT sequence FROM {schema}.event_tags \
              WHERE tag_key = 'role' AND tag_value = $2 AND event_type_name = ANY($1)) \
          AND e.sequence IN (SELECT sequence FROM {schema}.event_tags \
              WHERE tag_key = 'bounded_context' AND tag_value = $3 AND event_type_name = ANY($1)) \
          ORDER BY e.sequence"
-    )))
-    .bind(
-        AccessEventKind::ALL
-            .iter()
-            .filter(|kind| kind.is_mapping_event())
-            .map(|kind| kind.name())
-            .collect::<Vec<_>>(),
-    )
-    .bind(role_id)
-    .bind(bounded_context)
-    .fetch_all(executor)
-    .await?;
+        )))
+        .bind(
+            AccessEventKind::ALL
+                .iter()
+                .filter(|kind| kind.is_mapping_event())
+                .map(|kind| kind.name())
+                .collect::<Vec<_>>(),
+        )
+        .bind(role_id)
+        .bind(bounded_context)
+        .fetch_all(executor)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|(name, payload, created_at)| {
@@ -545,7 +548,7 @@ pub(super) async fn access_event_records<'e>(
             Ok(AccessEventRecord {
                 kind,
                 payload,
-                created_at,
+                created_at: created_at.to_jiff(),
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?)
@@ -718,13 +721,13 @@ pub async fn revoke_active_role_access_mapping<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     role_id: &str,
     bounded_context: &str,
-    revoked_at: DateTime<Utc>,
+    revoked_at: Timestamp,
 ) -> crate::error::Result<bool> {
     let done = sqlx::query(
         "UPDATE role_access_mappings SET status = 'revoked', revoked_at = $1 \
          WHERE role_id = $2 AND bounded_context = $3 AND status = 'active'",
     )
-    .bind(revoked_at)
+    .bind(revoked_at.to_sqlx())
     .bind(role_id)
     .bind(bounded_context)
     .execute(executor)

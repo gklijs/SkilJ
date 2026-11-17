@@ -19,7 +19,6 @@ use axum::http::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::SubsecRound;
 use http_body_util::BodyExt;
 use jsonwebtoken::{EncodingKey, Header};
 use serde_json::{json, Value};
@@ -62,8 +61,14 @@ async fn test_db(name: &str) -> Option<(String, Pool)> {
     Some((url, pool))
 }
 
-fn test_now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 fn temp_key_file() -> std::path::PathBuf {
@@ -1056,7 +1061,7 @@ fn sign_jwt(subject: &str) -> String {
         "sub": subject,
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
         .expect("the test private key PEM is well-formed");
@@ -1467,7 +1472,7 @@ fn unreadable_data_keys_are_marked_once_and_one_event_covers_every_batch() {
         assert_eq!(rewrapped.len(), 1, "{rewrapped:?}");
         assert_eq!(rewrapped[0]["rewrapped"], 249);
         assert_eq!(rewrapped[0]["unreadable"], 1);
-        let marked: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        let marked: Option<jiff_sqlx::Timestamp> = sqlx::query_scalar(sqlx::AssertSqlSafe(
             format!(
                 "SELECT unreadable_since FROM \"bc_{bc}\".encryption_keys WHERE subject_value = 's100'"
             ),
@@ -1531,7 +1536,7 @@ fn a_data_key_wrapped_under_an_old_version_after_the_rewrap_holds_up_the_retirem
         .await;
         wait_for_state(&pool, keys.provider_name(), "the rewrap done again", |s| {
             s.rewrapped_at
-                .is_some_and(|at| at > chrono::Utc::now() - chrono::Duration::minutes(5))
+                .is_some_and(|at| at > jiff::Timestamp::now() - jiff::SignedDuration::from_mins(5))
         })
         .await;
         assert_eq!(wraps(&pool, &bc).await[0].2, Some(2));
@@ -1589,12 +1594,10 @@ fn another_key_under_the_same_name_refuses_startup_and_marks_are_tried_again() {
             let pool = pool.clone();
             let bc = bc.clone();
             async move {
-                sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(sqlx::AssertSqlSafe(
-                    format!(
-                        "SELECT unreadable_since FROM \"bc_{bc}\".encryption_keys \
+                sqlx::query_scalar::<_, Option<jiff_sqlx::Timestamp>>(sqlx::AssertSqlSafe(format!(
+                    "SELECT unreadable_since FROM \"bc_{bc}\".encryption_keys \
                          WHERE subject_value = '{subject}'"
-                    ),
-                ))
+                )))
                 .fetch_one(&pool)
                 .await
                 .unwrap()
@@ -2239,7 +2242,7 @@ async fn assign(
     keys: &KeyService,
     bc: &str,
     key: &str,
-) -> (Arc<dyn KeyProvider>, u32, chrono::DateTime<chrono::Utc>) {
+) -> (Arc<dyn KeyProvider>, u32, jiff::Timestamp) {
     let state = db::assign_encryption_key(pool, keys, bc, Some(key), true, None)
         .await
         .unwrap();
@@ -3111,21 +3114,18 @@ fn data_keys_a_moved_context_left_behind_are_tried_once_more_and_do_not_hold_up_
             .unwrap()
             .unwrap()
             .rotated_at;
-        let rows: Vec<(
-            String,
-            Option<String>,
-            Option<chrono::DateTime<chrono::Utc>>,
-        )> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT subject_value, key_provider, unreadable_since \
+        let rows: Vec<(String, Option<String>, Option<jiff_sqlx::Timestamp>)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT subject_value, key_provider, unreadable_since \
                  FROM \"bc_{bc}\".encryption_keys WHERE status = 'active' ORDER BY subject_value"
-        )))
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+            )))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         for (subject, provider, unreadable_since) in &rows {
             if subject == "corrupt" {
                 assert_eq!(provider.as_deref(), Some("in-memory"));
-                assert!(unreadable_since.is_some_and(|at| at > rotated_at));
+                assert!(unreadable_since.is_some_and(|at| at.to_jiff() > rotated_at));
             } else {
                 assert_eq!(provider.as_deref(), Some("in-memory:tenant"), "{subject}");
                 assert!(unreadable_since.is_none(), "{subject}");
@@ -3645,7 +3645,7 @@ fn move_measurement() {
                     &keys,
                     target.as_ref(),
                     version,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                     None,
                 )
                 .await

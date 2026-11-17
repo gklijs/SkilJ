@@ -379,7 +379,7 @@ pub fn capability_history_field(n: &Naming) -> Field {
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
                 let as_of = match ctx.args.get("asOf").filter(|value| !value.is_null()) {
                     Some(value) => parse_rfc3339(value.string()?)?,
-                    None => chrono::Utc::now(),
+                    None => jiff::Timestamp::now(),
                 };
                 let records = skilj_core::db::list_access_event_records(
                     &state.pool,

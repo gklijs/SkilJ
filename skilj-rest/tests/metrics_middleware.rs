@@ -149,7 +149,7 @@ async fn a_request_records_the_http_server_request_duration_histogram() {
         None,
         EventBroadcaster::new(4),
         EventCache::new(4),
-        chrono::Duration::minutes(5),
+        jiff::SignedDuration::from_mins(5),
         skilj_core::event_store::DEFAULT_MAX_EVENTS_PER_READ,
         CommandBatcher::new(),
     );

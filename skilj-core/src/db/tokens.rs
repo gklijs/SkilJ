@@ -76,8 +76,10 @@ pub(super) struct AccessTokenColumns {
     pub(super) kind: String,
     pub(super) secret: String,
     pub(super) status: String,
-    pub(super) created_at: DateTime<Utc>,
-    pub(super) revoked_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) created_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) revoked_at: Option<Timestamp>,
     pub(super) event_type_name: Option<String>,
     pub(super) command_type_name: Option<String>,
     /// One column, all four kinds - see `EventReadToken.scope`'s own doc
@@ -95,7 +97,8 @@ pub(super) struct AccessTokenColumns {
     /// columns, all four kinds, meaningful only for `event_read` on the
     /// identical terms `start_from` above already is.
     pub(super) start_at_sequence: Option<i64>,
-    pub(super) start_at_time: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) start_at_time: Option<Timestamp>,
 }
 
 pub(super) struct AccessTokenRow {
@@ -247,7 +250,7 @@ pub async fn access_token_kind_for_credential(
 pub async fn revoke_access_token(
     pool: &Pool,
     id: &str,
-    revoked_at: DateTime<Utc>,
+    revoked_at: Timestamp,
 ) -> crate::error::Result<()> {
     let Some(bounded_context) = resolve_token_bounded_context(pool, id).await? else {
         return Ok(());
@@ -256,7 +259,7 @@ pub async fn revoke_access_token(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.access_tokens SET status = 'revoked', revoked_at = $1 WHERE id = $2"
     )))
-    .bind(revoked_at)
+    .bind(revoked_at.to_sqlx())
     .bind(id)
     .execute(pool)
     .await?;
@@ -285,8 +288,8 @@ pub(super) async fn insert_access_token_row(
     kind: AccessTokenKind,
     secret: &str,
     status: TokenStatus,
-    created_at: DateTime<Utc>,
-    revoked_at: Option<DateTime<Utc>>,
+    created_at: Timestamp,
+    revoked_at: Option<Timestamp>,
     bounded_context: &str,
     event_type_name: &str,
     scope: Option<&str>,
@@ -300,8 +303,8 @@ pub(super) async fn insert_access_token_row(
     .bind(kind.as_str())
     .bind(crate::shared::hash_secret(secret))
     .bind(token_status_to_str(status))
-    .bind(created_at)
-    .bind(revoked_at)
+    .bind(created_at.to_sqlx())
+    .bind(revoked_at.map(|t| t.to_sqlx()))
     .bind(event_type_name)
     .bind(scope)
     .execute(pool)
@@ -369,13 +372,13 @@ pub async fn insert_event_read_token(
     .bind(AccessTokenKind::EventRead.as_str())
     .bind(crate::shared::hash_secret(&token.secret))
     .bind(token_status_to_str(token.status))
-    .bind(token.created_at)
-    .bind(token.revoked_at)
+    .bind(token.created_at.to_sqlx())
+    .bind(token.revoked_at.map(|t| t.to_sqlx()))
     .bind(&token.event_type.name)
     .bind(token.scope.as_deref())
     .bind(event_read_start_position_to_str(token.start_from))
     .bind(token.start_at_sequence)
-    .bind(token.start_at_time)
+    .bind(token.start_at_time.map(|t| t.to_sqlx()))
     .execute(pool)
     .await?;
     insert_token_index(pool, &token.id, &token.event_type.bounded_context.name).await
@@ -398,8 +401,8 @@ pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::e
     .bind(AccessTokenKind::Command.as_str())
     .bind(crate::shared::hash_secret(&token.secret))
     .bind(token_status_to_str(token.status))
-    .bind(token.created_at)
-    .bind(token.revoked_at)
+    .bind(token.created_at.to_sqlx())
+    .bind(token.revoked_at.map(|t| t.to_sqlx()))
     .bind(&token.command_type.name)
     .bind(token.scope.as_deref())
     .execute(pool)

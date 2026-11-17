@@ -132,7 +132,7 @@ async fn pool() -> Option<Pool> {
 }
 impl Fixture {
     async fn new(pool: Pool, count: usize, sensitive_every: usize, delay: Duration) -> Self {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let bc = BoundedContext {
             name: format!("history_{}", crate::shared::generate_token_id()),
             status: BoundedContextStatus::Active,
@@ -256,7 +256,7 @@ impl Fixture {
             batch_delta,
             None,
             &DecisionContext {
-                now: Utc::now(),
+                now: Timestamp::now(),
                 deadline: None,
             },
         )
@@ -270,7 +270,7 @@ fn erasure_after_preparation_refuses_even_with_warm_cached_key() {
         let Some(pool) = pool().await else { return };
         let f = Fixture::new(pool, 2, 2, Duration::ZERO).await;
         f.prepare().await;
-        destroy_encryption_key(&f.pool, &f.bc.name, "user", "alice", Utc::now())
+        destroy_encryption_key(&f.pool, &f.bc.name, "user", "alice", Timestamp::now())
             .await
             .unwrap();
         let mut tx = f.pool.begin().await.unwrap();
@@ -327,7 +327,7 @@ fn locked_validation_keeps_subject_row_locked_until_transaction_end() {
         &schema_ident(&f.bc.name),
         "user",
         "alice",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .unwrap_err();
@@ -336,7 +336,7 @@ fn locked_validation_keeps_subject_row_locked_until_transaction_end() {
     );
     eraser.rollback().await.unwrap();
     tx.commit().await.unwrap();
-    destroy_encryption_key(&f.pool, &f.bc.name, "user", "alice", Utc::now())
+    destroy_encryption_key(&f.pool, &f.bc.name, "user", "alice", Timestamp::now())
         .await
         .unwrap();
     });

@@ -62,8 +62,8 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now()
+fn test_now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
 }
 
 async fn seed_bounded_context(pool: &Pool) -> BoundedContext {

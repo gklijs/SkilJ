@@ -92,7 +92,8 @@ pub struct Metadata {
     /// The client or caller that produced the message.
     pub client_id: String,
     /// When the message was created.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(serialize_with = "crate::wire_time::serialize")]
+    pub created_at: jiff::Timestamp,
     /// The business transaction the message belongs to: every command and
     /// event in one causal chain carries the same value. Supplied by the
     /// caller or generated.

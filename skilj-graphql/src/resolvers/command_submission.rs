@@ -36,7 +36,7 @@ use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::futures_util::StreamExt;
 use async_graphql::ErrorExtensions;
-use chrono::Utc;
+use jiff::Timestamp;
 use skilj_core::access_control::{Role, RoleAccessMapping};
 use skilj_core::command_batcher::CommandBatchItem;
 
@@ -158,7 +158,7 @@ pub fn submit_command_field(n: &Naming) -> Field {
                         item.correlation_id.as_deref(),
                         item.causation_id.as_deref(),
                         state.key_service.as_ref(),
-                        Utc::now(),
+                        Timestamp::now(),
                         item.idempotency_key.as_deref(),
                     )
                     .await
@@ -312,7 +312,7 @@ async fn prepare_command(
             args.idempotency_key.as_deref(),
             state.key_service.as_ref(),
             state.projection_dispatcher.payload_limits(),
-            Utc::now(),
+            Timestamp::now(),
         )
         .await
         .map_err(to_graphql_error)?;
@@ -706,7 +706,7 @@ pub fn dry_run_command_field(n: &Naming) -> Field {
                     &authorised.payload,
                     &authorised.client_id,
                     state.key_service.as_ref(),
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .await
                 .map_err(to_graphql_error)?;

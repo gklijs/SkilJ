@@ -21,7 +21,7 @@
 //! include both fields by construction - no separate DB test needed
 //! here.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::access_control::{
     self, AccessLevel, EventReadStartPosition, EventReadToken, Role, RoleAccessMapping, RoleStatus,
     TokenStatus,
@@ -37,8 +37,8 @@ use skilj_core::shared::{Metadata, Tag};
 // Fixtures
 // ---------------------------------------------------------------------
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 fn bounded_context() -> BoundedContext {
@@ -356,7 +356,7 @@ fn consume_events_serves_only_the_tokens_own_scope() {
         &events,
         &[],
         timestamp(0),
-        chrono::Duration::minutes(5),
+        jiff::SignedDuration::from_mins(5),
     )
     .unwrap();
 

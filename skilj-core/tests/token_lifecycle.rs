@@ -14,7 +14,7 @@
 //! this file: `surface-actor`/`surface-provides` for each of the three
 //! surfaces (6) - same GraphQL-scaffolding gap as `CommandSubmission`'s.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::access_control::{
     self, AccessLevel, AccessToken, CommandToken, DirectCreationToken, EventReadStartPosition,
     EventReadToken, ExternalEventToken, Role, RoleAccessMapping, RoleStatus, TokenStatus,
@@ -26,8 +26,8 @@ use skilj_core::event_store::{BoundedContext, BoundedContextStatus, CommandType,
 // Fixtures
 // ---------------------------------------------------------------------
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 fn bounded_context(status: BoundedContextStatus) -> BoundedContext {

@@ -26,7 +26,7 @@
 //! slowdown is added to every event a projection folds
 //! (docs/performance.md, "Comparing two commits").
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{
@@ -111,8 +111,14 @@ async fn pool() -> Option<Pool> {
     Some(pool)
 }
 
-fn now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed(pool: &Pool) -> (BoundedContext, EventType) {

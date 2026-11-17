@@ -221,7 +221,7 @@ async fn upload(
         bytes,
         routes.max_blob_bytes,
         subject,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await?;
     Ok((StatusCode::CREATED, Json(reference)).into_response())

@@ -72,7 +72,7 @@ pub(super) async fn insert_idempotency_key<'e>(
     client_id: &str,
     idempotency_key: &str,
     triggered_event_sequences: &[i64],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.idempotency_keys \
@@ -83,7 +83,7 @@ pub(super) async fn insert_idempotency_key<'e>(
     .bind(client_id)
     .bind(idempotency_key)
     .bind(triggered_event_sequences)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(executor)
     .await?;
     Ok(())

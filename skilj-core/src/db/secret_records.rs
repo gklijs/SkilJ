@@ -111,11 +111,16 @@ pub(super) struct SecretVersionRow {
     )]
     pub(super) encryption_key_id: i64,
     pub(super) status: String,
-    pub(super) expires_at: Option<DateTime<Utc>>,
-    pub(super) created_at: DateTime<Utc>,
-    pub(super) rotated_at: Option<DateTime<Utc>>,
-    pub(super) revoked_at: Option<DateTime<Utc>>,
-    pub(super) last_read_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) expires_at: Option<Timestamp>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) created_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) rotated_at: Option<Timestamp>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) revoked_at: Option<Timestamp>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) last_read_at: Option<Timestamp>,
     pub(super) last_read_by: Option<String>,
 }
 
@@ -263,9 +268,9 @@ pub async fn put_secret_value(
     bounded_context: &str,
     name: &str,
     plaintext: &SecretValue,
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<Timestamp>,
     key_service: &KeyService,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<Secret> {
     secrets::validate_secret_name(name).map_err(crate::error::Error::from)?;
     let bc = require_bounded_context(pool, bounded_context).await?;
@@ -281,7 +286,7 @@ pub async fn put_secret_value(
             "UPDATE {schema}.secret_versions SET status = 'rotated', rotated_at = $1 \
              WHERE id = $2"
         )))
-        .bind(now)
+        .bind(now.to_sqlx())
         .bind(old.id)
         .execute(&mut *tx)
         .await?;
@@ -324,8 +329,8 @@ pub async fn put_secret_value(
     .bind(next_version)
     .bind(&ciphertext)
     .bind(key_id)
-    .bind(expires_at)
-    .bind(now)
+    .bind(expires_at.map(|t| t.to_sqlx()))
+    .bind(now.to_sqlx())
     .fetch_one(&mut *tx)
     .await?;
 
@@ -342,7 +347,7 @@ pub async fn revoke_secret(
     pool: &Pool,
     bounded_context: &str,
     name: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<Secret> {
     secrets::validate_secret_name(name).map_err(crate::error::Error::from)?;
     let bc = require_bounded_context(pool, bounded_context).await?;
@@ -360,7 +365,7 @@ pub async fn revoke_secret(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.secret_versions SET status = 'revoked', revoked_at = $1 WHERE id = $2"
     )))
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(row.id)
     .execute(&mut *tx)
     .await?;
@@ -383,7 +388,7 @@ pub async fn grant_secret_access(
     bounded_context: &str,
     name: &str,
     grantee_role_id: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<SecretGrant> {
     let bc = require_bounded_context(pool, bounded_context).await?;
     let grant = secrets::grant_secret_access(&bc, name, grantee_role_id, now)
@@ -396,7 +401,7 @@ pub async fn grant_secret_access(
     .bind(&grant.id)
     .bind(&grant.name)
     .bind(&grant.grantee_role_id)
-    .bind(grant.created_at)
+    .bind(grant.created_at.to_sqlx())
     .execute(pool)
     .await?;
     Ok(grant)
@@ -411,14 +416,14 @@ pub async fn revoke_secret_access(
     bounded_context: &str,
     name: &str,
     grantee_role_id: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<u64> {
     let schema = schema_ident(bounded_context);
     let result = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.secret_grants SET status = 'revoked', revoked_at = $1 \
          WHERE name = $2 AND grantee_role_id = $3 AND status = 'active'"
     )))
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(name)
     .bind(grantee_role_id)
     .execute(pool)
@@ -432,8 +437,10 @@ pub(super) struct SecretGrantRow {
     pub(super) name: String,
     pub(super) grantee_role_id: String,
     pub(super) status: String,
-    pub(super) created_at: DateTime<Utc>,
-    pub(super) revoked_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) created_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) revoked_at: Option<Timestamp>,
 }
 
 pub(super) const SECRET_GRANT_COLUMNS: &str =
@@ -500,7 +507,7 @@ pub async fn fetch_secret_value(
     name: &str,
     caller_role_id: &str,
     key_service: &KeyService,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<SecretValue> {
     secrets::validate_secret_name(name).map_err(crate::error::Error::from)?;
     // Confirms the bounded context exists before anything else; the row
@@ -543,7 +550,7 @@ pub async fn fetch_secret_value(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.secret_versions SET last_read_at = $1, last_read_by = $2 WHERE id = $3"
     )))
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(caller_role_id)
     .bind(row.id)
     .execute(pool)

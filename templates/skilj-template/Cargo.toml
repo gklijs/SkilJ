@@ -11,21 +11,21 @@ default = ["local"]
 local = ["skilj/local"]
 
 [dependencies]
-skilj = "0.4.0"
-skilj-core = "0.4.0"
+skilj = "0.5.0"
+skilj-core = "0.5.0"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = { version = "1", features = ["chrono04"] }
-chrono = { version = "0.4", features = ["serde"] }
+schemars = { version = "1", features = ["jiff02"] }
+jiff = { version = "0.2.46", features = ["serde"] }
 
 [dev-dependencies]
-skilj-test-fixture = "0.4.0"
+skilj-test-fixture = "0.5.0"
 
 [package.metadata.cargo-machete]
-# schemars's `chrono04` feature above is for the date fields a project adds.
-ignored = ["chrono"]
+# jiff, and schemars's `jiff02` feature above, are for the date fields a project adds.
+ignored = ["jiff"]
 
 [[bin]]
 name = "server"

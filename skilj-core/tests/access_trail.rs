@@ -5,7 +5,7 @@
 //! baseline need Postgres (see `persistence.rs`'s module comment for how
 //! the database is found).
 
-use chrono::{Duration, SubsecRound, TimeZone, Utc};
+use jiff::{SignedDuration, Timestamp};
 use skilj_core::access_control::{
     AccessLevel, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
@@ -51,7 +51,7 @@ async fn provision() -> Option<Pool> {
         .await
         .expect("reading the admin bounded context");
     if let Some(admin) =
-        skilj_core::bootstrap::stamp_admin_bounded_context(existing.as_ref(), Utc::now())
+        skilj_core::bootstrap::stamp_admin_bounded_context(existing.as_ref(), Timestamp::now())
     {
         db::insert_bounded_context(&pool, &admin)
             .await
@@ -63,8 +63,14 @@ async fn provision() -> Option<Pool> {
     Some(pool)
 }
 
-fn now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed_role(pool: &Pool) -> Role {
@@ -124,12 +130,12 @@ fn record(kind: AccessEventKind, at: i64, payload: serde_json::Value) -> AccessE
     AccessEventRecord {
         kind,
         payload,
-        created_at: Utc.timestamp_opt(at, 0).unwrap(),
+        created_at: Timestamp::new(at, 0).unwrap(),
     }
 }
 
-fn at(seconds: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(seconds, 0).unwrap()
+fn at(seconds: i64) -> jiff::Timestamp {
+    Timestamp::new(seconds, 0).unwrap()
 }
 
 fn history() -> Vec<AccessEventRecord> {
@@ -966,7 +972,7 @@ fn a_grant_with_no_history_is_baselined_once() {
             vec![AccessEventKind::AccessBaselined],
             "a covered grant is not baselined again"
         );
-        let answer = fold_access_events(&records, now() + Duration::seconds(1));
+        let answer = fold_access_events(&records, now() + SignedDuration::from_secs(1));
         assert!(answer.held);
         assert_eq!(answer.level.as_deref(), Some("admin"));
         assert_eq!(answer.capabilities, raw.capabilities);
@@ -1031,7 +1037,7 @@ fn a_raw_grant_with_a_capability_event_is_still_baselined() {
                 AccessEventKind::AccessBaselined
             ]
         );
-        let answer = fold_access_events(&records, now() + Duration::seconds(1));
+        let answer = fold_access_events(&records, now() + SignedDuration::from_secs(1));
         assert!(answer.held, "an active grant is held");
         assert_eq!(answer.capabilities, BTreeSet::from(["staff".to_string()]));
     });
@@ -1068,7 +1074,7 @@ fn a_raw_regrant_after_a_revoke_is_baselined() {
             records.last().unwrap().kind,
             AccessEventKind::AccessBaselined
         );
-        let answer = fold_access_events(&records, now() + Duration::seconds(1));
+        let answer = fold_access_events(&records, now() + SignedDuration::from_secs(1));
         assert!(answer.held);
         assert_eq!(answer.level.as_deref(), Some("admin"));
     });
@@ -1130,7 +1136,7 @@ fn a_grant_made_with_capabilities_records_them() {
 
         let answer = fold_access_events(
             &trail(&pool, &role, &bc).await,
-            now() + Duration::seconds(1),
+            now() + SignedDuration::from_secs(1),
         );
         assert_eq!(answer.capabilities, granted.capabilities);
         assert_eq!(answer.delegable, granted.delegable);

@@ -447,9 +447,14 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
 }
 
-pub fn now() -> chrono::DateTime<chrono::Utc> {
-    use chrono::SubsecRound;
-    chrono::Utc::now().trunc_subsecs(6)
+pub fn now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 pub fn master_key() -> KeyService {

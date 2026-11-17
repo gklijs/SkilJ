@@ -70,9 +70,9 @@ pub struct Role {
     /// Whether it is in force.
     pub status: RoleStatus,
     /// When it was created.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// When it was revoked; `None` while active.
-    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_at: Option<jiff::Timestamp>,
 }
 
 /// See `enum AccessLevel`.
@@ -129,9 +129,9 @@ pub struct RoleAccessMapping {
     /// Whether the grant is in force.
     pub status: RoleStatus,
     /// When it was granted.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// When it was revoked; `None` while active.
-    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_at: Option<jiff::Timestamp>,
 }
 
 /// See `entity PrivateFieldGrant`. One Role letting another read the
@@ -190,9 +190,9 @@ pub struct PrivateFieldGrant {
     /// Whether the grant is in force.
     pub status: TokenStatus,
     /// When it was granted.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// When it was revoked; `None` while active.
-    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_at: Option<jiff::Timestamp>,
 }
 
 /// See `entity AccessToken`'s `status` field/transition graph. Reused by
@@ -222,9 +222,9 @@ pub struct EventReadToken {
     /// Whether it is accepted.
     pub status: TokenStatus,
     /// When it was minted.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// When it was revoked; `None` while active.
-    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_at: Option<jiff::Timestamp>,
     /// The event type it reads.
     pub event_type: crate::event_store::EventType,
     /// Cross-tenant read fix (docs/architecture.md's own write-up of
@@ -256,7 +256,7 @@ pub struct EventReadToken {
     pub start_at_sequence: Option<i64>,
     /// See `EventReadToken.start_at_time` in the spec - `start_at_sequence`'s
     /// own sibling, populated iff `start_from = AtTime`.
-    pub start_at_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub start_at_time: Option<jiff::Timestamp>,
 }
 
 /// See `variant EventReadToken.start_from`. `Beginning` unless a minting
@@ -291,9 +291,9 @@ pub struct ExternalEventToken {
     /// Whether it is accepted.
     pub status: TokenStatus,
     /// When it was minted.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// When it was revoked; `None` while active.
-    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_at: Option<jiff::Timestamp>,
     /// The event type it creates.
     pub event_type: crate::event_store::EventType,
     /// Cross-tenant write fix (docs/architecture.md's own write-up of
@@ -318,9 +318,9 @@ pub struct DirectCreationToken {
     /// Whether it is accepted.
     pub status: TokenStatus,
     /// When it was minted.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// When it was revoked; `None` while active.
-    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_at: Option<jiff::Timestamp>,
     /// The event type it creates.
     pub event_type: crate::event_store::EventType,
     /// The one owner it may create events for; `None` for any.
@@ -340,9 +340,9 @@ pub struct CommandToken {
     /// Whether it is accepted.
     pub status: TokenStatus,
     /// When it was minted.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// When it was revoked; `None` while active.
-    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_at: Option<jiff::Timestamp>,
     /// The command type it submits.
     pub command_type: crate::event_store::CommandType,
     /// The one owner it may submit commands for; `None` for any.
@@ -1217,7 +1217,7 @@ pub fn create_role(
     external_subject: String,
     existing_roles: &[Role],
     id: String,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<Role> {
     require_active_superadmin(caller)?;
     if existing_roles
@@ -1250,7 +1250,7 @@ pub fn revoke_role(
     caller: &Role,
     role: &Role,
     active_mappings: &[RoleAccessMapping],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<(Role, Vec<RoleAccessMapping>)> {
     require_active_superadmin(caller)?;
     if role.status != RoleStatus::Active {
@@ -1292,7 +1292,7 @@ pub fn grant_role_access_mapping(
     can_read_sensitive: bool,
     scope: Option<String>,
     existing_mappings: &[RoleAccessMapping],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<RoleAccessMapping> {
     require_active_superadmin(caller)?;
     if role.status != RoleStatus::Active {
@@ -1325,7 +1325,7 @@ pub fn grant_role_access_mapping(
 pub fn revoke_role_access_mapping(
     caller: &Role,
     access_mapping: &RoleAccessMapping,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<RoleAccessMapping> {
     require_active_superadmin(caller)?;
     if access_mapping.status != RoleStatus::Active {
@@ -1387,7 +1387,7 @@ pub fn grant_private_field_access_for_event(
     event: Option<&crate::event_store::Event>,
     field: Option<&str>,
     id: String,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<PrivateFieldGrant> {
     if access_mapping.status != RoleStatus::Active {
         return Err(Error::GrantNotActive.into());
@@ -1427,7 +1427,7 @@ pub fn grant_private_field_access_for_command(
     command: Option<&crate::event_store::Command>,
     field: Option<&str>,
     id: String,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<PrivateFieldGrant> {
     if access_mapping.status != RoleStatus::Active {
         return Err(Error::GrantNotActive.into());
@@ -1465,7 +1465,7 @@ pub fn grant_private_field_access_for_command(
 pub fn revoke_private_field_access(
     access_mapping: &RoleAccessMapping,
     grant: &PrivateFieldGrant,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<PrivateFieldGrant> {
     if access_mapping.status != RoleStatus::Active {
         return Err(Error::GrantNotActive.into());
@@ -1655,7 +1655,7 @@ pub fn create_external_event_token(
     id: String,
     secret: String,
     scope: Option<String>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<ExternalEventToken> {
     require_active_admin(access_mapping)?;
     let scope = scope_for_minted_token(access_mapping, scope)?;
@@ -1685,7 +1685,7 @@ pub fn create_direct_creation_token(
     id: String,
     secret: String,
     scope: Option<String>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<DirectCreationToken> {
     require_active_admin(access_mapping)?;
     let scope = scope_for_minted_token(access_mapping, scope)?;
@@ -1748,8 +1748,8 @@ pub fn create_event_read_token(
     scope: Option<String>,
     start_from: Option<EventReadStartPosition>,
     start_at_sequence: Option<i64>,
-    start_at_time: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
+    start_at_time: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<EventReadToken> {
     require_active_admin(access_mapping)?;
     let scope = scope_for_minted_token(access_mapping, scope)?;
@@ -1802,7 +1802,7 @@ pub fn create_command_token(
     id: String,
     secret: String,
     scope: Option<String>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<CommandToken> {
     require_active_admin(access_mapping)?;
     let scope = scope_for_minted_token(access_mapping, scope)?;
@@ -1831,7 +1831,7 @@ pub fn create_command_token(
 pub fn revoke_token(
     access_mapping: &RoleAccessMapping,
     token: &AccessToken,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<AccessToken> {
     require_active_admin(access_mapping)?;
     if !access_mapping.bounded_context.same_as(token.scope()) {

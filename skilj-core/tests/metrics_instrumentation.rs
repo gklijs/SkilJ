@@ -17,7 +17,7 @@
 //! `DATABASE_URL`-then-embedded-Postgres-then-skip harness, same as
 //! every other `skilj-core/tests/*.rs` file needing a real Postgres.
 
-use chrono::Utc;
+use jiff::Timestamp;
 use opentelemetry::global;
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 use skilj_core::bootstrap::ContextCreator;
@@ -81,7 +81,7 @@ async fn appending_an_event_records_the_events_appended_counter() {
     let bounded_context = BoundedContext {
         name: bounded_context_name.clone(),
         status: BoundedContextStatus::Active,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         created_by: ContextCreator::SystemCreator,
         template: None,
     };
@@ -120,7 +120,7 @@ async fn appending_an_event_records_the_events_appended_counter() {
             r#type: "SomethingHappened".into(),
             version: 1,
             client_id: "test".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             correlation_id: None,
             causation_id: None,
         },

@@ -25,7 +25,7 @@ use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::ErrorExtensions;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::Deserialize;
 use skilj_core::db::{self, ParkedDelivery, ParkedDeliveryKind};
 
@@ -143,7 +143,7 @@ async fn redrive_parked_delivery(
                     None,
                     None,
                     state.key_service.as_ref(),
-                    Utc::now(),
+                    Timestamp::now(),
                     Some(&idempotency_key),
                 )
                 .await?;
@@ -204,7 +204,7 @@ async fn redrive_parked_delivery(
                 redrive.correlation_id,
                 redrive.causation_id,
                 Some(dedupe),
-                Utc::now(),
+                Timestamp::now(),
                 state.key_service.as_ref(),
                 &state.dispatcher.blind_index(),
             )
@@ -270,7 +270,7 @@ async fn redrive_parked_delivery(
                     authorised.correlation_id.as_deref(),
                     authorised.causation_id.as_deref(),
                     state.key_service.as_ref(),
-                    Utc::now(),
+                    Timestamp::now(),
                     Some(&idempotency_key),
                 )
                 .await?;
@@ -445,7 +445,7 @@ pub fn retry_parked_delivery_field(n: &Naming) -> Field {
                             &bounded_context_name,
                             &id,
                             &message,
-                            Utc::now(),
+                            Timestamp::now(),
                         )
                         .await
                         .map_err(to_graphql_error)?;

@@ -23,7 +23,7 @@ use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::ErrorExtensions;
-use chrono::Utc;
+use jiff::Timestamp;
 use skilj_core::access_control::RoleAccessMapping;
 use skilj_core::approvals::CommandProposalStatus;
 use skilj_core::event_store::Command;
@@ -157,7 +157,7 @@ pub fn command_proposals_field(n: &Naming) -> Field {
                     access_mapping.scope.as_deref(),
                     after.as_ref(),
                     limit,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .await
                 .map_err(to_graphql_error)?;
@@ -213,7 +213,7 @@ pub fn approve_command_field(n: &Naming) -> Field {
                     &proposal_id,
                     &access_mapping,
                     state.key_service.as_ref(),
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .await
                 .map_err(to_graphql_error)?;
@@ -286,7 +286,7 @@ pub fn reject_command_field(n: &Naming) -> Field {
                     &proposal_id,
                     &access_mapping,
                     reason.as_deref(),
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .await
                 .map_err(to_graphql_error)?;

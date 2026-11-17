@@ -7,8 +7,9 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use chrono::{SubsecRound, Utc};
 use http_body_util::BodyExt;
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::{CommandType, EventType, Skilj};
@@ -130,8 +131,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 /// With `stale_key_before_start`, a key recorded two hours ago is inserted
@@ -189,7 +196,7 @@ async fn setup(
              (command_type_name, client_id, idempotency_key, triggered_event_sequences, created_at) \
              VALUES ('WithdrawMoney', 'before-the-outage', 'order-1', '{{0}}', $1)"
         )))
-        .bind(test_now() - chrono::Duration::hours(2))
+        .bind((test_now() - jiff::SignedDuration::from_hours(2)).to_sqlx())
         .execute(&pool)
         .await
         .unwrap();

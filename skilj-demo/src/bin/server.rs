@@ -60,7 +60,7 @@
 //! GraphQL with at all" shortcut, printed alongside the command tokens
 //! below.
 
-use chrono::Utc;
+use jiff::Timestamp;
 use jsonwebtoken::{EncodingKey, Header};
 use serde_json::json;
 use skilj::{IdpConfig, SigningAlgorithm, Skilj};
@@ -155,7 +155,7 @@ fn sign_jwt(subject: &str) -> String {
         "sub": subject,
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
-        "exp": (Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": (Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
         .expect("the test private key PEM is well-formed");

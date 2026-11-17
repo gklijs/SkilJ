@@ -298,7 +298,7 @@ pub(super) fn reported_snapshot_version(stored: i64) -> u64 {
 /// `get_snapshot_state`'s own return shape, named to satisfy
 /// `clippy::type_complexity` rather than because anything else reuses
 /// it.
-pub(super) type SnapshotStateRow = (u64, i64, String, DateTime<Utc>);
+pub(super) type SnapshotStateRow = (u64, i64, String, Timestamp);
 
 /// One snapshot's own materialised state, JSON-encoded, alongside the
 /// `snapshot_version` it was written at, the `sequence` it's folded up
@@ -321,7 +321,7 @@ pub async fn get_snapshot_state(
     tag_value: &str,
 ) -> crate::error::Result<Option<SnapshotStateRow>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<(i64, i64, String, DateTime<Utc>)> =
+    let row: Option<(i64, i64, String, jiff_sqlx::Timestamp)> =
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT snapshot_version, as_of_sequence, state::text, updated_at FROM {schema}.snapshots \
          WHERE snapshot_name = $1 AND tag_key = $2 AND tag_value = $3"
@@ -336,7 +336,7 @@ pub async fn get_snapshot_state(
             reported_snapshot_version(version),
             as_of_sequence,
             state,
-            updated_at,
+            updated_at.to_jiff(),
         )
     }))
 }
@@ -359,7 +359,7 @@ pub async fn get_snapshot_state_and_owner(
     tag_key: &str,
     tag_value: &str,
 ) -> crate::error::Result<Option<(SnapshotStateRow, Option<String>)>> {
-    type RawSnapshotStateAndOwnerRow = (i64, i64, String, DateTime<Utc>, Option<String>);
+    type RawSnapshotStateAndOwnerRow = (i64, i64, String, jiff_sqlx::Timestamp, Option<String>);
     let schema = schema_ident(bounded_context);
     let row: Option<RawSnapshotStateAndOwnerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT snapshot_version, as_of_sequence, state::text, updated_at, owner \
@@ -377,7 +377,7 @@ pub async fn get_snapshot_state_and_owner(
                     reported_snapshot_version(version),
                     as_of_sequence,
                     state,
-                    updated_at,
+                    updated_at.to_jiff(),
                 ),
                 owner,
             )

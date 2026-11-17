@@ -31,7 +31,7 @@
 //!     `RegisterCommandType`'s registration-ordering obligation, not
 //!     ProcessCommand's.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::access_control::{
     self, AccessLevel, CommandToken, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
@@ -134,8 +134,8 @@ fn event_with_tags(sequence: i64, tags: Vec<Tag>) -> Event {
     }
 }
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 fn role(status: RoleStatus) -> Role {

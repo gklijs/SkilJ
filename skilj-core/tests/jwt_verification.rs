@@ -174,15 +174,15 @@ fn sign_jwt(
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some(kid.to_string());
     let exp = if expires_in_the_past {
-        chrono::Utc::now() - chrono::Duration::hours(1)
+        jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1)
     } else {
-        chrono::Utc::now() + chrono::Duration::hours(1)
+        jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)
     };
     let claims = json!({
         subject_claim: subject_value,
         "iss": issuer,
         "aud": TEST_AUDIENCE,
-        "exp": exp.timestamp(),
+        "exp": exp.as_second(),
     });
     let key = EncodingKey::from_rsa_pem(signing_key_pem.as_bytes())
         .expect("the test private key PEM is well-formed");
@@ -341,16 +341,16 @@ fn verify_and_extract_subject_rejects_a_token_not_yet_valid() {
         let jwks_url = serve_jwks().await;
         let config = idp_config(&jwks_url);
         let cache = JwksCache::new(config.jwks_endpoint.clone());
-        let now = chrono::Utc::now();
-        let sign = |nbf: chrono::DateTime<chrono::Utc>| {
+        let now = jiff::Timestamp::now();
+        let sign = |nbf: jiff::Timestamp| {
             let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
             header.kid = Some(TEST_KID.to_string());
             let claims = json!({
                 "sub": "user-123",
                 "iss": TEST_ISSUER,
                 "aud": TEST_AUDIENCE,
-                "exp": (now + chrono::Duration::hours(2)).timestamp(),
-                "nbf": nbf.timestamp(),
+                "exp": (now + jiff::SignedDuration::from_hours(2)).as_second(),
+                "nbf": nbf.as_second(),
             });
             let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
                 .expect("the test private key PEM is well-formed");
@@ -358,16 +358,22 @@ fn verify_and_extract_subject_rejects_a_token_not_yet_valid() {
                 .expect("signing a well-formed JWT never fails")
         };
 
-        let err =
-            verify_and_extract_subject(&sign(now + chrono::Duration::hours(1)), &config, &cache)
-                .await
-                .unwrap_err();
+        let err = verify_and_extract_subject(
+            &sign(now + jiff::SignedDuration::from_hours(1)),
+            &config,
+            &cache,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), "jwt_verification_failed");
 
-        let subject =
-            verify_and_extract_subject(&sign(now - chrono::Duration::minutes(1)), &config, &cache)
-                .await
-                .unwrap();
+        let subject = verify_and_extract_subject(
+            &sign(now - jiff::SignedDuration::from_mins(1)),
+            &config,
+            &cache,
+        )
+        .await
+        .unwrap();
         assert_eq!(subject, "user-123");
     });
 }
@@ -380,7 +386,7 @@ fn sign_jwt_with_audience(aud: Option<serde_json::Value>) -> String {
     let mut claims = json!({
         "sub": "user-123",
         "iss": TEST_ISSUER,
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     });
     if let Some(aud) = aud {
         claims["aud"] = aud;

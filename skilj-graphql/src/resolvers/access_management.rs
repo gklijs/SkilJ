@@ -37,7 +37,7 @@ pub fn create_role_field(n: &Naming) -> Field {
                     external_subject,
                     &existing_roles,
                     try_generate_token_id().map_err(crate::error::to_graphql_error)?,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
                 skilj_core::db::insert_role(&state.pool, &role)
@@ -85,7 +85,7 @@ pub fn revoke_role_field(n: &Naming) -> Field {
                     &caller,
                     &role,
                     &active_mappings,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
 
@@ -183,7 +183,7 @@ pub fn grant_role_access_mapping_field(n: &Naming) -> Field {
                     can_read_sensitive,
                     scope,
                     &existing_mappings,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
                 skilj_core::db::grant_role_access_mapping_with_trail(
@@ -248,7 +248,7 @@ pub fn revoke_role_access_mapping_field(n: &Naming) -> Field {
                 let revoked = skilj_core::access_control::revoke_role_access_mapping(
                     &caller,
                     &mapping,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
                 skilj_core::db::revoke_role_access_mapping_with_trail(

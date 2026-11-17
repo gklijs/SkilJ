@@ -17,8 +17,10 @@ pub(super) struct EncryptionKeyRow {
     pub(super) subject_key: String,
     pub(super) subject_value: String,
     pub(super) status: String,
-    pub(super) created_at: DateTime<Utc>,
-    pub(super) destroyed_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) created_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) destroyed_at: Option<Timestamp>,
     pub(super) wrapped_key: Option<Vec<u8>>,
     pub(super) wrap_nonce: Option<Vec<u8>>,
     /// The key provider that wrapped it (docs/architecture.md §230),
@@ -27,7 +29,8 @@ pub(super) struct EncryptionKeyRow {
     /// The master key version it is wrapped under, `NULL` for a legacy one.
     pub(super) master_key_version: Option<i32>,
     /// When a rewrap found no configured key unwraps it.
-    pub(super) unreadable_since: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) unreadable_since: Option<Timestamp>,
 }
 
 impl EncryptionKeyRow {
@@ -174,7 +177,7 @@ pub(super) async fn provision_encryption_key(
             }
             Err(err) => return Err(err.into()),
         };
-        let now = Utc::now();
+        let now = Timestamp::now();
         // A bounded context's own key is stored only while its state row
         // is there, taken `FOR SHARE` in the same statement: a deletion of
         // the key waits for this, and one that came first leaves nothing to
@@ -197,7 +200,7 @@ pub(super) async fn provision_encryption_key(
         )))
         .bind(subject_key)
         .bind(subject_value)
-        .bind(now)
+        .bind(now.to_sqlx())
         .bind(&wrapped.ciphertext)
         .bind(provider.name())
         .bind(version_column(wrapped.version)?)
@@ -655,7 +658,7 @@ pub async fn destroy_encryption_key(
     bounded_context: &str,
     subject_key: &str,
     subject_value: &str,
-    destroyed_at: DateTime<Utc>,
+    destroyed_at: Timestamp,
 ) -> crate::error::Result<()> {
     if secrets::is_reserved_subject_key(subject_key) {
         return Err(secrets::Error::ReservedSubjectKey.into());
@@ -674,14 +677,14 @@ pub(super) async fn destroy_encryption_key_on(
     schema: &str,
     subject_key: &str,
     subject_value: &str,
-    destroyed_at: DateTime<Utc>,
+    destroyed_at: Timestamp,
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.encryption_keys SET status = 'destroyed', destroyed_at = $1, \
          wrapped_key = NULL, wrap_nonce = NULL \
          WHERE subject_key = $2 AND subject_value = $3 AND status = 'active'"
     )))
-    .bind(destroyed_at)
+    .bind(destroyed_at.to_sqlx())
     .bind(subject_key)
     .bind(subject_value)
     .execute(executor)

@@ -14,6 +14,7 @@ use super::{
     distinct_names, not_found, parse_rfc3339, require_admin_mapping, resolve_read_data_keys,
 };
 use crate::error::to_graphql_error;
+use crate::gql_types::rfc3339;
 use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -163,7 +164,7 @@ pub fn fetch_commands_field(n: &Naming) -> Field {
                 Ok(Some(FieldValue::list(page.iter().map(|c| {
                     FieldValue::owned_any((
                         c.id.clone(),
-                        c.metadata.created_at.to_rfc3339(),
+                        rfc3339(c.metadata.created_at),
                         skilj_core::event_store::render_command(
                             c,
                             &access_mapping,

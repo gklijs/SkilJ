@@ -613,7 +613,7 @@ impl CommandDispatcher for Dispatcher {
             payload,
             matching_events,
             &[],
-            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+            &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
         ))
     }
 
@@ -1213,13 +1213,13 @@ impl Skilj {
             self.event_broadcaster.clone(),
             self.event_cache.clone(),
             // issue #25 (docs/architecture.md §53) -
-            // `chrono::Duration::from_std` only fails for a duration too
+            // `jiff::SignedDuration::from_std` only fails for a duration too
             // large to fit, never a real concern for a checkout lease
             // measured in minutes; the same fallback
             // `skilj-kafka`/`skilj-amqp`/`skilj-nats`'s own retry-backoff
             // conversions already use.
-            chrono::Duration::from_std(self.read_cursor_checkout_lease)
-                .unwrap_or(chrono::Duration::zero()),
+            jiff::SignedDuration::try_from(self.read_cursor_checkout_lease)
+                .unwrap_or(jiff::SignedDuration::ZERO),
             self.max_events_per_read,
             self.command_batcher.clone(),
         )
@@ -1620,11 +1620,12 @@ async fn retire_unused_key(
     }
     match state.delete_after {
         None => {
-            let grace =
-                chrono::Duration::from_std(rotation.retire_after).unwrap_or(chrono::Duration::MAX);
-            let at = chrono::Utc::now()
-                .checked_add_signed(grace)
-                .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+            let grace = jiff::SignedDuration::try_from(rotation.retire_after)
+                .unwrap_or(jiff::SignedDuration::MAX);
+            let at = jiff::Timestamp::now()
+                .checked_add(grace)
+                .ok()
+                .unwrap_or(jiff::Timestamp::MAX);
             skilj_core::db::schedule_key_deletion(pool, &state.provider, at).await?;
         }
         Some(_) => {
@@ -1669,7 +1670,7 @@ async fn key_lifecycle(
         None => key.is_none(),
     };
     if let (true, Some(every)) = (managed, rotation.every) {
-        let every = chrono::Duration::from_std(every).unwrap_or(chrono::Duration::MAX);
+        let every = jiff::SignedDuration::try_from(every).unwrap_or(jiff::SignedDuration::MAX);
         if let Some(version) = skilj_core::db::rotate_master_key(
             pool,
             provider,
@@ -1771,14 +1772,15 @@ async fn key_lifecycle(
         return Ok(());
     }
     let grace = if state.retire_immediately {
-        chrono::Duration::zero()
+        jiff::SignedDuration::ZERO
     } else {
-        chrono::Duration::from_std(rotation.retire_after).unwrap_or(chrono::Duration::MAX)
+        jiff::SignedDuration::try_from(rotation.retire_after).unwrap_or(jiff::SignedDuration::MAX)
     };
     if rewrapped_at
-        .checked_add_signed(grace)
-        .is_some_and(|due| due > chrono::Utc::now())
-        || rewrapped_at.checked_add_signed(grace).is_none()
+        .checked_add(grace)
+        .ok()
+        .is_some_and(|due| due > jiff::Timestamp::now())
+        || rewrapped_at.checked_add(grace).ok().is_none()
     {
         return Ok(());
     }
@@ -2543,7 +2545,7 @@ async fn reconcile_blind_tags(
                 ),
                 key_generation: blind_index.current_generation(),
             },
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )
         .await?;
     }
@@ -4206,7 +4208,7 @@ impl SkiljBuilder {
             &role,
             &self.event_types,
             &mut phase,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
             &version,
         )
         .await;
@@ -4540,7 +4542,7 @@ impl SkiljBuilder {
                 &role,
                 &self.event_types,
                 &mut report,
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
                 &version,
             )
             .await?;
@@ -4772,7 +4774,8 @@ impl SkiljBuilder {
                 .min(IDEMPOTENCY_KEY_CLEANUP_INTERVAL)
                 .max(std::time::Duration::from_secs(1));
             let startup_grace = retention.min(IDEMPOTENCY_KEY_STARTUP_GRACE);
-            let retention = chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::MAX);
+            let retention =
+                jiff::SignedDuration::try_from(retention).unwrap_or(jiff::SignedDuration::MAX);
             background.spawn("idempotency_key_retention", move |mut stop| async move {
                 // docs/architecture.md §94: recovery paths that retry under
                 // a key (a reclaimed deadline, a route re-reading its
@@ -4807,8 +4810,8 @@ impl SkiljBuilder {
         {
             let pool = skilj.pool.clone();
             let store = skilj.blob_store.clone();
-            let grace =
-                chrono::Duration::from_std(self.blob_orphan_grace).unwrap_or(chrono::Duration::MAX);
+            let grace = jiff::SignedDuration::try_from(self.blob_orphan_grace)
+                .unwrap_or(jiff::SignedDuration::MAX);
             let interval = self
                 .blob_orphan_grace
                 .min(BLOB_COLLECTION_INTERVAL)
@@ -4837,7 +4840,8 @@ impl SkiljBuilder {
             let cleanup_interval = retention
                 .min(DEADLINE_CLEANUP_INTERVAL)
                 .max(std::time::Duration::from_secs(1));
-            let retention = chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::MAX);
+            let retention =
+                jiff::SignedDuration::try_from(retention).unwrap_or(jiff::SignedDuration::MAX);
             background.spawn("deadline_retention", move |mut stop| async move {
                 loop {
                     let start = std::time::Instant::now();
@@ -5196,7 +5200,7 @@ impl SkiljBuilder {
                     &deadline_fire_broadcaster,
                     &deadline_fire_event_cache,
                     deadline_fire_encryption_master_key.as_ref(),
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                     &deadline_retry_policy,
                     &fire_cancels,
                 )
@@ -5262,7 +5266,7 @@ impl SkiljBuilder {
                     &scheduler_broadcaster,
                     &scheduler_event_cache,
                     scheduler_encryption_master_key.as_ref(),
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 // One span per tick, a trace root - same reasoning as
                 // the async projection task above.
@@ -5498,7 +5502,7 @@ static EPOCH_CHANGES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 async fn observe_epoch(pool: &Pool) {
     let observed = async {
         let epoch = skilj_core::db::current_epoch(pool).await?;
-        let previous = skilj_core::db::record_epoch(pool, &epoch, chrono::Utc::now()).await?;
+        let previous = skilj_core::db::record_epoch(pool, &epoch, jiff::Timestamp::now()).await?;
         Ok::<_, skilj_core::Error>((epoch, previous))
     }
     .await;
@@ -5550,7 +5554,7 @@ impl RetentionTarget {
         self,
         pool: &Pool,
         bounded_context: &str,
-        cutoff: chrono::DateTime<chrono::Utc>,
+        cutoff: jiff::Timestamp,
     ) -> skilj_core::error::Result<u64> {
         match self {
             // External events' message keys share the retention
@@ -5594,12 +5598,10 @@ impl RetentionTarget {
 async fn blob_collection_tick(
     pool: &Pool,
     store: &dyn skilj_core::blob::BlobStore,
-    grace: chrono::Duration,
+    grace: jiff::SignedDuration,
 ) {
-    let now = chrono::Utc::now();
-    let cutoff = now
-        .checked_sub_signed(grace)
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+    let now = jiff::Timestamp::now();
+    let cutoff = now.checked_sub(grace).ok().unwrap_or(jiff::Timestamp::MIN);
     let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
         Ok(bcs) => bcs,
         Err(e) => {
@@ -5636,11 +5638,12 @@ async fn blob_collection_tick(
     }
 }
 
-async fn retention_tick(pool: &Pool, target: RetentionTarget, retention: chrono::Duration) {
+async fn retention_tick(pool: &Pool, target: RetentionTarget, retention: jiff::SignedDuration) {
     let task = target.task();
-    let cutoff = chrono::Utc::now()
-        .checked_sub_signed(retention)
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+    let cutoff = jiff::Timestamp::now()
+        .checked_sub(retention)
+        .ok()
+        .unwrap_or(jiff::Timestamp::MIN);
     let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
         Ok(bcs) => bcs,
         Err(e) => {
@@ -5704,7 +5707,7 @@ async fn deadline_fire_tick(
     broadcaster: &EventBroadcaster,
     event_cache: &EventCache,
     key_service: Option<&KeyService>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     retry_policy: &skilj_retry::RetryPolicy,
     cancels: &[skilj_core::plugin::CancelDeadlineInfo],
 ) {
@@ -5837,7 +5840,7 @@ async fn scheduler_tick(
     broadcaster: &EventBroadcaster,
     event_cache: &EventCache,
     key_service: Option<&KeyService>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) {
     let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
         Ok(bcs) => bcs,
@@ -5895,7 +5898,7 @@ async fn scheduler_tick_for_bounded_context(
     broadcaster: &EventBroadcaster,
     event_cache: &EventCache,
     key_service: Option<&KeyService>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     bc: &skilj_core::event_store::BoundedContext,
 ) {
     if bc.status != skilj_core::event_store::BoundedContextStatus::Active {
@@ -6103,7 +6106,7 @@ async fn reconcile_event_types(
     role: &Role,
     event_types: &HashMap<(String, String), RegisteredEventType>,
     report: &mut ReconciliationReport,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     version: &RegistrationVersion,
 ) -> Result<(), skilj_core::Error> {
     for ((bounded_context_name, name), registered) in event_types {
@@ -6640,7 +6643,7 @@ mod tests {
                 } else {
                     BoundedContextStatus::Archived
                 },
-                created_at: chrono::Utc::now(),
+                created_at: jiff::Timestamp::now(),
                 created_by: ContextCreator::SystemCreator,
                 template: None,
             })

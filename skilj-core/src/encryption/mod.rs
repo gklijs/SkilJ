@@ -508,7 +508,7 @@ mod randomness_tests {
         use crate::event_store::{
             self, EncryptionKey, EncryptionKeyStatus, MissedOccurrencePolicy,
         };
-        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let now = jiff::Timestamp::new(1_700_000_000, 0).unwrap();
         let admin = crate::bootstrap::stamp_admin_bounded_context(None, now).unwrap();
         let key = EncryptionKey {
             bounded_context: admin.clone(),
@@ -523,7 +523,7 @@ mod randomness_tests {
         event_type.system_triggered_allowed = true;
         event_type.system_triggered_schedule = Some("* * * * * * *".into());
         event_type.missed_occurrence_policy = Some(MissedOccurrencePolicy::ReplayBacklog);
-        event_type.schedule_position = Some(now - chrono::Duration::seconds(1));
+        event_type.schedule_position = Some(now - jiff::SignedDuration::from_secs(1));
         event_type.sensitive_fields = vec![crate::shared::SensitiveField {
             field: "email".into(),
             subject_key: "user".into(),
@@ -552,7 +552,7 @@ mod randomness_tests {
         });
         assert_eq!(
             event_type.schedule_position,
-            Some(now - chrono::Duration::seconds(1))
+            Some(now - jiff::SignedDuration::from_secs(1))
         );
         event_type.sensitive_fields.clear();
         with_rng_failure(|| {

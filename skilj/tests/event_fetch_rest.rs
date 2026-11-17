@@ -9,8 +9,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{SubsecRound, Utc};
 use http_body_util::BodyExt;
+use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::{EventType, Skilj};
@@ -93,8 +93,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 /// Builds a fully reconciled `Skilj` plus real, minted
@@ -925,7 +931,7 @@ fn an_at_time_token_replays_history_after_a_chosen_cutoff_but_not_before_it() {
 
         deposit(&router, &direct_credential, 5).await; // before the cutoff - excluded
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        let cutoff = Utc::now();
+        let cutoff = Timestamp::now();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         deposit(&router, &direct_credential, 7).await; // after the cutoff, but before minting - still served
 

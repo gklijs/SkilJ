@@ -138,7 +138,7 @@ pub async fn submit_command(
     matching_events: &[Event],
     initial_decision: crate::shared::CommandDecision,
     key_service: Option<&KeyService>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     snapshot: Option<SnapshotContext<'_>>,
     snapshot_states: &[crate::plugin::SnapshotState],
     idempotency_key: Option<&str>,
@@ -1445,7 +1445,7 @@ pub(super) async fn finish_accepted_command_in_tx(
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
     key_service: Option<&KeyService>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     idempotency_key: Option<&str>,
     sync_projections: &[String],
     sequences: Vec<i64>,
@@ -1602,7 +1602,7 @@ pub(super) async fn submit_one_command_in_tx(
     matching_events: &[Event],
     initial_decision: crate::shared::CommandDecision,
     key_service: Option<&KeyService>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     snapshot: Option<SnapshotContext<'_>>,
     snapshot_states: &[crate::plugin::SnapshotState],
     idempotency_key: Option<&str>,
@@ -1719,7 +1719,7 @@ pub struct BatchedCommand {
     pub consistency_tags: Vec<Tag>,
     pub matching_events: Vec<Event>,
     pub initial_decision: crate::shared::CommandDecision,
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
     pub snapshot: Option<OwnedSnapshotContext>,
     /// See `ResolvedCommandSubmission::snapshot_states`
     /// (docs/architecture.md §202).
@@ -2169,7 +2169,7 @@ pub(super) struct PlannedCommand {
     pub(super) command_key_ids: Vec<i64>,
     pub(super) event_key_ids: Vec<Vec<i64>>,
     pub(super) idempotency_key: Option<String>,
-    pub(super) now: DateTime<Utc>,
+    pub(super) now: Timestamp,
     /// Its blob references, already checked (docs/architecture.md §239).
     pub(super) blob_claims: Vec<BlobClaim>,
 }
@@ -2519,6 +2519,7 @@ pub(super) async fn write_planned_commands(
         commands
             .iter()
             .map(|c| c.metadata.created_at)
+            .map(ToSqlx::to_sqlx)
             .collect::<Vec<_>>(),
     )
     .bind(
@@ -2623,7 +2624,7 @@ pub(super) async fn write_planned_commands(
         .bind(
             events
                 .iter()
-                .map(|(e, _)| e.metadata.created_at)
+                .map(|(e, _)| e.metadata.created_at.to_sqlx())
                 .collect::<Vec<_>>(),
         )
         .bind(
@@ -2728,7 +2729,8 @@ pub(super) async fn write_planned_commands(
                 })
                 .collect::<Vec<_>>(),
         )
-        .bind(keyed.iter().map(|(p, _)| p.now).collect::<Vec<_>>())
+        .bind(keyed.iter().map(|(p, _)| p.now).map(ToSqlx::to_sqlx)
+            .collect::<Vec<_>>())
         .execute(&mut **tx)
         .await?;
     }
@@ -3427,7 +3429,7 @@ pub async fn dry_run_command(
     payload: &str,
     client_id: &str,
     key_service: Option<&KeyService>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<CommandDryRun> {
     let context = crate::plugin::DecisionContext::at(now);
     let resolved = resolve_command_submission(
@@ -3581,7 +3583,7 @@ pub async fn decide_and_submit_command(
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
     key_service: Option<&KeyService>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     idempotency_key: Option<&str>,
     deadline: Option<crate::plugin::DeadlineContext>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
@@ -3643,7 +3645,7 @@ pub(super) async fn decide_and_submit_command_once(
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
     key_service: Option<&KeyService>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     idempotency_key: Option<&str>,
     deadline: Option<crate::plugin::DeadlineContext>,
 ) -> crate::error::Result<SubmitCommandOutcome> {

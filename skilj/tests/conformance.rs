@@ -39,7 +39,6 @@
 
 use axum::body::Body;
 use axum::http::Request;
-use chrono::SubsecRound;
 use http_body_util::BodyExt;
 use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
@@ -354,8 +353,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 // --- JWKS test server + JWT signing ---
@@ -399,7 +404,7 @@ fn sign_jwt(subject: &str) -> String {
         "sub": subject,
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
         .expect("the test private key PEM is well-formed");

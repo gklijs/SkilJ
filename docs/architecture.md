@@ -13990,3 +13990,19 @@ Each source has skilj-demo's banking context as a fixture, and `skilj-codegen/te
 **Allium.** Rules stay optional, so Allium is a reference page of `skilj-event-modeling` (`references/allium.md`) rather than a seventh guide that would need its own index lines. The page sets a direction between the files. The model owns which commands, events and fields exist. The `.allium` file owns what each decision requires: a `rule` per command, each `requires:` a rejection kind of its `decide_*` function, each case a `skilj-test-fixture` test. A rule never declares fields, so a rename happens in one place. `allium check` accepts the page's example, and its only output is an info that no surface provides the trigger.
 
 **Docs.** `docs/modeling-tools.md` ("Bring your modeling tool") has the table with each source's support level and naming convention.
+
+## 254. chrono → jiff
+
+RustSec marked chrono unmaintained on 2026-09-14 (RUSTSEC-2026-0543, recommending jiff or time). `deny.toml` has `unmaintained = "workspace"`, so from then on `cargo deny check` failed for as long as a workspace crate depended on chrono directly. skilj moved to jiff; it is a breaking change, so the workspace goes to 0.5.0.
+
+**Which jiff.** jiff 1.0 was released on 2026-11-15, but not everything skilj needs supports it yet: schemars has only a `jiff02` feature and both jiff cron parsers (`jiff-cron`, `croner`) depend on jiff 0.2, while `jiff-sqlx` 0.2.2 pairs jiff 0.2 with sqlx 0.9. So skilj uses jiff 0.2 (0.2.46), `jiff-sqlx` 0.2.2 and `jiff-cron` 0.3, one jiff in the tree. Moving to jiff 1.0 is one version bump once schemars and a cron parser follow.
+
+**The mapping.** `DateTime<Utc>` → `jiff::Timestamp`, `chrono::Duration`/`TimeDelta` → `jiff::SignedDuration`, `NaiveDate`/`NaiveTime` → `jiff::civil::Date`/`Time` (only in `string_ordering`'s filter parsing, with the same `strptime` formats). Two differences change code rather than names: subtracting two timestamps gives a calendar `Span` in jiff, so durations come from `duration_since`; and `checked_add` returns a `Result`, where chrono's `checked_add_signed` returned an `Option`. `RetryPolicy::next_attempt_at` still saturates at the latest instant (`Timestamp::MAX`, year 9999, which unlike chrono's maximum Postgres can store).
+
+**Postgres.** sqlx has no jiff feature, so every bind goes through `jiff_sqlx::ToSqlx`, and every read through `jiff_sqlx::Timestamp`: a row struct's field with `#[sqlx(try_from = "jiff_sqlx::Timestamp")]`, a nullable one with `try_from = "NullableTimestamp"` (a transparent wrapper in `db`, since `try_from` can't name an `Option`). Both encode microseconds since 2000-01-01 and truncate below a microsecond, as sqlx's chrono encoding did, so stored values and the tests' `round(... Trunc)` agree. No column changes.
+
+**Cron.** `jiff-cron` is a fork of the `cron` crate on jiff: the same 7-field Quartz expressions, the same forward and backward iterators. `next_occurrence_after` and `latest_occurrence_at_or_before` evaluate in UTC as before; a schedule in a named time zone is now one argument away, but isn't offered.
+
+**On the wire nothing changes.** jiff writes a timestamp's fraction with every trailing zero trimmed (`.12345`), where chrono wrote 0, 3, 6 or 9 digits (`.123450`). Both are RFC 3339, but clients see the bytes, so `skilj_core::wire_time` writes chrono's forms: `+00:00` for GraphQL (chrono's `to_rfc3339`), `Z` for the REST metadata and the preflight report (chrono's serde). Input parses with jiff (`parse::<Timestamp>()`), which accepts what chrono accepted. schemars' `jiff02` derives the same `format`s as `chrono04` (`date-time`, `date`, `partial-time`, `partial-date-time`), so a payload type that moves from chrono to jiff registers a schema identical to the stored one.
+
+**What stays.** chrono is still in the tree through `object_store` (skilj-blob-s3) and the Temporal client crates, which `unmaintained = "workspace"` doesn't check.

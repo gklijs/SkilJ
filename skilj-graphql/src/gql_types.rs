@@ -110,9 +110,15 @@ where
 /// wrong value; a `kind: String` field shows it as is.
 pub const UNSUPPORTED_VALUE: &str = "UNSUPPORTED";
 
-fn optional_timestamp(t: Option<chrono::DateTime<chrono::Utc>>) -> Value {
+/// A timestamp as this schema has always rendered it: RFC 3339 with a
+/// `+00:00` offset (docs/architecture.md §254).
+pub(crate) fn rfc3339(t: jiff::Timestamp) -> String {
+    skilj_core::wire_time::rfc3339(t)
+}
+
+fn optional_timestamp(t: Option<jiff::Timestamp>) -> Value {
     match t {
-        Some(t) => Value::from(t.to_rfc3339()),
+        Some(t) => Value::from(rfc3339(t)),
         None => Value::Null,
     }
 }
@@ -232,7 +238,7 @@ pub fn role_object(n: &Naming) -> Object {
         scalar "name": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.name.clone()),
         scalar "superadmin": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.superadmin),
         scalar "status": TypeRef::named_nn(n.ty("RoleStatus")) => |r| Value::from(role_status_name(r.status)),
-        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.created_at.to_rfc3339()),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(rfc3339(r.created_at)),
         scalar "revokedAt": TypeRef::named(TypeRef::STRING) => |r| optional_timestamp(r.revoked_at),
     })
 }
@@ -333,7 +339,7 @@ pub fn master_key_object(n: &Naming) -> Object {
         scalar "provider": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.state.provider.clone()),
         scalar "key": TypeRef::named(TypeRef::STRING) => |k| optional_string(k.state.key.clone()),
         scalar "version": TypeRef::named_nn(TypeRef::INT) => |k| Value::from(k.state.version),
-        scalar "rotatedAt": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.state.rotated_at.to_rfc3339()),
+        scalar "rotatedAt": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(rfc3339(k.state.rotated_at)),
         scalar "rewrapPending": TypeRef::named_nn(TypeRef::BOOLEAN) => |k| Value::from(k.state.rewrapped_at.is_none()),
         scalar "rewrappedAt": TypeRef::named(TypeRef::STRING) => |k| optional_timestamp(k.state.rewrapped_at),
         scalar "retireImmediately": TypeRef::named_nn(TypeRef::BOOLEAN) => |k| Value::from(k.state.retire_immediately),
@@ -482,7 +488,7 @@ pub fn bounded_context_object(n: &Naming) -> Object {
         scalar "status": TypeRef::named_nn(n.ty("BoundedContextStatus")) => |bc| {
             Value::from(bounded_context_status_name(bc.context.status))
         },
-        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |bc| Value::from(bc.context.created_at.to_rfc3339()),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |bc| Value::from(rfc3339(bc.context.created_at)),
         object "createdBy": TypeRef::named_nn(n.ty("ContextCreator")) => |bc| Some(bc.context.created_by.clone()),
         list "accessMappings": TypeRef::named_nn_list_nn(n.ty("RoleAccessMapping")) => |bc| bc.access_mappings.clone(),
     })
@@ -645,7 +651,7 @@ pub fn private_field_grant_object(n: &Naming) -> Object {
         scalar "commandId": TypeRef::named(TypeRef::ID) => |g| optional_string(g.command_id.clone()),
         scalar "field": TypeRef::named(TypeRef::STRING) => |g| optional_string(g.field.clone()),
         scalar "status": TypeRef::named_nn(n.ty("AccessTokenStatus")) => |g| Value::from(access_token_status_name(g.status)),
-        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |g| Value::from(g.created_at.to_rfc3339()),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |g| Value::from(rfc3339(g.created_at)),
         scalar "revokedAt": TypeRef::named(TypeRef::STRING) => |g| optional_timestamp(g.revoked_at),
     })
 }
@@ -953,8 +959,8 @@ pub fn parked_delivery_object(n: &Naming) -> Object {
         ),
         scalar "error": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.error.clone()),
         scalar "attemptCount": TypeRef::named_nn(TypeRef::INT) => |d| Value::from(d.attempt_count),
-        scalar "firstFailedAt": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.first_failed_at.to_rfc3339()),
-        scalar "lastFailedAt": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.last_failed_at.to_rfc3339()),
+        scalar "firstFailedAt": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(rfc3339(d.first_failed_at)),
+        scalar "lastFailedAt": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(rfc3339(d.last_failed_at)),
         // Pass as `parkedDeliveries(after:)` for the next page.
         scalar "cursor": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(
             skilj_core::db::ParkedDeliveryCursor::of(d).encode()
@@ -996,7 +1002,7 @@ macro_rules! token_object {
             .field(scalar_field(
                 "createdAt",
                 TypeRef::named_nn(TypeRef::STRING),
-                |t: &$rust_type| Value::from(t.created_at.to_rfc3339()),
+                |t: &$rust_type| Value::from(rfc3339(t.created_at)),
             ))
             .field(scalar_field(
                 "revokedAt",
@@ -1219,7 +1225,7 @@ pub fn event_meta_object(n: &Naming) -> Object {
     use skilj_core::event_store::Event;
 
     gql_object!(Event => n.ty("EventMeta") {
-        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.metadata.created_at.to_rfc3339()),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(rfc3339(e.metadata.created_at)),
         // issue #18. `correlationId` is null only for a record
         // written before this field existed.
         scalar "correlationId": TypeRef::named(TypeRef::STRING) => |e| optional_string(e.metadata.correlation_id.clone()),
@@ -1270,7 +1276,7 @@ pub struct InspectedSnapshotData {
     /// The folded state, as stored JSON.
     pub state: String,
     /// When the row was last written.
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: jiff::Timestamp,
 }
 
 /// `type InspectedSnapshot`.
@@ -1281,7 +1287,7 @@ pub fn inspected_snapshot_object(n: &Naming) -> Object {
         scalar "version": TypeRef::named_nn(TypeRef::INT) => |i| Value::from(i.version),
         scalar "asOfSequence": TypeRef::named_nn(TypeRef::INT) => |i| Value::from(i.as_of_sequence),
         scalar "state": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.state.clone()),
-        scalar "updatedAt": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.updated_at.to_rfc3339()),
+        scalar "updatedAt": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(rfc3339(i.updated_at)),
     })
 }
 
@@ -1502,7 +1508,7 @@ pub fn command_proposal_object(n: &Naming) -> Object {
         scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.payload.clone()),
         scalar "status": TypeRef::named_nn(n.ty("CommandProposalStatus")) => |p| Value::from(command_proposal_status_name(p.proposal.status)),
         scalar "proposedBy": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.proposal.metadata.client_id.clone()),
-        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.proposal.created_at.to_rfc3339()),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(rfc3339(p.proposal.created_at)),
         scalar "expiresAt": TypeRef::named(TypeRef::STRING) => |p| optional_timestamp(p.proposal.expires_at),
         scalar "decidedAt": TypeRef::named(TypeRef::STRING) => |p| optional_timestamp(p.proposal.decided_at),
         scalar "decidedByRoleId": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.proposal.decided_by_role_id.clone()),
@@ -1620,7 +1626,7 @@ pub fn encryption_key_object(n: &Naming) -> Object {
         scalar "subjectKey": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.subject_key.clone()),
         scalar "subjectValue": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.subject_value.clone()),
         scalar "status": TypeRef::named_nn(n.ty("EncryptionKeyStatus")) => |k| Value::from(encryption_key_status_name(k.status)),
-        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.created_at.to_rfc3339()),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(rfc3339(k.created_at)),
         scalar "destroyedAt": TypeRef::named(TypeRef::STRING) => |k| optional_timestamp(k.destroyed_at),
     })
 }

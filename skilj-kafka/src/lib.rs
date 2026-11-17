@@ -182,8 +182,8 @@
 //!     .expect("producer creation failed");
 //! ```
 
-use chrono::{DateTime, Utc};
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use jiff::Timestamp;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{Header, Headers, OwnedHeaders, OwnedMessage};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -637,7 +637,7 @@ async fn report_parked_delivery(
     idempotency_key: Option<&str>,
     error: &str,
     attempt_count: u32,
-    first_failed_at: DateTime<Utc>,
+    first_failed_at: Timestamp,
 ) -> Result<(), BridgeError> {
     Ok(skilj_bridge::report_parked_delivery(
         http,
@@ -877,8 +877,11 @@ async fn dispatch_with_retry(
         }
         let backoff = match retry.on_failure(
             retry_policy,
-            Utc::now(),
-            |at| (Utc::now() - at).to_std().unwrap_or_default(),
+            Timestamp::now(),
+            |at| {
+                std::time::Duration::try_from(Timestamp::now().duration_since(at))
+                    .unwrap_or_default()
+            },
             // docs/architecture.md §161: no attempt spent, never parked.
             e.another_instance_can_do_it(),
             // Not JSON: no retry can change that (§144).

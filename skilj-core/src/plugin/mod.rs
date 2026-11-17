@@ -510,7 +510,7 @@ pub trait EventType {
         false
     }
 
-    /// The 7-field Quartz-dialect cron expression (`cron` crate) the
+    /// The 7-field Quartz-dialect cron expression (`jiff-cron` crate) the
     /// scheduler evaluates - required, and checked at registration time
     /// (see `Error::MissingScheduleOrPolicy`), when
     /// `system_triggered_allowed()` is `true`. `None` otherwise.
@@ -967,7 +967,7 @@ pub struct SnapshotState {
 pub struct DecisionContext {
     /// The instant the submission is stamped with - the same `now` the
     /// command's own `created_at` and idempotency row carry.
-    pub now: chrono::DateTime<chrono::Utc>,
+    pub now: jiff::Timestamp,
     /// Present only when this submission is a deadline firing
     /// (`db::fire_due_deadlines`); `None` for every ordinary submission.
     pub deadline: Option<DeadlineContext>,
@@ -975,7 +975,7 @@ pub struct DecisionContext {
 
 impl DecisionContext {
     /// An ordinary submission's context: `now`, no deadline.
-    pub fn at(now: chrono::DateTime<chrono::Utc>) -> Self {
+    pub fn at(now: jiff::Timestamp) -> Self {
         Self {
             now,
             deadline: None,
@@ -986,9 +986,9 @@ impl DecisionContext {
     /// the fired row's own `fire_at`, `deadline_at` its optional
     /// `expires_at`.
     pub fn for_deadline(
-        now: chrono::DateTime<chrono::Utc>,
-        scheduled_at: chrono::DateTime<chrono::Utc>,
-        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: jiff::Timestamp,
+        scheduled_at: jiff::Timestamp,
+        deadline_at: Option<jiff::Timestamp>,
     ) -> Self {
         Self {
             now,
@@ -1008,9 +1008,9 @@ impl DecisionContext {
 pub struct DeadlineContext {
     /// The fired row's own `fire_at` - when the deadline was scheduled to
     /// fire.
-    pub scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub scheduled_at: jiff::Timestamp,
     /// The fired row's own `expires_at`, if it had one.
-    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub deadline_at: Option<jiff::Timestamp>,
     /// `deadline_at` is `Some` and `now` is past it. Always `false` when
     /// there is no expiry at all.
     pub expired: bool,
@@ -1019,9 +1019,9 @@ pub struct DeadlineContext {
 impl DeadlineContext {
     /// A deadline's context: `expired` is whether `now` is past `deadline_at`.
     pub fn new(
-        scheduled_at: chrono::DateTime<chrono::Utc>,
-        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-        now: chrono::DateTime<chrono::Utc>,
+        scheduled_at: jiff::Timestamp,
+        deadline_at: Option<jiff::Timestamp>,
+        now: jiff::Timestamp,
     ) -> Self {
         Self {
             scheduled_at,
@@ -1082,7 +1082,7 @@ impl<'a, E> Decision<'a, E> {
     /// Shorthand for `self.context().now` - the instant the submission is
     /// stamped with, so `decide()` can reason about time without reading a
     /// clock.
-    pub fn now(&self) -> chrono::DateTime<chrono::Utc> {
+    pub fn now(&self) -> jiff::Timestamp {
         self.context.now
     }
 
@@ -1520,11 +1520,11 @@ pub trait CrossContextRoute {
 /// sequence already committed at or before a given point in time,
 /// exactly like an `EventReadToken` minted the same way would. `AtTime`
 /// carries a plain Unix timestamp (seconds, UTC) rather than
-/// `chrono::DateTime<Utc>` for one structural reason: `START_FROM` is a
+/// `jiff::Timestamp` for one structural reason: `START_FROM` is a
 /// trait *associated const*, so every value it can ever hold has to be
 /// const-evaluable at the implementing type's own definition site, and
-/// `DateTime<Utc>` has no `const fn` constructor to build one from - an
-/// `i64` literal is. Converted to a real `DateTime<Utc>` only where it's
+/// `Timestamp` has no `const fn` constructor to build one from - an
+/// `i64` literal is. Converted to a real `Timestamp` only where it's
 /// actually compared against event timestamps
 /// (`db::catch_up_cross_context_route`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1538,7 +1538,7 @@ pub enum CrossContextRouteStartFrom {
     /// From the event after this sequence number.
     AtSequence(i64),
     /// Unix timestamp, seconds, UTC - see this enum's own doc comment
-    /// for why not `DateTime<Utc>`.
+    /// for why not `Timestamp`.
     AtTime(i64),
 }
 
@@ -1602,7 +1602,7 @@ pub trait CrossContextRouteDispatcher: Send + Sync {
 /// what it's actually for beats leaning on a type whose own doc comment
 /// is written entirely in terms of routes. See `CrossContextRouteStartFrom`'s
 /// own doc comment for why `AtTime` carries a plain Unix timestamp rather
-/// than `DateTime<Utc>` - the identical reasoning (a trait associated
+/// than `Timestamp` - the identical reasoning (a trait associated
 /// const has to be const-evaluable) applies here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1643,25 +1643,25 @@ pub enum MissedRunPolicy {
 
 /// Recurrence specification for per-entity deadlines (issue
 /// #95). `schedule` is the same 7-field Quartz-dialect cron expression
-/// (`cron` crate) the global scheduler evaluates, so one mental model
+/// (`jiff-cron` crate) the global scheduler evaluates, so one mental model
 /// covers both surfaces. `start_at`/`end_at` bound the occurrences
 /// themselves; `valid_until` is the kill-switch - a pending row past it
 /// never fires and begets nothing, even if an occurrence would still be
 /// due. All three are optional: absent means unbounded that way.
 #[derive(Debug, Clone)]
 pub struct RecurrenceSpec {
-    /// A 7-field Quartz-dialect cron expression (`cron` crate) the occurrences
+    /// A 7-field Quartz-dialect cron expression (`jiff-cron` crate) the occurrences
     /// follow.
     pub schedule: String,
     /// What happens to occurrences missed while nothing could fire them.
     pub policy: MissedRunPolicy,
     /// No occurrence before this instant; `None` for no lower bound.
-    pub start_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub start_at: Option<jiff::Timestamp>,
     /// No occurrence after this instant; `None` for no upper bound.
-    pub end_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub end_at: Option<jiff::Timestamp>,
     /// A pending firing past this instant never fires and schedules nothing
     /// further; `None` for no limit.
-    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub valid_until: Option<jiff::Timestamp>,
 }
 
 /// The next firing of a recurring deadline chain, given only the
@@ -1676,15 +1676,11 @@ pub struct RecurrenceSpec {
 /// `valid_until`).
 pub fn next_recurrence_fire_at(
     recurrence: &RecurrenceSpec,
-    prev_fire_at: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+    prev_fire_at: jiff::Timestamp,
+    now: jiff::Timestamp,
+) -> Option<jiff::Timestamp> {
     use crate::event_store::{latest_occurrence_at_or_before, next_occurrence_after};
-    if now
-        > recurrence
-            .valid_until
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-    {
+    if now > recurrence.valid_until.unwrap_or(jiff::Timestamp::MAX) {
         return None;
     }
     let candidate = match recurrence.policy {
@@ -1709,25 +1705,13 @@ pub fn next_recurrence_fire_at(
             next_occurrence_after(&recurrence.schedule, prev_fire_at)?
         }
     };
-    if candidate
-        < recurrence
-            .start_at
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
-    {
+    if candidate < recurrence.start_at.unwrap_or(jiff::Timestamp::MIN) {
         return None;
     }
-    if candidate
-        > recurrence
-            .end_at
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-    {
+    if candidate > recurrence.end_at.unwrap_or(jiff::Timestamp::MAX) {
         return None;
     }
-    if candidate
-        > recurrence
-            .valid_until
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-    {
+    if candidate > recurrence.valid_until.unwrap_or(jiff::Timestamp::MAX) {
         return None;
     }
     Some(candidate)
@@ -1757,9 +1741,9 @@ pub fn next_recurrence_fire_at(
 #[derive(Debug, Clone)]
 pub struct DeadlineSpec<P> {
     /// When the deadline fires.
-    pub fire_at: chrono::DateTime<chrono::Utc>,
+    pub fire_at: jiff::Timestamp,
     /// See this struct's own doc comment (issue #97).
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<jiff::Timestamp>,
     /// The tags a `CancelDeadline` matches to cancel this deadline before it
     /// fires.
     pub tags: Vec<Tag>,
@@ -1959,10 +1943,10 @@ pub trait ScheduleDeadlineDispatcher: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ErasedDeadlineSpec {
     /// `DeadlineSpec::fire_at`.
-    pub fire_at: chrono::DateTime<chrono::Utc>,
+    pub fire_at: jiff::Timestamp,
     /// `DeadlineSpec::expires_at`, carried through verbatim (
     /// issue #97).
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<jiff::Timestamp>,
     /// `DeadlineSpec::tags`.
     pub tags: Vec<Tag>,
     /// `DeadlineSpec::payload`, serialized to JSON.

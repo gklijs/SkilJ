@@ -10,6 +10,33 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Upgrading from 0.4
+
+- skilj moved from chrono to jiff, because chrono is unmaintained
+  (RUSTSEC-2026-0543), which fails `cargo deny check` for every crate that
+  depends on it directly (docs/architecture.md §254). Every timestamp in
+  the public API is now a `jiff::Timestamp` instead of a
+  `chrono::DateTime<Utc>`, and every signed duration a
+  `jiff::SignedDuration` instead of a `chrono::Duration`. In application
+  code: `Utc::now()` becomes `Timestamp::now()`, `chrono::Duration::hours(1)`
+  becomes `SignedDuration::from_hours(1)`, `a - b` between two timestamps
+  becomes `a.duration_since(b)`, and a payload's date fields use
+  `jiff::Timestamp`/`jiff::civil::Date`/`jiff::civil::Time` with schemars'
+  `jiff02` feature in place of `chrono04`. The JSON Schemas schemars derives
+  for them are the same as chrono's, so registered event and command types
+  stay compatible.
+- No schema change, and nothing to migrate: timestamps are stored as
+  before, GraphQL (`+00:00`) and REST (`Z`) render them as before, with 0, 3,
+  6 or 9 fractional digits, and input parses as before.
+
+### Changed
+
+- chrono → jiff 0.2 (`jiff::Timestamp`, `jiff::SignedDuration`), with
+  `jiff-sqlx` for Postgres, and the `cron` crate → `jiff-cron`, its fork on
+  jiff with the same 7-field expressions. Schedules still run in UTC.
+  chrono stays in the dependency tree only through `object_store` and the
+  Temporal client crates.
+
 ### Added
 
 - A `skilj` plugin for Claude Code and Codex, from this repository's marketplace (`claude plugin

@@ -1,6 +1,6 @@
 {
   "name": "skilj",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Start a skilj project: generate it from the template, link skilj's guides as skills, and run its quickstart.",
   "author": {
     "name": "Gerard Klijs",

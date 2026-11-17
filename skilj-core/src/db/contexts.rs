@@ -8,7 +8,8 @@ use super::*;
 pub(super) struct BoundedContextRow {
     pub(super) name: String,
     pub(super) status: String,
-    pub(super) created_at: DateTime<Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) created_at: Timestamp,
     pub(super) created_by_kind: String,
     pub(super) created_by_role_id: Option<String>,
     /// issue #13 - just the referenced row's own name; hydrated
@@ -42,7 +43,7 @@ pub async fn insert_bounded_context(pool: &Pool, bc: &BoundedContext) -> crate::
     )))
     .bind(&bc.name)
     .bind(bounded_context_status_to_str(bc.status))
-    .bind(bc.created_at)
+    .bind(bc.created_at.to_sqlx())
     .bind(kind)
     .bind(role_id)
     .bind(bc.template.as_ref().map(|t| t.name.clone()))
@@ -220,7 +221,9 @@ pub(super) fn hydrated_bounded_context(
         Ok(Some(BoundedContextRow {
             name,
             status: row.try_get(format!("{alias}_status").as_str())?,
-            created_at: row.try_get(format!("{alias}_created_at").as_str())?,
+            created_at: row
+                .try_get::<jiff_sqlx::Timestamp, _>(format!("{alias}_created_at").as_str())?
+                .to_jiff(),
             created_by_kind: row.try_get(format!("{alias}_created_by_kind").as_str())?,
             created_by_role_id: row.try_get(format!("{alias}_created_by_role_id").as_str())?,
             template: row.try_get(format!("{alias}_template").as_str())?,
@@ -237,8 +240,12 @@ pub(super) fn hydrated_bounded_context(
                 name: row.try_get(format!("{alias}_name").as_str())?,
                 superadmin: row.try_get(format!("{alias}_superadmin").as_str())?,
                 status: row.try_get(format!("{alias}_status").as_str())?,
-                created_at: row.try_get(format!("{alias}_created_at").as_str())?,
-                revoked_at: row.try_get(format!("{alias}_revoked_at").as_str())?,
+                created_at: row
+                    .try_get::<jiff_sqlx::Timestamp, _>(format!("{alias}_created_at").as_str())?
+                    .to_jiff(),
+                revoked_at: row
+                    .try_get::<NullableTimestamp, _>(format!("{alias}_revoked_at").as_str())?
+                    .into(),
             }
             .into_domain(),
         ))

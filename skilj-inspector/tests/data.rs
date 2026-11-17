@@ -8,8 +8,6 @@
 //! the `skilj` facade, since this crate depends on `skilj_core` alone
 //! and its whole point is reading what's already in Postgres regardless
 //! of whether any server surface ever ran against it.
-
-use chrono::SubsecRound;
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::encryption::{InMemoryKeyProvider, KeyService};
@@ -70,8 +68,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 /// Nothing registered anywhere - `keys`/`project`/`default_state` all

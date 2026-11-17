@@ -78,7 +78,7 @@ members = [
 #                 partitions; broker-assigned (stream, stream-sequence)
 #                 on every message, unlike AMQP's sender-optional
 #                 group-id/group-sequence).
-# skilj-retry   - a small backoff/attempt-cap policy (chrono only)
+# skilj-retry   - a small backoff/attempt-cap policy (jiff only)
 #                 (issue #21) shared by `CrossContextRoute`'s own
 #                 catch-up loop and the three bridge crates' inbound and
 #                 outbound loops - the one piece of real code-sharing the
@@ -102,7 +102,7 @@ members = [
 #                 skilj-core directly, same posture as skilj-inspector.
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # The oldest Rust the workspace builds on: sqlx 0.9 and postgresql_embedded
 # need 1.94, and `AtomicUsize::try_update` (skilj-graphql) 1.95. CI checks it.
@@ -126,11 +126,12 @@ allow_attributes_without_reason = "warn"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = { version = "1", features = ["chrono04"] }
+schemars = { version = "1", features = ["jiff02"] }
 thiserror = "2"
 sha2 = "0.11"
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "chrono", "json", "migrate"] }
-chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "json", "migrate"] }
+jiff = { version = "0.2.46", features = ["serde"] }
+jiff-sqlx = { version = "0.2.2", features = ["postgres"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 axum = "0.8"
@@ -198,16 +199,16 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 opentelemetry-appender-tracing = "0.33"
 
 # Path dependencies between skilj's own crates
-skilj-core = { path = "skilj-core", version = "0.4.0" }
-skilj-graphql = { path = "skilj-graphql", version = "0.4.0" }
-skilj-macros = { path = "skilj-macros", version = "0.4.0" }
-skilj-rest = { path = "skilj-rest", version = "0.4.0" }
-skilj = { path = "skilj", version = "0.4.0" }
-skilj-codegen = { path = "skilj-codegen", version = "0.4.0" }
-skilj-test-fixture = { path = "skilj-test-fixture", version = "0.4.0" }
-skilj-retry = { path = "skilj-retry", version = "0.4.0" }
-skilj-bridge = { path = "skilj-bridge", version = "0.4.0" }
-skilj-blob-s3 = { path = "skilj-blob-s3", version = "0.4.0" }
+skilj-core = { path = "skilj-core", version = "0.5.0" }
+skilj-graphql = { path = "skilj-graphql", version = "0.5.0" }
+skilj-macros = { path = "skilj-macros", version = "0.5.0" }
+skilj-rest = { path = "skilj-rest", version = "0.5.0" }
+skilj = { path = "skilj", version = "0.5.0" }
+skilj-codegen = { path = "skilj-codegen", version = "0.5.0" }
+skilj-test-fixture = { path = "skilj-test-fixture", version = "0.5.0" }
+skilj-retry = { path = "skilj-retry", version = "0.5.0" }
+skilj-bridge = { path = "skilj-bridge", version = "0.5.0" }
+skilj-blob-s3 = { path = "skilj-blob-s3", version = "0.5.0" }
 
 # Only for Call Graph Analyzer (`cargo cga check --profile cga`, see
 # AGENTS.md). Release semantics (no overflow checks, no debug

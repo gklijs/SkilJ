@@ -41,7 +41,7 @@ pub(super) async fn update_cross_context_route_cursor(
     source_bounded_context: &str,
     route_name: &str,
     sequence: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(source_bounded_context);
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -56,7 +56,7 @@ pub(super) async fn update_cross_context_route_cursor(
     )))
     .bind(route_name)
     .bind(sequence)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(pool)
     .await?;
     Ok(())
@@ -65,7 +65,7 @@ pub(super) async fn update_cross_context_route_cursor(
 /// `(retry_attempt_count, retry_first_failed_at, retry_next_attempt_at)` -
 /// `get_cross_context_route_retry_state`'s own return shape, named only
 /// to keep that signature (and clippy) happy, not used anywhere else.
-pub(super) type CrossContextRouteRetryState = (i32, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+pub(super) type CrossContextRouteRetryState = (i32, Option<Timestamp>, Option<Timestamp>);
 
 /// `catch_up_cross_context_route`'s own read of the retry backoff state
 /// `record_cross_context_route_retry_failure` writes - `(0, None, None)`
@@ -78,14 +78,20 @@ pub(super) async fn get_cross_context_route_retry_state(
     route_name: &str,
 ) -> crate::error::Result<CrossContextRouteRetryState> {
     let schema = schema_ident(source_bounded_context);
-    let row: Option<CrossContextRouteRetryState> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT retry_attempt_count, retry_first_failed_at, retry_next_attempt_at \
+    let row: Option<(i32, NullableTimestamp, NullableTimestamp)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT retry_attempt_count, retry_first_failed_at, retry_next_attempt_at \
              FROM {schema}.cross_context_route_cursors WHERE route_name = $1"
-    )))
-    .bind(route_name)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.unwrap_or((0, None, None)))
+        )))
+        .bind(route_name)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map_or(
+        (0, None, None),
+        |(attempts, first_failed_at, next_attempt_at)| {
+            (attempts, first_failed_at.into(), next_attempt_at.into())
+        },
+    ))
 }
 
 /// Persists one more failed attempt at the route's own blocked
@@ -106,9 +112,9 @@ pub(super) async fn record_cross_context_route_retry_failure(
     route_name: &str,
     current_cursor: i64,
     attempt_count: i32,
-    first_failed_at: DateTime<Utc>,
-    next_attempt_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    first_failed_at: Timestamp,
+    next_attempt_at: Timestamp,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(source_bounded_context);
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -123,10 +129,10 @@ pub(super) async fn record_cross_context_route_retry_failure(
     )))
     .bind(route_name)
     .bind(current_cursor)
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(attempt_count)
-    .bind(first_failed_at)
-    .bind(next_attempt_at)
+    .bind(first_failed_at.to_sqlx())
+    .bind(next_attempt_at.to_sqlx())
     .execute(pool)
     .await?;
     Ok(())
@@ -140,7 +146,7 @@ pub(super) async fn defer_cross_context_route(
     source_bounded_context: &str,
     route_name: &str,
     current_cursor: i64,
-    next_attempt_at: DateTime<Utc>,
+    next_attempt_at: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(source_bounded_context);
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -152,8 +158,8 @@ pub(super) async fn defer_cross_context_route(
     )))
     .bind(route_name)
     .bind(current_cursor)
-    .bind(Utc::now())
-    .bind(next_attempt_at)
+    .bind(Timestamp::now().to_sqlx())
+    .bind(next_attempt_at.to_sqlx())
     .execute(pool)
     .await?;
     Ok(())
@@ -227,8 +233,8 @@ pub struct ParkedDelivery {
     pub request_json: serde_json::Value,
     pub error: String,
     pub attempt_count: i32,
-    pub first_failed_at: DateTime<Utc>,
-    pub last_failed_at: DateTime<Utc>,
+    pub first_failed_at: Timestamp,
+    pub last_failed_at: Timestamp,
 }
 
 #[derive(sqlx::FromRow)]
@@ -243,8 +249,10 @@ pub(super) struct ParkedDeliveryRow {
     pub(super) request_json: Json<serde_json::Value>,
     pub(super) error: String,
     pub(super) attempt_count: i32,
-    pub(super) first_failed_at: DateTime<Utc>,
-    pub(super) last_failed_at: DateTime<Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) first_failed_at: Timestamp,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) last_failed_at: Timestamp,
 }
 
 impl From<ParkedDeliveryRow> for ParkedDelivery {
@@ -455,8 +463,8 @@ pub async fn insert_parked_delivery<'e>(
     request_json: &serde_json::Value,
     error: &str,
     attempt_count: i32,
-    first_failed_at: DateTime<Utc>,
-    last_failed_at: DateTime<Utc>,
+    first_failed_at: Timestamp,
+    last_failed_at: Timestamp,
 ) -> crate::error::Result<ParkedDelivery> {
     let schema = schema_ident(bounded_context);
     let id = crate::shared::try_generate_token_id()?;
@@ -483,8 +491,8 @@ pub async fn insert_parked_delivery<'e>(
     .bind(Json(request_json))
     .bind(error)
     .bind(attempt_count)
-    .bind(first_failed_at)
-    .bind(last_failed_at)
+    .bind(first_failed_at.to_sqlx())
+    .bind(last_failed_at.to_sqlx())
     .fetch_one(executor)
     .await?;
     Ok(row.into())
@@ -508,8 +516,8 @@ pub async fn insert_parked_delivery_holding_blobs(
     request_json: &serde_json::Value,
     error: &str,
     attempt_count: i32,
-    first_failed_at: DateTime<Utc>,
-    last_failed_at: DateTime<Utc>,
+    first_failed_at: Timestamp,
+    last_failed_at: Timestamp,
 ) -> crate::error::Result<ParkedDelivery> {
     let ids = referenced_blob_ids(&request_json.to_string())?;
     let mut tx = pool.begin().await?;
@@ -571,7 +579,7 @@ pub async fn list_parked_deliveries_page(
          WHERE $1::timestamptz IS NULL OR (first_failed_at, id) < ($1, $2) \
          ORDER BY first_failed_at DESC, id DESC LIMIT $3"
     )))
-    .bind(after.map(|c| c.first_failed_at))
+    .bind(after.map(|c| c.first_failed_at).map(|t| t.to_sqlx()))
     .bind(after.map(|c| c.id.clone()))
     .bind(limit)
     .fetch_all(pool)
@@ -584,7 +592,7 @@ pub async fn list_parked_deliveries_page(
 /// row is retried or discarded between pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParkedDeliveryCursor {
-    pub first_failed_at: DateTime<Utc>,
+    pub first_failed_at: Timestamp,
     pub id: String,
 }
 
@@ -598,13 +606,13 @@ impl ParkedDeliveryCursor {
 
     /// `{microseconds since the epoch}:{id}` - opaque to clients.
     pub fn encode(&self) -> String {
-        format!("{}:{}", self.first_failed_at.timestamp_micros(), self.id)
+        format!("{}:{}", self.first_failed_at.as_microsecond(), self.id)
     }
 
     pub fn decode(cursor: &str) -> Option<Self> {
         let (micros, id) = cursor.split_once(':')?;
         Some(Self {
-            first_failed_at: DateTime::from_timestamp_micros(micros.parse().ok()?)?,
+            first_failed_at: Timestamp::from_microsecond(micros.parse().ok()?).ok()?,
             id: id.to_string(),
         })
     }
@@ -788,7 +796,7 @@ pub async fn record_parked_delivery_retry_failure(
     bounded_context: &str,
     id: &str,
     error: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -797,7 +805,7 @@ pub async fn record_parked_delivery_retry_failure(
          WHERE id = $3"
     )))
     .bind(error)
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(id)
     .execute(pool)
     .await?;
@@ -1085,7 +1093,7 @@ pub async fn forget_subject_in_deadlines(
     bounded_context: &str,
     subject_key: &str,
     subject_value: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<u64> {
     let mut forgotten = 0;
     let mut sensitive_fields = std::collections::HashMap::new();
@@ -1119,7 +1127,7 @@ pub(super) async fn forget_subject_in_holder_deadlines(
     bounded_context: &str,
     subject_key: &str,
     subject_value: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     sensitive_fields: &mut std::collections::HashMap<String, Option<Vec<SensitiveField>>>,
 ) -> crate::error::Result<u64> {
     const PAGE: i64 = 1000;
@@ -1168,7 +1176,7 @@ pub(super) async fn forget_subject_in_holder_deadlines(
                      SET status = 'forgotten', payload = '{{}}', resolved_at = $1 \
                      WHERE id = $2 AND status = 'pending'"
                 )))
-                .bind(now)
+                .bind(now.to_sqlx())
                 .bind(id)
                 .execute(pool)
                 .await?
@@ -1408,7 +1416,7 @@ pub(super) async fn catch_up_cross_context_route_locked(
             }
             crate::plugin::CrossContextRouteStartFrom::AtSequence(n) => n,
             crate::plugin::CrossContextRouteStartFrom::AtTime(unix_secs) => {
-                let threshold = DateTime::from_timestamp(unix_secs, 0).unwrap_or(Utc::now());
+                let threshold = Timestamp::new(unix_secs, 0).unwrap_or(Timestamp::now());
                 highest_sequence_of_type(
                     pool,
                     route.source_bounded_context,
@@ -1423,7 +1431,7 @@ pub(super) async fn catch_up_cross_context_route_locked(
             route.source_bounded_context,
             route.name,
             seed,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
         return Ok(());
@@ -1454,7 +1462,7 @@ pub(super) async fn catch_up_cross_context_route_locked(
     // (docs/architecture.md §161) sets a next attempt without spending
     // one. Advancing the cursor clears it.
     if let Some(next_attempt_at) = retry_next_attempt_at {
-        if Utc::now() < next_attempt_at {
+        if Timestamp::now() < next_attempt_at {
             // Not yet time - this route's own blocked occurrence is
             // still in backoff. Skip this tick entirely rather than
             // re-attempting the identical failing submission on
@@ -1511,7 +1519,7 @@ pub(super) async fn catch_up_cross_context_route_locked(
                         route.source_bounded_context,
                         route.name,
                         event.sequence,
-                        Utc::now(),
+                        Timestamp::now(),
                     )
                     .await?;
                     retry_attempt = 0;
@@ -1555,7 +1563,7 @@ pub(super) async fn catch_up_cross_context_route_locked(
                     Some(&causation_id),
                     &idempotency_key,
                     key_service,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .await
                 {
@@ -1573,7 +1581,7 @@ pub(super) async fn catch_up_cross_context_route_locked(
                         event.metadata.correlation_id.as_deref(),
                         Some(&causation_id),
                         key_service,
-                        Utc::now(),
+                        Timestamp::now(),
                         Some(&idempotency_key),
                         None,
                     )
@@ -1590,9 +1598,9 @@ pub(super) async fn catch_up_cross_context_route_locked(
                     Err(e) if e.another_instance_can_do_it() => {
                         // docs/architecture.md §161: no attempt spent, never
                         // parked - the route waits for an instance that can.
-                        let next_attempt_at = Utc::now()
-                            + chrono::Duration::from_std(ANOTHER_INSTANCE_RETRY_DELAY)
-                                .expect("a ten-second delay fits a chrono::Duration");
+                        let next_attempt_at = Timestamp::now()
+                            + jiff::SignedDuration::try_from(ANOTHER_INSTANCE_RETRY_DELAY)
+                                .expect("a ten-second delay fits a jiff::SignedDuration");
                         tracing::warn!(
                             sequence = event.sequence,
                             error = %e,
@@ -1622,9 +1630,11 @@ pub(super) async fn catch_up_cross_context_route_locked(
                         // corresponding outer reassignment needed for
                         // `first_failed_at` here, only this local,
                         // already-resolved value.
-                        let first_failed_at = retry_first_failed_at.unwrap_or_else(Utc::now);
-                        let now = Utc::now();
-                        let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
+                        let first_failed_at = retry_first_failed_at.unwrap_or_else(Timestamp::now);
+                        let now = Timestamp::now();
+                        let elapsed =
+                            std::time::Duration::try_from(now.duration_since(first_failed_at))
+                                .unwrap_or_default();
                         if retry_policy.is_exhausted(retry_attempt as u32, elapsed) {
                             tracing::error!(
                                 sequence = event.sequence,
@@ -1716,7 +1726,7 @@ pub(super) async fn catch_up_cross_context_route_locked(
             route.source_bounded_context,
             route.name,
             event.sequence,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
         retry_attempt = 0;

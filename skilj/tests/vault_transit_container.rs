@@ -368,7 +368,7 @@ async fn insert_bounded_context(pool: &Pool) -> String {
     let bc = BoundedContext {
         name: format!("customers_{}", generate_token_id()),
         status: BoundedContextStatus::Active,
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
         created_by: ContextCreator::SystemCreator,
         template: None,
     };

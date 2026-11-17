@@ -98,7 +98,7 @@ pub async fn propose_command(
     idempotency_key: Option<&str>,
     key_service: Option<&KeyService>,
     payload_limits: crate::payload_limits::PayloadLimits,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<CommandProposal> {
     let bounded_context_name = &command_type.bounded_context.name;
     let schema = schema_ident(bounded_context_name);
@@ -169,7 +169,7 @@ pub async fn propose_command(
     let id = crate::shared::try_generate_token_id()?;
     let expires_at = policy
         .deadline_seconds
-        .map(|seconds| now + chrono::Duration::seconds(seconds));
+        .map(|seconds| now + jiff::SignedDuration::from_secs(seconds));
     let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.command_proposals \
          (id, command_type_name, payload, metadata_version, metadata_client_id, \
@@ -186,11 +186,11 @@ pub async fn propose_command(
     .bind(&protected.payload)
     .bind(1_i64)
     .bind(&authorised.client_id)
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(&authorised.correlation_id)
     .bind(&authorised.causation_id)
     .bind(idempotency_key)
-    .bind(expires_at)
+    .bind(expires_at.map(|t| t.to_sqlx()))
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -236,14 +236,14 @@ pub async fn propose_command(
 pub async fn expire_command_proposals(
     pool: &Pool,
     bounded_context: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.command_proposals SET status = 'expired' \
          WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= $1"
     )))
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(pool)
     .await?;
     Ok(())
@@ -259,7 +259,7 @@ pub async fn list_command_proposals(
     status: Option<CommandProposalStatus>,
     command_type_name: Option<&str>,
     scope: Option<&str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<Vec<CommandProposal>> {
     expire_command_proposals(pool, bounded_context, now).await?;
     let schema = schema_ident(bounded_context);
@@ -306,7 +306,7 @@ pub async fn list_command_proposals_page(
     scope: Option<&str>,
     after: Option<&CommandProposalCursor>,
     limit: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<Vec<CommandProposal>> {
     expire_command_proposals(pool, bounded_context, now).await?;
     let schema = schema_ident(bounded_context);
@@ -324,7 +324,7 @@ pub async fn list_command_proposals_page(
         )))
         .bind(status.map(CommandProposalStatus::as_str))
         .bind(command_type_name)
-        .bind(after.as_ref().map(|c| c.created_at))
+        .bind(after.as_ref().map(|c| c.created_at).map(|t| t.to_sqlx()))
         .bind(after.as_ref().map(|c| c.id.clone()))
         .bind(limit)
         .fetch_all(pool)
@@ -355,7 +355,7 @@ pub async fn list_command_proposals_page(
 /// invalidate the next page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandProposalCursor {
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub id: String,
 }
 
@@ -369,13 +369,13 @@ impl CommandProposalCursor {
 
     /// `{microseconds since the epoch}:{id}` - opaque to clients.
     pub fn encode(&self) -> String {
-        format!("{}:{}", self.created_at.timestamp_micros(), self.id)
+        format!("{}:{}", self.created_at.as_microsecond(), self.id)
     }
 
     pub fn decode(cursor: &str) -> Option<Self> {
         let (micros, id) = cursor.split_once(':')?;
         Some(Self {
-            created_at: DateTime::from_timestamp_micros(micros.parse().ok()?)?,
+            created_at: Timestamp::from_microsecond(micros.parse().ok()?).ok()?,
             id: id.to_string(),
         })
     }
@@ -451,14 +451,18 @@ pub(super) struct ProposalRow {
     pub(super) payload: String,
     pub(super) metadata_version: i64,
     pub(super) metadata_client_id: String,
-    pub(super) metadata_created_at: DateTime<Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) metadata_created_at: Timestamp,
     pub(super) metadata_correlation_id: Option<String>,
     pub(super) metadata_causation_id: Option<String>,
     pub(super) status: String,
     pub(super) idempotency_key: Option<String>,
-    pub(super) created_at: DateTime<Utc>,
-    pub(super) expires_at: Option<DateTime<Utc>>,
-    pub(super) decided_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) created_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) expires_at: Option<Timestamp>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) decided_at: Option<Timestamp>,
     pub(super) decided_by_role_id: Option<String>,
     pub(super) rejection_reason: Option<String>,
     pub(super) rejection_kind: Option<String>,
@@ -501,7 +505,7 @@ impl ProposalRow {
 /// safe even if the original approval is somehow still running: both run
 /// under the same idempotency key ([`approval_idempotency_key`]), so the
 /// second one is deduplicated under the bounded context's lock.
-pub const APPROVAL_CLAIM_STALE_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+pub const APPROVAL_CLAIM_STALE_AFTER: jiff::SignedDuration = jiff::SignedDuration::from_mins(10);
 
 /// The idempotency key an approval submits under: the proposer's own key,
 /// or a reserved one derived from the proposal id.
@@ -530,7 +534,7 @@ pub async fn claim_command_proposal(
     id: &str,
     approver: &RoleAccessMapping,
     decision: crate::approvals::ProposalDecision,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<CommandProposal> {
     if approver.bounded_context.name != bounded_context {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
@@ -609,9 +613,9 @@ pub async fn claim_command_proposal(
          RETURNING id"
     )))
     .bind(id)
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(&approver.role.id)
-    .bind(stale_cutoff)
+    .bind(stale_cutoff.to_sqlx())
     .fetch_optional(pool)
     .await?;
     if claimed.is_none() {
@@ -636,7 +640,7 @@ pub(super) async fn settle_reclaimed_proposal(
     pool: &Pool,
     bounded_context: &str,
     proposal: &CommandProposal,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<bool> {
     if idempotency_key_already_used(
         pool,
@@ -728,7 +732,7 @@ pub async fn finish_command_proposal(
     rejection_reason: Option<&str>,
     rejection_kind: Option<&str>,
     command_external_id: Option<&str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -738,7 +742,7 @@ pub async fn finish_command_proposal(
     )))
     .bind(id)
     .bind(status.as_str())
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(rejection_reason)
     .bind(rejection_kind)
     .bind(command_external_id)
@@ -787,7 +791,7 @@ pub(super) async fn proposal_subject_forgotten(
         )))
         .bind(&subject_key)
         .bind(&subject_value)
-        .bind(proposal.created_at)
+        .bind(proposal.created_at.to_sqlx())
         .fetch_one(pool)
         .await?;
         if destroyed {
@@ -817,7 +821,7 @@ pub async fn forget_subject_in_command_proposals(
     bounded_context: &str,
     subject_key: &str,
     subject_value: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<u64> {
     const PAGE: i64 = 1000;
     let schema = schema_ident(bounded_context);
@@ -860,7 +864,7 @@ pub async fn forget_subject_in_command_proposals(
                     "UPDATE {schema}.command_proposals SET status = 'forgotten', decided_at = $1 \
                      WHERE id = $2 AND status = 'pending'"
                 )))
-                .bind(now)
+                .bind(now.to_sqlx())
                 .bind(id)
                 .execute(pool)
                 .await?
@@ -880,7 +884,7 @@ pub async fn reject_command_proposal(
     id: &str,
     approver: &RoleAccessMapping,
     reason: Option<&str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<CommandProposal> {
     let proposal = claim_command_proposal(
         pool,
@@ -903,7 +907,7 @@ pub async fn reject_command_proposal(
     )))
     .bind(id)
     .bind(reason)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(pool)
     .await?;
     get_command_proposal(pool, bounded_context, id)
@@ -943,7 +947,7 @@ pub async fn propose_if_approval_required(
     causation_id: Option<&str>,
     idempotency_key: &str,
     key_service: Option<&KeyService>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<bool> {
     let bounded_context = &command_type.bounded_context.name;
     let Some(policy) =
@@ -1018,7 +1022,7 @@ pub async fn approve_command_proposal(
     id: &str,
     approver: &RoleAccessMapping,
     key_service: Option<&KeyService>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<CommandApprovalOutcome> {
     let proposal = claim_command_proposal(
         pool,

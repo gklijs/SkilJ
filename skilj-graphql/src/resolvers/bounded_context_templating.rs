@@ -40,7 +40,7 @@ use std::collections::HashMap;
 fn synthetic_admin_mapping(
     caller: &Role,
     bounded_context: &BoundedContext,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> RoleAccessMapping {
     RoleAccessMapping {
         role: caller.clone(),
@@ -71,7 +71,7 @@ async fn apply_template_registrations(
     tenant: &BoundedContext,
     projection_dispatcher: &dyn ProjectionDispatcher,
     blind_index: &skilj_core::blind::BlindIndex,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> async_graphql::Result<()> {
     let mapping = synthetic_admin_mapping(caller, tenant, now);
 
@@ -272,7 +272,7 @@ async fn finish_creating_tenant(
     level: AccessLevel,
     can_read_sensitive: bool,
     scope: Option<String>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> async_graphql::Result<crate::gql_types::BoundedContextWithMappings> {
     skilj_core::db::set_dispatch_template(&state.pool, &tenant.name, template_name)
         .await
@@ -356,7 +356,7 @@ pub fn create_bounded_context_from_template_field(n: &Naming) -> Field {
                     .filter(|v| !v.is_null())
                     .map(|v| v.string().map(str::to_string))
                     .transpose()?;
-                let now = chrono::Utc::now();
+                let now = jiff::Timestamp::now();
 
                 let template = skilj_core::db::get_bounded_context(&state.pool, &template_name)
                     .await
@@ -484,7 +484,7 @@ pub fn resync_bounded_context_from_template_field(n: &Naming) -> Field {
                 let state = ctx.data::<GraphqlState>()?;
                 let bounded_context_name =
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
-                let now = chrono::Utc::now();
+                let now = jiff::Timestamp::now();
 
                 let tenant =
                     skilj_core::db::get_bounded_context(&state.pool, &bounded_context_name)

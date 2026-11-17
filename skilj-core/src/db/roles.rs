@@ -11,8 +11,10 @@ pub(super) struct RoleRow {
     pub(super) name: String,
     pub(super) superadmin: bool,
     pub(super) status: String,
-    pub(super) created_at: DateTime<Utc>,
-    pub(super) revoked_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) created_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) revoked_at: Option<Timestamp>,
 }
 
 impl RoleRow {
@@ -42,8 +44,8 @@ pub async fn insert_role(pool: &Pool, role: &Role) -> crate::error::Result<()> {
     .bind(&role.name)
     .bind(role.superadmin)
     .bind(role_status_to_str(role.status))
-    .bind(role.created_at)
-    .bind(role.revoked_at)
+    .bind(role.created_at.to_sqlx())
+    .bind(role.revoked_at.map(|t| t.to_sqlx()))
     .execute(pool)
     .await?;
     Ok(())
@@ -81,8 +83,8 @@ pub async fn insert_superadmin_if_none_active(
     .bind(&role.name)
     .bind(role.superadmin)
     .bind(role_status_to_str(role.status))
-    .bind(role.created_at)
-    .bind(role.revoked_at)
+    .bind(role.created_at.to_sqlx())
+    .bind(role.revoked_at.map(|t| t.to_sqlx()))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -156,8 +158,8 @@ pub async fn update_role<'e>(
     .bind(&role.name)
     .bind(role.superadmin)
     .bind(role_status_to_str(role.status))
-    .bind(role.created_at)
-    .bind(role.revoked_at)
+    .bind(role.created_at.to_sqlx())
+    .bind(role.revoked_at.map(|t| t.to_sqlx()))
     .bind(&role.id)
     .execute(executor)
     .await?;

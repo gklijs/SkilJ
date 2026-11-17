@@ -3,6 +3,7 @@
 //! that is a blind tag, so `decide()` can't compare values and the old value
 //! has to be released by tags alone.
 
+use jiff_sqlx::ToSqlx;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::retraction::{
@@ -1208,7 +1209,7 @@ fn a_retraction_committed_after_the_read_sends_the_command_back() {
             .unwrap()
             .unwrap();
         let payload = serde_json::json!({ "customer_id": alice }).to_string();
-        let context = skilj_core::plugin::DecisionContext::at(chrono::Utc::now());
+        let context = skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now());
         let resolved = db::resolve_command_submission(
             &crm.pool,
             &*crm.skilj.command_dispatcher(),
@@ -1276,7 +1277,7 @@ fn a_retraction_of_an_event_past_the_state_stays_under_the_lock() {
             .unwrap()
             .unwrap();
         let payload = serde_json::json!({ "customer_id": alice }).to_string();
-        let context = skilj_core::plugin::DecisionContext::at(chrono::Utc::now());
+        let context = skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now());
         let mut resolved = db::resolve_command_submission(
             &crm.pool,
             &*crm.skilj.command_dispatcher(),
@@ -1612,7 +1613,7 @@ mod side_effects {
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
     struct Order {
         order_id: String,
-        deadline_at: chrono::DateTime<chrono::Utc>,
+        deadline_at: jiff::Timestamp,
     }
 
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -1943,7 +1944,7 @@ mod side_effects {
     }
 
     impl Crm {
-        async fn place(&self, order_id: &str, deadline_at: chrono::DateTime<chrono::Utc>) -> i64 {
+        async fn place(&self, order_id: &str, deadline_at: jiff::Timestamp) -> i64 {
             let outcome = self
                 .submit(
                     "PlaceOrder",
@@ -2004,7 +2005,7 @@ mod side_effects {
                 bc: SHOP.to_string(),
                 cache: EventCache::new(1000),
             };
-            let far_off = now() + chrono::Duration::hours(1);
+            let far_off = now() + jiff::SignedDuration::from_hours(1);
             let position = before.place("replayed", far_off).await;
             before.withdraw("WithdrawOrder", "replayed", position).await;
             before.shutdown().await;
@@ -2037,7 +2038,7 @@ mod side_effects {
             };
 
             // Far enough off for each order to be routed and withdrawn first.
-            let due = now() + chrono::Duration::seconds(3);
+            let due = now() + jiff::SignedDuration::from_secs(3);
             let standing_order = shop.place("standing", due).await;
             let bare = shop.place("withdrawn", due).await;
             let announced = shop.place("announced", due).await;
@@ -2062,7 +2063,7 @@ mod side_effects {
                 "UPDATE \"bc_{SHOP}\".deadlines SET fire_at = $1 \
                  WHERE fire_at > $1 AND status = 'pending'"
             )))
-            .bind(due)
+            .bind(due.to_sqlx())
             .execute(&pool)
             .await
             .unwrap();

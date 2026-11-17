@@ -125,12 +125,12 @@
 //!   nothing wrong with the *message*, only (temporarily) with reaching
 //!   the broker.
 
-use chrono::{DateTime, Utc};
 use fe2o3_amqp::link::{RecvError, SendError};
 use fe2o3_amqp::types::messaging::{ApplicationProperties, Data, Message, MessageId, Properties};
 use fe2o3_amqp::types::primitives::SimpleValue;
 use fe2o3_amqp::{Receiver as AmqpReceiver, Sender as AmqpSender};
 use futures_util::FutureExt;
+use jiff::Timestamp;
 use std::collections::{HashMap, VecDeque};
 
 // docs/architecture.md §165: the skilj side every bridge shares.
@@ -619,7 +619,7 @@ async fn report_parked_delivery(
     idempotency_key: Option<&str>,
     error: &str,
     attempt_count: u32,
-    first_failed_at: DateTime<Utc>,
+    first_failed_at: Timestamp,
 ) -> Result<(), BridgeError> {
     Ok(skilj_bridge::report_parked_delivery(
         http,
@@ -1040,8 +1040,11 @@ async fn handle_one<S: std::future::Future<Output = ()>>(
         }
         let backoff = match retry.on_failure(
             retry_policy,
-            Utc::now(),
-            |at| (Utc::now() - at).to_std().unwrap_or_default(),
+            Timestamp::now(),
+            |at| {
+                std::time::Duration::try_from(Timestamp::now().duration_since(at))
+                    .unwrap_or_default()
+            },
             // docs/architecture.md §161: no attempt spent, never parked.
             e.another_instance_can_do_it(),
             // Not JSON: no retry can change that (§144).

@@ -221,7 +221,7 @@ pub struct BlobRecord {
     /// Where the store keeps the bytes.
     pub storage_key: String,
     /// When it was uploaded.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The `(subject_key, subject_value)` whose key encrypts the bytes.
     pub subject: Option<(String, String)>,
 }
@@ -233,7 +233,7 @@ type BlobRow = (
     String,
     String,
     String,
-    DateTime<Utc>,
+    jiff_sqlx::Timestamp,
     Option<String>,
     Option<String>,
 );
@@ -253,7 +253,7 @@ fn blob_record(row: BlobRow) -> BlobRecord {
         },
         state: BlobState::parse(&state),
         storage_key,
-        created_at,
+        created_at: created_at.to_jiff(),
         subject: subject_key.zip(subject_value),
     }
 }
@@ -382,7 +382,7 @@ pub async fn upload_blob(
     bytes: ByteStream<'_>,
     max_bytes: u64,
     subject: Option<BlobSubject<'_>>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<BlobRef> {
     let id = crate::shared::try_generate_token_id()?;
     let encrypted = subject.is_some();
@@ -435,7 +435,7 @@ pub async fn upload_blob(
     .bind(&stored.storage_key)
     .bind(subject_key)
     .bind(subject_value)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(pool)
     .await;
     if let Err(e) = inserted {
@@ -681,7 +681,7 @@ pub(super) async fn record_blob_claims(
     bounded_context: &str,
     claims: &[BlobClaim],
     command_id: Option<i64>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     record_blob_claims_by_command(
         conn,
@@ -701,7 +701,7 @@ pub(super) async fn record_blob_claims_by_command(
     conn: &mut sqlx::PgConnection,
     bounded_context: &str,
     claims: &[(&BlobClaim, Option<i64>)],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     if claims.is_empty() {
         return Ok(());
@@ -735,7 +735,7 @@ pub(super) async fn record_blob_claims_by_command(
     .bind(&sequences)
     .bind(&command_ids)
     .bind(&fields)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -799,7 +799,7 @@ pub(super) async fn hold_blobs_for_pin(
     tx: &mut Transaction<'_, Postgres>,
     bounded_context: &str,
     ids: &[String],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -811,7 +811,7 @@ pub(super) async fn hold_blobs_for_pin(
          WHERE b.id = held.id AND b.state = 'pending'"
     )))
     .bind(ids)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -854,7 +854,7 @@ pub async fn forget_subject_in_blobs(
     bounded_context: &str,
     subject_key: &str,
     subject_value: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<u64> {
     let schema = schema_ident(bounded_context);
     Ok(sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -863,7 +863,7 @@ pub async fn forget_subject_in_blobs(
     )))
     .bind(subject_key)
     .bind(subject_value)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(pool)
     .await?
     .rows_affected())
@@ -897,8 +897,8 @@ pub async fn collect_blobs(
     pool: &Pool,
     store: &dyn BlobStore,
     bounded_context: &str,
-    cutoff: DateTime<Utc>,
-    now: DateTime<Utc>,
+    cutoff: Timestamp,
+    now: Timestamp,
     limit: i64,
 ) -> crate::error::Result<CollectedBlobs> {
     let schema = schema_ident(bounded_context);
@@ -916,7 +916,7 @@ pub async fn collect_blobs(
          UPDATE {schema}.blobs SET grace_from = $1 \
          WHERE id IN (SELECT blob_id FROM dead) AND state = 'pending'"
     )))
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(pool)
     .await?;
     let orphans = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -926,8 +926,8 @@ pub async fn collect_blobs(
                AND NOT EXISTS (SELECT 1 FROM {schema}.blob_pins pin WHERE pin.blob_id = b.id) \
              ORDER BY b.grace_from LIMIT $3 FOR UPDATE SKIP LOCKED)"
     )))
-    .bind(cutoff)
-    .bind(now)
+    .bind(cutoff.to_sqlx())
+    .bind(now.to_sqlx())
     .bind(limit)
     .execute(pool)
     .await?
@@ -958,7 +958,7 @@ pub async fn collect_blobs(
             "UPDATE {schema}.blobs SET bytes_removed_at = $2 WHERE id = $1"
         )))
         .bind(&id)
-        .bind(now)
+        .bind(now.to_sqlx())
         .execute(pool)
         .await?;
         collected.bytes_removed += 1;
@@ -975,7 +975,7 @@ pub async fn collect_blobs(
 pub(super) async fn queue_blob_deletions(
     tx: &mut Transaction<'_, Postgres>,
     bounded_context: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     let (present,): (bool,) = sqlx::query_as("SELECT to_regclass($1) IS NOT NULL")
@@ -991,7 +991,7 @@ pub(super) async fn queue_blob_deletions(
          ON CONFLICT DO NOTHING"
     )))
     .bind(bounded_context)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(&mut **tx)
     .await?;
     Ok(())

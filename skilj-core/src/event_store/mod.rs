@@ -128,7 +128,7 @@ pub struct BoundedContext {
     /// Whether it accepts writes.
     pub status: BoundedContextStatus,
     /// When it was created.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// Who created it.
     pub created_by: crate::bootstrap::ContextCreator,
     /// See `entity BoundedContext`'s own `template` field doc comment
@@ -245,14 +245,14 @@ pub struct EventType {
     /// own doc comment for why that's what lets a later schedule-string
     /// change not reopen anything. `None` exactly when
     /// `missed_occurrence_policy` is `None`.
-    pub schedule_position: Option<chrono::DateTime<chrono::Utc>>,
+    pub schedule_position: Option<jiff::Timestamp>,
     /// The occurrence instant of the most recent occurrence of this
     /// type's schedule that actually produced an event - not the wall
     /// clock of the write, which is already on that event's own
     /// `Metadata.created_at` (see `create_system_event`'s own doc
     /// comment). `None` until the first one fires; never reset by
     /// switching scheduling off.
-    pub last_fired_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_fired_at: Option<jiff::Timestamp>,
     /// Whether event read tokens may be minted for this type.
     pub event_read_allowed: bool,
 }
@@ -336,9 +336,9 @@ pub struct EncryptionKey {
     /// Whether the key still exists.
     pub status: EncryptionKeyStatus,
     /// When the key was created.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// When it was destroyed; `None` while active.
-    pub destroyed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub destroyed_at: Option<jiff::Timestamp>,
 }
 
 /// See `value EncryptedPayload`.
@@ -492,7 +492,7 @@ pub struct AllEventsSubscription {
     /// The grant the events are delivered under.
     pub access_mapping: RoleAccessMapping,
     /// When the subscription started.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// Delivery starts after this sequence.
     pub from_sequence: i64,
     /// The event types delivered; empty for every type in the bounded context.
@@ -508,7 +508,7 @@ pub struct EventTypeSubscription {
     /// The grant the events are delivered under.
     pub access_mapping: RoleAccessMapping,
     /// When the subscription started.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// Delivery starts after this sequence.
     pub from_sequence: i64,
     /// The event type delivered.
@@ -593,10 +593,10 @@ pub struct ReadCursor {
     /// (`manual_ack`).
     pub sequence: i64,
     /// When the cursor last moved.
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: jiff::Timestamp,
     /// When a `manual_ack` read last claimed the cursor; `None` when it is not
     /// claimed.
-    pub checked_out_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub checked_out_at: Option<jiff::Timestamp>,
 }
 
 /// Library-level errors this module's own rules reject for.
@@ -1165,7 +1165,7 @@ fn resolve_field_kind(
 /// "the exact type-to-operator matrix... is deliberately not enumerated
 /// here... exactly the kind of mechanism this spec consistently hands to
 /// a black box"). `format` values `"date-time"`/`"date"`/
-/// `"partial-date-time"` (`chrono::DateTime<Utc>`/`NaiveDate`/`NaiveTime`'s
+/// `"partial-date-time"` (`jiff::Timestamp`/`NaiveDate`/`NaiveTime`'s
 /// own three renderings) additionally get ordering operators - see
 /// `matches_filters`' own `string_ordering` for why the comparison itself
 /// needs real parsing, not plain string `Ord`, despite the check here
@@ -1939,13 +1939,13 @@ fn like_matches(text: &str, pattern: &str) -> bool {
 /// `GreaterThan`/`LessThan` for a string leaf. `matches_filters` has no
 /// schema, so unlike `valid_filters` it can't know in advance which of
 /// the three ordered formats (`date-time`/`date`/`partial-date-time`)
-/// it's looking at - tries each of `chrono::DateTime`'s/`NaiveDate`'s/
-/// `NaiveTime`'s own parsers in turn on *both* sides, since each format
+/// it's looking at - tries `jiff::Timestamp`'s, `jiff::civil::Date`'s and
+/// `jiff::civil::Time`'s parsers in turn on *both* sides, since each format
 /// only parses its own shape. Real typed comparison (`PartialOrd`), not
 /// raw string `Ord` - plain string comparison is provably wrong here:
-/// chrono's own serde serialization trims trailing-zero fractional
-/// digits, even down to no fractional part at all when it's exactly
-/// zero, so e.g. `"...:00Z"` sorts *after* `"...:00.500Z"` as plain
+/// serde serialization (jiff's, as chrono's before it) trims trailing-zero
+/// fractional digits, even down to no fractional part at all when it's
+/// exactly zero, so e.g. `"...:00Z"` sorts *after* `"...:00.500Z"` as plain
 /// strings despite being chronologically earlier (`'Z'` > `'.'`).
 /// `valid_filters` already gated the field to one of these three formats
 /// before a caller could reach this at all; a value that doesn't parse
@@ -1961,20 +1961,20 @@ fn string_ordering(payload: &str, filter_value: &str, operator: FilterOperator) 
         }
     }
     if let (Ok(a), Ok(b)) = (
-        chrono::DateTime::parse_from_rfc3339(payload),
-        chrono::DateTime::parse_from_rfc3339(filter_value),
+        payload.parse::<jiff::Timestamp>(),
+        filter_value.parse::<jiff::Timestamp>(),
     ) {
         return cmp(a, b, operator);
     }
     if let (Ok(a), Ok(b)) = (
-        chrono::NaiveDate::parse_from_str(payload, "%Y-%m-%d"),
-        chrono::NaiveDate::parse_from_str(filter_value, "%Y-%m-%d"),
+        jiff::civil::Date::strptime("%Y-%m-%d", payload),
+        jiff::civil::Date::strptime("%Y-%m-%d", filter_value),
     ) {
         return cmp(a, b, operator);
     }
     if let (Ok(a), Ok(b)) = (
-        chrono::NaiveTime::parse_from_str(payload, "%H:%M:%S%.f"),
-        chrono::NaiveTime::parse_from_str(filter_value, "%H:%M:%S%.f"),
+        jiff::civil::Time::strptime("%H:%M:%S%.f", payload),
+        jiff::civil::Time::strptime("%H:%M:%S%.f", filter_value),
     ) {
         return cmp(a, b, operator);
     }
@@ -3139,7 +3139,7 @@ pub fn register_event_type(
     missed_occurrence_policy: Option<MissedOccurrencePolicy>,
     event_read_allowed: bool,
     existing: Option<&EventType>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<EventTypeRegistration> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -3480,7 +3480,7 @@ pub fn register_command_type(
 pub fn forget_subject(
     access_mapping: &RoleAccessMapping,
     key: &EncryptionKey,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<EncryptionKey> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -3807,8 +3807,8 @@ pub fn inspect_event(
 pub fn fetch_commands(
     access_mapping: &RoleAccessMapping,
     command_types: &[CommandType],
-    after: Option<chrono::DateTime<chrono::Utc>>,
-    before: Option<chrono::DateTime<chrono::Utc>>,
+    after: Option<jiff::Timestamp>,
+    before: Option<jiff::Timestamp>,
     triggered_event: Option<&Event>,
     correlation_id: Option<&str>,
     bounded_context_commands: &[Command],
@@ -3845,8 +3845,8 @@ pub fn fetch_commands(
 pub fn fetch_commands_select(
     access_mapping: &RoleAccessMapping,
     command_types: &[CommandType],
-    after: Option<chrono::DateTime<chrono::Utc>>,
-    before: Option<chrono::DateTime<chrono::Utc>>,
+    after: Option<jiff::Timestamp>,
+    before: Option<jiff::Timestamp>,
     triggered_event: Option<&Event>,
     correlation_id: Option<&str>,
     after_command: Option<&Command>,
@@ -3913,7 +3913,7 @@ pub fn create_all_events_subscription(
     event_types: Vec<EventType>,
     from_sequence: Option<i64>,
     bounded_context_events: &[Event],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<AllEventsSubscription> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -3954,7 +3954,7 @@ pub fn create_event_type_subscription(
     filters: Vec<Filter>,
     from_sequence: Option<i64>,
     bounded_context_events: &[Event],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<EventTypeSubscription> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -4281,7 +4281,7 @@ pub enum CursorUpdate {
         /// The cursor's new sequence.
         sequence: i64,
         /// When it moved.
-        updated_at: chrono::DateTime<chrono::Utc>,
+        updated_at: jiff::Timestamp,
     },
     /// `manual_ack`, cursor not already claimed (or a stale claim just
     /// reclaimed) - `ReadCursor.checked_out_at` becomes `now`, `sequence`
@@ -4291,7 +4291,7 @@ pub enum CursorUpdate {
     /// spec doc comment for why this exists.
     Claimed {
         /// When the claim was taken.
-        checked_out_at: chrono::DateTime<chrono::Utc>,
+        checked_out_at: jiff::Timestamp,
     },
     /// `manual_ack`, cursor already claimed by a live (not stale) lease -
     /// nothing moves, `served` is empty (see `consume_events`'s own
@@ -4321,8 +4321,8 @@ pub fn consume_events(
     ack_mode: Option<AckMode>,
     events: &[Event],
     filters: &[Filter],
-    now: chrono::DateTime<chrono::Utc>,
-    checkout_lease: chrono::Duration,
+    now: jiff::Timestamp,
+    checkout_lease: jiff::SignedDuration,
 ) -> crate::error::Result<ConsumeEventsResult> {
     check_consume_events(token, existing_cursor, ack_mode, filters)?;
     let position = match existing_cursor {
@@ -4477,8 +4477,8 @@ pub fn consume_events_page(
     events: &[Event],
     scanned_through: Option<i64>,
     filters: &[Filter],
-    now: chrono::DateTime<chrono::Utc>,
-    checkout_lease: chrono::Duration,
+    now: jiff::Timestamp,
+    checkout_lease: jiff::SignedDuration,
     max_events: usize,
 ) -> crate::error::Result<ConsumeEventsResult> {
     check_consume_events(token, existing_cursor, ack_mode, filters)?;
@@ -4503,7 +4503,8 @@ pub fn consume_events_page(
         match existing_cursor.and_then(|c| c.checked_out_at) {
             Some(checked_out_at) => {
                 checked_out_at
-                    .checked_add_signed(checkout_lease)
+                    .checked_add(checkout_lease)
+                    .ok()
                     .ok_or_else(|| {
                         crate::error::Error::configuration(
                             "read cursor checkout lease exceeds the timestamp range",
@@ -4608,8 +4609,8 @@ pub fn acknowledge_events(
     token: &EventReadToken,
     cursor: Option<&ReadCursor>,
     sequence: i64,
-    now: chrono::DateTime<chrono::Utc>,
-) -> crate::error::Result<(i64, chrono::DateTime<chrono::Utc>)> {
+    now: jiff::Timestamp,
+) -> crate::error::Result<(i64, jiff::Timestamp)> {
     if token.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
     }
@@ -4759,7 +4760,7 @@ pub fn create_external_event(
     correlation_id: Option<String>,
     causation_id: Option<String>,
     next_sequence: i64,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
     blind: &BlindIndex,
 ) -> crate::error::Result<Event> {
@@ -4816,7 +4817,7 @@ pub fn create_direct_event(
     correlation_id: Option<String>,
     causation_id: Option<String>,
     next_sequence: i64,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
     blind: &BlindIndex,
 ) -> crate::error::Result<Event> {
@@ -4868,40 +4869,40 @@ pub fn create_direct_event(
 ///
 /// `schedule` is a 7-field Quartz-style cron expression (`sec min hour
 /// day-of-month month day-of-week year`, e.g. `"0 0 3 * * * *"` for daily
-/// at 03:00) - the `cron` crate's own dialect, not the more familiar
-/// 5-field POSIX one; `RegisterEventType`'s own `requires` doesn't
+/// at 03:00 UTC) - the `cron` crate's dialect, which its fork `jiff-cron`
+/// keeps, not the more familiar 5-field POSIX one; `RegisterEventType`'s own `requires` doesn't
 /// validate this string's own syntax (the spec never added a
 /// `valid_schedule` black box the way it did for filters), so a
 /// malformed expression here just means this function returns `None`
 /// forever for it, the same as a schedule with no occurrence left at all
 /// - `create_system_event` never gets to reach a due occurrence, and the
 ///   type is never raised.
-pub fn next_occurrence_after(
-    schedule: &str,
-    instant: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+pub fn next_occurrence_after(schedule: &str, instant: jiff::Timestamp) -> Option<jiff::Timestamp> {
     use std::str::FromStr;
-    cron::Schedule::from_str(schedule)
+    jiff_cron::Schedule::from_str(schedule)
         .ok()?
-        .after(&instant)
+        .after(instant.to_zoned(jiff::tz::TimeZone::UTC))
         .next()
+        .map(|occurrence| occurrence.timestamp())
 }
 
 /// The latest occurrence of `schedule` at or before `instant` - the one a
 /// `fire_once` backlog collapses into - found without walking the
-/// backlog (docs/architecture.md §150). `cron`'s backward step gives an
+/// backlog (docs/architecture.md §150). `jiff-cron`'s backward step gives an
 /// occurrence just before `instant`; stepping forward from it while the
 /// next one is still at or before `instant` makes the answer exact
 /// whatever that step does at the boundary. `None` when the schedule
 /// doesn't parse or has no occurrence at or before `instant`.
 pub fn latest_occurrence_at_or_before(
     schedule: &str,
-    instant: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+    instant: jiff::Timestamp,
+) -> Option<jiff::Timestamp> {
     use std::str::FromStr;
-    let schedule = cron::Schedule::from_str(schedule).ok()?;
-    let mut latest = schedule.after(&instant).next_back()?;
-    while let Some(next) = schedule.after(&latest).next() {
+    let schedule = jiff_cron::Schedule::from_str(schedule).ok()?;
+    let utc = |t: jiff::Timestamp| t.to_zoned(jiff::tz::TimeZone::UTC);
+    let mut latest = schedule.after(utc(instant)).next_back()?.timestamp();
+    while let Some(next) = schedule.after(utc(latest)).next() {
+        let next = next.timestamp();
         if next > instant {
             break;
         }
@@ -4939,12 +4940,12 @@ pub fn latest_occurrence_at_or_before(
 /// to return the failure instead.
 pub fn create_system_event(
     event_type: &EventType,
-    occurrence_at: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
+    occurrence_at: jiff::Timestamp,
+    now: jiff::Timestamp,
     next_sequence: i64,
     resolve_payload: impl FnOnce() -> String,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
-) -> Option<(Event, chrono::DateTime<chrono::Utc>)> {
+) -> Option<(Event, jiff::Timestamp)> {
     try_create_system_event(
         event_type,
         occurrence_at,
@@ -4964,12 +4965,12 @@ pub fn create_system_event(
 )]
 pub fn try_create_system_event(
     event_type: &EventType,
-    occurrence_at: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
+    occurrence_at: jiff::Timestamp,
+    now: jiff::Timestamp,
     next_sequence: i64,
     resolve_payload: impl FnOnce() -> String,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
-) -> crate::error::Result<Option<(Event, chrono::DateTime<chrono::Utc>)>> {
+) -> crate::error::Result<Option<(Event, jiff::Timestamp)>> {
     if !event_type.system_triggered_allowed {
         return Ok(None);
     }
@@ -5050,8 +5051,8 @@ pub fn try_create_system_event(
 /// no typed rejection - `SystemScheduleResumed` reaches no surface either.
 pub fn skip_missed_occurrences(
     event_type: &EventType,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+    now: jiff::Timestamp,
+) -> Option<jiff::Timestamp> {
     // Drift audit finding #10 (2026-08-20, see project memory
     // `skilj-drift-audit-2026-08-20`): `rule SkipMissedOccurrences`'s own
     // first `requires` clause, missing here until this fix. Not reachable
@@ -5589,7 +5590,7 @@ pub fn process_command(
     decision: CommandDecision,
     resolve_event_type: impl Fn(&str) -> Option<EventType>,
     next_sequence: impl FnMut() -> i64,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
     blind: &BlindIndex,
 ) -> crate::error::Result<ProcessCommandResult> {
@@ -5640,7 +5641,7 @@ pub(crate) fn process_command_at_boundary(
     decision: CommandDecision,
     resolve_event_type: impl Fn(&str) -> Option<EventType>,
     mut next_sequence: impl FnMut() -> i64,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
     blind: &BlindIndex,
 ) -> crate::error::Result<ProcessCommandResult> {

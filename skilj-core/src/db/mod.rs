@@ -58,12 +58,27 @@ use crate::event_store::{
 use crate::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use crate::secrets::{self, Secret, SecretGrant, SecretGrantStatus, SecretStatus, SecretValue};
 use crate::shared::{Metadata, PrivateField, QueryItem, SensitiveField, Tag, TagMapping};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::KeyValue;
 use sqlx::types::Json;
 use sqlx::{Acquire, Postgres, Transaction};
 use std::sync::LazyLock;
+
+/// A nullable `timestamptz` column. sqlx has no jiff support of its own,
+/// so a row struct's `Option<Timestamp>` field is read through
+/// jiff-sqlx with `#[sqlx(try_from = "NullableTimestamp")]` (a plain
+/// `Timestamp` field uses `try_from = "jiff_sqlx::Timestamp"`).
+#[derive(sqlx::Type)]
+#[sqlx(transparent)]
+pub(crate) struct NullableTimestamp(Option<jiff_sqlx::Timestamp>);
+
+impl From<NullableTimestamp> for Option<Timestamp> {
+    fn from(value: NullableTimestamp) -> Self {
+        value.0.map(jiff_sqlx::Timestamp::to_jiff)
+    }
+}
 
 /// This crate's own OTel instrumentation scope. `opentelemetry::global::meter(...)`
 /// **snapshot-binds** to whichever `MeterProvider` is globally registered

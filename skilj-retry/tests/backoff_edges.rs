@@ -50,11 +50,12 @@ fn ordinary_policies_still_grow_geometrically_up_to_the_cap() {
 
 /// Callers that store a due time used to write `now +
 /// chrono::Duration::from_std(backoff).unwrap_or(zero)`: a backoff too
-/// large for chrono became *zero* (an immediate, endless retry), and one
-/// that fit could still overflow the addition, which panics in chrono.
+/// large for a signed duration became *zero* (an immediate, endless
+/// retry), and one that fit could still overflow the addition, which
+/// panics (in chrono then, in jiff now).
 #[test]
 fn next_attempt_at_saturates_instead_of_retrying_immediately_or_panicking() {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let uncapped = policy(2.0, Duration::MAX);
     for attempt in [1, 64, 1_000, u32::MAX] {
         let due = uncapped.next_attempt_at(now, attempt);
@@ -62,23 +63,23 @@ fn next_attempt_at_saturates_instead_of_retrying_immediately_or_panicking() {
     }
     assert_eq!(
         uncapped.next_attempt_at(now, u32::MAX),
-        chrono::DateTime::<chrono::Utc>::MAX_UTC,
+        jiff::Timestamp::MAX,
         "a far-off backoff is 'as late as possible', never 'right away'"
     );
     // Near the end of representable time, still no overflow panic.
-    let late = chrono::DateTime::<chrono::Utc>::MAX_UTC - chrono::TimeDelta::seconds(1);
+    let late = jiff::Timestamp::MAX - jiff::SignedDuration::from_secs(1);
     assert_eq!(
         policy(2.0, Duration::from_secs(60)).next_attempt_at(late, 10),
-        chrono::DateTime::<chrono::Utc>::MAX_UTC
+        jiff::Timestamp::MAX
     );
 }
 
 #[test]
 fn next_attempt_at_is_now_plus_the_backoff_normally() {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let p = policy(2.0, Duration::from_secs(1));
     assert_eq!(
         p.next_attempt_at(now, 2),
-        now + chrono::TimeDelta::milliseconds(200)
+        now + jiff::SignedDuration::from_millis(200)
     );
 }

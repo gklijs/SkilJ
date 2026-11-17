@@ -14,7 +14,8 @@ use crate::encryption::trail::{
 };
 use crate::encryption::{self, KeyService, StoredWrap};
 use crate::event_store::BoundedContext;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use sqlx::pool::PoolConnection;
 use sqlx::{Postgres, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,7 +46,7 @@ async fn record(
     change: MasterKeyChange,
 ) -> crate::error::Result<()> {
     let sequence = next_sequence(&mut **tx, &admin.name).await?;
-    let event = change.try_into_event(admin, sequence, Utc::now())?;
+    let event = change.try_into_event(admin, sequence, Timestamp::now())?;
     insert_event(&mut **tx, &event, None).await
 }
 
@@ -62,18 +63,18 @@ pub struct MasterKeyState {
     /// rewrapped to.
     pub version: u32,
     /// When it came into use.
-    pub rotated_at: DateTime<Utc>,
+    pub rotated_at: Timestamp,
     /// Whether the versions below retire as soon as the rewrap is done.
     pub retire_immediately: bool,
     /// When every data key of its bounded contexts was found wrapped under
     /// `version`; `None` while the rewrap is pending.
-    pub rewrapped_at: Option<DateTime<Utc>>,
+    pub rewrapped_at: Option<Timestamp>,
     /// Every version below this one is retired.
     pub retired_below: u32,
     /// Whether skilj created the key, and so deletes it when unused.
     pub created_by_skilj: bool,
     /// When the key, used by no bounded context, is deleted or let go.
-    pub delete_after: Option<DateTime<Utc>>,
+    pub delete_after: Option<Timestamp>,
     /// Raised by every assignment to the key, and by a data key behind it
     /// that turned out readable after all: a rewrap is marked done only
     /// when it is still the one read before the assignments were.
@@ -84,12 +85,12 @@ type StateRow = (
     String,
     Option<String>,
     i32,
-    DateTime<Utc>,
+    jiff_sqlx::Timestamp,
     bool,
-    Option<DateTime<Utc>>,
+    Option<jiff_sqlx::Timestamp>,
     i32,
     bool,
-    Option<DateTime<Utc>>,
+    Option<jiff_sqlx::Timestamp>,
     i64,
 );
 
@@ -110,12 +111,12 @@ fn to_state(row: StateRow) -> MasterKeyState {
         provider,
         key,
         version: u32::try_from(version).unwrap_or(0),
-        rotated_at,
+        rotated_at: rotated_at.to_jiff(),
         retire_immediately,
-        rewrapped_at,
+        rewrapped_at: rewrapped_at.map(jiff_sqlx::Timestamp::to_jiff),
         retired_below: u32::try_from(retired_below).unwrap_or(0),
         created_by_skilj,
-        delete_after,
+        delete_after: delete_after.map(jiff_sqlx::Timestamp::to_jiff),
         assignment_epoch,
     }
 }
@@ -218,7 +219,7 @@ pub async fn rotate_master_key(
     rotation: Rotation,
     retire_immediately: bool,
     actor_role_id: Option<&str>,
-    due: Option<chrono::Duration>,
+    due: Option<jiff::SignedDuration>,
 ) -> crate::error::Result<Option<u32>> {
     let admin = require_admin_bounded_context(pool).await?;
     // Recording runs at every check, on every instance, for every key: the
@@ -240,7 +241,7 @@ pub async fn rotate_master_key(
     let mut tx = pool.begin().await?;
     lock_key(&mut tx, provider.name()).await?;
     let current = locked_state(&mut tx, provider.name()).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     if let (Some(every), Some(state)) = (due, &current) {
         if state.rewrapped_at.is_none() || state.rotated_at + every > now {
             return Ok(None);
@@ -277,7 +278,7 @@ pub async fn rotate_master_key(
     .bind(provider.name())
     .bind(key)
     .bind(version_column(version)?)
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(retire_immediately)
     .bind(version_column(retired_below)?)
     .execute(&mut *tx)
@@ -317,7 +318,7 @@ pub async fn mark_data_keys_rewrapped(
          WHERE provider = $2 AND version = $3 AND rewrapped_at IS NULL \
          AND assignment_epoch = $4",
     )
-    .bind(Utc::now())
+    .bind(Timestamp::now().to_sqlx())
     .bind(provider)
     .bind(version_column(version)?)
     .bind(epoch)
@@ -514,7 +515,7 @@ pub async fn assign_encryption_key(
         .bind(provider.name())
         .bind(key)
         .bind(version_column(versions.latest)?)
-        .bind(Utc::now())
+        .bind(Timestamp::now().to_sqlx())
         .bind(version_column(versions.min_decryption)?)
         .execute(&mut *tx)
         .await?;
@@ -550,7 +551,7 @@ pub async fn assign_encryption_key(
             .bind(bounded_context)
             .bind(key)
             .bind(provider.name())
-            .bind(Utc::now())
+            .bind(Timestamp::now().to_sqlx())
             .execute(&mut *tx)
             .await?;
         }
@@ -608,14 +609,14 @@ pub async fn forget_assignments_of_deleted_contexts(
 pub async fn schedule_key_deletion(
     pool: &Pool,
     provider: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> crate::error::Result<()> {
     sqlx::query(
         "UPDATE encryption_master_keys SET delete_after = $2 \
          WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL",
     )
     .bind(provider)
-    .bind(at)
+    .bind(at.to_sqlx())
     .execute(pool)
     .await?;
     Ok(())
@@ -647,7 +648,7 @@ pub async fn delete_unused_key(
     .bind(provider.name())
     .fetch_one(&mut *tx)
     .await?;
-    let due = state.delete_after.is_some_and(|at| at <= Utc::now());
+    let due = state.delete_after.is_some_and(|at| at <= Timestamp::now());
     if state.key.is_none() || assigned || !due {
         return Ok(false);
     }
@@ -868,7 +869,7 @@ pub async fn data_keys_behind(
     bounded_context: &str,
     provider: &str,
     version: u32,
-    since: DateTime<Utc>,
+    since: Timestamp,
 ) -> crate::error::Result<bool> {
     let schema = schema_ident(bounded_context);
     let counts = readable_since("$3");
@@ -885,7 +886,7 @@ pub async fn data_keys_behind(
     )))
     .bind(provider)
     .bind(version_column(version)?)
-    .bind(since)
+    .bind(since.to_sqlx())
     .fetch_one(pool)
     .await?;
     Ok(behind)
@@ -909,7 +910,7 @@ async fn key_rows_below_on(
     conn: &mut sqlx::PgConnection,
     provider: &str,
     version: u32,
-    since: DateTime<Utc>,
+    since: Timestamp,
 ) -> crate::error::Result<bool> {
     Ok(!contexts_below_on(conn, provider, version, since, true)
         .await?
@@ -924,7 +925,7 @@ pub async fn contexts_with_data_keys_below(
     pool: &Pool,
     provider: &str,
     version: u32,
-    since: DateTime<Utc>,
+    since: Timestamp,
 ) -> crate::error::Result<Vec<String>> {
     let mut tx = pool.begin().await?;
     let contexts = contexts_below_on(&mut tx, provider, version, since, false).await?;
@@ -939,7 +940,7 @@ async fn contexts_below_on(
     conn: &mut sqlx::PgConnection,
     provider: &str,
     version: u32,
-    since: DateTime<Utc>,
+    since: Timestamp,
     first_only: bool,
 ) -> crate::error::Result<Vec<String>> {
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM bounded_contexts ORDER BY name")
@@ -959,7 +960,7 @@ async fn contexts_below_on(
         )))
         .bind(provider)
         .bind(version_column(version)?)
-        .bind(since)
+        .bind(since.to_sqlx())
         .fetch_one(&mut *conn)
         .await
         .map_err(crate::error::Error::from);
@@ -1080,7 +1081,7 @@ pub async fn rewrap_data_keys_once(
     key_service: &KeyService,
     target: &dyn KeyProvider,
     version: u32,
-    since: DateTime<Utc>,
+    since: Timestamp,
     retiring: Option<&str>,
 ) -> crate::error::Result<Option<RewrapOutcome>> {
     let mut lock = HeldLock(Some(pool.acquire().await?));
@@ -1188,7 +1189,7 @@ pub async fn rewrap_data_keys(
     key_service: &KeyService,
     target: &dyn KeyProvider,
     version: u32,
-    since: DateTime<Utc>,
+    since: Timestamp,
     retiring: Option<&str>,
 ) -> crate::error::Result<RewrapOutcome> {
     // Before any batch's transaction: a second pooled connection while one
@@ -1221,7 +1222,7 @@ pub async fn rewrap_data_keys(
         )))
         .bind(&target_name)
         .bind(version_column(version)?)
-        .bind(since)
+        .bind(since.to_sqlx())
         .bind(after)
         .bind(REWRAP_BATCH)
         .fetch_all(pool)
@@ -1366,7 +1367,7 @@ pub async fn rewrap_data_keys(
                  FROM UNNEST($2::BIGINT[], $3::BYTEA[]) AS u(id, old) \
                  WHERE k.id = u.id AND k.status = 'active' AND k.wrapped_key = u.old"
             )))
-            .bind(Utc::now())
+            .bind(Timestamp::now().to_sqlx())
             .bind(&ids)
             .bind(&old)
             .execute(&mut *tx)
@@ -1379,7 +1380,7 @@ pub async fn rewrap_data_keys(
         )))
         .bind(&target_name)
         .bind(version_column(version)?)
-        .bind(since)
+        .bind(since.to_sqlx())
         .bind(after)
         .fetch_one(&mut *tx)
         .await?;

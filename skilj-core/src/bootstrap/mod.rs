@@ -33,7 +33,7 @@ pub const ADMIN_BOUNDED_CONTEXT_NAME: &str = "admin";
 /// the first superadmin Role").
 pub fn stamp_admin_bounded_context(
     existing: Option<&BoundedContext>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> Option<BoundedContext> {
     if existing.is_some() {
         return None;
@@ -236,7 +236,7 @@ pub fn create_superadmin(
     external_subject: String,
     existing_roles: &[Role],
     id: String,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<Role> {
     if existing_roles
         .iter()
@@ -299,7 +299,7 @@ pub fn add_bounded_context(
     caller: &Role,
     name: String,
     existing_contexts: &[BoundedContext],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<BoundedContext> {
     crate::access_control::require_active_superadmin(caller)?;
     if existing_contexts.iter().any(|bc| bc.name == name) {
@@ -348,7 +348,7 @@ pub fn create_bounded_context_from_template(
     template: &BoundedContext,
     name: String,
     existing_contexts: &[BoundedContext],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> crate::error::Result<BoundedContext> {
     crate::access_control::require_active_superadmin(caller)?;
     if existing_contexts.iter().any(|bc| bc.name == name) {

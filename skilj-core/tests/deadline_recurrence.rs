@@ -15,7 +15,7 @@
 //! `deadline_cancel_ordering.rs` already uses is reused here, not
 //! re-explained.
 
-use chrono::{SubsecRound, TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{
@@ -27,8 +27,8 @@ use skilj_core::plugin::{
 };
 use skilj_core::shared::{generate_token_id, Metadata, Tag};
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 /// Top of every hour - minute 0 of every hour, so hand-computable.
@@ -186,8 +186,14 @@ async fn test_pool() -> Option<Pool> {
         .map(|db| db.pool.clone())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
@@ -252,7 +258,7 @@ async fn append(pool: &Pool, et: &EventType) {
 
 struct Schedules {
     info: ScheduleDeadlineInfo,
-    fire_at: chrono::DateTime<Utc>,
+    fire_at: jiff::Timestamp,
     recurrence: Option<RecurrenceSpec>,
 }
 
@@ -294,19 +300,31 @@ async fn deadline_row(
     bc: &BoundedContext,
 ) -> Option<(
     String,
-    chrono::DateTime<Utc>,
+    jiff::Timestamp,
     Option<String>,
     Option<String>,
     Option<i64>,
 )> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    sqlx::query_as::<
+        _,
+        (
+            String,
+            jiff_sqlx::Timestamp,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        ),
+    >(sqlx::AssertSqlSafe(format!(
         "SELECT id, fire_at, recurrence_schedule, recurrence_parent_id, recurrence_sequence \
-         FROM \"bc_{}\".deadlines ORDER BY id",
+             FROM \"bc_{}\".deadlines ORDER BY id",
         bc.name
     )))
     .fetch_optional(pool)
     .await
     .unwrap()
+    .map(|(id, fire_at, schedule, parent, sequence)| {
+        (id, fire_at.to_jiff(), schedule, parent, sequence)
+    })
 }
 
 /// A recurring spec persists its chain state: the schedule, the policy,
@@ -322,7 +340,7 @@ fn a_recurring_schedule_persists_its_chain_state() {
         seed_event_type(&pool, &bc).await;
         append(&pool, &seed_event_type(&pool, &bc).await).await;
         let name: &'static str = Box::leak(bc.name.clone().into_boxed_str());
-        let fire_at = test_now() + chrono::Duration::hours(1);
+        let fire_at = test_now() + jiff::SignedDuration::from_hours(1);
         let schedules = Schedules {
             info: schedule_info(name),
             fire_at,
@@ -330,7 +348,7 @@ fn a_recurring_schedule_persists_its_chain_state() {
                 schedule: every_hour(),
                 policy: MissedRunPolicy::FireAll,
                 start_at: None,
-                end_at: Some(fire_at + chrono::Duration::hours(1)),
+                end_at: Some(fire_at + jiff::SignedDuration::from_hours(1)),
                 valid_until: None,
             }),
         };
@@ -362,12 +380,12 @@ fn an_initial_fire_at_outside_its_window_schedules_nothing() {
         let schedules = Schedules {
             info: schedule_info(name),
             // Past the window's own end - already expired on arrival.
-            fire_at: test_now() + chrono::Duration::hours(2),
+            fire_at: test_now() + jiff::SignedDuration::from_hours(2),
             recurrence: Some(RecurrenceSpec {
                 schedule: every_hour(),
                 policy: MissedRunPolicy::FireAll,
                 start_at: None,
-                end_at: Some(test_now() + chrono::Duration::hours(1)),
+                end_at: Some(test_now() + jiff::SignedDuration::from_hours(1)),
                 valid_until: None,
             }),
         };
@@ -393,7 +411,7 @@ fn an_unparseable_schedule_degrades_to_a_stored_one_shot() {
         let name: &'static str = Box::leak(bc.name.clone().into_boxed_str());
         let schedules = Schedules {
             info: schedule_info(name),
-            fire_at: test_now() + chrono::Duration::hours(1),
+            fire_at: test_now() + jiff::SignedDuration::from_hours(1),
             recurrence: Some(RecurrenceSpec {
                 schedule: "not a cron expression".to_string(),
                 policy: MissedRunPolicy::FireAll,

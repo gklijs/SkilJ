@@ -9,8 +9,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{SubsecRound, Utc};
 use http_body_util::BodyExt;
+use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::{requires_role, CommandType, EventType, Skilj};
@@ -214,8 +214,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 /// Builds a fully reconciled `Skilj` (both `MoneyDeposited`/`WithdrawMoney`
@@ -371,7 +377,7 @@ fn an_approval_required_trigger_creates_a_pending_proposal() {
             Some(skilj_core::approvals::CommandProposalStatus::Pending),
             Some("TransferMoney"),
             None,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await
         .unwrap();

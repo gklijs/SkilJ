@@ -992,8 +992,10 @@ pub(super) struct PrivateFieldGrantRow {
     pub(super) command_id: Option<i64>,
     pub(super) field: Option<String>,
     pub(super) status: String,
-    pub(super) created_at: DateTime<Utc>,
-    pub(super) revoked_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) created_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) revoked_at: Option<Timestamp>,
 }
 
 impl PrivateFieldGrantRow {
@@ -1088,8 +1090,8 @@ pub(super) async fn insert_private_field_grant_row<'e>(
     .bind(grant.event_sequence)
     .bind(command_id)
     .bind(token_status_to_str(grant.status))
-    .bind(grant.created_at)
-    .bind(grant.revoked_at)
+    .bind(grant.created_at.to_sqlx())
+    .bind(grant.revoked_at.map(|t| t.to_sqlx()))
     .bind(grant.field.as_deref())
     .execute(executor)
     .await?;
@@ -1264,7 +1266,7 @@ pub async fn update_private_field_grant<'e>(
          WHERE id = $3 AND status = 'active'"
     )))
     .bind(token_status_to_str(grant.status))
-    .bind(grant.revoked_at)
+    .bind(grant.revoked_at.map(|t| t.to_sqlx()))
     .bind(&grant.id)
     .execute(executor)
     .await?;
@@ -1409,7 +1411,7 @@ pub async fn ensure_idempotency_keys_table<'e>(
 pub async fn delete_expired_idempotency_keys(
     pool: &Pool,
     bounded_context: &str,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     batch: i64,
 ) -> crate::error::Result<u64> {
     delete_expired_keys(pool, bounded_context, "idempotency_keys", cutoff, batch).await
@@ -1420,7 +1422,7 @@ pub async fn delete_expired_idempotency_keys(
 pub async fn delete_expired_external_message_keys(
     pool: &Pool,
     bounded_context: &str,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     batch: i64,
 ) -> crate::error::Result<u64> {
     delete_expired_keys(
@@ -1439,7 +1441,7 @@ pub(super) async fn delete_expired_keys(
     pool: &Pool,
     bounded_context: &str,
     table: &'static str,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     batch: i64,
 ) -> crate::error::Result<u64> {
     let schema = schema_ident(bounded_context);
@@ -1447,7 +1449,7 @@ pub(super) async fn delete_expired_keys(
         "DELETE FROM {schema}.{table} WHERE ctid IN ( \
              SELECT ctid FROM {schema}.{table} WHERE created_at < $1 LIMIT $2)"
     )))
-    .bind(cutoff)
+    .bind(cutoff.to_sqlx())
     .bind(batch)
     .execute(pool)
     .await?;
@@ -1464,7 +1466,7 @@ pub(super) async fn delete_expired_keys(
 pub async fn delete_expired_deadlines(
     pool: &Pool,
     bounded_context: &str,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     batch: i64,
 ) -> crate::error::Result<u64> {
     let schema = schema_ident(bounded_context);
@@ -1473,7 +1475,7 @@ pub async fn delete_expired_deadlines(
              SELECT ctid FROM {schema}.deadlines \
              WHERE status NOT IN ('pending', 'firing') AND resolved_at < $1 LIMIT $2)"
     )))
-    .bind(cutoff)
+    .bind(cutoff.to_sqlx())
     .bind(batch)
     .execute(pool)
     .await?;
@@ -2309,7 +2311,7 @@ pub async fn register_blind_tag(
     pool: &Pool,
     bounded_context: &str,
     declaration: &crate::blind::BlindTagDeclaration,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     let mut tx = pool.begin().await?;
@@ -2392,7 +2394,7 @@ pub async fn register_blind_tag(
             .bind(&declaration.key_fingerprint)
             .bind(i64::from(declaration.key_generation))
             .bind(Json(&declaration.erasure))
-            .bind(now)
+            .bind(now.to_sqlx())
             .execute(&mut *tx)
             .await?;
         }
@@ -2709,7 +2711,7 @@ pub async fn ensure_consistency_query_column<'e>(
 /// Bounded contexts, by name and creation time, this process has run
 /// [`ensure_bounded_context_current`] for.
 pub(super) type CurrentBoundedContexts =
-    std::sync::Mutex<std::collections::HashSet<(String, DateTime<Utc>)>>;
+    std::sync::Mutex<std::collections::HashSet<(String, Timestamp)>>;
 
 pub(super) fn current_bounded_contexts() -> &'static CurrentBoundedContexts {
     static CURRENT: std::sync::OnceLock<CurrentBoundedContexts> = std::sync::OnceLock::new();
@@ -3371,7 +3373,7 @@ pub async fn ensure_event_read_token_start_from_column(
 pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::error::Result<()> {
     let schema = schema_ident(name);
     let mut tx = pool.begin().await?;
-    super::blobs::queue_blob_deletions(&mut tx, name, Utc::now()).await?;
+    super::blobs::queue_blob_deletions(&mut tx, name, Timestamp::now()).await?;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&mut *tx)
         .await?;
@@ -3432,7 +3434,7 @@ pub async fn hard_delete_bounded_context_with_trail(
     )))
     .fetch_all(&mut *tx)
     .await?;
-    super::blobs::queue_blob_deletions(&mut tx, name, Utc::now()).await?;
+    super::blobs::queue_blob_deletions(&mut tx, name, Timestamp::now()).await?;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&mut *tx)
         .await?;

@@ -208,7 +208,7 @@ pub fn all_events_field(n: &Naming) -> SubscriptionField {
                 event_types,
                 Some(from_sequence),
                 &[],
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )
             .map_err(to_graphql_error)?;
 
@@ -394,7 +394,7 @@ pub fn events_by_type_field(n: &Naming) -> SubscriptionField {
                 filters,
                 Some(from_sequence),
                 &[],
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )
             .map_err(to_graphql_error)?;
 

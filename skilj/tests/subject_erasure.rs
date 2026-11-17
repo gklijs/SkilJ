@@ -13,8 +13,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::SubsecRound;
 use http_body_util::BodyExt;
+use jiff_sqlx::ToSqlx;
 use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -199,8 +199,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 // --- JWKS test server + JWT signing ---
@@ -244,7 +250,7 @@ fn sign_jwt(subject: &str) -> String {
         "sub": subject,
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
         .expect("the test private key PEM is well-formed");
@@ -483,11 +489,11 @@ fn subject_erasure_end_to_end() {
                      VALUES ($1, 'EmailLater', $2, '[]'::jsonb, $3, $4, $5, 'pending', $6)"
                     )))
                     .bind(&id)
-                    .bind(test_now() + chrono::Duration::hours(1))
+                    .bind((test_now() + jiff::SignedDuration::from_hours(1)).to_sqlx())
                     .bind(&target)
                     .bind(command)
                     .bind(json!({ "email": "person@example.com", "user_id": user_id }).to_string())
-                    .bind(test_now())
+                    .bind(test_now().to_sqlx())
                     .execute(&pool)
                     .await
                     .unwrap();
@@ -818,7 +824,7 @@ fn forgetting_a_subject_forgets_its_pending_proposals() {
 
         // Forgotten without forgetSubject: caught when approving.
         let naming_44 = propose("44").await;
-        skilj_core::db::destroy_encryption_key(&pool, &bc_name, "user", "44", chrono::Utc::now())
+        skilj_core::db::destroy_encryption_key(&pool, &bc_name, "user", "44", jiff::Timestamp::now())
             .await
             .unwrap();
         // ...even after a later submission provisioned 44 a fresh key.

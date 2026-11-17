@@ -130,7 +130,7 @@ use async_nats::jetstream::consumer::Consumer;
 use async_nats::jetstream::context::Context as Jetstream;
 use async_nats::jetstream::message::PublishMessage;
 use async_nats::jetstream::Message as JetstreamMessage;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// A pull consumer, already bound to its own stream and subject filter
 /// at creation - see [`InboundMapping`]'s own doc comment for why
@@ -604,7 +604,7 @@ async fn report_parked_delivery(
     idempotency_key: Option<&str>,
     error: &str,
     attempt_count: u32,
-    first_failed_at: DateTime<Utc>,
+    first_failed_at: Timestamp,
 ) -> Result<(), BridgeError> {
     Ok(skilj_bridge::report_parked_delivery(
         http,
@@ -944,8 +944,11 @@ async fn handle_one<S: std::future::Future<Output = ()>>(
         }
         let backoff = match retry.on_failure(
             retry_policy,
-            Utc::now(),
-            |at| (Utc::now() - at).to_std().unwrap_or_default(),
+            Timestamp::now(),
+            |at| {
+                std::time::Duration::try_from(Timestamp::now().duration_since(at))
+                    .unwrap_or_default()
+            },
             // docs/architecture.md §161: no attempt spent, never parked.
             e.another_instance_can_do_it(),
             // Not JSON: no retry can change that (§144).

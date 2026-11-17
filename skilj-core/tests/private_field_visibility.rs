@@ -19,7 +19,7 @@
 //! `PrivateFieldGrant` itself is covered by `persistence.rs`'s existing
 //! whole-struct `assert_eq!` round-trip convention.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::access_control::{
     self, AccessLevel, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
@@ -33,8 +33,8 @@ use skilj_core::shared::{Metadata, PrivateField, PrivateFieldKind, TagMapping};
 // Fixtures
 // ---------------------------------------------------------------------
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 fn bounded_context() -> BoundedContext {
