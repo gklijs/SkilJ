@@ -17,7 +17,10 @@
 //! events. See docs/architecture.md §193.
 
 // Only the types and `deposit_through`; the rest is command_throughput's.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "this binary uses only the types and `deposit_through`; the rest is command_throughput's"
+)]
 mod deposit_bench;
 
 use deposit_bench::{deposit_through, now, Deposit, Deposited};

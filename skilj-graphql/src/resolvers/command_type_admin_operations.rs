@@ -6,6 +6,7 @@ use super::create_type_token_field;
 use crate::naming::Naming;
 use async_graphql::dynamic::Field;
 
+/// The `createCommandToken` mutation.
 pub fn create_command_token_field(n: &Naming) -> Field {
     create_type_token_field!(
         n,

@@ -111,7 +111,10 @@ pub struct SnapshotContext<'a> {
 /// database error) rolls the whole transaction back, sequence allocation
 /// included, rather than burning a sequence number on a write that never
 /// lands - the actual bug this function exists to close.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 #[tracing::instrument(
     skip_all,
     fields(
@@ -908,7 +911,10 @@ pub(super) enum DecideOutcome {
 /// `warm_up_event_types_and_encryption_keys`) and is grown in place for
 /// whatever a redispatch still needs - identical to how `submit_command`
 /// itself used to do this inline.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn decide_command_in_tx(
     conn: &mut sqlx::PgConnection,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
@@ -1426,7 +1432,10 @@ pub(super) async fn provision_encryption_subjects(
 /// call for `submit_command`'s own batch-of-one path, a shared
 /// [`SequencePool`] draw for `commit_command_batch`'s multi-command one) -
 /// this function itself never touches `{schema}.sequence` at all.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn finish_accepted_command_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
@@ -1575,7 +1584,10 @@ pub(super) async fn finish_accepted_command_in_tx(
 /// on top of it at all, so a real failure in either half rolls back that
 /// one, whole transaction, exactly as before this function was split in
 /// two.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn submit_one_command_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
@@ -2181,7 +2193,10 @@ pub(super) struct PlannedCommand {
 /// back the savepoint `tx` is and replays the batch one command at a time.
 /// A command's own failure to decide is not that: it is that command's
 /// result, as it would be in the per-command path.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn write_command_batch_as_set(
     tx: &mut Transaction<'_, Postgres>,
     savepoint: &mut AsSetSavepoint,
@@ -2926,7 +2941,10 @@ pub(super) async fn fold_events_into_sync_projections_in_tx(
 /// order, decided and written in its own savepoint, so a command that
 /// fails rolls back alone. Since docs/architecture.md §196 it is the
 /// fallback for a batch that couldn't be written as a set.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn commit_command_batch_per_command(
     tx: &mut Transaction<'static, Postgres>,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
@@ -3396,7 +3414,10 @@ pub enum DryRunDecision {
 /// event, as
 /// `process_command` stamps it: it is what an `Own` private field's
 /// default reader is decided by.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub async fn dry_run_command(
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
@@ -3543,7 +3564,10 @@ pub async fn dry_run_command(
 /// `fire_due_deadlines`) still call through here, deliberately - batching
 /// buys the least where a caller is already ticking on its own schedule
 /// rather than arriving as a burst of concurrent external requests.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub async fn decide_and_submit_command(
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
@@ -3602,7 +3626,10 @@ pub fn back_to_the_read(err: &crate::error::Error) -> bool {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn decide_and_submit_command_once(
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,

@@ -700,6 +700,10 @@ pub fn mapping_holds_capability(mapping: &RoleAccessMapping, required: Option<&s
 /// Who is changing a grant's capabilities (`rule GrantCapabilityAsSuperadmin`
 /// and `rule GrantCapabilityAsAdmin`, and their revoke twins).
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "#[non_exhaustive] would break 0.4's semver; add it with the next minor release"
+)]
 pub enum CapabilityActor<'a> {
     /// A superadmin Role: any grant, any well-formed name, its own grant
     /// included.
@@ -1276,7 +1280,10 @@ pub fn revoke_role(
 /// exists RoleAccessMapping{role, bounded_context, status: active}`
 /// check - same full-snapshot treatment as `create_role`'s
 /// `existing_roles`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn grant_role_access_mapping(
     caller: &Role,
     role: &Role,
@@ -1729,7 +1736,10 @@ pub fn create_direct_creation_token(
 /// (`StartAtSequenceMismatch`/`StartAtTimeMismatch`/`StartAtValueNotAllowed`)
 /// rather than silently resolved to some default - see those guards' own
 /// doc comment in the spec for why.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn create_event_read_token(
     access_mapping: &RoleAccessMapping,
     event_type: &crate::event_store::EventType,

@@ -8,7 +8,10 @@
 //! own doc comment) - factored into one place here since this crate,
 //! unlike the rest of the workspace, doesn't need to keep each test file
 //! independently copy-pasteable.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test binary that includes this module uses a different part of it"
+)]
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

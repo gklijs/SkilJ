@@ -22,9 +22,11 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+/// A whole `.skilj.toml` file: one bounded context's declared types.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedContextSpec {
+    /// The bounded context's name, checked against skilj's own naming rule.
     pub bounded_context: String,
     /// `Vec` field name stays plural (idiomatic Rust); the TOML key is
     /// singular (`[[event_type]]`) since each array-of-tables block
@@ -32,6 +34,7 @@ pub struct BoundedContextSpec {
     /// itself uses (`[[bin]]`/`[[test]]`, not `[[bins]]`/`[[tests]]`).
     #[serde(default, rename = "event_type")]
     pub event_types: Vec<EventTypeSpec>,
+    /// One `[[command_type]]` block per command type.
     #[serde(default, rename = "command_type")]
     pub command_types: Vec<CommandTypeSpec>,
     /// One `[[blind_tag]]` per blind tag key (docs/architecture.md §205).
@@ -75,6 +78,8 @@ pub struct BlindTagSpec {
     /// `subject_tag` says otherwise - the plain tag key carrying the
     /// subject's value.
     pub subject: Option<String>,
+    /// For `erasure = "with_subject"`: the plain tag key carrying the
+    /// subject's value, when it isn't `subject` itself.
     pub subject_tag: Option<String>,
 }
 
@@ -84,9 +89,13 @@ fn first_version() -> u32 {
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// `BlindTag::ERASURE`: what forgetting a subject does to the hashes.
 #[non_exhaustive]
 pub enum ErasureSpec {
+    /// `Erasure::Keep`: the hash stays, so the value stays taken.
     Keep,
+    /// `Erasure::WithSubject`: forgetting the subject removes the hash,
+    /// so the value is free again.
     WithSubject,
 }
 
@@ -97,8 +106,11 @@ pub(crate) const NORMALIZERS: &[&str] = &["email", "compact_uppercase"];
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SensitiveSpec {
+    /// The payload field that is encrypted.
     pub field: String,
+    /// The namespace of the subject whose key encrypts it, e.g. `customer`.
     pub subject_key: String,
+    /// The payload field holding the subject's identifier, never encrypted.
     pub subject_field: String,
 }
 
@@ -112,10 +124,13 @@ pub struct BlobSpec {
     pub subject_field: String,
 }
 
+/// One `[[event_type]]` block: an `EventType` impl and its payload struct.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventTypeSpec {
+    /// The event type's name, also the generated Rust type's.
     pub name: String,
+    /// The payload's fields, in the order they are emitted.
     #[serde(default)]
     pub fields: Vec<FieldSpec>,
     /// `key -> field` - `TagMapping`'s own two-part shape. A `BTreeMap`,
@@ -134,12 +149,18 @@ pub struct EventTypeSpec {
     pub blobs: Vec<BlobSpec>,
 }
 
+/// One `[[command_type]]` block: a `CommandType` impl and its payload
+/// struct, its `decide()` delegating to a hand-written `decide_*` function.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandTypeSpec {
+    /// The command type's name, also the generated Rust type's.
     pub name: String,
+    /// The payload's fields, in the order they are emitted.
     #[serde(default)]
     pub fields: Vec<FieldSpec>,
+    /// `key -> field`, as `EventTypeSpec::tags`; also the consistency
+    /// tags unless `query` or `reads_nothing` says otherwise.
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
     /// See `EventTypeSpec::sensitive`.
@@ -148,6 +169,7 @@ pub struct CommandTypeSpec {
     /// See `EventTypeSpec::blobs`.
     #[serde(default)]
     pub blobs: Vec<BlobSpec>,
+    /// Whether REST command tokens may submit this type.
     #[serde(default)]
     pub rest_trigger_allowed: bool,
     /// `CommandType::consistency_query()` (docs/architecture.md §198), one
@@ -183,10 +205,13 @@ pub struct QueryItemSpec {
     pub latest: Option<u32>,
 }
 
+/// One payload field: `{ name, type }`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldSpec {
+    /// The field's name, on the wire and in Rust (`r#` for a keyword).
     pub name: String,
+    /// The field's type, `type` in TOML.
     #[serde(rename = "type")]
     pub ty: FieldType,
 }
@@ -201,8 +226,11 @@ pub struct FieldSpec {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum FieldType {
+    /// A `String`.
     String,
+    /// An `i64`.
     I64,
+    /// A `bool`.
     Bool,
     /// A `skilj_core::blob::BlobRef`: declared as a blob field of its type,
     /// with the subject `blobs` gives it, if any (docs/architecture.md §239).

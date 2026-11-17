@@ -67,7 +67,10 @@ impl EventType for OrderPlaced {
 }
 
 enum OrderEvent {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "the event enum's shape needs this variant; this test never reads its payload"
+    )]
     OrderPlaced(OrderPlacedPayload),
 }
 

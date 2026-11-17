@@ -265,7 +265,10 @@ pub fn private_fields_consumed(
 /// check in this function that needs more than the two looked-up rows,
 /// the same full-snapshot treatment `access_control::create_role`'s
 /// `existing_roles` gets elsewhere.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn register_projection(
     access_mapping: &RoleAccessMapping,
     bounded_context: &BoundedContext,

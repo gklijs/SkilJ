@@ -6,6 +6,11 @@
 //! the generated `BlindTag`, blind tag mappings and sensitive fields
 //! compile and work against a real Postgres.
 
+#![allow(
+    clippy::exhaustive_enums,
+    reason = "includes skilj-codegen's generated code, whose event enum is exhaustive"
+)]
+
 use skilj::{BlindIndexKey, KeyService, Skilj};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;

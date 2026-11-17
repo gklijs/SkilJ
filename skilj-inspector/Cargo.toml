@@ -25,3 +25,6 @@ serde_json.workspace = true
 [[bin]]
 name = "skilj-inspector"
 path = "src/main.rs"
+
+[lints]
+workspace = true

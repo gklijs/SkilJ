@@ -191,7 +191,10 @@ pub(crate) async fn fetch_projection_result(
 /// caller, and `query_projection`'s access checks. Shared by
 /// [`fetch_projection_result`] and `_entities`, which reads a whole page
 /// of rows at once (docs/architecture.md §199).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the request's state plus each input of the projection lookup"
+)]
 async fn projection_instance(
     state: &GraphqlState,
     access_mapping: &RoleAccessMapping,
@@ -307,6 +310,7 @@ pub(crate) async fn require_admitted(
     Err(refused)
 }
 
+/// The `projection` query.
 pub fn field(n: &Naming) -> Field {
     Field::new(
         n.root("projection"),

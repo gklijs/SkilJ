@@ -49,3 +49,6 @@ sqlx.workspace = true
 [[bin]]
 name = "server"
 path = "src/bin/server.rs"
+
+[lints]
+workspace = true

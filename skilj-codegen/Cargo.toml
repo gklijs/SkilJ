@@ -24,3 +24,6 @@ prettyplease.workspace = true
 [dev-dependencies]
 serde.workspace = true
 schemars.workspace = true
+
+[lints]
+workspace = true

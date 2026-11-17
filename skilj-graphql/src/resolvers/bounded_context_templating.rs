@@ -257,7 +257,10 @@ async fn apply_template_registrations(
 /// Factored out so the caller can wrap it: any `Err` here means a
 /// compensating `hard_delete_bounded_context_with_trail` runs before the error is
 /// propagated (ultra-review bug_002).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the request's state plus each input of the tenant's grant"
+)]
 async fn finish_creating_tenant(
     state: &GraphqlState,
     caller: &Role,

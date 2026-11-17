@@ -8,6 +8,7 @@ use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
+/// The `createExternalEventToken` mutation.
 pub fn create_external_event_token_field(n: &Naming) -> Field {
     create_type_token_field!(
         n,
@@ -20,6 +21,8 @@ pub fn create_external_event_token_field(n: &Naming) -> Field {
         skilj_core::db::insert_external_event_token
     )
 }
+
+/// The `createDirectCreationToken` mutation.
 pub fn create_direct_creation_token_field(n: &Naming) -> Field {
     create_type_token_field!(
         n,

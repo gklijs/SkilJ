@@ -80,7 +80,10 @@ impl EventType for MoneyDeposited {
 }
 
 enum BankingEvent {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "the event enum's shape needs this variant; this test never reads its payload"
+    )]
     MoneyDeposited(MoneyDepositedPayload),
 }
 
@@ -534,7 +537,10 @@ impl EventType for CaseNoteAdded {
 }
 
 enum CaseEvent {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "the event enum's shape needs this variant; this test never reads its payload"
+    )]
     CaseNoteAdded(CaseNotePayload),
 }
 

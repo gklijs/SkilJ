@@ -110,6 +110,14 @@ rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gklijs/SkilJ"
 
+# Lints every crate opts into with `[lints] workspace = true`. Kept to the
+# few that guard rules this workspace already follows (AGENTS.md): every
+# public enum of a library crate is `#[non_exhaustive]`, and every
+# suppression says why. CI's `-D warnings` makes them errors.
+[workspace.lints.clippy]
+exhaustive_enums = "warn"
+allow_attributes_without_reason = "warn"
+
 # Shared dependency versions across the workspace, so crates that share a
 # dependency (e.g. skilj-core and skilj-graphql both need serde) can't drift
 # to incompatible versions by accident. Individual crates pull these in with

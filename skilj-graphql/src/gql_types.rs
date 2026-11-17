@@ -117,6 +117,8 @@ fn optional_timestamp(t: Option<chrono::DateTime<chrono::Utc>>) -> Value {
     }
 }
 
+/// `status`'s value in GraphQL's `enum RoleStatus`;
+/// [`UNSUPPORTED_VALUE`] for a variant this surface predates.
 pub fn role_status_name(status: RoleStatus) -> &'static str {
     match status {
         RoleStatus::Active => "ACTIVE",
@@ -125,6 +127,8 @@ pub fn role_status_name(status: RoleStatus) -> &'static str {
     }
 }
 
+/// `level`'s value in GraphQL's `enum AccessLevel`;
+/// [`UNSUPPORTED_VALUE`] for a variant this surface predates.
 pub fn access_level_name(level: AccessLevel) -> &'static str {
     match level {
         AccessLevel::Read => "READ",
@@ -134,6 +138,8 @@ pub fn access_level_name(level: AccessLevel) -> &'static str {
     }
 }
 
+/// `status`'s value in GraphQL's `enum BoundedContextStatus`;
+/// [`UNSUPPORTED_VALUE`] for a variant this surface predates.
 pub fn bounded_context_status_name(status: BoundedContextStatus) -> &'static str {
     match status {
         BoundedContextStatus::Active => "ACTIVE",
@@ -151,6 +157,7 @@ pub fn role_status_enum(n: &Naming) -> async_graphql::dynamic::Enum {
         .item("REVOKED")
 }
 
+/// `enum AccessLevel`.
 pub fn access_level_enum(n: &Naming) -> async_graphql::dynamic::Enum {
     async_graphql::dynamic::Enum::new(n.ty("AccessLevel"))
         .item("READ")
@@ -158,6 +165,7 @@ pub fn access_level_enum(n: &Naming) -> async_graphql::dynamic::Enum {
         .item("ADMIN")
 }
 
+/// `enum BoundedContextStatus`.
 pub fn bounded_context_status_enum(n: &Naming) -> async_graphql::dynamic::Enum {
     async_graphql::dynamic::Enum::new(n.ty("BoundedContextStatus"))
         .item("ACTIVE")
@@ -176,6 +184,8 @@ pub fn missed_occurrence_policy_enum(n: &Naming) -> async_graphql::dynamic::Enum
         .item("REPLAY_BACKLOG")
 }
 
+/// `policy`'s value in GraphQL's `enum MissedOccurrencePolicy`;
+/// [`UNSUPPORTED_VALUE`] for a variant this surface predates.
 pub fn missed_occurrence_policy_name(policy: MissedOccurrencePolicy) -> &'static str {
     match policy {
         MissedOccurrencePolicy::Skip => "SKIP",
@@ -199,6 +209,8 @@ pub fn event_read_start_position_enum(n: &Naming) -> Enum {
         .item("AT_TIME")
 }
 
+/// `position`'s value in GraphQL's `enum EventReadStartPosition`;
+/// [`UNSUPPORTED_VALUE`] for a variant this surface predates.
 pub fn event_read_start_position_name(position: EventReadStartPosition) -> &'static str {
     match position {
         EventReadStartPosition::Beginning => "BEGINNING",
@@ -456,7 +468,9 @@ pub fn context_creator_object(n: &Naming) -> Object {
 /// stored field (the same "caller resolves it" treatment every
 /// relationship projection gets elsewhere in this codebase).
 pub struct BoundedContextWithMappings {
+    /// The bounded context itself.
     pub context: BoundedContext,
+    /// Its currently active access mappings.
     pub access_mappings: Vec<RoleAccessMapping>,
 }
 
@@ -479,6 +493,8 @@ pub fn bounded_context_object(n: &Naming) -> Object {
 // CommandTypeAdminOperations, TokenRevocation.
 // ---------------------------------------------------------------------
 
+/// `status`'s value in GraphQL's `enum AccessTokenStatus`;
+/// [`UNSUPPORTED_VALUE`] for a variant this surface predates.
 pub fn access_token_status_name(status: TokenStatus) -> &'static str {
     match status {
         TokenStatus::Active => "ACTIVE",
@@ -487,12 +503,15 @@ pub fn access_token_status_name(status: TokenStatus) -> &'static str {
     }
 }
 
+/// `enum AccessTokenStatus`.
 pub fn access_token_status_enum(n: &Naming) -> Enum {
     Enum::new(n.ty("AccessTokenStatus"))
         .item("ACTIVE")
         .item("REVOKED")
 }
 
+/// `status`'s value in GraphQL's `enum ProjectionRebuildStatus`;
+/// [`UNSUPPORTED_VALUE`] for a variant this surface predates.
 pub fn projection_rebuild_status_name(status: ProjectionRebuildStatus) -> &'static str {
     match status {
         ProjectionRebuildStatus::Pending => "PENDING",
@@ -501,6 +520,7 @@ pub fn projection_rebuild_status_name(status: ProjectionRebuildStatus) -> &'stat
     }
 }
 
+/// `enum ProjectionRebuildStatus`.
 pub fn projection_rebuild_status_enum(n: &Naming) -> Enum {
     Enum::new(n.ty("ProjectionRebuildStatus"))
         .item("PENDING")
@@ -520,6 +540,7 @@ pub fn tag_mapping_object(n: &Naming) -> Object {
     })
 }
 
+/// `type UsedTag`.
 pub fn used_tag_object(n: &Naming) -> Object {
     gql_object!(Tag => n.ty("UsedTag") {
         scalar "key": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.key.clone()),
@@ -527,6 +548,7 @@ pub fn used_tag_object(n: &Naming) -> Object {
     })
 }
 
+/// `input TagMappingInput`.
 pub fn tag_mapping_input(n: &Naming) -> InputObject {
     InputObject::new(n.ty("TagMappingInput"))
         .field(InputValue::new("key", TypeRef::named_nn(TypeRef::STRING)))
@@ -544,6 +566,7 @@ pub fn sensitive_field_object(n: &Naming) -> Object {
     })
 }
 
+/// `input SensitiveFieldInput`.
 pub fn sensitive_field_input(n: &Naming) -> InputObject {
     InputObject::new(n.ty("SensitiveFieldInput"))
         .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
@@ -585,6 +608,7 @@ pub fn private_field_object(n: &Naming) -> Object {
     })
 }
 
+/// `input PrivateFieldInput`.
 pub fn private_field_input(n: &Naming) -> InputObject {
     InputObject::new(n.ty("PrivateFieldInput"))
         .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
@@ -832,11 +856,15 @@ pub fn projection_rebuild_object(n: &Naming) -> Object {
 /// of.)
 #[derive(Clone)]
 pub struct ProjectionWithRebuild {
+    /// The projection itself.
     pub projection: Projection,
+    /// Its rebuild waiting to start, if any.
     pub pending_rebuild: Option<ProjectionRebuild>,
+    /// Its rebuild in progress, if any.
     pub building_rebuild: Option<ProjectionRebuild>,
 }
 
+/// `type Projection`.
 pub fn projection_object(n: &Naming) -> Object {
     gql_object!(ProjectionWithRebuild => n.ty("Projection") {
         scalar "name": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.projection.name.clone()),
@@ -862,11 +890,15 @@ pub fn projection_object(n: &Naming) -> Object {
 /// populated (`Created`/`ReconciledTrivially` fill `projection`,
 /// `RebuildStaged` fills `rebuild`; the other is always null).
 pub struct ProjectionRegistrationResult {
+    /// Which of the three outcomes it was, as the wire names it.
     pub outcome: &'static str,
+    /// The projection, for `Created` and `ReconciledTrivially`.
     pub projection: Option<ProjectionWithRebuild>,
+    /// The staged rebuild, for `RebuildStaged`.
     pub rebuild: Option<ProjectionRebuild>,
 }
 
+/// `type ProjectionRegistrationResult`.
 pub fn projection_registration_result_object(n: &Naming) -> Object {
     gql_object!(ProjectionRegistrationResult => n.ty("ProjectionRegistrationResult") {
         scalar "outcome": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.outcome),
@@ -888,6 +920,7 @@ pub fn parked_delivery_kind_name(kind: skilj_core::db::ParkedDeliveryKind) -> &'
     }
 }
 
+/// `enum ParkedDeliveryKind`.
 pub fn parked_delivery_kind_enum(n: &Naming) -> Enum {
     Enum::new(n.ty("ParkedDeliveryKind"))
         .item("CROSS_CONTEXT_ROUTE")
@@ -983,6 +1016,7 @@ macro_rules! token_object {
     };
 }
 
+/// `type ExternalEventToken`.
 pub fn external_event_token_object(n: &Naming) -> Object {
     token_object!(
         n,
@@ -994,6 +1028,7 @@ pub fn external_event_token_object(n: &Naming) -> Object {
     )
 }
 
+/// `type DirectCreationToken`.
 pub fn direct_creation_token_object(n: &Naming) -> Object {
     token_object!(
         n,
@@ -1038,6 +1073,7 @@ pub fn event_read_token_object(n: &Naming) -> Object {
     ))
 }
 
+/// `type CommandToken`.
 pub fn command_token_object(n: &Naming) -> Object {
     token_object!(
         n,
@@ -1067,6 +1103,7 @@ pub fn access_token_union(n: &Naming) -> Union {
 // Phase 3 additions: EventQuery, CommandQuery, CommandSubmission.
 // ---------------------------------------------------------------------
 
+/// `input TagInput`.
 pub fn tag_input(n: &Naming) -> InputObject {
     InputObject::new(n.ty("TagInput"))
         .field(InputValue::new("key", TypeRef::named_nn(TypeRef::STRING)))
@@ -1195,11 +1232,15 @@ pub fn event_meta_object(n: &Naming) -> Object {
 /// delivered alongside each other (see `event_store::EventInspected`'s
 /// own doc comment, which this mirrors on the wire).
 pub struct InspectedEventData {
+    /// The event as stored.
     pub event: skilj_core::event_store::Event,
+    /// Its payload rendered for the caller.
     pub rendered_payload: String,
+    /// Whether it stands, is retracted or is doubted.
     pub stance: skilj_core::retraction::EventStance,
 }
 
+/// `type InspectedEvent`.
 pub fn inspected_event_object(n: &Naming) -> Object {
     gql_object!(InspectedEventData => n.ty("InspectedEvent") {
         object "event": TypeRef::named_nn(n.ty("EventMeta")) => |i| Some(i.event.clone()),
@@ -1218,14 +1259,21 @@ pub fn inspected_event_object(n: &Naming) -> Object {
 /// only the in-process `SnapshotDispatcher` registry's own `tag_key`/
 /// `version` (see that resolver's own doc comment).
 pub struct InspectedSnapshotData {
+    /// The tag key the snapshot is kept per.
     pub tag_key: String,
+    /// The tag value this row is for.
     pub tag_value: String,
+    /// The snapshot impl's version the state was folded with.
     pub version: i64,
+    /// The last event sequence folded into the state.
     pub as_of_sequence: i64,
+    /// The folded state, as stored JSON.
     pub state: String,
+    /// When the row was last written.
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// `type InspectedSnapshot`.
 pub fn inspected_snapshot_object(n: &Naming) -> Object {
     gql_object!(InspectedSnapshotData => n.ty("InspectedSnapshot") {
         scalar "tagKey": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.tag_key.clone()),
@@ -1244,37 +1292,43 @@ pub fn inspected_snapshot_object(n: &Naming) -> Object {
 /// `to_graphql_error` as everywhere else in this crate).
 #[derive(Clone)]
 pub struct SubmitCommandResult {
+    /// Whether `decide()` accepted the command.
     pub accepted: bool,
+    /// The sequences of the events it produced; `None` unless accepted.
     pub triggered_event_sequences: Option<Vec<i64>>,
+    /// `decide()`'s human-readable reason, for a rejection.
     pub rejection_reason: Option<String>,
+    /// `decide()`'s machine-readable kind, for a rejection.
     pub rejection_kind: Option<String>,
-    // issue #7's DCB conflict visualizer - `Some` only on
-    // rejection (see the resolver's own construction of this struct for
-    // why `Accepted` gets `None`), the tag-scoped set `decide()`
-    // actually evaluated against for the rejection that governed.
+    /// issue #7's DCB conflict visualizer - `Some` only on
+    /// rejection (see the resolver's own construction of this struct for
+    /// why `Accepted` gets `None`), the tag-scoped set `decide()`
+    /// actually evaluated against for the rejection that governed.
     pub matching_events: Option<Vec<skilj_core::event_store::Event>>,
     /// Alongside `matching_events`: whether events the caller may see
     /// were left out for `max_events_per_read` (docs/architecture.md
     /// §118). `None` whenever `matching_events` is.
     pub matching_events_truncated: Option<bool>,
-    // issue #12: `true` only when an `idempotencyKey` was given
-    // and it matched a prior `Accepted` outcome - `triggered_event_sequences`
-    // is that prior outcome's, not a fresh decision. Always `false` when
-    // no key was given, matching today's behaviour exactly.
+    /// issue #12: `true` only when an `idempotencyKey` was given
+    /// and it matched a prior `Accepted` outcome - `triggered_event_sequences`
+    /// is that prior outcome's, not a fresh decision. Always `false` when
+    /// no key was given, matching today's behaviour exactly.
     pub deduplicated: bool,
-    // issue #18: the resulting Command's own correlation_id -
-    // the caller's, if it supplied one, or generated server-side
-    // otherwise. `None` for a rejection (nothing was stored) and for a
-    // deduplicated outcome (the cached prior answer doesn't carry it -
-    // see the resolver's own construction of this struct).
+    /// issue #18: the resulting Command's own correlation_id -
+    /// the caller's, if it supplied one, or generated server-side
+    /// otherwise. `None` for a rejection (nothing was stored) and for a
+    /// deduplicated outcome (the cached prior answer doesn't carry it -
+    /// see the resolver's own construction of this struct).
     pub correlation_id: Option<String>,
-    // issue #98: `true` when the command became a proposal
-    // instead of being decided. `proposal_id` names it; `accepted` is
-    // false in that case (nothing was accepted yet).
+    /// issue #98: `true` when the command became a proposal
+    /// instead of being decided. `proposal_id` names it; `accepted` is
+    /// false in that case (nothing was accepted yet).
     pub pending_approval: bool,
+    /// The proposal's id, when `pending_approval`.
     pub proposal_id: Option<String>,
 }
 
+/// `type SubmitCommandPayload`.
 pub fn submit_command_payload_object(n: &Naming) -> Object {
     // `triggeredEventSequences` is a nullable *list of scalars*, and
     // `matchingEvents` a nullable *list of objects* -
@@ -1352,10 +1406,13 @@ pub fn submit_command_input(n: &Naming) -> InputObject {
 /// `submitCommand` would have answered it with in `errors`.
 #[derive(Clone)]
 pub struct BatchItemError {
+    /// The error's stable code, as `extensions.code` would carry it.
     pub code: String,
+    /// The error's message.
     pub message: String,
 }
 
+/// `type BatchItemError`.
 pub fn batch_item_error_object(n: &Naming) -> Object {
     gql_object!(BatchItemError => n.ty("BatchItemError") {
         scalar "code": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.code.clone()),
@@ -1367,10 +1424,13 @@ pub fn batch_item_error_object(n: &Naming) -> Object {
 /// `submitCommand` would have answered, and `error`, the error it would
 /// have answered with instead.
 pub struct SubmitCommandsItem {
+    /// The command's result, when it didn't fail on its own.
     pub result: Option<SubmitCommandResult>,
+    /// The command's error, when it did.
     pub error: Option<BatchItemError>,
 }
 
+/// `type SubmitCommandsItem`.
 pub fn submit_commands_item_object(n: &Naming) -> Object {
     gql_object!(SubmitCommandsItem => n.ty("SubmitCommandsItem") {
         object "result": TypeRef::named(n.ty("SubmitCommandPayload")) => |i| i.result.clone(),
@@ -1383,10 +1443,14 @@ pub fn submit_commands_item_object(n: &Naming) -> Object {
 /// `fetchCommands` applies to a real `Command`.
 #[derive(Clone)]
 pub struct CommandProposalData {
+    /// The proposal as stored.
     pub proposal: CommandProposal,
+    /// Its payload rendered for the reader.
     pub payload: String,
 }
 
+/// `status`'s value in GraphQL's `enum CommandProposalStatus`;
+/// [`UNSUPPORTED_VALUE`] for a variant this surface predates.
 pub fn command_proposal_status_name(status: CommandProposalStatus) -> &'static str {
     match status {
         CommandProposalStatus::Pending => "PENDING",
@@ -1399,6 +1463,7 @@ pub fn command_proposal_status_name(status: CommandProposalStatus) -> &'static s
     }
 }
 
+/// `enum CommandProposalStatus`.
 pub fn command_proposal_status_enum(n: &Naming) -> Enum {
     Enum::new(n.ty("CommandProposalStatus"))
         .item("PENDING")
@@ -1415,13 +1480,20 @@ pub fn command_proposal_status_enum(n: &Naming) -> Enum {
 /// (or a deduplicated one); a `decide()` rejection comes back as
 /// `accepted: false` with the rejection reason/kind.
 pub struct CommandProposalDecisionResult {
+    /// The proposal after the decision.
     pub proposal: CommandProposalData,
+    /// Whether approval produced a command.
     pub accepted: bool,
+    /// `decide()`'s human-readable reason, for a rejection.
     pub rejection_reason: Option<String>,
+    /// `decide()`'s machine-readable kind, for a rejection.
     pub rejection_kind: Option<String>,
+    /// The sequences of the events the command produced; `None` unless
+    /// accepted.
     pub triggered_event_sequences: Option<Vec<i64>>,
 }
 
+/// `type CommandProposal`.
 pub fn command_proposal_object(n: &Naming) -> Object {
     gql_object!(CommandProposalData => n.ty("CommandProposal") {
         scalar "id": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.proposal.id.clone()),
@@ -1442,6 +1514,7 @@ pub fn command_proposal_object(n: &Naming) -> Object {
     })
 }
 
+/// `type CommandProposalDecisionPayload`.
 pub fn command_proposal_decision_object(n: &Naming) -> Object {
     gql_object!(CommandProposalDecisionResult => n.ty("CommandProposalDecisionPayload") {
         scalar "accepted": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.accepted),
@@ -1481,17 +1554,23 @@ pub fn command_proposal_decision_object(n: &Naming) -> Object {
 /// unlike `SubmitCommandPayload` it always carries the matching events,
 /// accepted or not.
 pub struct DryRunCommandResult {
+    /// Whether `decide()` would accept the command.
     pub accepted: bool,
+    /// `decide()`'s human-readable reason, for a rejection.
     pub rejection_reason: Option<String>,
+    /// `decide()`'s machine-readable kind, for a rejection.
     pub rejection_kind: Option<String>,
     /// Empty on a rejection. Each one's payload already rendered
     /// (`event_store::render_would_be_event`).
     pub events: Vec<skilj_core::event_store::WouldBeEvent>,
     /// Rendered and scoped as `SubmitCommandPayload.matchingEvents`.
     pub matching_events: Vec<skilj_core::event_store::Event>,
+    /// Whether events the caller may see were left out of
+    /// `matching_events` for `max_events_per_read`.
     pub matching_events_truncated: bool,
 }
 
+/// `type DryRunCommandPayload`.
 pub fn dry_run_command_payload_object(n: &Naming) -> Object {
     gql_object!(DryRunCommandResult => n.ty("DryRunCommandPayload") {
         scalar "accepted": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.accepted),
@@ -1514,6 +1593,8 @@ pub fn would_be_event_object(n: &Naming) -> Object {
     })
 }
 
+/// `status`'s value in GraphQL's `enum EncryptionKeyStatus`;
+/// [`UNSUPPORTED_VALUE`] for a variant this surface predates.
 pub fn encryption_key_status_name(status: EncryptionKeyStatus) -> &'static str {
     match status {
         EncryptionKeyStatus::Active => "ACTIVE",
@@ -1522,6 +1603,7 @@ pub fn encryption_key_status_name(status: EncryptionKeyStatus) -> &'static str {
     }
 }
 
+/// `enum EncryptionKeyStatus`.
 pub fn encryption_key_status_enum(n: &Naming) -> Enum {
     Enum::new(n.ty("EncryptionKeyStatus"))
         .item("ACTIVE")
@@ -1561,6 +1643,7 @@ pub fn filter_operator_enum(n: &Naming) -> Enum {
         .item("IN")
 }
 
+/// `input FilterInput`.
 pub fn filter_input(n: &Naming) -> InputObject {
     InputObject::new(n.ty("FilterInput"))
         .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))

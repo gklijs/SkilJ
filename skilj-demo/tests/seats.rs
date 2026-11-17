@@ -4,6 +4,11 @@
 //! from the generated `retractable` commands. The rest is proof that the
 //! generated built-ins and queries compile and work against a real Postgres.
 
+#![allow(
+    clippy::exhaustive_enums,
+    reason = "includes skilj-codegen's generated code, whose event enum is exhaustive"
+)]
+
 use skilj::retraction::{
     corrected, doubt, open_doubts, standing, Retractable, RetractionGround, ValueClaims,
     ValueEffect,

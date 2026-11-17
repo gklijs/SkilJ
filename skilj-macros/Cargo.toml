@@ -16,3 +16,6 @@ proc-macro = true
 [dependencies]
 syn = { workspace = true, features = ["full"] }
 quote.workspace = true
+
+[lints]
+workspace = true

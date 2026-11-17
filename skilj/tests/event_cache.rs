@@ -56,7 +56,10 @@ enum OrderEvent {
     // never destructures the payload - so this field is structurally
     // required (matches `BoundedContextEvent`'s own shape) but never
     // read.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "the event enum's shape needs this variant; this test never reads its payload"
+    )]
     OrderShipped(OrderShippedPayload),
 }
 

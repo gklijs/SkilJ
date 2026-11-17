@@ -290,7 +290,10 @@ impl CommandBatcher {
     /// for why joining that queue never changes what a caller observes,
     /// only how many other commands happen to share the lock acquisition
     /// that produces its result.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+    )]
     pub async fn submit(
         &self,
         pool: &Pool,
@@ -356,7 +359,10 @@ impl CommandBatcher {
     /// `now` is retained for both optimistic and locked decisions. No command
     /// is persisted until [`submit_prepared`](Self::submit_prepared) is called;
     /// key warm-up may provision encryption keys, as in `decide_and_submit`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+    )]
     pub async fn prepare_command(
         &self,
         pool: &Pool,
@@ -421,7 +427,10 @@ impl CommandBatcher {
     /// Unlike [`decide_and_submit`](Self::decide_and_submit), this low-level
     /// method returns errors requiring a fresh optimistic read to the caller;
     /// use [`crate::db::back_to_the_read`] to identify them and prepare again.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+    )]
     pub async fn submit_prepared(
         &self,
         pool: &Pool,
@@ -456,7 +465,10 @@ impl CommandBatcher {
     /// whichever one becomes leader, serially, for the whole batch. See
     /// `db::warm_up_event_types_and_encryption_keys`'s own doc comment for
     /// why this is always safe.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the command's own fields plus the pool and key service it is prepared with"
+    )]
     async fn prepare(
         pool: &Pool,
         command_type: &CommandType,
@@ -512,7 +524,10 @@ impl CommandBatcher {
     /// caller queues lands between them in the queue - and becomes the
     /// leader if the queue was empty. One reply per command, in the same
     /// order.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+    )]
     async fn enqueue(
         &self,
         pool: &Pool,
@@ -609,7 +624,10 @@ impl CommandBatcher {
     /// whose blind tags a key rotation made stale (§209) is answered with
     /// that error rather than submitted again: submitted again, it would
     /// land after the commands that followed it.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+    )]
     pub async fn decide_and_submit_many(
         &self,
         pool: &Pool,
@@ -695,7 +713,10 @@ impl CommandBatcher {
     /// own doc comment for why the lower-volume, periodic internal
     /// callers (the cross-context router's tick, `fire_due_deadlines`)
     /// deliberately still call that one directly instead.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+    )]
     pub async fn decide_and_submit(
         &self,
         pool: &Pool,
@@ -743,7 +764,10 @@ impl CommandBatcher {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+    )]
     async fn decide_and_submit_once(
         &self,
         pool: &Pool,
@@ -823,7 +847,10 @@ impl CommandBatcher {
     ///   (a retryable `BatchFailed`) and empties the queue, so the next
     ///   caller becomes a fresh leader instead of every later caller
     ///   hanging forever.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+    )]
     async fn run_as_leader(
         &self,
         pool: &Pool,

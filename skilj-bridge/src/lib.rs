@@ -19,6 +19,9 @@
 //! Speaks skilj's wire protocol only - no dependency on `skilj-core` -
 //! the same posture every bridge crate has.
 
+// Every public item is documented; CI fails on a gap (`-D warnings`).
+#![warn(missing_docs)]
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
@@ -53,9 +56,13 @@ pub fn http_client_with_timeout(timeout: std::time::Duration) -> reqwest::Client
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumedEvent {
+    /// The event's position in its bounded context's history.
     pub sequence: i64,
+    /// The event type's name.
     pub event_type: String,
+    /// The event's payload, as skilj serves it to this token.
     pub payload: serde_json::Value,
+    /// The event's consistency tags.
     pub tags: Vec<Tag>,
     /// Defaults to no ids when a response leaves it out.
     #[serde(default)]
@@ -67,13 +74,19 @@ pub struct ConsumedEvent {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumedEventMetadata {
+    /// The correlation id the event was written with, if any.
     pub correlation_id: Option<String>,
+    /// The causation id the event was written with, if any.
     pub causation_id: Option<String>,
 }
 
+/// One of a [`ConsumedEvent`]'s consistency tags.
 #[derive(Debug, Deserialize)]
 pub struct Tag {
+    /// The tag's key.
     pub key: String,
+    /// The tag's value; `None` when the payload field it maps from was
+    /// absent at write time.
     pub value: Option<String>,
 }
 
@@ -81,6 +94,7 @@ pub struct Tag {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumeResponse {
+    /// The events served, in sequence order.
     pub events: Vec<ConsumedEvent>,
     /// The `EventReadToken`'s own scoped event type, echoed back on every
     /// response - [`consume`] checks it against the mapping's.
@@ -109,11 +123,16 @@ pub fn correlation_key(key_tag_key: Option<&str>, tags: &[Tag]) -> Option<String
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SkiljError {
+    /// The request didn't get an answer: connecting, sending, a timeout,
+    /// or a body that didn't decode.
     #[error("calling skilj's own REST surface: {0}")]
     Http(#[from] reqwest::Error),
+    /// skilj answered with a status other than success.
     #[error("skilj returned {status}: {body}")]
     SkiljStatus {
+        /// The HTTP status skilj answered with.
         status: reqwest::StatusCode,
+        /// The response body, which carries skilj's error `code`.
         body: String,
     },
     /// A mapping's declared event type doesn't match what the
@@ -123,7 +142,12 @@ pub enum SkiljError {
         "OutboundMapping declares event_type \"{declared}\", but its own credential is scoped \
          to \"{actual}\" - wrong token for this mapping"
     )]
-    EventTypeMismatch { declared: String, actual: String },
+    EventTypeMismatch {
+        /// The event type the mapping declares.
+        declared: String,
+        /// The event type the token actually serves.
+        actual: String,
+    },
 }
 
 impl SkiljError {
@@ -243,6 +267,7 @@ pub struct InboundMapping {
     /// A credential scoped to whichever `action` needs it -
     /// `ExternalEventToken` for `Record`, `CommandToken` for `Trigger`.
     pub credential: String,
+    /// What the address's messages become in skilj.
     pub action: InboundAction,
     /// The message's fields to store as blobs (docs/architecture.md §239),
     /// `None` for none. Everything else stays in the payload, and a payload
@@ -422,12 +447,18 @@ pub enum InboundAction {
     /// fact. Redelivery-safe via the `dedupe` mechanism
     /// (docs/architecture.md §39) where the broker supplies an ordered
     /// sequence.
-    Record { event_type: String },
+    Record {
+        /// The event type the `ExternalEventToken` is scoped to.
+        event_type: String,
+    },
     /// `POST /v1/commands/trigger` - decide on the message via a real
     /// `decide()`. Redelivery-safe via `Idempotency-Key` (§21),
     /// `client_id`-scoped (§37) so a mapping's inbound traffic can never
     /// collide with an unrelated caller's.
-    Trigger { command_type: String },
+    Trigger {
+        /// The command type the `CommandToken` is scoped to.
+        command_type: String,
+    },
 }
 
 impl InboundAction {
@@ -578,6 +609,7 @@ pub struct InboundBatcher {
 }
 
 impl InboundBatcher {
+    /// Starts at `batching`'s batch size, at least one message.
     pub fn new(batching: InboundBatching) -> Self {
         InboundBatcher {
             linger: batching.linger,
@@ -605,7 +637,9 @@ impl InboundBatcher {
 /// One message of a batch: the body [`post_inbound`] would send for it
 /// alone, and the `Idempotency-Key` it would carry.
 pub struct InboundItem<'a> {
+    /// The request body for this message alone.
     pub body: &'a serde_json::Value,
+    /// The `Idempotency-Key` this message carries, if its action uses one.
     pub idempotency_key: Option<&'a str>,
 }
 
@@ -736,7 +770,10 @@ pub async fn post_inbound_batch(
 /// the key it was sent with (through [`wire_idempotency_key`], as
 /// [`post_inbound`] sends it), both stored so a later
 /// `retryParkedDelivery` redrives the identical request.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the HTTP client, skilj URL and mapping, plus the message's own fields"
+)]
 pub async fn report_parked_delivery(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -1107,7 +1144,10 @@ where
 /// backoff. An exhausted retry policy gives up the way a failed delivery
 /// does - by acknowledging anyway - so a failure of that last attempt is
 /// returned as the cycle's error.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the HTTP client, skilj URL and mapping, plus the message's own fields"
+)]
 async fn flush_run<E: std::fmt::Display + From<SkiljError>>(
     http: &reqwest::Client,
     skilj_base_url: &str,

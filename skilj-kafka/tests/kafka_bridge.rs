@@ -425,7 +425,6 @@ async fn batch(state: &MockSkiljState, items: Vec<Value>, external: bool) -> Jso
             );
             continue;
         }
-        #[allow(unused_mut)]
         let mut headers = HeaderMap::new();
         if let Some(Value::String(key)) = item
             .as_object_mut()

@@ -393,7 +393,10 @@ pub(super) struct CatchUpChunkTarget<'a> {
 /// the chunk stalled every write folding into it, under the sequence
 /// lock. Promotion doesn't wait for a chunk either; see
 /// [`promote_projection_rebuild`].
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn fold_catch_up_chunk(
     pool: &Pool,
     bounded_context: &str,
@@ -425,7 +428,10 @@ pub(super) async fn fold_catch_up_chunk(
 
 /// [`fold_catch_up_chunk`]'s body - `reached` is the index of the event
 /// being folded, `0` outside the fold itself.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn fold_catch_up_chunk_in_tx(
     pool: &Pool,
     bounded_context: &str,
@@ -806,7 +812,10 @@ pub(super) async fn write_chunk_states(
 /// never a correctness risk, since `as_of_sequence` still skips every
 /// already-folded key/event pair it re-scans. Not worth promotion-side
 /// bookkeeping to close for what is a rare, self-correcting cost.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn catch_up_partitioned_projection(
     pool: &Pool,
     bounded_context: &str,
@@ -1128,7 +1137,10 @@ pub(super) struct SnapshotChunkRow {
 /// `reached` is set to the index in `events` of the event a failing fold
 /// was folding, and left alone otherwise - see
 /// [`CatchUpChunkFailure`].
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn fold_snapshot_chunk_in_tx(
     conn: &mut sqlx::PgConnection,
     bc: &BoundedContext,
@@ -1315,7 +1327,10 @@ pub(super) async fn fold_snapshot_chunk_in_tx(
 /// before its end, and moves their progress to its end, in one
 /// transaction (docs/architecture.md §197). Snapshots go by name, so two
 /// instances' chunks lock their rows in the same order.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn fold_snapshots_chunk(
     pool: &Pool,
     bc: &BoundedContext,
@@ -1378,7 +1393,10 @@ pub(super) async fn fold_snapshots_chunk(
 /// events at or after the failing one: the event at which the per-event
 /// loop would have reached it, and failed - the first chunk event for
 /// history from before the chunk.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn refold_snapshot_histories(
     conn: &mut sqlx::PgConnection,
     bc: &BoundedContext,
@@ -1659,7 +1677,10 @@ pub async fn catch_up_snapshots(
 /// no GraphQL-exposed `caughtUpTo` field the way `Projection` does, but
 /// `resolve_snapshot_context`'s own correctness already depends on
 /// `snapshots.as_of_sequence` per row, untouched by any of this).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn catch_up_partitioned_snapshot(
     pool: &Pool,
     bounded_context: &str,

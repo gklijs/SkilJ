@@ -370,7 +370,10 @@ fn decrypting_stream(
 /// under that subject's data key, and the reference's `sha256` is of those
 /// stored bytes: it must say nothing about the content once the key is
 /// gone (docs/architecture.md §239).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub async fn upload_blob(
     pool: &Pool,
     store: &dyn BlobStore,

@@ -275,7 +275,10 @@ pub async fn revoke_access_token(
 /// in memory by the caller to hand back once) - only `hash_secret`'s
 /// output of it is ever written, per `AccessToken.secret`'s own "stored
 /// hashed and never compared in plaintext" text.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub(super) async fn insert_access_token_row(
     pool: &Pool,
     id: &str,

@@ -18,7 +18,10 @@ use std::sync::Arc;
 /// matters).
 #[derive(Clone)]
 pub struct Identity {
+    /// The identity provider's issuer, audiences, signing algorithm and
+    /// key endpoint.
     pub config: IdpConfig,
+    /// The provider's signing keys, cached and shared across requests.
     pub cache: Arc<JwksCache>,
 }
 

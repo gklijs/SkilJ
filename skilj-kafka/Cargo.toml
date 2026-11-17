@@ -72,3 +72,6 @@ path = "src/lib.rs"
 testcontainers-modules = { version = "0.15", features = ["kafka"] }
 skilj-test-support = { path = "../skilj-test-support" }
 axum = { workspace = true }
+
+[lints]
+workspace = true

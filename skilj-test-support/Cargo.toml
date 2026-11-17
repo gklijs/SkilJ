@@ -12,3 +12,6 @@ publish = false
 postgresql_embedded = "0.22"
 sqlx.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true
