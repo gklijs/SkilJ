@@ -178,14 +178,14 @@ fn a_superadmin_cannot_really_add_a_bounded_context_named_admin() {
             name: "Superadmin".to_string(),
             superadmin: true,
             status: skilj_core::access_control::RoleStatus::Active,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             revoked_at: None,
         };
         let result = bootstrap::add_bounded_context(
             &caller,
             bootstrap::ADMIN_BOUNDED_CONTEXT_NAME.to_string(),
             &existing_contexts,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         assert!(matches!(
             result,

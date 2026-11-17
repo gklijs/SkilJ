@@ -13,7 +13,7 @@
 //! comment at the bottom of this file for why that reasoning is now
 //! stale, and where these three are actually exercised today.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use proptest::prelude::*;
 use skilj_core::access_control::{self, EventReadStartPosition, EventReadToken, TokenStatus};
 use skilj_core::error::SkiljRejection;
@@ -108,8 +108,8 @@ fn event(event_type: EventType, sequence: i64) -> Event {
     }
 }
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 /// `consume_events`'s own `checkout_lease` parameter (issue #25,
@@ -117,14 +117,14 @@ fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
 /// own spec default and `SkiljBuilder::read_cursor_checkout_lease`'s own
 /// Rust default, so a test relying on this fixture is exercising the
 /// same real-world value a default deployment would.
-fn checkout_lease() -> chrono::Duration {
-    chrono::Duration::minutes(5)
+fn checkout_lease() -> jiff::SignedDuration {
+    jiff::SignedDuration::from_mins(5)
 }
 
 /// `event()` above with a caller-chosen `metadata.created_at`, for
 /// `at_time` fixtures that need to distinguish events by when they
 /// happened rather than only by their own sequence.
-fn event_at(event_type: EventType, sequence: i64, created_at: chrono::DateTime<Utc>) -> Event {
+fn event_at(event_type: EventType, sequence: i64, created_at: jiff::Timestamp) -> Event {
     Event {
         metadata: skilj_core::shared::Metadata {
             created_at,
@@ -925,7 +925,7 @@ proptest! {
                 ack_mode,
                 &[],
                 &[],
-                Utc::now(),
+                Timestamp::now(),
                 checkout_lease(),
             )
             .unwrap();
@@ -957,15 +957,9 @@ proptest! {
 fn consume_events_rejects_checkout_lease_timestamp_overflow() {
     let t = token(TokenStatus::Active, event_type(true));
     for (checked_out_at, lease) in [
-        (
-            chrono::DateTime::<Utc>::MAX_UTC,
-            chrono::Duration::seconds(1),
-        ),
-        (
-            chrono::DateTime::<Utc>::MIN_UTC,
-            chrono::Duration::seconds(-1),
-        ),
-        (timestamp(0), chrono::Duration::MAX),
+        (jiff::Timestamp::MAX, jiff::SignedDuration::from_secs(1)),
+        (jiff::Timestamp::MIN, jiff::SignedDuration::from_secs(-1)),
+        (timestamp(0), jiff::SignedDuration::MAX),
     ] {
         let existing = ReadCursor {
             token: t.clone(),

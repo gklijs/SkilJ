@@ -13,7 +13,7 @@ use crate::preflight::{
     InspectOptions, PendingMigration, PreflightReport, RecordedLevel, Refusal, Rewrite, RowCount,
     TableLock, Unknown, Verdict, MIN_COMPATIBLE_SCHEMA_LEVEL, REPORT_FORMAT, SCHEMA_LEVEL,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use sqlx::migrate::Migrator;
 use sqlx::PgConnection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -187,7 +187,7 @@ async fn recorded_level(conn: &mut PgConnection) -> crate::error::Result<Option<
     if !relation_exists(conn, "skilj_schema_compatibility").await? {
         return Ok(None);
     }
-    let row: Option<(i64, i64, String, DateTime<Utc>)> = sqlx::query_as(
+    let row: Option<(i64, i64, String, jiff_sqlx::Timestamp)> = sqlx::query_as(
         "SELECT level, min_compatible_level, upgraded_by, upgraded_at \
          FROM skilj_schema_compatibility WHERE id = 1",
     )
@@ -198,7 +198,7 @@ async fn recorded_level(conn: &mut PgConnection) -> crate::error::Result<Option<
             level,
             min_compatible_level,
             upgraded_by,
-            upgraded_at,
+            upgraded_at: upgraded_at.to_jiff(),
         },
     ))
 }
@@ -515,7 +515,7 @@ fn admin_placeholder() -> BoundedContext {
     BoundedContext {
         name: ADMIN_BOUNDED_CONTEXT_NAME.to_string(),
         status: BoundedContextStatus::Active,
-        created_at: DateTime::<Utc>::UNIX_EPOCH,
+        created_at: Timestamp::UNIX_EPOCH,
         created_by: ContextCreator::SystemCreator,
         template: None,
     }
@@ -602,7 +602,7 @@ async fn inspect_admin(
         for (role_id, bounded_context) in &active {
             let records =
                 super::access::access_event_records(&mut *conn, role_id, bounded_context).await?;
-            if !fold_access_events(&records, DateTime::<Utc>::MAX_UTC).held {
+            if !fold_access_events(&records, Timestamp::MAX).held {
                 count += 1;
             }
         }
@@ -1029,7 +1029,7 @@ pub async fn ensure_admin_bounded_context(pool: &Pool) -> crate::error::Result<(
         super::get_bounded_context(pool, crate::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME).await?;
     if let Some(admin_context) = crate::bootstrap::stamp_admin_bounded_context(
         existing_admin_context.as_ref(),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     ) {
         if let Err(e) = super::insert_bounded_context(pool, &admin_context).await {
             if super::get_bounded_context(pool, crate::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME)
@@ -1075,7 +1075,7 @@ mod tests {
             level: SCHEMA_LEVEL + 1,
             min_compatible_level: min,
             upgraded_by: "9.9.9".into(),
-            upgraded_at: Utc::now(),
+            upgraded_at: Timestamp::now(),
         };
         assert!(compatibility_refusal(Some(&record(SCHEMA_LEVEL)), &[99]).is_none());
         assert!(compatibility_refusal(Some(&record(SCHEMA_LEVEL + 1)), &[]).is_some());

@@ -57,8 +57,10 @@ pub(super) struct EventTypeRow {
     pub(super) system_triggered_allowed: bool,
     pub(super) system_triggered_schedule: Option<String>,
     pub(super) missed_occurrence_policy: Option<String>,
-    pub(super) schedule_position: Option<DateTime<Utc>>,
-    pub(super) last_fired_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) schedule_position: Option<Timestamp>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) last_fired_at: Option<Timestamp>,
     pub(super) event_read_allowed: bool,
     pub(super) private_fields: Json<Vec<PrivateField>>,
     pub(super) blob_fields: Json<Vec<crate::blob::BlobField>>,
@@ -149,8 +151,8 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
         et.missed_occurrence_policy
             .map(missed_occurrence_policy_to_str),
     )
-    .bind(et.schedule_position)
-    .bind(et.last_fired_at)
+    .bind(et.schedule_position.map(|t| t.to_sqlx()))
+    .bind(et.last_fired_at.map(|t| t.to_sqlx()))
     .bind(et.event_read_allowed)
     .bind(Json(&et.private_fields))
     .bind(Json(&et.blob_fields))
@@ -338,8 +340,8 @@ pub async fn fire_system_event(
     event_cache: &crate::event_cache::EventCache,
     bounded_context: &str,
     event_type_name: &str,
-    occurrence_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    occurrence_at: Timestamp,
+    now: Timestamp,
     key_service: Option<&KeyService>,
 ) -> crate::error::Result<Option<Event>> {
     let Some(unlocked_event_type) = get_event_type(pool, bounded_context, event_type_name).await?
@@ -428,8 +430,8 @@ pub async fn fire_system_event(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.event_types SET schedule_position = $1, last_fired_at = $2 WHERE name = $3"
     )))
-    .bind(new_position)
-    .bind(new_position)
+    .bind(new_position.to_sqlx())
+    .bind(new_position.to_sqlx())
     .bind(event_type_name)
     .execute(&mut *tx)
     .await?;
@@ -458,8 +460,8 @@ pub async fn skip_missed_occurrences_for_event_type(
     pool: &Pool,
     bounded_context: &str,
     event_type_name: &str,
-    now: DateTime<Utc>,
-) -> crate::error::Result<Option<DateTime<Utc>>> {
+    now: Timestamp,
+) -> crate::error::Result<Option<Timestamp>> {
     let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
         return Ok(None);
     };
@@ -483,7 +485,7 @@ pub async fn skip_missed_occurrences_for_event_type(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.event_types SET schedule_position = $1 WHERE name = $2"
     )))
-    .bind(new_position)
+    .bind(new_position.to_sqlx())
     .bind(event_type_name)
     .execute(&mut *tx)
     .await?;

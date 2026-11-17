@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{
@@ -47,8 +47,14 @@ async fn test_pool() -> Option<Pool> {
         .map(|db| db.pool.clone())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
@@ -142,8 +148,8 @@ fn schedule_info(bc_name: &'static str) -> ScheduleDeadlineInfo {
 /// `expires_at` (issue #97).
 struct SchedulesAt {
     info: ScheduleDeadlineInfo,
-    fire_at: chrono::DateTime<Utc>,
-    expires_at: Option<chrono::DateTime<Utc>>,
+    fire_at: jiff::Timestamp,
+    expires_at: Option<jiff::Timestamp>,
 }
 
 impl ScheduleDeadlineDispatcher for SchedulesAt {
@@ -170,7 +176,7 @@ impl ScheduleDeadlineDispatcher for SchedulesAt {
 
 /// One recorded decision: the `now` it was made against, and, for a
 /// deadline firing, the deadline's context.
-type Recording = (chrono::DateTime<Utc>, Option<DeadlineContext>);
+type Recording = (jiff::Timestamp, Option<DeadlineContext>);
 
 /// Records the `DecisionContext` every decision is dispatched with, then
 /// rejects (an outcome the fire path treats as a settled, non-error one, so
@@ -312,9 +318,9 @@ async fn deadline_statuses(pool: &Pool, bc: &BoundedContext) -> Vec<String> {
 /// recorded and the row's status afterwards.
 async fn fire_one(
     pool: &Pool,
-    fire_at: chrono::DateTime<Utc>,
-    expires_at: Option<chrono::DateTime<Utc>>,
-    tick: chrono::DateTime<Utc>,
+    fire_at: jiff::Timestamp,
+    expires_at: Option<jiff::Timestamp>,
+    tick: jiff::Timestamp,
 ) -> (Vec<Recording>, String) {
     let bc = seed_bounded_context(pool).await;
     let placed = seed_event_type(pool, &bc).await;
@@ -362,8 +368,8 @@ fn a_deadline_row_stores_its_expiry() {
         let placed = seed_event_type(&pool, &bc).await;
         append(&pool, &placed).await;
         let name: &'static str = Box::leak(bc.name.clone().into_boxed_str());
-        let fire_at = test_now() + chrono::Duration::hours(1);
-        let expires_at = fire_at + chrono::Duration::minutes(5);
+        let fire_at = test_now() + jiff::SignedDuration::from_hours(1);
+        let expires_at = fire_at + jiff::SignedDuration::from_mins(5);
         let schedules = SchedulesAt {
             info: schedule_info(name),
             fire_at,
@@ -373,14 +379,16 @@ fn a_deadline_row_stores_its_expiry() {
         db::catch_up_schedule_deadline(&pool, &schedules.info, &schedules, &cache)
             .await
             .unwrap();
-        let stored: Option<chrono::DateTime<Utc>> =
-            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        let stored: Option<jiff::Timestamp> =
+            sqlx::query_scalar::<_, Option<jiff_sqlx::Timestamp>>(sqlx::AssertSqlSafe(format!(
                 "SELECT expires_at FROM \"bc_{}\".deadlines LIMIT 1",
                 bc.name
             )))
             .fetch_optional(&pool)
             .await
-            .unwrap();
+            .unwrap()
+            .flatten()
+            .map(jiff_sqlx::Timestamp::to_jiff);
         assert_eq!(stored, Some(expires_at));
     });
 }
@@ -395,8 +403,8 @@ fn a_late_fire_hands_decide_an_expired_deadline() {
             return;
         };
         let base = test_now();
-        let fire_at = base - chrono::Duration::seconds(2);
-        let expires_at = base - chrono::Duration::seconds(1);
+        let fire_at = base - jiff::SignedDuration::from_secs(2);
+        let expires_at = base - jiff::SignedDuration::from_secs(1);
         let (calls, status) = fire_one(&pool, fire_at, Some(expires_at), base).await;
         assert_eq!(status, "fired", "a rejection is still a settled fire");
         assert!(!calls.is_empty(), "the fire must reach the dispatcher");
@@ -418,8 +426,8 @@ fn an_on_time_fire_is_not_expired() {
             return;
         };
         let base = test_now();
-        let fire_at = base - chrono::Duration::seconds(1);
-        let expires_at = base + chrono::Duration::seconds(60);
+        let fire_at = base - jiff::SignedDuration::from_secs(1);
+        let expires_at = base + jiff::SignedDuration::from_secs(60);
         let (calls, status) = fire_one(&pool, fire_at, Some(expires_at), base).await;
         assert_eq!(status, "fired");
         assert!(!calls.is_empty());
@@ -440,7 +448,7 @@ fn a_deadline_without_an_expiry_is_never_expired() {
             return;
         };
         let base = test_now();
-        let fire_at = base - chrono::Duration::seconds(1);
+        let fire_at = base - jiff::SignedDuration::from_secs(1);
         let (calls, _) = fire_one(&pool, fire_at, None, base).await;
         assert!(!calls.is_empty());
         for (_, deadline) in calls {

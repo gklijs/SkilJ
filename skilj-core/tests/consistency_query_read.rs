@@ -17,7 +17,7 @@
 //! - **query**: the company's latest lifecycle event, and `TicketCreated`
 //!   for its own ticket id - two index lookups.
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_cache::EventCache;
@@ -137,8 +137,14 @@ async fn pool() -> Option<Pool> {
     Some(pool)
 }
 
-fn now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 fn event_type(bc: &BoundedContext, name: &str, tag_mappings: Vec<TagMapping>) -> EventType {
@@ -267,7 +273,7 @@ async fn time_reads(pool: &Pool, command_type: &CommandType) -> (Duration, usize
             &cache,
             command_type,
             payload,
-            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+            &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
         )
         .await
         .unwrap();

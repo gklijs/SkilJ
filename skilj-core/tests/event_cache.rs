@@ -10,7 +10,7 @@
 //! `seed_bounded_context`/`seed_order_shipped_event_type`'s own shape is
 //! borrowed from that file too.
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_cache::EventCache;
@@ -63,8 +63,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
@@ -608,7 +614,7 @@ fn a_scheduled_fire_does_not_change_the_registrations_stamp() {
             system_triggered_allowed: true,
             system_triggered_schedule: Some("0 * * * * *".to_string()),
             missed_occurrence_policy: Some(skilj_core::event_store::MissedOccurrencePolicy::Skip),
-            schedule_position: Some(test_now() - chrono::Duration::hours(1)),
+            schedule_position: Some(test_now() - jiff::SignedDuration::from_hours(1)),
             ..et
         };
         db::upsert_event_type(&pool, &scheduled).await.unwrap();

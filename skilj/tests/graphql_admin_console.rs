@@ -156,7 +156,7 @@ fn sign_jwt(subject: &str) -> String {
         "sub": subject,
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
         .expect("the test private key PEM is well-formed");
@@ -480,7 +480,7 @@ fn a_non_superadmin_cannot_tell_existing_bounded_contexts_from_missing_ones() {
         let (skilj, pool) = setup().await;
         let router = skilj.graphql_router().await.unwrap();
 
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let prober = skilj_core::access_control::Role {
             id: generate_token_id(),
             external_subject: unique_name("prober"),

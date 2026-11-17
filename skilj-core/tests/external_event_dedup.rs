@@ -10,7 +10,7 @@
 //! `skilj-core/tests/submit_command.rs` - see its own doc comment for
 //! the details, not repeated a third time here.
 
-use chrono::Utc;
+use jiff::Timestamp;
 use skilj_core::access_control::{self, DirectCreationToken, ExternalEventToken, TokenStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, CreateExternalEventOutcome, DedupeCursor, ExternalEventDedupe, Pool};
@@ -116,9 +116,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    use chrono::SubsecRound;
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
@@ -733,7 +738,7 @@ fn an_expired_message_key_no_longer_deduplicates() {
         let kept = db::delete_expired_external_message_keys(
             &pool,
             &bc.name,
-            test_now() - chrono::Duration::seconds(1),
+            test_now() - jiff::SignedDuration::from_secs(1),
             10,
         )
         .await
@@ -742,7 +747,7 @@ fn an_expired_message_key_no_longer_deduplicates() {
         let deleted = db::delete_expired_external_message_keys(
             &pool,
             &bc.name,
-            test_now() + chrono::Duration::seconds(1),
+            test_now() + jiff::SignedDuration::from_secs(1),
             10,
         )
         .await

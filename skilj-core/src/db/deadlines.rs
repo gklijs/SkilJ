@@ -36,7 +36,7 @@ pub(super) async fn update_deadline_cursor(
     bounded_context: &str,
     cursor_owner: &str,
     sequence: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -48,7 +48,7 @@ pub(super) async fn update_deadline_cursor(
     )))
     .bind(cursor_owner)
     .bind(sequence)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(pool)
     .await?;
     Ok(())
@@ -87,7 +87,7 @@ pub async fn catch_up_schedule_deadline(
             }
             crate::plugin::DeadlinePollStartFrom::AtSequence(n) => n,
             crate::plugin::DeadlinePollStartFrom::AtTime(unix_secs) => {
-                let threshold = DateTime::from_timestamp(unix_secs, 0).unwrap_or(Utc::now());
+                let threshold = Timestamp::new(unix_secs, 0).unwrap_or(Timestamp::now());
                 highest_sequence_of_type(
                     pool,
                     schedule.source_bounded_context,
@@ -102,7 +102,7 @@ pub async fn catch_up_schedule_deadline(
             schedule.source_bounded_context,
             schedule.name,
             seed,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
         return Ok(());
@@ -151,18 +151,9 @@ pub async fn catch_up_schedule_deadline(
                 // bug in `schedule()`, not a condition to retry.
                 let out_of_window = match &spec.recurrence {
                     Some(recurrence) => {
-                        spec.fire_at
-                            < recurrence
-                                .start_at
-                                .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
-                            || spec.fire_at
-                                > recurrence
-                                    .end_at
-                                    .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC)
-                            || spec.fire_at
-                                > recurrence
-                                    .valid_until
-                                    .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC)
+                        spec.fire_at < recurrence.start_at.unwrap_or(jiff::Timestamp::MIN)
+                            || spec.fire_at > recurrence.end_at.unwrap_or(jiff::Timestamp::MAX)
+                            || spec.fire_at > recurrence.valid_until.unwrap_or(jiff::Timestamp::MAX)
                     }
                     None => false,
                 };
@@ -209,19 +200,19 @@ pub async fn catch_up_schedule_deadline(
                     )))
                     .bind(&id)
                     .bind(schedule.name)
-                    .bind(spec.fire_at)
-                    .bind(spec.expires_at)
+                    .bind(spec.fire_at.to_sqlx())
+                    .bind(spec.expires_at.map(|t| t.to_sqlx()))
                     .bind(Json(&spec.tags))
                     .bind(event.metadata.correlation_id.as_deref())
                     .bind(schedule.target_bounded_context)
                     .bind(schedule.target_command_type)
                     .bind(&spec.payload_json)
-                    .bind(Utc::now())
+                    .bind(Timestamp::now().to_sqlx())
                     .bind(recurrence_schedule)
                     .bind(recurrence_policy)
-                    .bind(recurrence_start_at)
-                    .bind(recurrence_end_at)
-                    .bind(recurrence_valid_until)
+                    .bind(recurrence_start_at.map(|t| t.to_sqlx()))
+                    .bind(recurrence_end_at.map(|t| t.to_sqlx()))
+                    .bind(recurrence_valid_until.map(|t| t.to_sqlx()))
                     .bind(spec.recurrence.as_ref().map(|_| id.clone()))
                     .bind(spec.recurrence.as_ref().map(|_| 0_i64))
                     .execute(pool)
@@ -234,7 +225,7 @@ pub async fn catch_up_schedule_deadline(
             schedule.source_bounded_context,
             schedule.name,
             event.sequence,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
     }
@@ -248,7 +239,7 @@ pub async fn catch_up_schedule_deadline(
 pub(super) async fn cancel_backlog_start(
     pool: &Pool,
     cancel: &crate::plugin::CancelDeadlineInfo,
-) -> crate::error::Result<Option<DateTime<Utc>>> {
+) -> crate::error::Result<Option<Timestamp>> {
     // A cancel whose source bounded context was hard-deleted can never
     // cancel anything again, so there is nothing to wait for. Querying its
     // dropped schema instead failed every fire tick of the bounded context
@@ -265,14 +256,17 @@ pub(super) async fn cancel_backlog_start(
         .await?
         .unwrap_or(-1);
     let schema = schema_ident(cancel.source_bounded_context);
-    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT metadata_created_at FROM {schema}.events \
-         WHERE event_type_name = $1 AND sequence > $2 ORDER BY sequence LIMIT 1"
-    )))
-    .bind(cancel.source_event_type)
-    .bind(cursor)
-    .fetch_optional(pool)
-    .await?)
+    Ok(
+        sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(sqlx::AssertSqlSafe(format!(
+            "SELECT metadata_created_at FROM {schema}.events \
+             WHERE event_type_name = $1 AND sequence > $2 ORDER BY sequence LIMIT 1"
+        )))
+        .bind(cancel.source_event_type)
+        .bind(cursor)
+        .fetch_optional(pool)
+        .await?
+        .map(jiff_sqlx::Timestamp::to_jiff),
+    )
 }
 
 /// Where a `CancelDeadline`'s schedule still has work: the first of the
@@ -282,7 +276,7 @@ pub(super) async fn cancel_backlog_start(
 /// bounded contexts, where sequences aren't comparable.
 pub(super) enum ScheduleBacklogStart {
     Sequence(i64),
-    Time(DateTime<Utc>),
+    Time(Timestamp),
 }
 
 /// The start of `cancel`'s schedule's unprocessed backlog, or `None` when
@@ -300,7 +294,7 @@ pub(super) async fn deadline_schedule_backlog_start(
     .await?
     .unwrap_or(-1);
     let schema = schema_ident(cancel.deadline_schedule_bounded_context);
-    let first: Option<(i64, DateTime<Utc>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let first: Option<(i64, jiff_sqlx::Timestamp)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT sequence, metadata_created_at FROM {schema}.events \
          WHERE event_type_name = $1 AND sequence > $2 ORDER BY sequence LIMIT 1"
     )))
@@ -312,7 +306,7 @@ pub(super) async fn deadline_schedule_backlog_start(
         if cancel.deadline_schedule_bounded_context == cancel.source_bounded_context {
             ScheduleBacklogStart::Sequence(sequence)
         } else {
-            ScheduleBacklogStart::Time(created_at)
+            ScheduleBacklogStart::Time(created_at.to_jiff())
         }
     }))
 }
@@ -353,7 +347,7 @@ pub async fn catch_up_cancel_deadline(
             }
             crate::plugin::DeadlinePollStartFrom::AtSequence(n) => n,
             crate::plugin::DeadlinePollStartFrom::AtTime(unix_secs) => {
-                let threshold = DateTime::from_timestamp(unix_secs, 0).unwrap_or(Utc::now());
+                let threshold = Timestamp::new(unix_secs, 0).unwrap_or(Timestamp::now());
                 highest_sequence_of_type(
                     pool,
                     cancel.source_bounded_context,
@@ -368,7 +362,7 @@ pub async fn catch_up_cancel_deadline(
             cancel.source_bounded_context,
             cancel.name,
             seed,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
         return Ok(());
@@ -462,7 +456,7 @@ pub async fn catch_up_cancel_deadline(
                      payload = '{{}}' \
                      WHERE schedule_name = $2 AND status = 'pending' AND ({tag_clause})"
                 )))
-                .bind(Utc::now())
+                .bind(Timestamp::now().to_sqlx())
                 .bind(cancel.deadline_schedule_name);
                 for literal in tag_literals {
                     query = query.bind(literal);
@@ -475,7 +469,7 @@ pub async fn catch_up_cancel_deadline(
             cancel.source_bounded_context,
             cancel.name,
             event.sequence,
-            Utc::now(),
+            Timestamp::now(),
         )
         .await?;
     }
@@ -502,28 +496,34 @@ pub(super) const MAX_DUE_DEADLINES_PER_TICK: i64 = 1000;
 /// defense-in-depth `fire_due_deadlines`'s own doc comment already
 /// describes for the fire-vs-fire case this claim mechanism otherwise
 /// closes off entirely.
-pub(super) fn deadline_firing_claim_stale_after() -> chrono::Duration {
-    chrono::Duration::minutes(5)
+pub(super) fn deadline_firing_claim_stale_after() -> jiff::SignedDuration {
+    jiff::SignedDuration::from_mins(5)
 }
 
 #[derive(sqlx::FromRow)]
 pub(super) struct DueDeadlineRow {
     pub(super) id: String,
     pub(super) schedule_name: String,
-    pub(super) fire_at: DateTime<Utc>,
-    pub(super) expires_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) fire_at: Timestamp,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) expires_at: Option<Timestamp>,
     pub(super) tags: Json<Vec<Tag>>,
     pub(super) correlation_id: Option<String>,
     pub(super) target_bounded_context: String,
     pub(super) target_command_type: String,
     pub(super) payload: String,
     pub(super) attempt_count: i32,
-    pub(super) first_failed_at: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) first_failed_at: Option<Timestamp>,
     pub(super) recurrence_schedule: Option<String>,
     pub(super) recurrence_policy: Option<String>,
-    pub(super) recurrence_start_at: Option<DateTime<Utc>>,
-    pub(super) recurrence_end_at: Option<DateTime<Utc>>,
-    pub(super) recurrence_valid_until: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) recurrence_start_at: Option<Timestamp>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) recurrence_end_at: Option<Timestamp>,
+    #[sqlx(try_from = "NullableTimestamp")]
+    pub(super) recurrence_valid_until: Option<Timestamp>,
     pub(super) recurrence_parent_id: Option<String>,
     pub(super) recurrence_sequence: Option<i64>,
 }
@@ -536,9 +536,9 @@ pub(super) struct DueDeadlineRow {
 pub(super) struct Recurrence {
     pub(super) schedule: String,
     pub(super) policy: crate::plugin::MissedRunPolicy,
-    pub(super) start_at: Option<DateTime<Utc>>,
-    pub(super) end_at: Option<DateTime<Utc>>,
-    pub(super) valid_until: Option<DateTime<Utc>>,
+    pub(super) start_at: Option<Timestamp>,
+    pub(super) end_at: Option<Timestamp>,
+    pub(super) valid_until: Option<Timestamp>,
     pub(super) parent_id: Option<String>,
     pub(super) sequence: Option<i64>,
 }
@@ -639,7 +639,7 @@ pub async fn fire_due_deadlines(
     broadcaster: &crate::event_store::EventBroadcaster,
     event_cache: &crate::event_cache::EventCache,
     bounded_context: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     key_service: Option<&KeyService>,
     retry_policy: &skilj_retry::RetryPolicy,
     cancels: &[crate::plugin::CancelDeadlineInfo],
@@ -649,7 +649,7 @@ pub async fn fire_due_deadlines(
     // docs/architecture.md §131: per cancel that can reach this bounded
     // context's deadlines, when its first unprocessed source event was
     // created - looked up once per tick, on first need.
-    let mut cancel_backlogs: std::collections::HashMap<&str, Option<DateTime<Utc>>> =
+    let mut cancel_backlogs: std::collections::HashMap<&str, Option<Timestamp>> =
         std::collections::HashMap::new();
     let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, schedule_name, fire_at, expires_at, tags, correlation_id, \
@@ -662,8 +662,8 @@ pub async fn fire_due_deadlines(
          AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \
          ORDER BY fire_at LIMIT {MAX_DUE_DEADLINES_PER_TICK}"
     )))
-    .bind(stale_cutoff)
-    .bind(now)
+    .bind(stale_cutoff.to_sqlx())
+    .bind(now.to_sqlx())
     .fetch_all(pool)
     .await?;
 
@@ -697,11 +697,10 @@ pub async fn fire_due_deadlines(
         // "cancelled before it fired", the same register the
         // unregistered-target path already is.
         let recurrence = row.recurrence();
-        if recurrence.as_ref().is_some_and(|recurrence| {
-            now > recurrence
-                .valid_until
-                .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC)
-        }) {
+        if recurrence
+            .as_ref()
+            .is_some_and(|recurrence| now > recurrence.valid_until.unwrap_or(jiff::Timestamp::MAX))
+        {
             mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
             continue;
         }
@@ -747,9 +746,9 @@ pub async fn fire_due_deadlines(
              AND (next_attempt_at IS NULL OR next_attempt_at <= $1) \
              RETURNING id"
         )))
-        .bind(now)
+        .bind(now.to_sqlx())
         .bind(&row.id)
-        .bind(stale_cutoff)
+        .bind(stale_cutoff.to_sqlx())
         .fetch_optional(pool)
         .await?;
         if claimed.is_none() {
@@ -873,7 +872,7 @@ pub(super) async fn advance_deadline_chain(
     schema: &str,
     row: &DueDeadlineRow,
     recurrence: Option<&Recurrence>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let Some(recurrence) = recurrence else {
         return Ok(());
@@ -919,19 +918,19 @@ pub(super) async fn advance_deadline_chain(
     )))
     .bind(&next_id)
     .bind(&row.schedule_name)
-    .bind(next_fire_at)
-    .bind(row.expires_at)
+    .bind(next_fire_at.to_sqlx())
+    .bind(row.expires_at.map(|t| t.to_sqlx()))
     .bind(&row.tags)
     .bind(row.correlation_id.as_deref())
     .bind(&row.target_bounded_context)
     .bind(&row.target_command_type)
     .bind(&row.payload)
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(&recurrence.schedule)
     .bind(recurrence_policy_to_str(recurrence.policy))
-    .bind(recurrence.start_at)
-    .bind(recurrence.end_at)
-    .bind(recurrence.valid_until)
+    .bind(recurrence.start_at.map(|t| t.to_sqlx()))
+    .bind(recurrence.end_at.map(|t| t.to_sqlx()))
+    .bind(recurrence.valid_until.map(|t| t.to_sqlx()))
     .bind(parent_id)
     .bind(next_sequence)
     .execute(pool)
@@ -965,11 +964,11 @@ pub(super) async fn defer_deadline_to_another_instance(
     schema: &str,
     row: &DueDeadlineRow,
     error: &crate::error::Error,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let next_attempt_at = now
-        + chrono::Duration::from_std(ANOTHER_INSTANCE_RETRY_DELAY)
-            .expect("a ten-second delay fits a chrono::Duration");
+        + jiff::SignedDuration::try_from(ANOTHER_INSTANCE_RETRY_DELAY)
+            .expect("a ten-second delay fits a jiff::SignedDuration");
     tracing::warn!(
         deadline_id = %row.id,
         error = %error,
@@ -980,7 +979,7 @@ pub(super) async fn defer_deadline_to_another_instance(
         "UPDATE {schema}.deadlines SET status = 'pending', firing_at = NULL, \
          next_attempt_at = $1 WHERE id = $2 AND status = 'firing'"
     )))
-    .bind(next_attempt_at)
+    .bind(next_attempt_at.to_sqlx())
     .bind(&row.id)
     .execute(pool)
     .await?;
@@ -993,11 +992,12 @@ pub(super) async fn record_deadline_failure(
     row: &DueDeadlineRow,
     error: &crate::error::Error,
     retry_policy: &skilj_retry::RetryPolicy,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     let attempt_count = row.attempt_count + 1;
     let first_failed_at = row.first_failed_at.unwrap_or(now);
-    let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
+    let elapsed =
+        std::time::Duration::try_from(now.duration_since(first_failed_at)).unwrap_or_default();
     let message = error.to_string();
     if retry_policy.is_exhausted(attempt_count as u32, elapsed) {
         tracing::error!(
@@ -1029,7 +1029,7 @@ pub(super) async fn record_deadline_failure(
              attempt_count = $2, last_error = $3, payload = '{{}}' \
              WHERE id = $4 AND status = 'firing'"
         )))
-        .bind(now)
+        .bind(now.to_sqlx())
         .bind(attempt_count)
         .bind(&message)
         .bind(&row.id)
@@ -1051,8 +1051,8 @@ pub(super) async fn record_deadline_failure(
          WHERE id = $5 AND status = 'firing'"
     )))
     .bind(attempt_count)
-    .bind(first_failed_at)
-    .bind(next_attempt_at)
+    .bind(first_failed_at.to_sqlx())
+    .bind(next_attempt_at.to_sqlx())
     .bind(&message)
     .bind(&row.id)
     .execute(pool)
@@ -1065,14 +1065,14 @@ pub(super) async fn mark_deadline_resolved(
     schema: &str,
     id: &str,
     status: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.deadlines SET status = $1, resolved_at = $2, payload = '{{}}' \
          WHERE id = $3 AND status IN ('pending', 'firing')"
     )))
     .bind(status)
-    .bind(now)
+    .bind(now.to_sqlx())
     .bind(id)
     .execute(pool)
     .await?;

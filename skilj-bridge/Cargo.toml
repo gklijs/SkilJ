@@ -20,7 +20,7 @@ serde_json.workspace = true
 reqwest = { workspace = true, features = ["query"] }
 thiserror.workspace = true
 sha2.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 skilj-retry.workspace = true
 tracing.workspace = true
 opentelemetry.workspace = true

@@ -26,7 +26,7 @@ pub fn field(n: &Naming) -> Field {
                     &caller,
                     name.clone(),
                     &existing_contexts,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
                 skilj_core::db::insert_bounded_context(&state.pool, &bounded_context)

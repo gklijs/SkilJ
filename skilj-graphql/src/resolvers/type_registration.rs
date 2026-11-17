@@ -115,7 +115,7 @@ pub fn register_event_type_field(n: &Naming) -> Field {
                     missed_occurrence_policy,
                     event_read_allowed,
                     existing.as_ref(),
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
                 skilj_core::db::upsert_event_type(&state.pool, registration.event_type())

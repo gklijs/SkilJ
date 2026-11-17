@@ -62,7 +62,7 @@ use crate::event_cache::EventCache;
 use crate::event_store::{CommandType, Event, EventBroadcaster};
 use crate::plugin::{CommandDispatcher, ProjectionDispatcher};
 use crate::shared::{CommandDecision, Tag};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -311,7 +311,7 @@ impl CommandBatcher {
         matching_events: &[Event],
         initial_decision: CommandDecision,
         key_service: Option<&KeyService>,
-        now: DateTime<Utc>,
+        now: Timestamp,
         snapshot: Option<SnapshotContext<'_>>,
         snapshot_states: &[crate::plugin::SnapshotState],
         idempotency_key: Option<&str>,
@@ -371,7 +371,7 @@ impl CommandBatcher {
         event_cache: &EventCache,
         item: CommandBatchItem,
         key_service: Option<&KeyService>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<PreparedCommand> {
         let resolved = crate::db::resolve_command_submission(
             pool,
@@ -481,7 +481,7 @@ impl CommandBatcher {
         matching_events: &[Event],
         initial_decision: CommandDecision,
         key_service: Option<&KeyService>,
-        now: DateTime<Utc>,
+        now: Timestamp,
         snapshot: Option<SnapshotContext<'_>>,
         snapshot_states: &[crate::plugin::SnapshotState],
         idempotency_key: Option<&str>,
@@ -655,7 +655,7 @@ impl CommandBatcher {
                     event_cache,
                     item,
                     key_service,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .await
                 .map(|prepared| prepared.command)
@@ -731,7 +731,7 @@ impl CommandBatcher {
         correlation_id: Option<&str>,
         causation_id: Option<&str>,
         key_service: Option<&KeyService>,
-        now: DateTime<Utc>,
+        now: Timestamp,
         idempotency_key: Option<&str>,
     ) -> Result<SubmitCommandOutcome> {
         // Once more, from the read, when a key rotation (docs/architecture.md
@@ -782,7 +782,7 @@ impl CommandBatcher {
         correlation_id: Option<&str>,
         causation_id: Option<&str>,
         key_service: Option<&KeyService>,
-        now: DateTime<Utc>,
+        now: Timestamp,
         idempotency_key: Option<&str>,
     ) -> Result<SubmitCommandOutcome> {
         let prepared = self

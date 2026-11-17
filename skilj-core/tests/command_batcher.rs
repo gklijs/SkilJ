@@ -9,7 +9,7 @@
 //! `submit_command.rs` - see its own doc comment for the details, not
 //! repeated a third time here.
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::command_batcher::CommandBatcher;
 use skilj_core::db::{self, Pool, SubmitCommandOutcome};
@@ -162,8 +162,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
@@ -992,7 +998,13 @@ fn a_slow_read_or_decide_before_the_lock_warns_once_per_command_type_and_interva
                         None,
                         None,
                         None,
-                        Utc::now().trunc_subsecs(6),
+                        Timestamp::now()
+                            .round(
+                                jiff::TimestampRound::new()
+                                    .smallest(jiff::Unit::Microsecond)
+                                    .mode(jiff::RoundMode::Trunc),
+                            )
+                            .unwrap(),
                         None,
                     )
                     .await

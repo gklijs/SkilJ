@@ -27,7 +27,8 @@
 //! safe to run concurrently against the same database - the same reason
 //! `skilj-core`'s own pure-function tests never share mutable state.
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use skilj_core::access_control::{
     AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
     ExternalEventToken, Role, RoleAccessMapping, RoleStatus, TokenStatus,
@@ -105,7 +106,7 @@ async fn provision() -> Option<TestDb> {
             .await
             .expect("reading the admin bounded context")
             .as_ref(),
-        Utc::now(),
+        Timestamp::now(),
     );
     if let Some(admin) = admin {
         db::insert_bounded_context(&pool, &admin)
@@ -122,8 +123,8 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-/// `Utc::now()` truncated to microsecond precision - `TIMESTAMPTZ` is
-/// microsecond-precision in Postgres, `chrono::Utc::now()` is nanosecond-
+/// `Timestamp::now()` truncated to microsecond precision - `TIMESTAMPTZ` is
+/// microsecond-precision in Postgres, `jiff::Timestamp::now()` is nanosecond-
 /// precision in Rust, so a value built with the latter and compared
 /// against what a round-trip through the former hands back never
 /// `assert_eq!`s equal otherwise. Not a persistence bug - `db::insert_*`/
@@ -131,8 +132,14 @@ fn unique_name(prefix: &str) -> String {
 /// column precision allows; this only matters for test fixtures that
 /// construct a value in memory and then compare it byte-for-byte against
 /// the same value freshly loaded back.
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
@@ -1351,7 +1358,7 @@ fn capability_changes_and_delegable_touch_only_an_active_mapping() {
             .await
             .unwrap());
 
-        db::revoke_active_role_access_mapping(&pool, &role.id, &bc.name, Utc::now())
+        db::revoke_active_role_access_mapping(&pool, &role.id, &bc.name, Timestamp::now())
             .await
             .unwrap();
         assert!(
@@ -2777,7 +2784,7 @@ fn re_registration_never_rewinds_what_the_scheduler_advanced() {
         };
         let bc = seed_bounded_context(&pool).await;
         let et = seed_event_type(&pool, &bc).await;
-        let enabled_at = test_now() - chrono::Duration::hours(1);
+        let enabled_at = test_now() - jiff::SignedDuration::from_hours(1);
         let enabled = EventType {
             system_triggered_allowed: true,
             system_triggered_schedule: Some("0 0 * * * * *".to_string()),
@@ -2805,7 +2812,7 @@ fn re_registration_never_rewinds_what_the_scheduler_advanced() {
              WHERE name = $2",
             bc.name
         )))
-        .bind(fired_at)
+        .bind(fired_at.to_sqlx())
         .bind(&et.name)
         .execute(&pool)
         .await
@@ -2840,13 +2847,13 @@ fn expired_idempotency_keys_are_deleted_in_bounded_batches() {
                 bc.name
             )))
             .bind(key)
-            .bind(now - chrono::Duration::minutes(age_minutes))
+            .bind((now - jiff::SignedDuration::from_mins(age_minutes)).to_sqlx())
             .execute(&pool)
             .await
             .unwrap();
         }
 
-        let cutoff = now - chrono::Duration::hours(1);
+        let cutoff = now - jiff::SignedDuration::from_hours(1);
         let mut deleted = Vec::new();
         for _ in 0..3 {
             deleted.push(
@@ -2879,13 +2886,17 @@ fn resolved_deadlines_past_their_retention_are_deleted_in_bounded_batches() {
         };
         let bc = seed_bounded_context(&pool).await;
         let now = test_now();
-        let old = now - chrono::Duration::days(40);
+        let old = now - jiff::SignedDuration::from_hours(960);
         for (id, status, resolved_at) in [
             ("fired", "fired", Some(old)),
             ("cancelled", "cancelled", Some(old)),
             ("parked", "parked", Some(old)),
             ("forgotten", "forgotten", Some(old)),
-            ("recent", "fired", Some(now - chrono::Duration::days(1))),
+            (
+                "recent",
+                "fired",
+                Some(now - jiff::SignedDuration::from_hours(24)),
+            ),
             ("pending", "pending", None),
             ("firing", "firing", None),
         ] {
@@ -2897,15 +2908,15 @@ fn resolved_deadlines_past_their_retention_are_deleted_in_bounded_batches() {
                 bc.name
             )))
             .bind(id)
-            .bind(old)
+            .bind(old.to_sqlx())
             .bind(status)
-            .bind(resolved_at)
+            .bind(resolved_at.map(|t| t.to_sqlx()))
             .execute(&pool)
             .await
             .unwrap();
         }
 
-        let cutoff = now - chrono::Duration::days(30);
+        let cutoff = now - jiff::SignedDuration::from_hours(720);
         let mut deleted = Vec::new();
         for _ in 0..3 {
             deleted.push(

@@ -12,7 +12,8 @@ pub(super) struct CommandRow {
     pub(super) metadata_type: String,
     pub(super) metadata_version: i64,
     pub(super) metadata_client_id: String,
-    pub(super) metadata_created_at: DateTime<Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) metadata_created_at: Timestamp,
     // issue #18 - `None` only for a row written before these
     // columns existed.
     pub(super) metadata_correlation_id: Option<String>,
@@ -131,7 +132,7 @@ pub async fn insert_command(
     .bind(&command.metadata.r#type)
     .bind(command.metadata.version)
     .bind(&command.metadata.client_id)
-    .bind(command.metadata.created_at)
+    .bind(command.metadata.created_at.to_sqlx())
     .bind(&command.metadata.correlation_id)
     .bind(&command.metadata.causation_id)
     .bind(Json(&command.consistency_tags))
@@ -272,7 +273,8 @@ pub(super) struct CommandRowWithId {
     pub(super) metadata_type: String,
     pub(super) metadata_version: i64,
     pub(super) metadata_client_id: String,
-    pub(super) metadata_created_at: DateTime<Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) metadata_created_at: Timestamp,
     pub(super) metadata_correlation_id: Option<String>,
     pub(super) metadata_causation_id: Option<String>,
     pub(super) consistency_tags: Json<Vec<Tag>>,

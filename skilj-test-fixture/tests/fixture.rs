@@ -172,23 +172,23 @@ impl CommandType for TimeAware {
     ) -> CommandDecision {
         match decision.deadline() {
             Some(deadline) if deadline.expired => CommandDecision::Rejected {
-                reason: decision.now().to_rfc3339(),
+                reason: decision.now().to_string(),
                 kind: "expired".into(),
             },
             Some(_) => CommandDecision::Rejected {
-                reason: decision.now().to_rfc3339(),
+                reason: decision.now().to_string(),
                 kind: "on_time".into(),
             },
             None => CommandDecision::Rejected {
-                reason: decision.now().to_rfc3339(),
+                reason: decision.now().to_string(),
                 kind: "no_deadline".into(),
             },
         }
     }
 }
 
-fn ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(secs, 0).unwrap()
+fn ts(secs: i64) -> jiff::Timestamp {
+    jiff::Timestamp::new(secs, 0).unwrap()
 }
 
 /// The injected `now` (not the wall clock) reaches `decide()`, and an
@@ -202,7 +202,7 @@ fn an_injected_now_reaches_decide_with_no_deadline() {
         .then(|decision| match decision {
             CommandDecision::Rejected { reason, kind } => {
                 assert_eq!(kind, "no_deadline");
-                assert_eq!(reason, &now.to_rfc3339());
+                assert_eq!(reason, &now.to_string());
             }
             CommandDecision::Accepted { .. } => panic!("expected a rejection"),
             other => panic!("unexpected {other:?}"),

@@ -351,7 +351,7 @@ pub async fn latest_sequence_and_epoch(
 pub async fn record_epoch(
     pool: &Pool,
     epoch: &Epoch,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<Option<Epoch>> {
     let previous: Option<(Option<String>,)> = sqlx::query_as(
         "WITH previous AS (SELECT epoch FROM skilj_epoch WHERE id = 1) \
@@ -361,7 +361,7 @@ pub async fn record_epoch(
          RETURNING (SELECT epoch FROM previous)",
     )
     .bind(epoch.as_str())
-    .bind(now)
+    .bind(now.to_sqlx())
     .fetch_optional(pool)
     .await?;
     Ok(previous.and_then(|(previous,)| previous).map(Epoch))
@@ -467,7 +467,8 @@ pub(super) struct EventRowAnyType {
     pub(super) metadata_type: String,
     pub(super) metadata_version: i64,
     pub(super) metadata_client_id: String,
-    pub(super) metadata_created_at: DateTime<Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub(super) metadata_created_at: Timestamp,
     // issue #18 - `None` only for a row written before these
     // columns existed.
     pub(super) metadata_correlation_id: Option<String>,
@@ -1620,7 +1621,7 @@ pub(super) async fn highest_sequence_of_type(
     pool: &Pool,
     bounded_context: &str,
     event_type_name: &str,
-    created_at_or_before: Option<DateTime<Utc>>,
+    created_at_or_before: Option<Timestamp>,
 ) -> crate::error::Result<i64> {
     let schema = schema_ident(bounded_context);
     let (max,): (Option<i64>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -1628,7 +1629,7 @@ pub(super) async fn highest_sequence_of_type(
          AND ($2::timestamptz IS NULL OR metadata_created_at <= $2)"
     )))
     .bind(event_type_name)
-    .bind(created_at_or_before)
+    .bind(created_at_or_before.map(|t| t.to_sqlx()))
     .fetch_one(pool)
     .await?;
     Ok(max.unwrap_or(-1))
@@ -2150,7 +2151,7 @@ pub async fn insert_event<'e>(
     .bind(&event.metadata.r#type)
     .bind(event.metadata.version)
     .bind(&event.metadata.client_id)
-    .bind(event.metadata.created_at)
+    .bind(event.metadata.created_at.to_sqlx())
     .bind(&event.metadata.correlation_id)
     .bind(&event.metadata.causation_id)
     .bind(Json(&event.tags))
@@ -2527,7 +2528,7 @@ pub(super) async fn record_external_message_key<'e>(
     adapter_id: &str,
     key: &str,
     event_sequence: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.external_message_keys \
@@ -2536,7 +2537,7 @@ pub(super) async fn record_external_message_key<'e>(
     .bind(adapter_id)
     .bind(key)
     .bind(event_sequence)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(executor)
     .await?;
     Ok(())
@@ -2557,7 +2558,7 @@ pub(super) async fn advance_dedupe_watermark<'e>(
     adapter_id: &str,
     partition_key: &str,
     sequence: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.external_message_cursors \
@@ -2569,7 +2570,7 @@ pub(super) async fn advance_dedupe_watermark<'e>(
     .bind(adapter_id)
     .bind(partition_key)
     .bind(sequence)
-    .bind(now)
+    .bind(now.to_sqlx())
     .execute(executor)
     .await?;
     Ok(())
@@ -2637,7 +2638,7 @@ pub async fn create_and_insert_external_event(
     correlation_id: Option<String>,
     causation_id: Option<String>,
     dedupe: Option<ExternalEventDedupe<'_>>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     key_service: Option<&KeyService>,
     blind: &crate::blind::BlindIndex,
 ) -> crate::error::Result<CreateExternalEventOutcome> {
@@ -2913,7 +2914,7 @@ pub async fn create_and_insert_external_events(
                 continue;
             }
             // Each item its own time, as if sent alone.
-            let now = Utc::now();
+            let now = Timestamp::now();
             let dedupe = item.dedupe.clone();
             let mut savepoint = tx.begin().await?;
             let outcome = insert_external_event_in_tx(
@@ -2993,7 +2994,7 @@ pub(super) async fn insert_external_event_in_tx(
     adapter: &ExternalEventToken,
     item: ExternalEventBatchItem,
     dedupe: Option<ExternalEventDedupe<'_>>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     resolved: &std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
     sync_projections: &[String],
     blind: &crate::blind::BlindIndex,
@@ -3096,7 +3097,7 @@ pub async fn create_and_insert_direct_event(
     payload: String,
     correlation_id: Option<String>,
     causation_id: Option<String>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     key_service: Option<&KeyService>,
     blind: &crate::blind::BlindIndex,
 ) -> crate::error::Result<Event> {

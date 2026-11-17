@@ -20,7 +20,7 @@ use crate::pretty;
 pub struct GivenEvents<T: CommandType> {
     events: Vec<T::Event>,
     snapshots: Vec<SnapshotState>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     deadline: Option<DeadlineContext>,
 }
 
@@ -32,7 +32,7 @@ impl<T: CommandType> GivenEvents<T> {
             snapshots: Vec::new(),
             // A fixed, replayable default (issue #97): a test that
             // doesn't set one gets the same `now` every run.
-            now: chrono::DateTime::UNIX_EPOCH,
+            now: jiff::Timestamp::UNIX_EPOCH,
             deadline: None,
         }
     }
@@ -67,7 +67,7 @@ impl<T: CommandType> GivenEvents<T> {
     /// The `now` `decide()` is handed through `Decision::now()`, and the
     /// instant a `.deadline()` expiry is judged against (issue
     /// #97). Defaults to the Unix epoch.
-    pub fn now(mut self, now: chrono::DateTime<chrono::Utc>) -> Self {
+    pub fn now(mut self, now: jiff::Timestamp) -> Self {
         self.now = now;
         self
     }
@@ -78,8 +78,8 @@ impl<T: CommandType> GivenEvents<T> {
     /// `now`, so call `.now()` first to control it.
     pub fn deadline(
         mut self,
-        scheduled_at: chrono::DateTime<chrono::Utc>,
-        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        scheduled_at: jiff::Timestamp,
+        deadline_at: Option<jiff::Timestamp>,
     ) -> Self {
         self.deadline = Some(DeadlineContext::new(scheduled_at, deadline_at, self.now));
         self

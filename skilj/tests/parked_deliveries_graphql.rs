@@ -118,9 +118,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<chrono::Utc> {
-    use chrono::SubsecRound;
-    chrono::Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 // --- JWKS test server + JWT signing (same fixture as graphql_type_registration.rs) ---
@@ -164,7 +169,7 @@ fn sign_jwt(subject: &str) -> String {
         "sub": subject,
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
         .expect("the test private key PEM is well-formed");
@@ -335,7 +340,7 @@ fn parked_deliveries_are_listed_retried_and_discarded_over_real_graphql() {
         let (skilj, pool, bc_name, jwt, access_token_id) = setup().await;
         let router = skilj.graphql_router().await.unwrap();
 
-        let first_failed_at = test_now() - chrono::Duration::seconds(30);
+        let first_failed_at = test_now() - jiff::SignedDuration::from_secs(30);
         let last_failed_at = test_now();
         let seeded = db::insert_parked_delivery(
             &pool,
@@ -1308,7 +1313,7 @@ fn parked_deliveries_are_served_in_bounded_stable_pages() {
         let router = skilj.graphql_router().await.unwrap();
 
         // Five rows, parked a second apart; row 0 is the oldest.
-        let base = test_now() - chrono::Duration::minutes(10);
+        let base = test_now() - jiff::SignedDuration::from_mins(10);
         let mut ids = Vec::new();
         for i in 0..5 {
             let row = db::insert_parked_delivery(
@@ -1323,8 +1328,8 @@ fn parked_deliveries_are_served_in_bounded_stable_pages() {
                 &json!({ "payload": { "amount": i } }),
                 "connection refused",
                 1,
-                base + chrono::Duration::seconds(i),
-                base + chrono::Duration::seconds(i),
+                base + jiff::SignedDuration::from_secs(i),
+                base + jiff::SignedDuration::from_secs(i),
             )
             .await
             .unwrap();

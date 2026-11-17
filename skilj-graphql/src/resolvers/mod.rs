@@ -440,9 +440,9 @@ pub fn parse_event_read_start_position(name: &str) -> EventReadStartPosition {
 /// not a custom GraphQL scalar - this schema has none), so this moved
 /// here once a second call site needed it rather than staying a private
 /// helper local to the first.
-pub(crate) fn parse_rfc3339(value: &str) -> async_graphql::Result<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+pub(crate) fn parse_rfc3339(value: &str) -> async_graphql::Result<jiff::Timestamp> {
+    value
+        .parse::<jiff::Timestamp>()
         .map_err(|e| async_graphql::Error::new(format!("not a valid RFC3339 timestamp: {e}")))
 }
 
@@ -525,7 +525,7 @@ macro_rules! create_type_token_field {
                         ::skilj_core::shared::try_generate_token_secret()
                             .map_err($crate::error::to_graphql_error)?,
                         scope,
-                        chrono::Utc::now(),
+                        jiff::Timestamp::now(),
                     )
                     .map_err($crate::error::to_graphql_error)?;
                     $insert_fn(&state.pool, &token)

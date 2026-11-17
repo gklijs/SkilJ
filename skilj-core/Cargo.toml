@@ -17,7 +17,7 @@ serde_json.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
 sqlx.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
 ring.workspace = true
@@ -30,7 +30,8 @@ ring.workspace = true
 # compiling if that path ever leaves the graph.
 zeroize.workspace = true
 skilj-macros.workspace = true
-cron = "0.17.0"
+jiff-cron = "0.3.0"
+jiff-sqlx.workspace = true
 tracing.workspace = true
 # API-only - records measurements through `opentelemetry::global::meter(...)`.
 # No SDK/exporter dependency here; see docs/architecture.md's tracing

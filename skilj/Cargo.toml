@@ -31,7 +31,7 @@ skilj-macros.workspace = true
 skilj-retry.workspace = true
 tokio.workspace = true
 axum.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
 # `SkiljBuilder::auto_register()`'s own collection mechanism - see
@@ -53,6 +53,7 @@ thiserror.workspace = true
 postgresql_embedded = { version = "0.22", optional = true }
 
 [dev-dependencies]
+jiff-sqlx.workspace = true
 skilj-test-fixture.workspace = true
 skilj-test-support = { path = "../skilj-test-support" }
 # docs/architecture.md §227: the bridges' batch client against the real

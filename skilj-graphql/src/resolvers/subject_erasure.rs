@@ -45,7 +45,7 @@ pub fn field(n: &Naming) -> Field {
                     not_found("EncryptionKey", &format!("{subject_key}/{subject_value}"))
                 })?;
 
-                let now = chrono::Utc::now();
+                let now = jiff::Timestamp::now();
                 let destroyed = skilj_core::event_store::forget_subject(&access_mapping, &key, now)
                     .map_err(to_graphql_error)?;
                 // docs/architecture.md §91: parked deliveries hold the plaintext

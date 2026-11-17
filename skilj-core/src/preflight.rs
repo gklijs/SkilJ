@@ -15,7 +15,7 @@
 //! values, key material or connection details.
 
 use crate::db::Pool;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
@@ -293,7 +293,8 @@ pub struct RecordedLevel {
     /// The release that recorded it.
     pub upgraded_by: String,
     /// When.
-    pub upgraded_at: DateTime<Utc>,
+    #[serde(serialize_with = "crate::wire_time::serialize")]
+    pub upgraded_at: Timestamp,
 }
 
 /// The global migrations, compared with the ones this binary embeds.

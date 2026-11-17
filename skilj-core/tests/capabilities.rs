@@ -6,15 +6,15 @@
 //! the capabilities open are `projection_owner_scoping.rs`'s and
 //! `private_field_visibility.rs`'s.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::access_control::{
     self, AccessLevel, CapabilityActor, Role, RoleAccessMapping, RoleStatus,
 };
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
 
-fn timestamp() -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(0, 0).unwrap()
+fn timestamp() -> jiff::Timestamp {
+    Timestamp::new(0, 0).unwrap()
 }
 
 fn role(id: &str, superadmin: bool) -> Role {

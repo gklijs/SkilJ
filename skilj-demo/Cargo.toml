@@ -13,7 +13,7 @@ skilj = { workspace = true, features = ["local"] }
 skilj-core.workspace = true
 tokio.workspace = true
 axum.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

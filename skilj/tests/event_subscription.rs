@@ -18,7 +18,6 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::SubsecRound;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use jsonwebtoken::{EncodingKey, Header};
@@ -185,8 +184,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 // --- JWKS test server + JWT signing ---
@@ -226,7 +231,7 @@ async fn serve_jwks() -> String {
 fn sign_jwt(subject: &str) -> String {
     sign_jwt_expiring(
         subject,
-        (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     )
 }
 
@@ -1556,7 +1561,7 @@ fn a_websocket_is_closed_when_its_credential_expires() {
             serve_reader_graphql(database_url, Default::default()).await;
 
         // Past `exp`, but still inside the leeway for another ~3s.
-        let exp = chrono::Utc::now().timestamp() - 57;
+        let exp = jiff::Timestamp::now().as_second() - 57;
         let mut ws = ws_connect(&format!("ws://{addr}/graphql")).await;
         init_and_subscribe(&mut ws, &sign_jwt_expiring(&reader_subject, exp), &bc_name).await;
         assert_eq!(

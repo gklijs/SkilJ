@@ -113,7 +113,7 @@ const normalize = head => head.replace(/\s+/g, ' ').replace(/\b(?:[a-z_]+::)+/g,
 
 // Words every Rust or markdown reader knows, and that mean nothing here.
 const COMMON = new Set(`std core alloc self Self crate super String Vec Option Some None Ok Err Result
-  Box Arc str bool i64 u64 u8 u32 usize serde serde_json schemars chrono tokio axum async await
+  Box Arc str bool i64 u64 u8 u32 usize serde serde_json schemars jiff tokio axum async await
   json true false null`.split(/\s+/));
 
 // What a Rust example calls on a value of the standard library's or serde's.

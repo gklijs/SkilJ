@@ -14,7 +14,7 @@
 //! embedded-Postgres-then-skip harness as `submit_command.rs` - see its
 //! own doc comment for the details, not repeated a third time here.
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, ParkedDeliveryKind, Pool};
 use skilj_core::event_cache::EventCache;
@@ -249,8 +249,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
@@ -542,7 +548,7 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
             &inventory_bc.name,
             &parked_delivery.id,
             "still down",
-            Utc::now(),
+            Timestamp::now(),
         )
         .await
         .unwrap();
@@ -582,7 +588,7 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
                 None,
                 None,
                 None,
-                Utc::now(),
+                Timestamp::now(),
                 Some(&idempotency_key),
                 None,
             )
@@ -949,7 +955,7 @@ fn a_command_into_an_archived_bounded_context_is_refused() {
             None,
             None,
             None,
-            Utc::now(),
+            Timestamp::now(),
             None,
             None,
         )

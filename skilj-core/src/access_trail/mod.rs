@@ -19,7 +19,7 @@ use crate::access_control::AccessLevel;
 use crate::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME;
 use crate::event_store::{BoundedContext, Event, EventOrigin, EventType};
 use crate::shared::{Metadata, Tag, TagMapping};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -415,7 +415,7 @@ impl AccessChange {
     /// # Panics
     /// Panics if secure randomness is unavailable. Use [`Self::try_into_event`]
     /// to return the failure instead.
-    pub fn into_event(self, admin: &BoundedContext, sequence: i64, now: DateTime<Utc>) -> Event {
+    pub fn into_event(self, admin: &BoundedContext, sequence: i64, now: Timestamp) -> Event {
         self.try_into_event(admin, sequence, now)
             .expect("secure randomness is unavailable")
     }
@@ -425,7 +425,7 @@ impl AccessChange {
         self,
         admin: &BoundedContext,
         sequence: i64,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> crate::error::Result<Event> {
         debug_assert_eq!(admin.name, ADMIN_BOUNDED_CONTEXT_NAME);
         let event_type = access_event_type(admin, self.kind);
@@ -467,7 +467,7 @@ pub struct AccessEventRecord {
     /// Its payload.
     pub payload: Value,
     /// When it was recorded.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// What `capabilityHistory` answers (`CapabilityHistoryReturned`).
@@ -506,7 +506,7 @@ fn string_set(value: Option<&Value>) -> BTreeSet<String> {
 /// before `as_of`, applied in the order given (stored order, i.e. by
 /// sequence). A revoked grant holds nothing, so its capabilities and
 /// delegable set are empty until a new grant begins.
-pub fn fold_access_events(events: &[AccessEventRecord], as_of: DateTime<Utc>) -> AccessHistory {
+pub fn fold_access_events(events: &[AccessEventRecord], as_of: Timestamp) -> AccessHistory {
     let mut state = AccessHistory::default();
     for event in events
         .iter()

@@ -16,7 +16,7 @@
 //! that reasoning is now stale, and where these four are actually
 //! exercised today.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::access_control::{self, DirectCreationToken, ExternalEventToken, TokenStatus};
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{self, BoundedContext, BoundedContextStatus, EventOrigin, EventType};
@@ -57,8 +57,8 @@ fn event_type(external_creation_allowed: bool, direct_creation_allowed: bool) ->
     }
 }
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 fn external_token(status: TokenStatus, event_type: EventType) -> ExternalEventToken {

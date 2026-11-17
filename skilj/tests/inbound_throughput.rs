@@ -25,8 +25,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{SubsecRound, Utc};
 use http_body_util::BodyExt;
+use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::{CommandType, EventType, Skilj};
@@ -118,8 +118,14 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
 }
 
-fn now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 struct Setup {

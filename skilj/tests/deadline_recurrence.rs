@@ -10,7 +10,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::{
@@ -34,7 +34,7 @@ const ORDERS_BOUNDED_CONTEXT: &str = "skilj_deadline_recurrence_e2e_orders";
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct OrderPlacedPayload {
     order_id: String,
-    deadline_at: chrono::DateTime<chrono::Utc>,
+    deadline_at: jiff::Timestamp,
 }
 
 struct OrderPlaced;
@@ -173,7 +173,7 @@ impl ScheduleDeadline for ScheduleRecurringReminder {
                 schedule: "* * * * * * *".to_string(),
                 policy: MissedRunPolicy::FireAll,
                 start_at: None,
-                end_at: Some(source_payload.deadline_at + chrono::Duration::seconds(3)),
+                end_at: Some(source_payload.deadline_at + jiff::SignedDuration::from_secs(3)),
                 valid_until: None,
             }),
         })
@@ -239,8 +239,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn create_direct_event(
@@ -368,7 +374,7 @@ fn a_recurring_deadline_fires_until_its_window_ends_and_a_cancel_stops_the_chain
         //   order-cancelled: paid right away - the cancel ends the chain
         //     before, or shortly after, its first firing, so it must see
         //     at most one reminder, never the full chain.
-        let deadline_at = test_now() + chrono::Duration::milliseconds(300);
+        let deadline_at = test_now() + jiff::SignedDuration::from_millis(300);
         for order_id in ["order-recurring", "order-cancelled"] {
             let status = create_direct_event(
                 &router,

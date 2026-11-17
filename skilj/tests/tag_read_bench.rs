@@ -110,9 +110,14 @@ impl EventType for Withdrawn {
 /// The long-lived account.
 const HOT: &str = "acc-hot";
 
-fn now() -> chrono::DateTime<chrono::Utc> {
-    use chrono::SubsecRound;
-    chrono::Utc::now().trunc_subsecs(6)
+fn now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 /// A bounded context with the three types registered, and its name.

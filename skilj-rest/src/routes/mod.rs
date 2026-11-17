@@ -55,7 +55,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 // solved with `axum_extra::extract::Query` (built on `serde_html_form`),
 // which does; the small extractor below replaces that dependency, parsing
 // only the shapes these routes actually carry.
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use skilj_core::access_control::{
     CommandToken, DirectCreationToken, Error as AccessControlError, EventReadStartPosition,
@@ -94,7 +94,7 @@ struct AppState {
     /// `ConsumeEvents`' own `manual_ack` claim lease - see
     /// `skilj::SkiljBuilder::read_cursor_checkout_lease`'s own doc
     /// comment (issue #25, docs/architecture.md §53).
-    read_cursor_checkout_lease: chrono::Duration,
+    read_cursor_checkout_lease: jiff::SignedDuration,
     /// `config.max_events_per_read` - the most events one `GET
     /// /v1/events` or `GET /v1/events/consume` serves. See
     /// `skilj::SkiljBuilder::max_events_per_read`.
@@ -205,7 +205,7 @@ pub fn router(
     key_service: Option<KeyService>,
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
-    read_cursor_checkout_lease: chrono::Duration,
+    read_cursor_checkout_lease: jiff::SignedDuration,
     max_events_per_read: usize,
     command_batcher: CommandBatcher,
 ) -> Router {
@@ -461,7 +461,8 @@ struct MetadataDto {
     r#type: String,
     version: i64,
     client_id: String,
-    created_at: chrono::DateTime<Utc>,
+    #[serde(serialize_with = "skilj_core::wire_time::serialize")]
+    created_at: jiff::Timestamp,
     // issue #18. `correlation_id` is `None` only for a record
     // written before this field existed - see `Metadata`'s own doc
     // comment.
@@ -932,7 +933,7 @@ struct ParkedDeliveryRequest {
     identifier: String,
     error: String,
     attempt_count: i32,
-    first_failed_at: chrono::DateTime<Utc>,
+    first_failed_at: jiff::Timestamp,
     request: serde_json::Value,
     /// The `Idempotency-Key` header the original `POST
     /// /v1/commands/trigger` or `POST /v1/events/external` carried, which
@@ -1002,7 +1003,7 @@ async fn post_events_external(
         body.correlation_id,
         body.causation_id,
         dedupe,
-        Utc::now(),
+        Timestamp::now(),
         state.key_service.as_ref(),
         &state.dispatcher.blind_index(),
     )
@@ -1144,7 +1145,7 @@ async fn post_events_direct(
         payload,
         body.correlation_id,
         body.causation_id,
-        Utc::now(),
+        Timestamp::now(),
         state.key_service.as_ref(),
         &state.dispatcher.blind_index(),
     )
@@ -1440,7 +1441,7 @@ async fn get_events_consume(
             &candidates.events,
             candidates.scanned_through,
             &filters,
-            Utc::now(),
+            Timestamp::now(),
             state.read_cursor_checkout_lease,
             state.max_events_per_read,
         )?;
@@ -1488,7 +1489,7 @@ async fn post_events_consume_ack(
     let cursor = db::get_read_cursor(&mut *tx, &token).await?;
 
     let (sequence, updated_at) =
-        event_store::acknowledge_events(&token, cursor.as_ref(), body.sequence, Utc::now())?;
+        event_store::acknowledge_events(&token, cursor.as_ref(), body.sequence, Timestamp::now())?;
     db::record_acknowledgement(&mut *tx, &token, sequence, updated_at).await?;
     tx.commit().await.map_err(skilj_core::error::Error::from)?;
 
@@ -1581,7 +1582,7 @@ async fn post_commands_trigger(
             authorised.correlation_id.as_deref(),
             authorised.causation_id.as_deref(),
             state.key_service.as_ref(),
-            Utc::now(),
+            Timestamp::now(),
             idempotency_key,
         )
         .await?;
@@ -1758,7 +1759,7 @@ async fn propose_unless_key_used(
         idempotency_key,
         state.key_service.as_ref(),
         state.projection_dispatcher.payload_limits(),
-        Utc::now(),
+        Timestamp::now(),
     )
     .await?;
     Ok(Some(CommandTriggerResponse {
@@ -1863,7 +1864,7 @@ async fn post_commands_dry_run(
         &authorised.payload,
         &authorised.client_id,
         state.key_service.as_ref(),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await?;
     Ok(Json(match dry_run.decision {
@@ -1970,7 +1971,7 @@ async fn post_parked_deliveries(
         &body.error,
         body.attempt_count,
         body.first_failed_at,
-        Utc::now(),
+        Timestamp::now(),
     )
     .await?;
 

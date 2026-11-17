@@ -1,4 +1,4 @@
-//! A small backoff/attempt-cap policy (its one dependency is `chrono`, for
+//! A small backoff/attempt-cap policy (its one dependency is `jiff`, for
 //! [`RetryPolicy::next_attempt_at`]) - see
 //! docs/architecture.md's parked-deliveries section. Pure data and pure
 //! functions only, deliberately: no `tokio::time::sleep`, no clock read,
@@ -151,20 +151,17 @@ impl RetryPolicy {
     /// When the next attempt is due: `now` plus [`next_backoff`], for a
     /// caller that stores a due time rather than sleeping. Saturates at
     /// the latest representable instant instead of either failing the
-    /// conversion to `chrono` - which callers used to answer with a zero
-    /// delay, retrying immediately and forever - or overflowing the
-    /// addition, which panics in chrono.
+    /// conversion to a [`jiff::SignedDuration`] - which callers used to
+    /// answer with a zero delay, retrying immediately and forever - or
+    /// overflowing the addition, which panics in jiff.
     ///
     /// [`next_backoff`]: RetryPolicy::next_backoff
-    pub fn next_attempt_at(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-        attempt: u32,
-    ) -> chrono::DateTime<chrono::Utc> {
-        let backoff = chrono::TimeDelta::from_std(self.next_backoff(attempt))
-            .unwrap_or(chrono::TimeDelta::MAX);
-        now.checked_add_signed(backoff)
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+    pub fn next_attempt_at(&self, now: jiff::Timestamp, attempt: u32) -> jiff::Timestamp {
+        let backoff = jiff::SignedDuration::try_from(self.next_backoff(attempt))
+            .unwrap_or(jiff::SignedDuration::MAX);
+        now.checked_add(backoff)
+            .ok()
+            .unwrap_or(jiff::Timestamp::MAX)
     }
 
     /// `attempt` is 1-based (the attempt number that just failed),

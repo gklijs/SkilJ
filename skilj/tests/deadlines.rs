@@ -37,7 +37,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::{CancelDeadline, CommandType, EventType, Projection, ScheduleDeadline, Skilj};
@@ -58,7 +59,7 @@ const ORDERS_BOUNDED_CONTEXT: &str = "skilj_deadlines_test_orders";
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct OrderPlacedPayload {
     order_id: String,
-    deadline_at: chrono::DateTime<chrono::Utc>,
+    deadline_at: jiff::Timestamp,
     /// Exercises `ScheduleOrderCancelDeadline::schedule` returning
     /// `None` (the occurrence this schedule itself decided doesn't
     /// apply) when `false` - `ScheduleReminderDeadline` below ignores
@@ -392,8 +393,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 async fn create_direct_event(
@@ -534,7 +541,7 @@ fn a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag() {
         //     `CancelOrder` deadline is ever scheduled at all; its
         //     reminder still fires, unaffected by the sibling schedule's
         //     own skip.
-        let deadline_at = test_now() + chrono::Duration::milliseconds(300);
+        let deadline_at = test_now() + jiff::SignedDuration::from_millis(300);
 
         for (order_id, schedule_cancel_deadline) in
             [("order-A", true), ("order-B", true), ("order-C", false)]
@@ -816,11 +823,11 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
              VALUES ($1, 'race-schedule', $2, '[]'::jsonb, NULL, $3, $4, $5, 'pending', $6)"
         )))
         .bind(&deadline_id)
-        .bind(now - chrono::Duration::seconds(1))
+        .bind((now - jiff::SignedDuration::from_secs(1)).to_sqlx())
         .bind(DEADLINE_RACE_BOUNDED_CONTEXT)
         .bind(RaceCommand::NAME)
         .bind(serde_json::json!({ "order_id": "race-order" }).to_string())
-        .bind(now)
+        .bind(now.to_sqlx())
         .execute(&pool)
         .await
         .unwrap();
@@ -854,7 +861,7 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
             "UPDATE {schema}.deadlines SET status = 'cancelled', resolved_at = $1 \
              WHERE id = $2 AND status = 'pending'"
         )))
-        .bind(now)
+        .bind(now.to_sqlx())
         .bind(&deadline_id)
         .execute(&pool);
 
@@ -983,11 +990,11 @@ fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
             race_schema(&source)
         )))
         .bind(&deadline_id)
-        .bind(now - chrono::Duration::seconds(1))
+        .bind((now - jiff::SignedDuration::from_secs(1)).to_sqlx())
         .bind(&target)
         .bind(RaceCommand::NAME)
         .bind(serde_json::json!({ "order_id": "order-1" }).to_string())
-        .bind(now)
+        .bind(now.to_sqlx())
         .execute(&pool)
         .await
         .unwrap();
@@ -1093,7 +1100,7 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
             dispatchers_without_background_ticks(skilj).await;
 
         let now = test_now();
-        let insert = |id: String, fire_at: chrono::DateTime<Utc>, payload: serde_json::Value| {
+        let insert = |id: String, fire_at: jiff::Timestamp, payload: serde_json::Value| {
             let (pool, source, target) = (pool.clone(), source.clone(), target.clone());
             async move {
                 sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -1104,11 +1111,11 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
                     race_schema(&source)
                 )))
                 .bind(&id)
-                .bind(fire_at)
+                .bind(fire_at.to_sqlx())
                 .bind(&target)
                 .bind(RaceCommand::NAME)
                 .bind(payload.to_string())
-                .bind(now)
+                .bind(now.to_sqlx())
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -1118,13 +1125,13 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
         let valid = unique_name("valid");
         insert(
             failing.clone(),
-            now - chrono::Duration::seconds(2),
+            now - jiff::SignedDuration::from_secs(2),
             serde_json::json!({ "not_an_order_id": 1 }),
         )
         .await;
         insert(
             valid.clone(),
-            now - chrono::Duration::seconds(1),
+            now - jiff::SignedDuration::from_secs(1),
             serde_json::json!({ "order_id": "order-1" }),
         )
         .await;
@@ -1143,7 +1150,7 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
             }
         };
 
-        let tick = |at: chrono::DateTime<Utc>| {
+        let tick = |at: jiff::Timestamp| {
             let (pool, source) = (pool.clone(), source.clone());
             let (c, p, s) = (
                 command_dispatcher.clone(),
@@ -1181,7 +1188,9 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
         assert_eq!(status(failing.clone()).await, "pending");
 
         // Not before its backoff has passed.
-        tick(now + chrono::Duration::seconds(30)).await.unwrap();
+        tick(now + jiff::SignedDuration::from_secs(30))
+            .await
+            .unwrap();
         assert_eq!(status(failing.clone()).await, "pending");
         assert!(db::list_parked_deliveries(&pool, &target)
             .await
@@ -1190,7 +1199,9 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
 
         // The second attempt exhausts the policy: parked in the target
         // context, redrivable under the deadline's own idempotency key.
-        tick(now + chrono::Duration::seconds(61)).await.unwrap();
+        tick(now + jiff::SignedDuration::from_secs(61))
+            .await
+            .unwrap();
         assert_eq!(status(failing.clone()).await, "parked");
         let (payload,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT payload FROM {}.deadlines WHERE id = $1",
@@ -1226,7 +1237,9 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
         );
 
         // Parked is final for the deadline: later ticks leave it alone.
-        tick(now + chrono::Duration::hours(1)).await.unwrap();
+        tick(now + jiff::SignedDuration::from_hours(1))
+            .await
+            .unwrap();
         assert_eq!(status(failing.clone()).await, "parked");
         assert_eq!(
             db::list_parked_deliveries(&pool, &target)
@@ -1348,7 +1361,7 @@ fn a_deadline_an_instance_cannot_fire_waits_for_one_that_can() {
             race_schema(&source)
         )))
         .bind(&id)
-        .bind(now - chrono::Duration::seconds(1))
+        .bind((now - jiff::SignedDuration::from_secs(1)).to_sqlx())
         .bind(&target)
         .bind(RaceCommand::NAME)
         .bind(serde_json::json!({ "order_id": "order-1" }).to_string())
@@ -1370,7 +1383,7 @@ fn a_deadline_an_instance_cannot_fire_waits_for_one_that_can() {
             }
         };
         let tick = |dispatcher: std::sync::Arc<dyn skilj_core::plugin::CommandDispatcher>,
-                    at: chrono::DateTime<Utc>| {
+                    at: jiff::Timestamp| {
             let (pool, source) = (pool.clone(), source.clone());
             let (p, s) = (projection_dispatcher.clone(), snapshot_dispatcher.clone());
             async move {
@@ -1401,12 +1414,12 @@ fn a_deadline_an_instance_cannot_fire_waits_for_one_that_can() {
 
         // The older instance claims it three times over: each time it's
         // handed back, with no attempt spent and nothing parked.
-        let retry = chrono::Duration::from_std(db::ANOTHER_INSTANCE_RETRY_DELAY).unwrap();
+        let retry = jiff::SignedDuration::try_from(db::ANOTHER_INSTANCE_RETRY_DELAY).unwrap();
         let mut at = now;
         for _ in 0..3 {
             tick(older.clone(), at).await;
             assert_eq!(state().await, ("pending".to_string(), 0));
-            at += retry + chrono::Duration::seconds(1);
+            at += retry + jiff::SignedDuration::from_secs(1);
         }
         assert!(db::list_parked_deliveries(&pool, &target)
             .await
@@ -1438,7 +1451,7 @@ fn resolved_deadlines_are_deleted_after_their_retention() {
             template: None,
         };
         db::insert_bounded_context(&pool, &bc).await.unwrap();
-        let old = test_now() - chrono::Duration::hours(1);
+        let old = test_now() - jiff::SignedDuration::from_hours(1);
         for (id, status, resolved_at) in
             [("fired", "fired", Some(old)), ("pending", "pending", None)]
         {
@@ -1450,9 +1463,9 @@ fn resolved_deadlines_are_deleted_after_their_retention() {
                 race_schema(&bc.name)
             )))
             .bind(id)
-            .bind(old)
+            .bind(old.to_sqlx())
             .bind(status)
-            .bind(resolved_at)
+            .bind(resolved_at.map(|t| t.to_sqlx()))
             .execute(&pool)
             .await
             .unwrap();
@@ -1574,11 +1587,11 @@ fn a_deadline_targeting_an_approval_required_command_proposes_it() {
             race_schema(&source)
         )))
         .bind(&deadline_id)
-        .bind(now - chrono::Duration::seconds(1))
+        .bind((now - jiff::SignedDuration::from_secs(1)).to_sqlx())
         .bind(&target)
         .bind(RaceCommand::NAME)
         .bind(serde_json::json!({ "order_id": "order-1" }).to_string())
-        .bind(now)
+        .bind(now.to_sqlx())
         .execute(&pool)
         .await
         .unwrap();

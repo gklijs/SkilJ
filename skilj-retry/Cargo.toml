@@ -15,7 +15,7 @@ name = "skilj_retry"
 path = "src/lib.rs"
 
 [dependencies]
-chrono.workspace = true
+jiff.workspace = true
 
 [lints]
 workspace = true

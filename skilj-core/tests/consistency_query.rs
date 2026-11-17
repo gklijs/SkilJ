@@ -5,7 +5,7 @@
 //! the company's tag. Same `DATABASE_URL`-then-embedded-Postgres-then-skip
 //! harness as `submit_command.rs`.
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool, SubmitCommandOutcome};
 use skilj_core::event_cache::EventCache;
@@ -244,8 +244,14 @@ async fn test_pool() -> Option<Pool> {
         .clone()
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 struct Helpdesk {
@@ -494,7 +500,7 @@ async fn resolve(
         cache,
         &h.create_ticket,
         &payload(ticket),
-        &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+        &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
     )
     .await
     .unwrap()
@@ -530,7 +536,7 @@ async fn submit(
         &[],
         None,
         Some(resolved.covered_through),
-        &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+        &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
     )
     .await
     .unwrap()
@@ -709,7 +715,7 @@ fn an_item_keeps_its_last_n_matches() {
             &cache,
             &h.recent_tickets,
             &payload,
-            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+            &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
         )
         .await
         .unwrap();
@@ -723,7 +729,7 @@ fn an_item_keeps_its_last_n_matches() {
             &EventCache::new(0),
             &h.recent_tickets,
             &payload,
-            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+            &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
         )
         .await
         .unwrap();
@@ -756,7 +762,7 @@ fn an_item_keeps_its_last_n_matches() {
             &[],
             None,
             Some(resolved.covered_through),
-            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+            &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
         )
         .await
         .unwrap();
@@ -793,7 +799,7 @@ fn a_batch_rechecks_a_query_its_tag_query_does_not_cover() {
             &cache,
             &stored,
             &payload("t1"),
-            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+            &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
         )
         .await
         .unwrap();
@@ -920,7 +926,7 @@ fn a_query_of_nothing_reads_no_history_and_never_conflicts() {
         let dispatcher = HelpdeskDispatcher::new();
         let cache = EventCache::new(1000);
         let contact = serde_json::json!({ "company_id": "acme" }).to_string();
-        let context = skilj_core::plugin::DecisionContext::at(chrono::Utc::now());
+        let context = skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now());
         let resolve_contact = || {
             db::resolve_command_submission(
                 &pool,
@@ -958,7 +964,7 @@ fn a_query_of_nothing_reads_no_history_and_never_conflicts() {
             &[],
             None,
             Some(resolved.covered_through),
-            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+            &skilj_core::plugin::DecisionContext::at(jiff::Timestamp::now()),
         )
         .await
         .unwrap();

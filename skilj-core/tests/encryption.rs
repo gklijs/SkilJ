@@ -6,7 +6,7 @@
 //! `encryption_keys` table round-trip, `skilj/tests/subject_erasure.rs`
 //! the real end-to-end GraphQL path.
 
-use chrono::Utc;
+use jiff::Timestamp;
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::encryption::{self, EncryptionMasterKey};
@@ -25,7 +25,7 @@ fn bounded_context() -> BoundedContext {
     BoundedContext {
         name: "banking".into(),
         status: BoundedContextStatus::Active,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         created_by: ContextCreator::SystemCreator,
         template: None,
     }
@@ -136,7 +136,7 @@ fn protect_sensitive_fields_encrypts_the_declared_leaf_and_leaves_the_rest_untou
         subject_key: "user".into(),
         subject_value: "42".into(),
         status: EncryptionKeyStatus::Active,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         destroyed_at: None,
     };
 
@@ -334,7 +334,7 @@ fn access_mapping(can_read_sensitive: bool, external_subject: &str) -> RoleAcces
             name: "Reader".into(),
             superadmin: false,
             status: RoleStatus::Active,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             revoked_at: None,
         },
         bounded_context: bounded_context(),
@@ -344,7 +344,7 @@ fn access_mapping(can_read_sensitive: bool, external_subject: &str) -> RoleAcces
         capabilities: Default::default(),
         delegable: Default::default(),
         status: RoleStatus::Active,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         revoked_at: None,
     }
 }
@@ -358,7 +358,7 @@ fn event_with_payload(payload: &str) -> Event {
             r#type: "AccountOpened".into(),
             version: 1,
             client_id: "someone".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             correlation_id: None,
             causation_id: None,
         },
@@ -409,7 +409,7 @@ fn command_with_real_ciphertext(data_key: &encryption::DataKey) -> Command {
             r#type: "OpenAccount".into(),
             version: 1,
             client_id: "someone".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             correlation_id: None,
             causation_id: None,
         },

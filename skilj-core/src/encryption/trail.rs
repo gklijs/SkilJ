@@ -10,7 +10,7 @@
 use crate::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME;
 use crate::event_store::{BoundedContext, Event, EventOrigin, EventType};
 use crate::shared::{Metadata, Tag, TagMapping};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{json, Value};
 
 /// The event types SkilJ registers in the admin bounded context for the
@@ -315,7 +315,7 @@ impl MasterKeyChange {
     /// # Panics
     /// Panics if secure randomness is unavailable. Use [`Self::try_into_event`]
     /// to return the failure instead.
-    pub fn into_event(self, admin: &BoundedContext, sequence: i64, now: DateTime<Utc>) -> Event {
+    pub fn into_event(self, admin: &BoundedContext, sequence: i64, now: Timestamp) -> Event {
         self.try_into_event(admin, sequence, now)
             .expect("secure randomness is unavailable")
     }
@@ -325,7 +325,7 @@ impl MasterKeyChange {
         self,
         admin: &BoundedContext,
         sequence: i64,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> crate::error::Result<Event> {
         debug_assert_eq!(admin.name, ADMIN_BOUNDED_CONTEXT_NAME);
         let event_type = master_key_event_type(admin, self.kind);
@@ -370,7 +370,7 @@ mod tests {
         BoundedContext {
             name: ADMIN_BOUNDED_CONTEXT_NAME.to_string(),
             status: crate::event_store::BoundedContextStatus::Active,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             created_by: crate::bootstrap::ContextCreator::SystemCreator,
             template: None,
         }
@@ -410,7 +410,7 @@ mod tests {
             MasterKeyChange::deleted("file:banking", true),
         ];
         for change in events {
-            let event = change.into_event(&admin(), 1, Utc::now());
+            let event = change.into_event(&admin(), 1, Timestamp::now());
             assert!(
                 valid(&event),
                 "{} matches its schema",
@@ -428,7 +428,7 @@ mod tests {
         let event = MasterKeyChange::rewrapped("file", 2, "banking", 3, 0).into_event(
             &admin(),
             1,
-            Utc::now(),
+            Timestamp::now(),
         );
         assert_eq!(event.tags[1].key, "bounded_context");
         assert_eq!(event.tags[1].value.as_deref(), Some("banking"));

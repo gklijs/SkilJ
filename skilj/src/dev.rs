@@ -25,7 +25,7 @@
 //! # }
 //! ```
 
-use chrono::Utc;
+use jiff::Timestamp;
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
@@ -67,7 +67,7 @@ pub async fn seed_admin(
                 &BoundedContext {
                     name: (*bounded_context).to_string(),
                     status: BoundedContextStatus::Active,
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                     created_by: ContextCreator::SystemCreator,
                     template: None,
                 },
@@ -83,7 +83,7 @@ pub async fn seed_admin(
         name: name.to_string(),
         superadmin: false,
         status: RoleStatus::Active,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         revoked_at: None,
     };
     db::insert_role(&pool, &role).await?;
@@ -102,7 +102,7 @@ pub async fn seed_admin(
             capabilities: Default::default(),
             delegable: Default::default(),
             status: RoleStatus::Active,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             revoked_at: None,
         };
         db::insert_role_access_mapping(&pool, &mapping).await?;
@@ -157,7 +157,7 @@ impl DevAdmin {
             try_generate_token_id()?,
             try_generate_token_secret()?,
             None,
-            Utc::now(),
+            Timestamp::now(),
         )?;
         db::insert_command_token(&self.pool, &token).await?;
         Ok(format!("{}.{}", token.id, token.secret))

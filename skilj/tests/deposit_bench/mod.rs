@@ -8,8 +8,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{SubsecRound, Utc};
 use http_body_util::BodyExt;
+use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::{CommandType, EventType, Skilj, Snapshot};
@@ -232,8 +232,14 @@ impl CommandType for DepositBlind {
     }
 }
 
-pub fn now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+pub fn now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 pub struct Setup {

@@ -13,7 +13,7 @@
 //!
 //! docs/architecture.md §186: `Skilj::build()` refuses a pool the
 //! cross-instance listener would take whole.
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use skilj::Skilj;
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
@@ -68,7 +68,13 @@ async fn seed_bounded_context(pool: &Pool) -> String {
         &BoundedContext {
             name: name.clone(),
             status: BoundedContextStatus::Active,
-            created_at: Utc::now().trunc_subsecs(6),
+            created_at: Timestamp::now()
+                .round(
+                    jiff::TimestampRound::new()
+                        .smallest(jiff::Unit::Microsecond)
+                        .mode(jiff::RoundMode::Trunc),
+                )
+                .unwrap(),
             created_by: ContextCreator::SystemCreator,
             template: None,
         },
@@ -191,8 +197,14 @@ fn a_bounded_context_deleted_while_forgetting_a_subject_is_skipped() {
         let forgotten = delete_while_waiting(&pool, &name, "deadlines", {
             let pool = pool.clone();
             async move {
-                db::forget_subject_in_deadlines(&pool, "customers", "customer", "42", Utc::now())
-                    .await
+                db::forget_subject_in_deadlines(
+                    &pool,
+                    "customers",
+                    "customer",
+                    "42",
+                    Timestamp::now(),
+                )
+                .await
             }
         })
         .await;
@@ -325,7 +337,13 @@ fn reconciliation_runs_on_a_patched_bounded_context() {
             name: "Reconciliation Role".to_string(),
             superadmin: false,
             status: skilj_core::access_control::RoleStatus::Active,
-            created_at: Utc::now().trunc_subsecs(6),
+            created_at: Timestamp::now()
+                .round(
+                    jiff::TimestampRound::new()
+                        .smallest(jiff::Unit::Microsecond)
+                        .mode(jiff::RoundMode::Trunc),
+                )
+                .unwrap(),
             revoked_at: None,
         };
         db::insert_role(&pool, &role).await.unwrap();
@@ -343,7 +361,13 @@ fn reconciliation_runs_on_a_patched_bounded_context() {
                 capabilities: Default::default(),
                 delegable: Default::default(),
                 status: skilj_core::access_control::RoleStatus::Active,
-                created_at: Utc::now().trunc_subsecs(6),
+                created_at: Timestamp::now()
+                    .round(
+                        jiff::TimestampRound::new()
+                            .smallest(jiff::Unit::Microsecond)
+                            .mode(jiff::RoundMode::Trunc),
+                    )
+                    .unwrap(),
                 revoked_at: None,
             },
         )
@@ -983,7 +1007,13 @@ async fn reconciler_for(pool: &Pool, bounded_context: &str) -> skilj_core::acces
         name: "Reconciliation Role".to_string(),
         superadmin: false,
         status: skilj_core::access_control::RoleStatus::Active,
-        created_at: Utc::now().trunc_subsecs(6),
+        created_at: Timestamp::now()
+            .round(
+                jiff::TimestampRound::new()
+                    .smallest(jiff::Unit::Microsecond)
+                    .mode(jiff::RoundMode::Trunc),
+            )
+            .unwrap(),
         revoked_at: None,
     };
     db::insert_role(pool, &role).await.unwrap();
@@ -1001,7 +1031,13 @@ async fn reconciler_for(pool: &Pool, bounded_context: &str) -> skilj_core::acces
             capabilities: Default::default(),
             delegable: Default::default(),
             status: skilj_core::access_control::RoleStatus::Active,
-            created_at: Utc::now().trunc_subsecs(6),
+            created_at: Timestamp::now()
+                .round(
+                    jiff::TimestampRound::new()
+                        .smallest(jiff::Unit::Microsecond)
+                        .mode(jiff::RoundMode::Trunc),
+                )
+                .unwrap(),
             revoked_at: None,
         },
     )

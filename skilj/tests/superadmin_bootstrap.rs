@@ -143,7 +143,7 @@ fn the_bootstrap_secret_ends_at_the_first_claim_and_claims_cannot_race() {
             "root-late".to_string(),
             &[],
             skilj_core::shared::generate_token_id(),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )
         .unwrap();
         assert!(!db::insert_superadmin_if_none_active(&pool, &stale)

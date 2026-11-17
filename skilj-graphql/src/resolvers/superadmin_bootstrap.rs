@@ -46,7 +46,7 @@ pub fn field(n: &Naming) -> Field {
                     external_subject,
                     &existing_roles,
                     try_generate_token_id().map_err(crate::error::to_graphql_error)?,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 ) {
                     Ok(role) => role,
                     Err(e) => {

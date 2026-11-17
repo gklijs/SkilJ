@@ -1,7 +1,7 @@
 //! Reproducible read probe. Run explicitly with DATABASE_URL and:
 //! cargo test --release -p skilj-core --test authorized_event_bench -- --ignored --nocapture
 //! SKILJ_BENCH_EVENTS defaults to one million; SKILJ_BENCH_RUNS to 20.
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::db::{self, AuthorizedEventQuery};
 use skilj_core::event_cache::EventCache;
@@ -31,8 +31,8 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 fn bounded_context(status: BoundedContextStatus) -> BoundedContext {

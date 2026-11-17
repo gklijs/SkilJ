@@ -26,7 +26,7 @@
 //! use - a second run against a persistent `DATABASE_URL` reuses the same
 //! row instead of failing on it.
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::{auto_register, CommandType, EventType, Projection, Skilj, Snapshot};
@@ -197,8 +197,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 /// Idempotent get-or-insert - see this file's own doc comment for why

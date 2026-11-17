@@ -95,10 +95,10 @@ pub fn revoke_token_field(n: &Naming) -> Field {
                 let revoked = skilj_core::access_control::revoke_token(
                     &access_mapping,
                     &token,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
-                skilj_core::db::revoke_access_token(&state.pool, &token_id, chrono::Utc::now())
+                skilj_core::db::revoke_access_token(&state.pool, &token_id, jiff::Timestamp::now())
                     .await
                     .map_err(to_graphql_error)?;
 

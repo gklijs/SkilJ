@@ -16,7 +16,7 @@
 //! `surface-provides.ProjectionQuery` (3) - the usual GraphQL-scaffolding
 //! gap.
 
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
@@ -26,8 +26,8 @@ use skilj_core::projections::{self, Projection, ProjectionAccessScope};
 // Fixtures
 // ---------------------------------------------------------------------
 
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
+fn timestamp(secs: i64) -> jiff::Timestamp {
+    Timestamp::new(secs, 0).unwrap()
 }
 
 fn bounded_context(status: BoundedContextStatus) -> BoundedContext {

@@ -16,7 +16,8 @@
 //! `skilj/tests/async_projections.rs` - see its own doc comment for the
 //! details, not repeated a third time here.
 
-use chrono::{SubsecRound, Utc};
+use jiff::Timestamp;
+use jiff_sqlx::ToSqlx;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skilj::{EventType, Skilj};
@@ -154,8 +155,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 /// Sets up a fresh `Role`/`BoundedContext`/admin `RoleAccessMapping`,
@@ -300,7 +307,7 @@ fn skip_policy_resolves_a_real_backlog_without_replaying_it() {
             .await
             .unwrap()
             .unwrap();
-        let backlog_start = Utc::now() - chrono::Duration::seconds(10);
+        let backlog_start = Timestamp::now() - jiff::SignedDuration::from_secs(10);
         event_type.schedule_position = Some(backlog_start);
         // Written directly, as a stalled scheduler would have left it:
         // registration deliberately never rewinds the scheduler's own
@@ -319,7 +326,7 @@ fn skip_policy_resolves_a_real_backlog_without_replaying_it() {
                 .unwrap()
                 .unwrap();
             if let Some(position) = current.schedule_position {
-                if position > backlog_start + chrono::Duration::seconds(5) {
+                if position > backlog_start + jiff::SignedDuration::from_secs(5) {
                     caught_up = Some(position);
                     break;
                 }
@@ -382,7 +389,7 @@ fn fire_once_resolves_a_real_backlog_into_its_own_last_occurrence_and_does_not_s
             .await
             .unwrap()
             .unwrap();
-        let backlog_start = Utc::now() - chrono::Duration::seconds(10);
+        let backlog_start = Timestamp::now() - jiff::SignedDuration::from_secs(10);
         event_type.schedule_position = Some(backlog_start);
         // Written directly, as a stalled scheduler would have left it:
         // registration deliberately never rewinds the scheduler's own
@@ -402,7 +409,7 @@ fn fire_once_resolves_a_real_backlog_into_its_own_last_occurrence_and_does_not_s
                 .unwrap()
                 .unwrap();
             if let Some(position) = current.schedule_position {
-                if position > backlog_start + chrono::Duration::seconds(5) {
+                if position > backlog_start + jiff::SignedDuration::from_secs(5) {
                     caught_up = Some(position);
                     break;
                 }
@@ -461,13 +468,13 @@ fn fire_once_resolves_a_real_backlog_into_its_own_last_occurrence_and_does_not_s
 async fn force_schedule_position(
     pool: &skilj_core::db::Pool,
     event_type: &skilj_core::event_store::EventType,
-    position: chrono::DateTime<Utc>,
+    position: jiff::Timestamp,
 ) {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"bc_{}\".event_types SET schedule_position = $1 WHERE name = $2",
         event_type.bounded_context.name
     )))
-    .bind(position)
+    .bind(position.to_sqlx())
     .bind(&event_type.name)
     .execute(pool)
     .await
@@ -503,7 +510,7 @@ fn fire_once_resolves_a_backlog_longer_than_one_tick_can_walk() {
             .await
             .unwrap()
             .unwrap();
-        let backlog_start = Utc::now() - chrono::Duration::seconds(2000);
+        let backlog_start = Timestamp::now() - jiff::SignedDuration::from_secs(2000);
         force_schedule_position(&pool, &event_type, backlog_start).await;
 
         let mut caught_up = false;
@@ -515,7 +522,7 @@ fn fire_once_resolves_a_backlog_longer_than_one_tick_can_walk() {
                 .unwrap();
             if current
                 .schedule_position
-                .is_some_and(|p| p > Utc::now() - chrono::Duration::seconds(5))
+                .is_some_and(|p| p > Timestamp::now() - jiff::SignedDuration::from_secs(5))
             {
                 caught_up = true;
                 break;

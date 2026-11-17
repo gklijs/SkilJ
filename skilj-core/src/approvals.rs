@@ -126,11 +126,11 @@ pub struct CommandProposal {
     /// The submission's idempotency key, applied when it is approved.
     pub idempotency_key: Option<String>,
     /// When it was proposed.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     /// Its approval deadline; `None` for none.
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<jiff::Timestamp>,
     /// When it was approved, rejected, expired or forgotten.
-    pub decided_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub decided_at: Option<jiff::Timestamp>,
     /// The role that approved or rejected it.
     pub decided_by_role_id: Option<String>,
     /// Why it was rejected, by the approver or by `decide()`.
@@ -145,7 +145,7 @@ pub struct CommandProposal {
 impl CommandProposal {
     /// Whether `now` is at or past this proposal's own deadline. A
     /// proposal with no deadline is never expired.
-    pub fn is_expired_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+    pub fn is_expired_at(&self, now: jiff::Timestamp) -> bool {
         self.expires_at.is_some_and(|expires_at| now >= expires_at)
     }
 }
@@ -317,7 +317,7 @@ mod tests {
             name: "Admin".to_string(),
             superadmin: false,
             status: RoleStatus::Active,
-            created_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            created_at: jiff::Timestamp::MIN,
             revoked_at: None,
         }
     }
@@ -328,7 +328,7 @@ mod tests {
             bounded_context: crate::event_store::BoundedContext {
                 name: "banking".to_string(),
                 status: crate::event_store::BoundedContextStatus::Active,
-                created_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+                created_at: jiff::Timestamp::MIN,
                 created_by: crate::bootstrap::ContextCreator::SystemCreator,
                 template: None,
             },
@@ -338,7 +338,7 @@ mod tests {
             capabilities: Default::default(),
             delegable: Default::default(),
             status: RoleStatus::Active,
-            created_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            created_at: jiff::Timestamp::MIN,
             revoked_at: None,
         }
     }

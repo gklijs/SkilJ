@@ -16,7 +16,7 @@ tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 clap.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 
 [dev-dependencies]
 skilj-test-support = { path = "../skilj-test-support" }

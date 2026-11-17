@@ -8,8 +8,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::SubsecRound;
 use http_body_util::BodyExt;
+use jiff_sqlx::ToSqlx;
 use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -801,8 +801,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn test_now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now().trunc_subsecs(6)
+fn test_now() -> jiff::Timestamp {
+    jiff::Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 // --- JWKS test server + JWT signing ---
@@ -846,7 +852,7 @@ fn sign_jwt(subject: &str) -> String {
         "sub": subject,
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
         .expect("the test private key PEM is well-formed");
@@ -3752,13 +3758,13 @@ async fn propose_transfer(router: &axum::Router, jwt: &str, bc_name: &str) -> St
 
 /// Puts a proposal back into `approving` with a claim made `age` ago -
 /// what a crash mid-approval leaves behind.
-async fn leave_claim_behind(pool: &Pool, bc_name: &str, id: &str, age: chrono::Duration) {
+async fn leave_claim_behind(pool: &Pool, bc_name: &str, id: &str, age: jiff::SignedDuration) {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"bc_{bc_name}\".command_proposals \
          SET status = 'approving', decided_at = $2, command_external_id = NULL WHERE id = $1"
     )))
     .bind(id)
-    .bind(chrono::Utc::now() - age)
+    .bind((jiff::Timestamp::now() - age).to_sqlx())
     .execute(pool)
     .await
     .unwrap();
@@ -3795,7 +3801,7 @@ fn a_stale_approval_claim_is_taken_over() {
         let router = skilj.graphql_router().await.unwrap();
         let id = propose_transfer(&router, &jwt, &bc_name).await;
 
-        leave_claim_behind(&pool, &bc_name, &id, chrono::Duration::seconds(5)).await;
+        leave_claim_behind(&pool, &bc_name, &id, jiff::SignedDuration::from_secs(5)).await;
         let fresh = graphql_request(
             &router,
             Some(&jwt),
@@ -3809,7 +3815,7 @@ fn a_stale_approval_claim_is_taken_over() {
             "a claim younger than the stale window still belongs to its approver: {fresh}"
         );
 
-        leave_claim_behind(&pool, &bc_name, &id, chrono::Duration::minutes(11)).await;
+        leave_claim_behind(&pool, &bc_name, &id, jiff::SignedDuration::from_mins(11)).await;
         let approved = graphql_request(
             &router,
             Some(&jwt),
@@ -3853,7 +3859,7 @@ fn a_stale_claim_whose_command_committed_settles_as_approved() {
             "{approved}"
         );
 
-        leave_claim_behind(&pool, &bc_name, &id, chrono::Duration::minutes(11)).await;
+        leave_claim_behind(&pool, &bc_name, &id, jiff::SignedDuration::from_mins(11)).await;
         let rejected = graphql_request(
             &router,
             Some(&jwt),
@@ -3879,7 +3885,7 @@ fn a_stale_claim_whose_command_committed_settles_as_approved() {
             "{listed}"
         );
 
-        leave_claim_behind(&pool, &bc_name, &id, chrono::Duration::minutes(11)).await;
+        leave_claim_behind(&pool, &bc_name, &id, jiff::SignedDuration::from_mins(11)).await;
         let again = graphql_request(
             &router,
             Some(&jwt),

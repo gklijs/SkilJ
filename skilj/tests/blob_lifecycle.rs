@@ -7,9 +7,9 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{SubsecRound, Utc};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
+use jiff::Timestamp;
 use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -240,7 +240,7 @@ fn sign_jwt(subject: &str) -> String {
         "sub": subject,
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
         .expect("the test private key PEM is well-formed");
@@ -279,8 +279,14 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
 
-fn now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
+fn now() -> jiff::Timestamp {
+    Timestamp::now()
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
+        .unwrap()
 }
 
 struct Setup {
@@ -464,12 +470,12 @@ impl Setup {
             .as_str()
     }
 
-    async fn collect_at(&self, at: chrono::DateTime<Utc>) -> db::CollectedBlobs {
+    async fn collect_at(&self, at: jiff::Timestamp) -> db::CollectedBlobs {
         db::collect_blobs(
             &self.pool,
             &store(self),
             &self.bc,
-            at - chrono::Duration::hours(24),
+            at - jiff::SignedDuration::from_hours(24),
             at,
             100,
         )
@@ -769,7 +775,7 @@ fn a_blob_with_a_subject_is_stored_sealed_and_erased_with_the_subject() {
             &setup.pool,
             &store(&setup),
             &setup.bc,
-            now() - chrono::Duration::hours(24),
+            now() - jiff::SignedDuration::from_hours(24),
             now(),
             100,
         )
@@ -1003,8 +1009,8 @@ fn collection_takes_orphans_and_spares_what_is_referenced_or_pinned() {
         .unwrap();
 
         // All three are past the grace period.
-        let later = now() + chrono::Duration::hours(25);
-        let cutoff = later - chrono::Duration::hours(24);
+        let later = now() + jiff::SignedDuration::from_hours(25);
+        let cutoff = later - jiff::SignedDuration::from_hours(24);
         let collected =
             db::collect_blobs(&setup.pool, &store(&setup), &setup.bc, cutoff, later, 100)
                 .await
@@ -1043,12 +1049,12 @@ fn collection_takes_orphans_and_spares_what_is_referenced_or_pinned() {
                 .unwrap();
         assert_eq!(collected.orphans, 0);
         assert_eq!(state(pinned.id.clone()).await, "pending");
-        let much_later = later + chrono::Duration::hours(25);
+        let much_later = later + jiff::SignedDuration::from_hours(25);
         let collected = db::collect_blobs(
             &setup.pool,
             &store(&setup),
             &setup.bc,
-            much_later - chrono::Duration::hours(24),
+            much_later - jiff::SignedDuration::from_hours(24),
             much_later,
             100,
         )
@@ -1347,7 +1353,7 @@ fn a_proposal_is_refused_when_too_large_or_undeclared_and_pins_its_blob() {
             .await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         assert_eq!(proposals().await, 1);
-        let later = now() + chrono::Duration::hours(25);
+        let later = now() + jiff::SignedDuration::from_hours(25);
         assert_eq!(setup.collect_at(later).await.orphans, 0);
         assert_eq!(setup.state(&held.id).await, "pending");
 
@@ -1360,7 +1366,7 @@ fn a_proposal_is_refused_when_too_large_or_undeclared_and_pins_its_blob() {
         .await
         .unwrap();
         assert_eq!(setup.collect_at(later).await.orphans, 0);
-        let much_later = later + chrono::Duration::hours(25);
+        let much_later = later + jiff::SignedDuration::from_hours(25);
         assert_eq!(setup.collect_at(much_later).await.orphans, 1);
         assert_eq!(setup.state(&held.id).await, "deleted");
     });
@@ -1503,7 +1509,7 @@ fn a_parked_message_keeps_its_blob_past_the_grace_period_and_its_retry_succeeds(
         .unwrap();
 
         // Long past its grace period, the parked row still holds it.
-        let later = now() + chrono::Duration::days(30);
+        let later = now() + jiff::SignedDuration::from_hours(720);
         assert_eq!(setup.collect_at(later).await.orphans, 0);
         assert_eq!(setup.state(&id).await, "pending");
 

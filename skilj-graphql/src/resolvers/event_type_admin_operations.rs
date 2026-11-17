@@ -107,7 +107,7 @@ pub fn create_event_read_token_field(n: &Naming) -> Field {
                     start_from,
                     start_at_sequence,
                     start_at_time,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .map_err(to_graphql_error)?;
                 skilj_core::db::insert_event_read_token(&state.pool, &token)
