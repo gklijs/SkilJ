@@ -34,6 +34,11 @@
 //! `tests/banking.rs`/`tests/courses.rs` (the integration-test suite that
 //! doubles as this crate's own proof it behaves as documented).
 
+#![allow(
+    clippy::exhaustive_enums,
+    reason = "an example application (publish = false): no other crate matches its event enums"
+)]
+
 pub mod banking;
 pub mod courses;
 

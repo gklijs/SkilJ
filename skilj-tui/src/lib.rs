@@ -5,6 +5,11 @@
 //! so `tests/*.rs` can exercise `graphql`/`projection_query` directly -
 //! a `[[bin]]`-only crate has nothing `tests/` can import.
 
+#![allow(
+    clippy::exhaustive_enums,
+    reason = "a tool, not a library: nothing outside this crate's own tests matches its enums"
+)]
+
 pub mod app;
 pub mod cli;
 pub mod form;

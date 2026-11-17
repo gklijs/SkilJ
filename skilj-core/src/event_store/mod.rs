@@ -3118,7 +3118,10 @@ impl EventTypeRegistration {
 /// in also anchors the schedule position, and only opting in does"). Every
 /// other field this function sets stays timestamp-free, so this is the
 /// one place `EventType` itself needs a clock at all.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn register_event_type(
     access_mapping: &RoleAccessMapping,
     bounded_context: &BoundedContext,
@@ -3330,7 +3333,10 @@ impl CommandTypeRegistration {
 /// `register_event_type` above - the only differences are the absence of
 /// the three `EventType`-only permission fields and the presence of
 /// `rest_trigger_allowed` in their place.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn register_command_type(
     access_mapping: &RoleAccessMapping,
     bounded_context: &BoundedContext,
@@ -3530,7 +3536,10 @@ pub const DEFAULT_MAX_EVENTS_PER_READ: usize = 1000;
 /// `skilj-graphql`'s `EventQuery` resolver ([§8](../../../docs/architecture.md#open-for-a-future-pass) item 5, Phase 3) - a
 /// caller with only the rendered strings back could never page past the
 /// first call.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn query_events(
     access_mapping: &RoleAccessMapping,
     event_types: &[EventType],
@@ -3556,7 +3565,10 @@ pub fn query_events(
 
 /// [`query_events`] with an explicit `config.max_events_per_read`:
 /// [`query_events_select`], then each selected event rendered.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn query_events_page(
     access_mapping: &RoleAccessMapping,
     event_types: &[EventType],
@@ -3788,7 +3800,10 @@ pub fn inspect_event(
 /// Returns rendered payloads only, the same "deliberately coarse on the
 /// wire contract" choice `query_events` makes for `EventsQueried.events`
 /// - see its own doc comment.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn fetch_commands(
     access_mapping: &RoleAccessMapping,
     command_types: &[CommandType],
@@ -3823,7 +3838,10 @@ pub fn fetch_commands(
 /// `db::collect_command_page` hands it - since recording order isn't
 /// part of `Command` itself; `after_command` is checked here only for the
 /// rule's own bounded-context requirement.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn fetch_commands_select(
     access_mapping: &RoleAccessMapping,
     command_types: &[CommandType],
@@ -4447,7 +4465,10 @@ pub fn check_consume_events(
 /// fewer than `max_events` are served, nothing up to it was left
 /// unserved that this call could serve, so the cursor moves there rather
 /// than stopping at the last event served (docs/architecture.md §112).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn consume_events_page(
     token: &EventReadToken,
     existing_cursor: Option<&ReadCursor>,
@@ -4726,7 +4747,10 @@ pub(crate) fn protect_source_content(event_type: &EventType, content: String) ->
 /// this module uses. Same "derived, not a separate parameter" treatment
 /// as `fetch_events`' `read_type` for `adapter.event_type = event_type`:
 /// there's no `event_type` argument to disagree with `adapter.event_type`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn create_external_event(
     adapter: &ExternalEventToken,
     payload: String,
@@ -4782,7 +4806,10 @@ pub fn create_external_event(
 /// checked (`direct_creation_allowed`), the absence of the two opaque
 /// `source_content`/`source_context` fields, and the resulting
 /// `EventOrigin` variant.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn create_direct_event(
     adapter: &DirectCreationToken,
     payload: String,
@@ -4902,7 +4929,10 @@ pub fn latest_occurrence_at_or_before(
 /// built event with the instant both `EventType.schedule_position` and
 /// `EventType.last_fired_at` advance to - the caller's own job to persist,
 /// atomically with the event itself (see `db::fire_system_event`).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 ///
 /// # Panics
 /// Panics if secure randomness is unavailable. Use [`try_create_system_event`]
@@ -4928,7 +4958,10 @@ pub fn create_system_event(
 
 /// Like [`create_system_event`], propagating encryption and randomness
 /// failures so the scheduler can retry without advancing its position.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub fn try_create_system_event(
     event_type: &EventType,
     occurrence_at: chrono::DateTime<chrono::Utc>,
@@ -5534,7 +5567,10 @@ pub struct ProcessCommandResult {
 /// this function has no way to generate one itself, the same "black box
 /// resolved outside, handed in" treatment every id-bearing entity's own
 /// pure constructor gets (see `access_control::create_role`).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 #[tracing::instrument(
     skip_all,
     fields(
@@ -5588,7 +5624,10 @@ pub fn process_command(
 /// known - [`consistency_boundary`] over the events its decision saw - so
 /// a caller holding the bounded context's lock needn't hand over (or
 /// copy) that history (docs/architecture.md §196).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a rule function: each input it decides on is its own argument"
+)]
 pub(crate) fn process_command_at_boundary(
     id: String,
     command_type: &CommandType,

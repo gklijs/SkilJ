@@ -79,7 +79,10 @@ impl EventType for MoneyDeposited {
     }
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "the event enum's shape needs this variant; this test never reads its payload"
+)]
 enum BankingEvent {
     MoneyDeposited(MoneyDepositedPayload),
 }

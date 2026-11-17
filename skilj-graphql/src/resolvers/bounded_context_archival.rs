@@ -13,6 +13,7 @@ use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
+/// The `archiveBoundedContext` mutation.
 pub fn field(n: &Naming) -> Field {
     Field::new(
         n.root("archiveBoundedContext"),

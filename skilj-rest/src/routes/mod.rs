@@ -193,7 +193,10 @@ async fn trace_request(request: Request, next: Next) -> Response {
 
 /// The REST surface's `axum` router, every route under `/v1`. Usually
 /// built for you by `skilj::Skilj::rest_router`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per service and setting the routes share"
+)]
 pub fn router(
     pool: Pool,
     dispatcher: Arc<dyn CommandDispatcher>,

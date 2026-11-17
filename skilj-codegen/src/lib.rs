@@ -62,6 +62,9 @@
 //! (docs/architecture.md §191). A consumer can do the same in a few
 //! lines.
 
+// Every public item is documented; CI fails on a gap (`-D warnings`).
+#![warn(missing_docs)]
+
 pub mod emhcl;
 mod emit;
 pub mod import;
@@ -72,6 +75,7 @@ pub use spec::{
     FieldType, SensitiveSpec,
 };
 
+/// Why [`generate`] or [`validate`] couldn't finish.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {

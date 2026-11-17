@@ -14,6 +14,9 @@
 //! and use `FederationOptions`/`GraphqlLimits` through `skilj`'s
 //! re-exports (README.md, "Status and stability").
 
+// Every public item is documented; CI fails on a gap (`-D warnings`).
+#![warn(missing_docs)]
+
 pub mod auth;
 mod error;
 pub mod federation;
@@ -56,6 +59,7 @@ static REQUEST_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
 /// own `Arc<JwksCache>`, both dispatchers are already `Arc`-wrapped.
 #[derive(Clone)]
 pub struct GraphqlState {
+    /// The database pool every resolver reads and writes through.
     pub pool: Pool,
     /// How many `retryParkedDelivery` redrives may run at once, shared by
     /// every `GraphqlState` of one process. Each holds its per-row lock on
@@ -67,6 +71,8 @@ pub struct GraphqlState {
     /// other `GraphqlState` built from it, so a claim through any of them
     /// consumes it for all (docs/architecture.md §109).
     pub bootstrap: skilj_core::bootstrap::BootstrapGate,
+    /// How a bearer token is verified; `None` when no identity provider
+    /// is configured.
     pub identity: Option<auth::Identity>,
     /// `submitCommand`'s own bridge into the right bounded context's
     /// typed `decide()` - the identical `Arc<dyn CommandDispatcher>`

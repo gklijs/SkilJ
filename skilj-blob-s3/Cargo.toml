@@ -19,3 +19,6 @@ object_store = { version = "0.14.2", features = ["aws"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 testcontainers-modules = "0.15"
+
+[lints]
+workspace = true

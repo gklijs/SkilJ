@@ -5692,7 +5692,10 @@ async fn retention_tick(pool: &Pool, target: RetentionTarget, retention: chrono:
 /// active* bounded context each tick instead - the identical shape
 /// `scheduler_tick` below already uses for its own per-bc due-occurrence
 /// scan.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 async fn deadline_fire_tick(
     pool: &Pool,
     command_dispatcher: &dyn CommandDispatcher,
@@ -5881,7 +5884,10 @@ async fn scheduler_tick(
 /// extraction of what used to be that function's own loop body, so
 /// issue #15's `for_each_concurrent` fan-out has something to
 /// call per bounded context.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 async fn scheduler_tick_for_bounded_context(
     pool: &Pool,
     projection_dispatcher: &dyn skilj_core::plugin::ProjectionDispatcher,

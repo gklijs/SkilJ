@@ -50,3 +50,6 @@ tar = "0.4"
 # The Windows test-server archive is a `.zip`; 9.x is the fixed line (the
 # yanked 8.x line is exactly what this crate no longer depends on).
 zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

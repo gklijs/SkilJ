@@ -37,6 +37,14 @@ README.md, "Status and stability").
   deletion takes them, and the command reads as having an unknown command
   type, as it does after the deletion (docs/architecture.md §251).
 
+### Documentation
+
+- Every public item of `skilj-graphql`, `skilj-bridge` and `skilj-codegen` is documented, and
+  those crates now fail CI on an undocumented one, as the other library crates already did.
+  Every crate takes its lints from the workspace's `[workspace.lints]`, which adds two clippy
+  checks: a library crate's public enum is `#[non_exhaustive]`, and every `#[allow(...)]`
+  gives its reason.
+
 ## [0.4.0] - 2026-11-13
 
 ### Upgrading from 0.3

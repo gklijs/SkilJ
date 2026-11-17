@@ -30,3 +30,6 @@ tracing-subscriber.workspace = true
 # Tests only: building a `sqlx::Error` to check it never reaches a caller
 # (docs/architecture.md §93). The library itself stays free of `sqlx`.
 sqlx.workspace = true
+
+[lints]
+workspace = true

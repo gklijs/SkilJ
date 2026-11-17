@@ -94,7 +94,10 @@ impl EventType for MoneyDeposited {
 // registered in this test at all (`EventSubscription` is the surface
 // under test, not §8 item 6), unlike `skilj/tests/projection_query.rs`'s
 // own `BankingEvent`, which an `AccountBalance` projection does read.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "the event enum's shape needs this variant; this test never reads its payload"
+)]
 enum BankingEvent {
     MoneyDeposited(MoneyDepositedPayload),
 }

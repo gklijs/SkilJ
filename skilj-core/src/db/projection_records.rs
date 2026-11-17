@@ -209,7 +209,10 @@ pub(super) async fn get_or_create_projection_state_for_update(
 /// `get_or_create_projection_state_for_update` just returned, *before* `dispatcher.project()` is ever called - by the
 /// time this function runs, the caller has already decided this event
 /// genuinely hasn't been folded into this row yet.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub(super) async fn apply_projection_fold_update(
     executor: impl sqlx::PgExecutor<'_>,
     schema: &str,

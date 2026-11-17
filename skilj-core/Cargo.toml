@@ -72,3 +72,6 @@ tracing-subscriber.workspace = true
 # (`opentelemetry_sdk::metrics::InMemoryMetricExporter`) the metrics
 # test uses instead of a real OTLP collector.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

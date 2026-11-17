@@ -237,7 +237,7 @@ pub fn now() -> chrono::DateTime<Utc> {
 }
 
 pub struct Setup {
-    #[allow(dead_code)] // command_throughput.rs only
+    #[allow(dead_code, reason = "used by command_throughput.rs only")]
     pub linked_credential: String,
     /// Owns the background tasks `router` relies on.
     pub skilj: Skilj,
@@ -245,19 +245,19 @@ pub struct Setup {
     /// More instances on the same database and bounded context, for
     /// `command_throughput.rs`' `SKILJ_BENCH_INSTANCES`: each with its own
     /// command batcher, as separate processes would be.
-    #[allow(dead_code)] // command_throughput.rs only
+    #[allow(dead_code, reason = "used by command_throughput.rs only")]
     pub others: Vec<(Skilj, axum::Router)>,
     /// `Deposit`'s token.
     pub credential: String,
     /// `DepositFast`'s token.
-    #[allow(dead_code)] // command_throughput.rs only
+    #[allow(dead_code, reason = "used by command_throughput.rs only")]
     pub fast_credential: String,
     /// `DepositBlind`'s token.
-    #[allow(dead_code)] // command_throughput.rs only
+    #[allow(dead_code, reason = "used by command_throughput.rs only")]
     pub blind_credential: String,
 }
 
-#[allow(dead_code)] // coresident_pgbench.rs only
+#[allow(dead_code, reason = "used by coresident_pgbench.rs only")]
 pub async fn setup(database_url: String, pool: &Pool) -> Setup {
     setup_instances(database_url, pool, 1).await
 }
@@ -265,7 +265,7 @@ pub async fn setup(database_url: String, pool: &Pool) -> Setup {
 impl Setup {
     /// The router a caller numbered `worker` submits through: callers are
     /// spread over the instances round-robin.
-    #[allow(dead_code)] // command_throughput.rs only
+    #[allow(dead_code, reason = "used by command_throughput.rs only")]
     pub fn router_for(&self, worker: usize) -> &axum::Router {
         match worker % (self.others.len() + 1) {
             0 => &self.router,
@@ -274,7 +274,7 @@ impl Setup {
     }
 
     /// Shuts every instance down.
-    #[allow(dead_code)] // command_throughput.rs only
+    #[allow(dead_code, reason = "used by command_throughput.rs only")]
     pub async fn shutdown(self) {
         for (skilj, _) in self.others {
             skilj.shutdown(Duration::from_secs(10)).await;
@@ -387,14 +387,17 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
 }
 
 /// Submits one deposit and returns its latency.
-#[allow(dead_code)] // coresident_pgbench.rs only
+#[allow(dead_code, reason = "used by coresident_pgbench.rs only")]
 pub async fn deposit(setup: &Setup, account_id: &str) -> Duration {
     deposit_with(setup, &setup.credential, account_id).await
 }
 
 /// Submits one deposit with `credential`'s command and returns its
 /// latency.
-#[allow(dead_code)] // coresident_pgbench.rs only, through `deposit`
+#[allow(
+    dead_code,
+    reason = "used by coresident_pgbench.rs only, through `deposit`"
+)]
 pub async fn deposit_with(setup: &Setup, credential: &str, account_id: &str) -> Duration {
     deposit_through(&setup.router, credential, account_id).await
 }
@@ -409,7 +412,7 @@ pub async fn deposit_through(
     command_through(router, credential, body).await
 }
 
-#[allow(dead_code)] // command_throughput.rs only
+#[allow(dead_code, reason = "used by command_throughput.rs only")]
 pub async fn linked_deposit_through(
     router: &axum::Router,
     credential: &str,
@@ -453,7 +456,7 @@ async fn command_through(
 /// One deposit per entry of `account_ids`, in one
 /// `POST /v1/commands/trigger/batch` call (docs/architecture.md §227).
 /// Returns the call's latency.
-#[allow(dead_code)] // command_throughput.rs only
+#[allow(dead_code, reason = "used by command_throughput.rs only")]
 pub async fn deposit_batch_through(
     router: &axum::Router,
     credential: &str,
@@ -502,7 +505,7 @@ pub async fn deposit_batch_through(
 /// tokio: tokio's timer ticks in whole milliseconds, which turned a 0.5 ms
 /// delay into 1-2 ms and a "1 ms" round trip into about 3.5. Returns
 /// `database_url` pointed at the proxy.
-#[allow(dead_code)] // command_throughput.rs only
+#[allow(dead_code, reason = "used by command_throughput.rs only")]
 pub async fn latency_proxy(database_url: &str, round_trip: Duration) -> String {
     let (prefix, rest) = database_url
         .split_once('@')

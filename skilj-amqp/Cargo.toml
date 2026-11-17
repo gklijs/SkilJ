@@ -54,3 +54,6 @@ path = "src/lib.rs"
 testcontainers = "0.27"
 skilj-test-support = { path = "../skilj-test-support" }
 axum = { workspace = true }
+
+[lints]
+workspace = true

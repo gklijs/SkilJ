@@ -34,7 +34,10 @@
 //!   reads the history of.
 
 // Each test binary that includes this module uses a different part of it.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test binary that includes this module uses a different part of it"
+)]
 
 pub mod model;
 

@@ -71,7 +71,9 @@ pub struct SchemaRegistry {
 /// (docs/architecture.md §194), and the one-field schema that answers
 /// `_service` with it.
 pub struct PublishedDescription {
+    /// The subgraph SDL `_service { sdl }` answers with.
     pub sdl: Arc<String>,
+    /// The one-field schema that answers `_service`.
     pub service: Schema,
 }
 

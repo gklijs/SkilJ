@@ -85,7 +85,10 @@ pub async fn set_command_approval_policy(
 /// as a real command's is. With an idempotency key, a repeated pending
 /// submission for the same `(command type, client, key)` returns the
 /// original proposal rather than creating a second one.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 #[tracing::instrument(skip_all, fields(bounded_context = %command_type.bounded_context.name))]
 pub async fn propose_command(
     pool: &Pool,
@@ -290,7 +293,10 @@ pub async fn list_command_proposals(
 /// `parkedDeliveries` (docs/architecture.md §86), proposals outside
 /// `scope` are skipped and the page is filled from as many stored pages
 /// as that takes, so a page shorter than `limit` means the end.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_command_proposals_page(
     pool: &Pool,
@@ -710,7 +716,10 @@ pub async fn reveal_command_proposal_payload(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub async fn finish_command_proposal(
     pool: &Pool,
     bounded_context: &str,
@@ -921,7 +930,10 @@ pub async fn reject_command_proposal(
 /// A deadline's `DeadlineContext` is not carried onto the proposal: the
 /// approved command runs at approval time, so its `decide_with` sees no
 /// deadline - an approver deciding late is the approver's call.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub async fn propose_if_approval_required(
     pool: &Pool,
     command_type: &CommandType,
@@ -991,7 +1003,10 @@ pub struct CommandApprovalOutcome {
 /// On an `Err` the claim is released back to `pending`, so a transient
 /// failure is retryable; on a business rejection the proposal is recorded
 /// rejected with `decide()`'s own reason.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub async fn approve_command_proposal(
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,

@@ -1740,7 +1740,10 @@ pub async fn for_each_event_chunk(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 async fn for_each_event_chunk_up_to(
     pool: &Pool,
     cache: &crate::event_cache::EventCache,
@@ -1817,7 +1820,10 @@ async fn for_each_event_chunk_up_to(
 /// empty history, so its own validation errors still surface. `up_to` is an
 /// as-of read (docs/architecture.md §237): nothing past that sequence is
 /// served, and the walk stops there rather than going on to the end.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub async fn collect_event_page(
     pool: &Pool,
     cache: &crate::event_cache::EventCache,
@@ -1870,7 +1876,10 @@ fn chunk_up_to(chunk: &[Event], up_to: Option<i64>) -> &[Event] {
 /// events become visible in sequence order: `next_sequence`'s row lock
 /// is held until its transaction commits, so nothing can later appear
 /// below a sequence already read.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub async fn collect_scanned_event_page(
     pool: &Pool,
     cache: &crate::event_cache::EventCache,
@@ -1946,7 +1955,10 @@ pub async fn for_each_tagged_event_chunk(
 /// [`collect_event_page`] over [`for_each_tagged_event_chunk`]: the first
 /// `max_events` events `select` serves out of those carrying any of
 /// `tags` after `after_sequence`, read a chunk at a time. `up_to` as there.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub async fn collect_tagged_event_page(
     pool: &Pool,
     bounded_context: &str,
@@ -2608,7 +2620,10 @@ pub(super) async fn advance_dedupe_watermark<'e>(
 /// against `external_message_keys` instead (docs/architecture.md §175): a
 /// hit is `Redelivered` with the sequence of the event the key created,
 /// a miss records the key against the new event before the commit.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 #[tracing::instrument(skip_all)]
 pub async fn create_and_insert_external_event(
     pool: &Pool,
@@ -2819,7 +2834,10 @@ pub struct ExternalEventBatchItem {
 /// check sees the watermarks and keys recorded by the items before it, so
 /// a batch that repeats a message answers the repeat as redelivered. An
 /// error taking the lock or committing fails every item.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 #[tracing::instrument(skip_all, fields(events = items.len()))]
 pub async fn create_and_insert_external_events(
     pool: &Pool,
@@ -2964,7 +2982,10 @@ pub async fn create_and_insert_external_events(
 /// the dedupe check, the sequence number, the event, its insert and sync
 /// projections, and the watermark or key - what
 /// `create_and_insert_external_event` does for one event under the lock.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn insert_external_event_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     schema: &str,
@@ -3061,7 +3082,10 @@ pub(super) async fn insert_external_event_in_tx(
 /// `CreateDirectEvent`'s own twin of `create_and_insert_external_event`
 /// above - same reasoning, same fix, only the adapter type and the
 /// absent `source_content`/`source_context` differ.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 #[tracing::instrument(skip_all)]
 pub async fn create_and_insert_direct_event(
     pool: &Pool,

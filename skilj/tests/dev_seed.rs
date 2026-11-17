@@ -27,7 +27,10 @@ impl EventType for Deposited {
 }
 
 enum WalletEvent {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "the event enum's shape needs this variant; this test never reads its payload"
+    )]
     Deposited(DepositedPayload),
 }
 

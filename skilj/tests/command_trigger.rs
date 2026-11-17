@@ -45,7 +45,10 @@ enum BankingEvent {
     // Never read - decide() below doesn't consult matching_events -
     // built only to satisfy CommandType::Event's own BoundedContextEvent
     // bound.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "the event enum's shape needs this variant; this test never reads its payload"
+    )]
     MoneyDeposited(MoneyDepositedPayload),
 }
 

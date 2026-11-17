@@ -562,7 +562,10 @@ fn inbound_idempotency_key(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the HTTP client, skilj URL and mapping, plus the message's own fields"
+)]
 pub async fn dispatch_inbound_message(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -621,7 +624,10 @@ pub async fn dispatch_inbound_message(
 /// that kept failing, and `idempotency_key` the header it was sent with
 /// ([`inbound_idempotency_key`]), both stored so a later
 /// `retryParkedDelivery` redrives the identical request.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the HTTP client, skilj URL and mapping, plus the message's own fields"
+)]
 async fn report_parked_delivery(
     http: &reqwest::Client,
     skilj_base_url: &str,

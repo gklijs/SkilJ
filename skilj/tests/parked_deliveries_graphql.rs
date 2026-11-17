@@ -1096,7 +1096,10 @@ impl skilj::EventType for Deposited {
 }
 
 enum DepositEvent {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "the event enum's shape needs this variant; this test never reads its payload"
+    )]
     Deposited(DepositPayload),
 }
 

@@ -254,7 +254,10 @@ fn draw_commands_picking(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a render function: each piece of form state it draws is an argument"
+)]
 fn draw_commands_form(
     frame: &mut Frame,
     area: Rect,

@@ -96,7 +96,10 @@ pub(super) async fn get_cross_context_route_retry_state(
 /// `update_cross_context_route_cursor` has ever run for it). Doesn't
 /// touch `updated_at` on conflict - that column tracks the cursor's own
 /// last *advance*, not the last retry attempt.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub(super) async fn record_cross_context_route_retry_failure(
     pool: &Pool,
     source_bounded_context: &str,
@@ -436,7 +439,10 @@ pub async fn migrate_parked_deliveries_dedup_and_unique_index(
 /// `RETURNING` so the id/fields this returns always describe the row
 /// that actually exists afterward, real either way (the fresh `id` this
 /// generated, or the winning row's own from an earlier insert).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub async fn insert_parked_delivery<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     bounded_context: &str,
@@ -488,7 +494,10 @@ pub async fn insert_parked_delivery<'e>(
 /// whoever uploaded its blobs (docs/architecture.md §239): holds them from
 /// collection, in one transaction with the row, so a stored delivery always
 /// has its blobs and a failure stores neither.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per value the statement or scan uses"
+)]
 pub async fn insert_parked_delivery_holding_blobs(
     pool: &Pool,
     bounded_context: &str,
@@ -1310,7 +1319,10 @@ pub async fn delete_parked_delivery(
 /// its own connection for the tick's whole duration serializes callers
 /// just as effectively, since what needs protecting is "only one
 /// instance runs this route's tick at a time," not any single row.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 #[tracing::instrument(skip_all, fields(route = %route.name))]
 pub async fn catch_up_cross_context_route(
     pool: &Pool,
@@ -1357,7 +1369,10 @@ pub async fn catch_up_cross_context_route(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub(super) async fn catch_up_cross_context_route_locked(
     pool: &Pool,
     route: &crate::plugin::CrossContextRouteInfo,

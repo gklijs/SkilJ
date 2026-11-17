@@ -627,7 +627,10 @@ pub const DEADLINE_CLIENT_ID: &str = "deadline";
 /// `valid_until` never submits at all: marked `fired`, nothing begotten.
 /// `Cancelled` rows never reach here, so a `CancelDeadline` matching the
 /// head ends the chain the same way - nothing further is ever inserted.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 pub async fn fire_due_deadlines(
     pool: &Pool,
     command_dispatcher: &dyn crate::plugin::CommandDispatcher,

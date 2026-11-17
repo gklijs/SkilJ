@@ -591,7 +591,10 @@ pub async fn dispatch_inbound_message(
 /// [`inbound_request_body`]'s own output, the exact body that kept
 /// failing, stored verbatim so a later `retryParkedDelivery` redrives
 /// the identical request.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the HTTP client, skilj URL and mapping, plus the message's own fields"
+)]
 async fn report_parked_delivery(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -872,7 +875,10 @@ enum One {
 /// One message on its own: dispatched, retried per `retry_policy` and
 /// finally parked - everything [`run_inbound`] does for a message a batch
 /// didn't get done.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the HTTP client, skilj URL and mapping, plus the message's own fields"
+)]
 async fn handle_one<S: std::future::Future<Output = ()>>(
     http: &reqwest::Client,
     skilj_base_url: &str,

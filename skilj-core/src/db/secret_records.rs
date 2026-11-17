@@ -100,9 +100,15 @@ pub(super) struct SecretVersionRow {
     pub(super) id: i64,
     pub(super) name: String,
     pub(super) version: i64,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "selected with the rest of the row by sqlx::FromRow; nothing reads it"
+    )]
     pub(super) ciphertext: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "selected with the rest of the row by sqlx::FromRow; nothing reads it"
+    )]
     pub(super) encryption_key_id: i64,
     pub(super) status: String,
     pub(super) expires_at: Option<DateTime<Utc>>,

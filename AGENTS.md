@@ -40,6 +40,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+Every crate opts into the root `Cargo.toml`'s `[workspace.lints]` with `[lints] workspace = true`; a new crate must too. Two clippy lints there guard rules below: `exhaustive_enums` (a library crate's public enum is `#[non_exhaustive]`; the tools `skilj-tui` and `skilj-inspector`, whose library halves exist only for their tests, and `skilj-demo`, an unpublished example application, opt out) and `allow_attributes_without_reason` (every `#[allow(...)]` says why with `reason = "..."`).
+
 ## Dependencies
 
 ```sh
@@ -54,7 +56,7 @@ cargo deny check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
 
-`skilj`, `skilj-core`, `skilj-rest`, `skilj-retry`, `skilj-test-fixture`, `skilj-macros` and `skilj-blob-s3` have `#![warn(missing_docs)]`, which clippy's `-D warnings` makes an error: a new public item there needs a doc comment.
+`skilj`, `skilj-core`, `skilj-rest`, `skilj-graphql`, `skilj-bridge`, `skilj-codegen`, `skilj-retry`, `skilj-test-fixture`, `skilj-macros` and `skilj-blob-s3` have `#![warn(missing_docs)]`, which clippy's `-D warnings` makes an error: a new public item there needs a doc comment.
 
 Every public enum of the library crates is `#[non_exhaustive]` (docs/architecture.md §217, §219), and a new one must be too: match one from another crate with a `_` arm that answers `skilj_core::Error::Unsupported` (or the bridge's `BridgeError::Unsupported`). Adding a variant therefore compiles everywhere - search for the enum's matches in the other crates and handle it there.
 

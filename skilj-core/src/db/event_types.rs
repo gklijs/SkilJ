@@ -325,7 +325,10 @@ pub async fn list_command_types_for_bounded_context(
 /// tolerated the same way `catch_up_bounded_context` tolerates an
 /// unregistered projection dispatcher - logged and skipped by the
 /// caller, not propagated as an `Err`).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "takes the engine's shared services (the pool, dispatchers and the like) as separate borrows, beside the call's own inputs"
+)]
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn fire_system_event(
     pool: &Pool,

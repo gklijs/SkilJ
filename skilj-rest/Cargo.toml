@@ -31,3 +31,6 @@ tower = { version = "0.5", features = ["util"] }
 # (`opentelemetry_sdk::testing::trace`) the tracing-middleware test uses
 # instead of a real OTLP collector.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

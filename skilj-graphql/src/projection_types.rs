@@ -85,7 +85,9 @@ const AS_OF_SEQUENCE_FIELD: &str = "asOfSequence";
 /// their part of `state` directly.
 #[derive(Clone)]
 pub struct ProjectionInstance {
+    /// The instance's key.
     pub key: String,
+    /// The instance's decoded state.
     pub state: serde_json::Value,
     /// The sequence of the last event folded into `state`; `None` for an
     /// instance nothing has been folded into.
@@ -120,6 +122,8 @@ impl AdmittedProjections {
         self.by_type.get(type_name)
     }
 
+    /// `Ok` when `projection` of `bounded_context` has a type in this
+    /// schema; otherwise a `projection_not_in_schema` error.
     pub fn require(&self, bounded_context: &str, projection: &str) -> async_graphql::Result<()> {
         if self
             .pairs
@@ -135,9 +139,6 @@ impl AdmittedProjections {
     }
 }
 
-/// `visible`: only these bounded contexts' projections, for a caller who
-/// may not learn that the others exist (docs/architecture.md §138);
-/// `None` for all of them.
 /// Who a schema is built for: the bounded contexts whose projection types
 /// it carries, and the capabilities held in them. A projection requiring
 /// a capability is in the schema only for a caller holding it, so one
@@ -163,6 +164,13 @@ impl Visibility {
     }
 }
 
+/// Every registered projection's generated GraphQL types: their objects
+/// and enums, the `ProjectionResult` union over them, and which projections
+/// were admitted; `None` when no projection produced a type. `visible`:
+/// only these bounded contexts' projections, for a caller who may not
+/// learn that the others exist (docs/architecture.md §138); `None` for all
+/// of them. `federated` makes each projection type a federation entity
+/// keyed by its instance key (§194).
 pub async fn build(
     pool: &Pool,
     visible: Option<&Visibility>,
@@ -537,7 +545,10 @@ fn snake_to_camel(s: &str) -> String {
     result
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a recursive schema walk: its context and the objects and enums it collects are arguments"
+)]
 fn build_field(
     parent_type_name: &str,
     field_name: &str,

@@ -24,6 +24,11 @@
 //! (`can_read_sensitive`/subject-match) lives and stays the only path to
 //! it.
 
+#![allow(
+    clippy::exhaustive_enums,
+    reason = "a tool, not a library: nothing outside this crate's own tests matches its enums"
+)]
+
 pub mod app;
 pub mod cli;
 pub mod data;
