@@ -915,7 +915,7 @@
     },
     {
       "file": "skilj-core/src/access_control/mod.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/access_control/mod.rs:1046:5: 1046:82}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/access_control/mod.rs:1050:5: 1050:82}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(jwks_endpoint = %self.jwks_endpoint))]",
       "count": 1
     },
@@ -3207,13 +3207,13 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:1151:1: 1151:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:1166:1: 1166:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:417:1: 417:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:423:1: 423:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -3225,7 +3225,7 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:89:1: 89:95}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:92:1: 92:95}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %command_type.bounded_context.name))]",
       "count": 1
     },
@@ -6693,13 +6693,13 @@
     },
     {
       "file": "skilj-core/src/db/commands.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/commands.rs:115:1: 121:3}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/commands.rs:118:1: 124:3}>` which can panic",
       "source": ")]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/commands.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/commands.rs:1989:1: 1989:67}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/commands.rs:2001:1: 2001:67}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(batch_size = batch.len()))]",
       "count": 1
     },
@@ -11847,19 +11847,19 @@
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2021:1: 2021:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2033:1: 2033:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2080:1: 2080:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2092:1: 2092:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/events.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2230:1: 2230:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/events.rs:2242:1: 2242:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -17187,7 +17187,7 @@
     },
     {
       "file": "skilj-core/src/db/projection_consumers.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/projection_consumers.rs:2192:1: 2192:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/projection_consumers.rs:2213:1: 2213:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -19035,7 +19035,7 @@
     },
     {
       "file": "skilj-core/src/db/projection_records.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/projection_records.rs:820:1: 820:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/projection_records.rs:823:1: 823:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -20649,7 +20649,7 @@
     },
     {
       "file": "skilj-core/src/db/routes.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/routes.rs:279:1: 279:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/routes.rs:282:1: 282:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -24495,7 +24495,7 @@
     },
     {
       "file": "skilj-core/src/db/secret_records.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/secret_records.rs:452:1: 452:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/secret_records.rs:458:1: 458:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -27063,7 +27063,7 @@
     },
     {
       "file": "skilj-core/src/event_store/mod.rs",
-      "message": "call to drop of `{closure@skilj-core/src/db/event_types.rs:385:9: 385:11}` which can panic",
+      "message": "call to drop of `{closure@skilj-core/src/db/event_types.rs:388:9: 388:11}` which can panic",
       "source": "}",
       "count": 1
     },
