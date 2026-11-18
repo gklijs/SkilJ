@@ -36,7 +36,8 @@ const SCHEMA: &str = r##"{
         "name": {"type": "string"},
         "when": {"type": "string", "format": "date-time"},
         "day": {"type": "string", "format": "date"},
-        "clock": {"type": "string", "format": "partial-date-time"},
+        "clock": {"type": "string", "format": "partial-time"},
+        "local": {"type": "string", "format": "partial-date-time"},
         "id": {"type": "string", "format": "uuid"},
         "amount": {"type": "integer"},
         "price": {"type": "number"},
@@ -109,9 +110,9 @@ fn valid_filters_plain_string_accepts_equals_contains_is_like_only() {
 }
 
 #[test]
-fn valid_filters_date_time_date_and_partial_date_time_additionally_accept_ordering() {
+fn valid_filters_date_time_date_partial_time_and_partial_date_time_additionally_accept_ordering() {
     let et = event_type();
-    for field in ["when", "day", "clock"] {
+    for field in ["when", "day", "clock", "local"] {
         for op in [FilterOperator::GreaterThan, FilterOperator::LessThan] {
             assert!(
                 event_store::valid_filters(&et, &[filter(field, op, "x")]),
@@ -395,6 +396,7 @@ const PAYLOAD: &str = r##"{
     "when": "2027-01-15T08:00:00Z",
     "day": "2027-01-15",
     "clock": "08:00:00",
+    "local": "2027-01-15T08:00:00",
     "id": "5b1f6e2a-0000-4000-8000-000000000000",
     "amount": 42,
     "price": 9.99,
@@ -656,7 +658,7 @@ fn matches_filters_date_ordering() {
 }
 
 #[test]
-fn matches_filters_partial_date_time_ordering() {
+fn matches_filters_partial_time_ordering() {
     let e = event(PAYLOAD); // clock = "08:00:00"
     assert!(event_store::matches_filters(
         &e,
@@ -666,6 +668,98 @@ fn matches_filters_partial_date_time_ordering() {
         &e,
         &[filter("clock", FilterOperator::LessThan, "09:00:00")]
     ));
+}
+
+#[test]
+fn matches_filters_partial_date_time_ordering() {
+    // A civil date-time has no offset, so it parses neither as a timestamp
+    // nor as a bare date or time - it used to pass `valid_filters` and then
+    // match nothing at all.
+    let e = event(PAYLOAD); // local = "2027-01-15T08:00:00"
+    assert!(event_store::matches_filters(
+        &e,
+        &[filter(
+            "local",
+            FilterOperator::GreaterThan,
+            "2027-01-15T07:59:59.5"
+        )]
+    ));
+    assert!(event_store::matches_filters(
+        &e,
+        &[filter(
+            "local",
+            FilterOperator::LessThan,
+            "2027-01-15T08:00:00.500"
+        )]
+    ));
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter(
+            "local",
+            FilterOperator::GreaterThan,
+            "2027-01-16T00:00:00"
+        )]
+    ));
+}
+
+#[test]
+fn matches_filters_does_not_order_an_instant_against_a_wall_clock_reading() {
+    let e = event(PAYLOAD);
+    // `local` has no offset; a filter value with one is an instant.
+    for op in [FilterOperator::GreaterThan, FilterOperator::LessThan] {
+        assert!(!event_store::matches_filters(
+            &e,
+            &[filter("local", op, "2027-01-15T07:00:00Z")]
+        ));
+        assert!(!event_store::matches_filters(
+            &e,
+            &[filter("when", op, "2027-01-15T07:00:00")]
+        ));
+    }
+}
+
+/// The schemas applications actually register come from schemars, not a
+/// hand-written `format`: every jiff date/time type a payload can use gets
+/// ordering operators that then match.
+#[test]
+fn ordering_works_for_every_date_time_type_schemars_derives_a_format_for() {
+    #[derive(schemars::JsonSchema)]
+    #[expect(dead_code, reason = "only the derived schema is used")]
+    struct Payload {
+        at: jiff::Timestamp,
+        day: jiff::civil::Date,
+        clock: jiff::civil::Time,
+        local: jiff::civil::DateTime,
+    }
+    let et = EventType {
+        schema: serde_json::to_string(&schemars::schema_for!(Payload)).unwrap(),
+        ..event_type()
+    };
+    let payload = r#"{
+        "at": "2027-01-15T08:00:00Z",
+        "day": "2027-01-15",
+        "clock": "08:00:00",
+        "local": "2027-01-15T08:00:00"
+    }"#;
+    for (field, lower, higher) in [
+        ("at", "2027-01-15T07:00:00Z", "2027-01-15T09:00:00+00:00"),
+        ("day", "2027-01-14", "2027-01-16"),
+        ("clock", "07:00:00", "09:00:00.5"),
+        ("local", "2027-01-15T07:00:00", "2027-01-15T09:00:00"),
+    ] {
+        let above = [filter(field, FilterOperator::GreaterThan, lower)];
+        let below = [filter(field, FilterOperator::LessThan, higher)];
+        assert!(event_store::valid_filters(&et, &above), "{field}");
+        assert!(event_store::valid_filters(&et, &below), "{field}");
+        assert!(
+            event_store::matches_filters(&event(payload), &above),
+            "{field}"
+        );
+        assert!(
+            event_store::matches_filters(&event(payload), &below),
+            "{field}"
+        );
+    }
 }
 
 #[test]
