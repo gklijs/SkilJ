@@ -1164,9 +1164,12 @@ fn resolve_field_kind(
 /// The type-to-operator matrix (see the note above rule `FetchEvents`:
 /// "the exact type-to-operator matrix... is deliberately not enumerated
 /// here... exactly the kind of mechanism this spec consistently hands to
-/// a black box"). `format` values `"date-time"`/`"date"`/
-/// `"partial-date-time"` (`jiff::Timestamp`/`NaiveDate`/`NaiveTime`'s
-/// own three renderings) additionally get ordering operators - see
+/// a black box"). `format` values `"date-time"`/`"date"`/`"partial-time"`/
+/// `"partial-date-time"` (what schemars derives for `jiff::Timestamp`,
+/// `jiff::civil::Date`, `jiff::civil::Time` and `jiff::civil::DateTime`,
+/// and for chrono's `DateTime<Utc>`/`NaiveDate`/`NaiveTime`/
+/// `NaiveDateTime`; docs/architecture.md §255) additionally get ordering
+/// operators - see
 /// `matches_filters`' own `string_ordering` for why the comparison itself
 /// needs real parsing, not plain string `Ord`, despite the check here
 /// being schema-driven. Three more `format` values gate their own single
@@ -1189,7 +1192,7 @@ fn filter_operator_is_valid(kind: &FieldKind, operator: FilterOperator) -> bool 
                     | FilterOperator::In
             ) || (matches!(
                 format.as_deref(),
-                Some("date-time" | "date" | "partial-date-time")
+                Some("date-time" | "date" | "partial-time" | "partial-date-time")
             ) && matches!(
                 operator,
                 FilterOperator::GreaterThan | FilterOperator::LessThan
@@ -1938,16 +1941,21 @@ fn like_matches(text: &str, pattern: &str) -> bool {
 
 /// `GreaterThan`/`LessThan` for a string leaf. `matches_filters` has no
 /// schema, so unlike `valid_filters` it can't know in advance which of
-/// the three ordered formats (`date-time`/`date`/`partial-date-time`)
-/// it's looking at - tries `jiff::Timestamp`'s, `jiff::civil::Date`'s and
+/// the four ordered formats (`date-time`/`date`/`partial-time`/
+/// `partial-date-time`) it's looking at - tries `jiff::Timestamp`'s,
+/// `jiff::civil::DateTime`'s, `jiff::civil::Date`'s and
 /// `jiff::civil::Time`'s parsers in turn on *both* sides, since each format
-/// only parses its own shape. Real typed comparison (`PartialOrd`), not
+/// only parses its own shape: a timestamp needs an offset, a civil
+/// date-time has none, and neither parses as a bare date or time. So a
+/// timestamp is never compared with a civil date-time - an instant and a
+/// wall-clock reading aren't ordered against each other, and such a filter
+/// matches nothing. Real typed comparison (`PartialOrd`), not
 /// raw string `Ord` - plain string comparison is provably wrong here:
 /// serde serialization (jiff's, as chrono's before it) trims trailing-zero
 /// fractional digits, even down to no fractional part at all when it's
 /// exactly zero, so e.g. `"...:00Z"` sorts *after* `"...:00.500Z"` as plain
 /// strings despite being chronologically earlier (`'Z'` > `'.'`).
-/// `valid_filters` already gated the field to one of these three formats
+/// `valid_filters` already gated the field to one of these four formats
 /// before a caller could reach this at all; a value that doesn't parse
 /// under any of them here just doesn't match - the same "reject
 /// gracefully rather than panic" register as everywhere else in this
@@ -1963,6 +1971,12 @@ fn string_ordering(payload: &str, filter_value: &str, operator: FilterOperator) 
     if let (Ok(a), Ok(b)) = (
         payload.parse::<jiff::Timestamp>(),
         filter_value.parse::<jiff::Timestamp>(),
+    ) {
+        return cmp(a, b, operator);
+    }
+    if let (Ok(a), Ok(b)) = (
+        jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", payload),
+        jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", filter_value),
     ) {
         return cmp(a, b, operator);
     }

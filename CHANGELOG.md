@@ -57,6 +57,13 @@ README.md, "Status and stability").
 
 ### Fixed
 
+- `GREATER_THAN`/`LESS_THAN` filters now work on every date and time field
+  schemars derives a schema for (docs/architecture.md §255). A time-only
+  field (`jiff::civil::Time`, `format: partial-time`) used to be refused as
+  an invalid filter, and a date-time without an offset
+  (`jiff::civil::DateTime`, `format: partial-date-time`) was accepted but
+  never matched. An instant and an offset-less date-time are still not
+  ordered against each other: such a filter matches nothing.
 - A command submitted to a bounded context while that bounded context is
   being deleted no longer fails with a database deadlock (`40P01`), and the
   deletion no longer fails because of it. The command's type lookup now
