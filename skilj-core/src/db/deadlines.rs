@@ -565,6 +565,27 @@ pub const DEADLINE_PARKED_SOURCE_PREFIX: &str = "deadline:";
 /// The `client_id` every deadline's command is submitted under.
 pub const DEADLINE_CLIENT_ID: &str = "deadline";
 
+/// The poll's query for one tick's due deadlines in `schema` (an
+/// already-quoted identifier): `$1` is the cutoff before which a `firing`
+/// claim counts as stale, `$2` now. Its predicate is implied by
+/// `deadlines_claimable`'s, which is how the poll reads through that index
+/// rather than the whole table (docs/architecture.md §256). Public, hidden,
+/// so a test can `EXPLAIN` exactly this text.
+#[doc(hidden)]
+pub fn due_deadlines_sql(schema: &str) -> String {
+    format!(
+        "SELECT id, schedule_name, fire_at, expires_at, tags, correlation_id, \
+         target_bounded_context, \
+         target_command_type, payload, attempt_count, first_failed_at, recurrence_schedule, \
+         recurrence_policy, recurrence_start_at, recurrence_end_at, recurrence_valid_until, \
+         recurrence_parent_id, recurrence_sequence \
+         FROM {schema}.deadlines \
+         WHERE (status = 'pending' OR (status = 'firing' AND firing_at <= $1)) AND fire_at <= $2 \
+         AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \
+         ORDER BY fire_at LIMIT {MAX_DUE_DEADLINES_PER_TICK}"
+    )
+}
+
 /// One bounded context's own share of the firing scan - **not** tied to
 /// any one registered `ScheduleDeadline`, unlike the two catch-up
 /// functions above: it scans `{schema}.deadlines` itself, so a row fires
@@ -651,21 +672,11 @@ pub async fn fire_due_deadlines(
     // created - looked up once per tick, on first need.
     let mut cancel_backlogs: std::collections::HashMap<&str, Option<Timestamp>> =
         std::collections::HashMap::new();
-    let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT id, schedule_name, fire_at, expires_at, tags, correlation_id, \
-         target_bounded_context, \
-         target_command_type, payload, attempt_count, first_failed_at, recurrence_schedule, \
-         recurrence_policy, recurrence_start_at, recurrence_end_at, recurrence_valid_until, \
-         recurrence_parent_id, recurrence_sequence \
-         FROM {schema}.deadlines \
-         WHERE (status = 'pending' OR (status = 'firing' AND firing_at <= $1)) AND fire_at <= $2 \
-         AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \
-         ORDER BY fire_at LIMIT {MAX_DUE_DEADLINES_PER_TICK}"
-    )))
-    .bind(stale_cutoff.to_sqlx())
-    .bind(now.to_sqlx())
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(due_deadlines_sql(&schema)))
+        .bind(stale_cutoff.to_sqlx())
+        .bind(now.to_sqlx())
+        .fetch_all(pool)
+        .await?;
 
     'rows: for row in rows {
         // docs/architecture.md §131: a deadline only fires once every

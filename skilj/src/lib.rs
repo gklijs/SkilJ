@@ -258,6 +258,106 @@ pub const DEFAULT_DEADLINE_RETENTION: std::time::Duration =
 /// much.
 const DEADLINE_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// How often the `concurrent_indexes` task looks for indexes to build or
+/// drop concurrently (docs/architecture.md §256): a bounded context an
+/// older instance provisions during a rolling deploy gets its index about
+/// this long after.
+const CONCURRENT_INDEX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One tick of the `concurrent_indexes` task (docs/architecture.md §256):
+/// the bounded contexts with indexes left to build or drop, one at a time.
+/// A failure is the bounded context's, never the task's: a deadlock or
+/// lock timeout against another statement is retried next tick, a context
+/// deleted meanwhile is skipped, and one whose tables this instance's role
+/// doesn't own is warned about once and left to `migrate`. `true` when a
+/// stop was requested.
+async fn concurrent_index_tick(
+    pool: &skilj_core::db::Pool,
+    stop: &mut StopSignal,
+    not_owner: &mut std::collections::HashSet<String>,
+) -> bool {
+    let names = match skilj_core::db::pending_concurrent_index_work(pool).await {
+        Ok(names) => names,
+        Err(err) => {
+            tracing::warn!(error = %err, "looking for indexes to build concurrently failed");
+            BACKGROUND_TASK_ERRORS.add(
+                1,
+                &[
+                    KeyValue::new("task", "concurrent_indexes"),
+                    KeyValue::new("reason", "discovery_failed"),
+                ],
+            );
+            return false;
+        }
+    };
+    for name in names {
+        if not_owner.contains(&name) {
+            continue;
+        }
+        let mut outcome = None;
+        contain_panic("concurrent_indexes", name.clone(), async {
+            let stop_requested = async {
+                stop.stopped().await;
+            };
+            outcome = Some(
+                skilj_core::db::build_concurrent_indexes_until(pool, &name, stop_requested).await,
+            );
+        })
+        .await;
+        if matches!(
+            outcome,
+            Some(Ok(skilj_core::db::ConcurrentIndexOutcome::Stopped))
+        ) {
+            return true;
+        }
+        let Some(Err(err)) = outcome else {
+            continue;
+        };
+        let code = match &err {
+            skilj_core::Error::Database(e) => e
+                .as_database_error()
+                .and_then(|d| d.code())
+                .map(|c| c.into_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        match code.as_str() {
+            // deadlock_detected, lock_not_available: another statement
+            // (an older instance's patch, a hard delete) got in the way.
+            "40P01" | "55P03" => {
+                tracing::info!(bounded_context = %name, error = %err, "concurrent index build retrying next tick");
+            }
+            // insufficient_privilege: the tables belong to another role.
+            "42501" => {
+                tracing::warn!(
+                    bounded_context = %name,
+                    error = %err,
+                    "this instance's role may not build the bounded context's indexes; \
+                     run migrate as the schema owner"
+                );
+                not_owner.insert(name);
+            }
+            _ => {
+                if matches!(
+                    skilj_core::db::get_bounded_context(pool, &name).await,
+                    Ok(None)
+                ) {
+                    continue;
+                }
+                tracing::warn!(bounded_context = %name, error = %err, "concurrent index build failed");
+                BACKGROUND_TASK_ERRORS.add(
+                    1,
+                    &[
+                        KeyValue::new("task", "concurrent_indexes"),
+                        KeyValue::new("reason", "build_failed"),
+                    ],
+                );
+            }
+        }
+    }
+    false
+}
+
 /// Runs one unit of a background task's work (one bounded context's, one
 /// route's, one deadline schedule's), turning a panic into a logged error
 /// and a `reason = "panicked"` error count. The units run application
@@ -338,14 +438,18 @@ pub use skilj_macros::auto_register;
 #[non_exhaustive]
 pub enum SchemaChanges {
     /// Upgrade it: the global migrations, every bounded context's schema
-    /// patches, the admin context's access trail. The default.
+    /// patches, the admin context's access trail, and the indexes built
+    /// concurrently (docs/architecture.md §256). The default.
     #[default]
     Apply,
-    /// Change no schema: refuse with `schema_upgrade_required` when
-    /// [`preflight::inspect`] finds anything to upgrade. For deployments
-    /// where a separate job runs [`preflight::migrate`] first. A bounded
-    /// context an older instance creates later is still brought up to date
-    /// on first use (docs/architecture.md §200).
+    /// Change no schema at startup: refuse with `schema_upgrade_required`
+    /// when [`preflight::inspect`] finds anything to upgrade other than
+    /// concurrent index work. For deployments where a separate job runs
+    /// [`preflight::migrate`] first. A bounded context an older instance
+    /// creates later is still brought up to date on first use
+    /// (docs/architecture.md §200), and the background task builds and
+    /// drops its concurrently built indexes, which blocks no writes
+    /// (§256).
     Refuse,
 }
 
@@ -1122,6 +1226,7 @@ impl Skilj {
             blob_orphan_grace: skilj_core::blob::DEFAULT_ORPHAN_GRACE,
             application_version: None,
             schema_changes: SchemaChanges::Apply,
+            concurrent_index_interval: Some(CONCURRENT_INDEX_INTERVAL),
         }
     }
 
@@ -3179,6 +3284,7 @@ pub struct SkiljBuilder {
     blob_orphan_grace: std::time::Duration,
     application_version: Option<u64>,
     schema_changes: SchemaChanges,
+    concurrent_index_interval: Option<std::time::Duration>,
 }
 
 impl SkiljBuilder {
@@ -3787,6 +3893,16 @@ impl SkiljBuilder {
     /// ([`SchemaChanges::Refuse`]); docs/architecture.md §249.
     pub fn schema_changes(mut self, mode: SchemaChanges) -> Self {
         self.schema_changes = mode;
+        self
+    }
+
+    /// How often the `concurrent_indexes` background task looks for
+    /// indexes to build or drop concurrently (docs/architecture.md §256);
+    /// `None` spawns no task. For tests: the default, a minute, is what an
+    /// application wants.
+    #[doc(hidden)]
+    pub fn concurrent_index_interval(mut self, interval: Option<std::time::Duration>) -> Self {
+        self.concurrent_index_interval = interval;
         self
     }
 
@@ -4496,6 +4612,28 @@ impl SkiljBuilder {
             .try_collect::<Vec<()>>()
             .await?;
 
+        // docs/architecture.md §256: indexes on tables that grow with
+        // traffic, built concurrently, one bounded context at a time - the
+        // builds wait for older snapshots anywhere in the database, so
+        // running them side by side would gain little. Before the level is
+        // recorded, so it means they exist. Not in `Refuse` mode: the
+        // deploy job's migrate did it, and a replica that starts later must
+        // not wait on other transactions or need to own the tables; its
+        // background task picks up whatever is left.
+        if self.schema_changes == SchemaChanges::Apply {
+            for name in skilj_core::db::pending_concurrent_index_work(&pool).await? {
+                if let Err(err) = skilj_core::db::build_concurrent_indexes(&pool, &name).await {
+                    // docs/architecture.md §157.
+                    if skilj_core::db::get_bounded_context(&pool, &name)
+                        .await?
+                        .is_some()
+                    {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
         // The access trail (docs/architecture.md §229): after the patches
         // above, whose columns the admin context's event types need, and
         // before anything can change a grant. The baseline covers every
@@ -4857,6 +4995,42 @@ impl SkiljBuilder {
                         &[KeyValue::new("task", "deadline_retention")],
                     );
                     if stop.sleep(cleanup_interval).await {
+                        return;
+                    }
+                }
+            });
+        }
+
+        // docs/architecture.md §256: indexes built concurrently for a
+        // bounded context an older instance provisioned during a rolling
+        // deploy, or one an interrupted build left invalid - in both
+        // modes, since none of it blocks writes. In `Apply` mode startup
+        // just did it, so the first tick waits an interval; in `Refuse`
+        // mode startup did none of it, so it runs at once.
+        if let Some(interval) = self.concurrent_index_interval {
+            let pool = skilj.pool.clone();
+            let first_wait = match self.schema_changes {
+                SchemaChanges::Refuse => std::time::Duration::ZERO,
+                _ => interval,
+            };
+            background.spawn("concurrent_indexes", move |mut stop| async move {
+                // Bounded contexts whose tables this instance's role may not
+                // index, warned about once each.
+                let mut not_owner: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                if stop.sleep(first_wait).await {
+                    return;
+                }
+                loop {
+                    let start = std::time::Instant::now();
+                    let stopped = concurrent_index_tick(&pool, &mut stop, &mut not_owner)
+                        .instrument(tracing::info_span!("concurrent_indexes_tick"))
+                        .await;
+                    BACKGROUND_TASK_TICK_DURATION.record(
+                        start.elapsed().as_secs_f64(),
+                        &[KeyValue::new("task", "concurrent_indexes")],
+                    );
+                    if stopped || stop.sleep(interval).await {
                         return;
                     }
                 }

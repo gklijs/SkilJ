@@ -328,18 +328,20 @@ pub(super) async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
-    // issue #20 - `ensure_deadlines_table`'s own two-index shape
-    // run directly against this transaction rather than calling that
+    // issue #20 - `ensure_deadlines_table`'s table and GIN index (and
+    // §256's claim index) run directly against this transaction rather than calling that
     // function (it takes `&Pool`, not a transaction - see its own doc
     // comment), the identical split `private_field_grants_table_ddl`'s
     // own two call sites already use.
     sqlx::query(sqlx::AssertSqlSafe(deadlines_table_ddl(&schema)))
         .execute(&mut **tx)
         .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \
-         WHERE status = 'pending'"
-    )))
+    // docs/architecture.md §256: the index the deadline poll claims
+    // through, built plainly here - the table was only just created - from
+    // the same definition the concurrent build uses for an older one.
+    sqlx::query(sqlx::AssertSqlSafe(
+        super::concurrent_indexes::DEADLINES_CLAIMABLE.create_sql(&schema, false),
+    ))
     .execute(&mut **tx)
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -1966,16 +1968,10 @@ pub async fn ensure_deadlines_table(
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
-        &schema,
-        "deadlines_due",
-        format!(
-            "CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \
-         WHERE status = 'pending'"
-        ),
-    )))
-    .execute(pool)
-    .await?;
+    // `deadlines_due` is no longer created here, and `deadlines_claimable`,
+    // which replaces it, not with a plain `CREATE INDEX`: the table grows
+    // with traffic, so `build_concurrent_indexes` builds it concurrently,
+    // later in startup (docs/architecture.md §256).
     sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
         &schema,
         "deadlines_tags_gin",

@@ -97,7 +97,10 @@ already did. To make the change a step of its own, run
 `skilj::preflight::migrate(database_url, &MigrateOptions::new().lock_timeout(..))`
 from a deploy job or init container. Then start the application with
 `.schema_changes(SchemaChanges::Refuse)`, so an instance that would otherwise
-upgrade fails with `schema_upgrade_required` instead.
+upgrade fails with `schema_upgrade_required` instead. A `Refuse` instance changes
+no schema at startup. Its `concurrent_indexes` background task still builds and
+drops indexes concurrently, which blocks no writes (below), so the preflight
+lists that work as `lazy` and doesn't make `Refuse` refuse over it.
 
 A schema change that has real work to do waits for every open transaction on
 its table, and queries on that table queue behind it. Startup itself sets no
@@ -106,12 +109,28 @@ reporting queries, no idle `psql` sessions. `migrate`'s `lock_timeout` turns a
 long wait into a failure. The step that waited is not committed, and the steps
 before it stay done.
 
+Indexes on tables that grow with traffic (from 0.5, `deadlines_claimable`) are
+built with `CREATE INDEX CONCURRENTLY` instead, and the indexes they replace
+dropped with `DROP INDEX CONCURRENTLY` (docs/architecture.md §256). Writes go on
+while they work, unless a conflicting schema change such as a bounded context's
+hard delete queues behind them. They still wait for transactions already
+writing the table, and a build also for every older transaction anywhere in the
+database. The first instance on the new version does them one bounded context
+at a time, so with many bounded contexts that adds up: run `migrate` as a
+deploy job then. `lock_timeout` bounds these waits too, with the same `55P03`
+error. A build cut short leaves an invalid index; the preflight lists it, and
+the rerun, the next default start or the background task rebuilds it. If the
+instances connect as a role that doesn't own the tables, the background task
+logs that once per bounded context; run `migrate` as the owner.
+
 ### If it's interrupted
 
 Each global migration and each patch commits on its own. After a crash, a
 timeout or a killed deploy, run the upgrade again: it carries on where it
 stopped, and a preflight shows where that is. A global migration recorded as
 failed (`migration_failed` in the preflight) needs inspecting before a rerun.
+An interrupted concurrent index build is the one step that leaves something
+behind: an invalid index, which the rerun drops and builds again.
 
 ### After: rebuilds
 
@@ -120,6 +139,27 @@ the background. Watch each projection's `pendingRebuild`/`buildingRebuild`
 until promoted before relying on it. A staged or building rebuild can pause
 live folding unless `LIVE_FOLD_COMPATIBLE` is declared, and a paused
 synchronous projection refuses writes with `live_fold_paused`.
+
+### Upgrading from 0.4 to 0.5
+
+The first startup (or `migrate`) builds `deadlines_claimable` concurrently on
+every bounded context and then drops `deadlines_due`; writes go on. 0.4 may keep
+running against the upgraded database (schema level 2, compatible with 1), so a
+rolling deploy works. Two things to know:
+
+- A 0.4 instance that starts in default mode, an old replica restarting during
+  the rollout or a rollback, builds `deadlines_due` again with its
+  write-blocking `CREATE INDEX`. The next 0.5 start, or within a minute a 0.5
+  instance's background task, drops it again.
+- A bounded context a 0.4 instance creates during the rollout has only
+  `deadlines_due`. The 0.5 instances' background task builds its index within
+  about a minute, in either mode.
+
+To roll back to 0.4, stop every 0.5 instance first; a running one drops
+`deadlines_due` again. Check that no `DROP INDEX CONCURRENTLY` is still running
+(`pg_stat_activity`), then start 0.4. With `SchemaChanges::Refuse`, run 0.4's
+`migrate` before starting it: 0.4 refuses a database without `deadlines_due`
+until its own `migrate` has rebuilt it.
 
 ### Upgrading from 0.2 to 0.3
 

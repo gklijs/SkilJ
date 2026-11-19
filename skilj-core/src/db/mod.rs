@@ -398,10 +398,19 @@ pub use preflight::{
     bounded_context_shape, ensure_admin_bounded_context, record_schema_level,
     upgrade_bounded_context, EXPECTED_BOUNDED_CONTEXT_SHAPE,
 };
-pub(crate) use preflight::{check_schema_compatibility, inspect as inspect_for_preflight};
+pub(crate) use preflight::{
+    check_schema_compatibility, concurrent_index_work, inspect as inspect_for_preflight,
+};
 
 mod schema;
 pub use schema::*;
+
+mod concurrent_indexes;
+pub use concurrent_indexes::{
+    build_concurrent_indexes, build_concurrent_indexes_until, pending_concurrent_index_work,
+    ConcurrentIndexOutcome, CONCURRENT_INDEX_APPLICATION_NAME,
+};
+pub(crate) use concurrent_indexes::{IndexState, IndexStates, MANAGED_INDEXES};
 
 mod roles;
 pub use roles::*;
