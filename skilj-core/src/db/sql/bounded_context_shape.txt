@@ -409,7 +409,7 @@ index commands_external_id_key on commands
 index commands_pkey on commands
 index cross_context_route_cursors_pkey on cross_context_route_cursors
 index deadline_cursors_pkey on deadline_cursors
-index deadlines_due on deadlines
+index deadlines_claimable on deadlines
 index deadlines_pkey on deadlines
 index deadlines_tags_gin on deadlines
 index encryption_keys_master_key on encryption_keys

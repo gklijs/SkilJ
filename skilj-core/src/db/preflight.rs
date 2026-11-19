@@ -95,8 +95,41 @@ pub async fn bounded_context_shape(
     .fetch_all(&mut *conn)
     .await?;
     let mut lines: Vec<String> = lines.into_iter().map(|(line,)| line).collect();
+    // docs/architecture.md §256: an index built concurrently is marked by
+    // its catalog state - ` invalid` when an interrupted build left it so,
+    // ` foreign` when what sits under the name isn't the index this
+    // release creates - so the diff can tell work startup does from an
+    // operator's object it leaves alone. Columns only: no deparsing, so no
+    // table lock.
+    if lines.iter().any(|l| concurrent_index_name(l).is_some()) {
+        let states = super::IndexStates::for_schema(conn, &raw).await?;
+        for line in &mut lines {
+            if let Some(spec) = concurrent_index_name(line) {
+                match states.get(&raw, &spec) {
+                    super::IndexState::Invalid => line.push_str(" invalid"),
+                    super::IndexState::Foreign => line.push_str(" foreign"),
+                    super::IndexState::Valid | super::IndexState::Absent => {}
+                }
+            }
+        }
+    }
     lines.sort();
     Ok(lines)
+}
+
+/// The managed or replaced index a shape line `index <name> on <table>`
+/// names, whatever the table.
+fn concurrent_index_name(line: &str) -> Option<super::concurrent_indexes::IndexSpec> {
+    let name = line.strip_prefix("index ")?.split(' ').next()?;
+    super::MANAGED_INDEXES
+        .iter()
+        .flat_map(|(managed, replaced)| std::iter::once(*managed).chain(*replaced))
+        .find(|spec| spec.name == name)
+}
+
+/// The shape line of a valid `spec` on its table.
+fn index_line(spec: &super::concurrent_indexes::IndexSpec) -> String {
+    format!("index {} on {}", spec.name, spec.table)
 }
 
 /// The key of a shape line: a function's line without its body hash, so a
@@ -144,7 +177,46 @@ pub(crate) fn diff_shape(expected: &[&str], actual: &[String]) -> ShapeDiff {
         drops: Vec::new(),
         lazy: Vec::new(),
     };
+    // docs/architecture.md §256: concurrent index work - a managed index
+    // to build or rebuild, a replaced one to drop once it is - is `lazy`:
+    // reported, with its lock, but no reason to refuse, because startup in
+    // default mode and the background task in either mode do it without
+    // blocking writes. A foreign object under either name is `unexpected`.
+    let foreign = |spec: &super::concurrent_indexes::IndexSpec| {
+        actual_keys
+            .keys()
+            .any(|k| k.starts_with(&format!("index {} on ", spec.name)) && k.ends_with(" foreign"))
+    };
+    let mut handled: BTreeSet<String> = BTreeSet::new();
+    for (managed, replaced) in super::MANAGED_INDEXES {
+        let line = index_line(managed);
+        if !expected_keys.contains_key(line.as_str()) {
+            continue;
+        }
+        handled.insert(line.clone());
+        let invalid = format!("{line} invalid");
+        if actual_keys.contains_key(line.as_str()) {
+            // Valid: only the replaced index may be left to drop.
+        } else if actual_keys.contains_key(invalid.as_str()) {
+            diff.lazy.push(invalid.clone());
+            handled.insert(invalid);
+        } else if !foreign(managed) {
+            diff.lazy.push(line.clone());
+        }
+        if let Some(replaced) = replaced {
+            let old = index_line(replaced);
+            for key in [old.clone(), format!("{old} invalid")] {
+                if actual_keys.contains_key(key.as_str()) && !foreign(managed) {
+                    diff.lazy.push(key.clone());
+                    handled.insert(key);
+                }
+            }
+        }
+    }
     for (key, line) in &expected_keys {
+        if handled.contains(*key) {
+            continue;
+        }
         match actual_keys.get(key) {
             None if is_lazy(line) => diff.lazy.push(key.to_string()),
             None => diff.missing.push(key.to_string()),
@@ -153,7 +225,7 @@ pub(crate) fn diff_shape(expected: &[&str], actual: &[String]) -> ShapeDiff {
         }
     }
     for key in actual_keys.keys() {
-        if expected_keys.contains_key(key) {
+        if expected_keys.contains_key(key) || handled.contains(*key) {
             continue;
         }
         if is_known_drop(key) {
@@ -419,57 +491,127 @@ async fn rewrites(
     Ok(rewrites)
 }
 
-/// The table locks the missing columns, indexes and constraints take, one
-/// entry per table, the strongest lock first named.
+/// The table, and what is done, for a `lazy` line that is concurrent
+/// index work (docs/architecture.md §256): a managed index to build or
+/// rebuild, a replaced one to drop. `None` for any other line.
+pub(crate) fn concurrent_index_work(line: &str) -> Option<(&'static str, String)> {
+    let (line, invalid) = match line.strip_suffix(" invalid") {
+        Some(base) => (base, true),
+        None => (line, false),
+    };
+    for (managed, replaced) in super::MANAGED_INDEXES {
+        if line == index_line(managed) {
+            let what = if invalid {
+                format!(
+                    "rebuilds index {} concurrently (a build was interrupted)",
+                    managed.name
+                )
+            } else {
+                format!("builds index {} concurrently", managed.name)
+            };
+            return Some((managed.table, what));
+        }
+        if let Some(replaced) = replaced {
+            if line == index_line(replaced) {
+                return Some((
+                    replaced.table,
+                    format!("drops index {} concurrently", replaced.name),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// How strongly a lock mode blocks: the strongest one taken on a table is
+/// the one reported.
+fn lock_rank(mode: &str) -> u8 {
+    match mode {
+        "ACCESS EXCLUSIVE" => 3,
+        "SHARE" => 2,
+        _ => 1,
+    }
+}
+
+/// The table locks the missing columns, indexes and constraints take, and
+/// the concurrent index work among the `lazy` lines (`SHARE UPDATE
+/// EXCLUSIVE`, which lets writes go on), one entry per table, the
+/// strongest lock first named.
 async fn ddl_locks(
     conn: &mut PgConnection,
     bounded_context: &str,
     missing: &[String],
+    lazy: &[String],
     tables: &BTreeSet<String>,
     exact: bool,
 ) -> crate::error::Result<Vec<TableLock>> {
-    // table -> (strongest mode, what is added)
-    let mut by_table: BTreeMap<String, (&'static str, Vec<String>)> = BTreeMap::new();
+    // table -> (strongest mode, what is added, concurrent work)
+    let mut by_table: BTreeMap<String, (&'static str, Vec<String>, Vec<String>)> = BTreeMap::new();
+    let mut note = |table: &str, mode: &'static str, add: Option<String>, work: Option<String>| {
+        // A table that is itself missing is created with all of it.
+        if !tables.contains(table) {
+            return;
+        }
+        let entry = by_table
+            .entry(table.to_string())
+            .or_insert((mode, Vec::new(), Vec::new()));
+        if lock_rank(mode) > lock_rank(entry.0) {
+            entry.0 = mode;
+        }
+        entry.1.extend(add);
+        entry.2.extend(work);
+    };
     for line in missing {
-        let (mode, table, what) = if let Some(rest) = line.strip_prefix("column ") {
+        if let Some(rest) = line.strip_prefix("column ") {
             let column = rest.split(' ').next().unwrap_or(rest);
             let Some((table, name)) = column.split_once('.') else {
                 continue;
             };
-            ("ACCESS EXCLUSIVE", table, format!("column {name}"))
+            note(
+                table,
+                "ACCESS EXCLUSIVE",
+                Some(format!("column {name}")),
+                None,
+            );
         } else if let Some(rest) = line.strip_prefix("index ") {
             let Some((name, table)) = rest.split_once(" on ") else {
                 continue;
             };
-            ("SHARE", table, format!("index {name}"))
+            note(table, "SHARE", Some(format!("index {name}")), None);
         } else if let Some(rest) = line.strip_prefix("constraint ") {
             let Some((name, rest)) = rest.split_once(" on ") else {
                 continue;
             };
             let table = rest.split(' ').next().unwrap_or(rest);
-            ("ACCESS EXCLUSIVE", table, format!("constraint {name}"))
-        } else {
-            continue;
-        };
-        // A table that is itself missing is created with all of it.
-        if !tables.contains(table) {
-            continue;
+            note(
+                table,
+                "ACCESS EXCLUSIVE",
+                Some(format!("constraint {name}")),
+                None,
+            );
         }
-        let entry = by_table
-            .entry(table.to_string())
-            .or_insert((mode, Vec::new()));
-        if mode == "ACCESS EXCLUSIVE" {
-            entry.0 = mode;
+    }
+    for line in lazy {
+        if let Some((table, what)) = concurrent_index_work(line) {
+            note(table, "SHARE UPDATE EXCLUSIVE", None, Some(what));
         }
-        entry.1.push(what);
     }
     let mut locks = Vec::new();
-    for (table, (mode, adds)) in by_table {
+    for (table, (mode, adds, work)) in by_table {
         let rows = row_count(conn, bounded_context, &table, exact).await?;
+        let mut reason: Vec<String> = Vec::new();
+        if !adds.is_empty() {
+            reason.push(format!("adds {}", adds.join(", ")));
+        }
+        reason.extend(work);
+        let mut reason = reason.join("; ");
+        if mode == "SHARE UPDATE EXCLUSIVE" {
+            reason.push_str("; writes go on");
+        }
         locks.push(TableLock {
             table,
             mode: mode.into(),
-            reason: format!("adds {}", adds.join(", ")),
+            reason,
             rows,
         });
     }
@@ -495,7 +637,7 @@ async fn inspect_bounded_context(
     } else {
         (
             rewrites(conn, name, &tables, exact).await?,
-            ddl_locks(conn, name, &diff.missing, &tables, exact).await?,
+            ddl_locks(conn, name, &diff.missing, &diff.lazy, &tables, exact).await?,
         )
     };
     Ok(BoundedContextReport {
@@ -1067,6 +1209,119 @@ mod tests {
         let diff = diff_shape(&expected, &[]);
         assert!(diff.missing.is_empty());
         assert_eq!(diff.lazy.len(), 1);
+    }
+
+    /// docs/architecture.md §256: concurrent index work is `lazy`, an
+    /// operator's object under a managed name `unexpected`, never a drop or
+    /// a repair.
+    #[test]
+    fn concurrent_index_work_is_lazy_and_foreign_objects_unexpected() {
+        let expected = ["index deadlines_claimable on deadlines", "table deadlines"];
+        let shape = |lines: &[&str]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l.to_string())
+                .chain(["table deadlines".to_string()])
+                .collect()
+        };
+        let old = diff_shape(&expected, &shape(&["index deadlines_due on deadlines"]));
+        assert_eq!(
+            old.lazy,
+            [
+                "index deadlines_claimable on deadlines",
+                "index deadlines_due on deadlines"
+            ]
+        );
+        assert!(old.missing.is_empty() && old.drops.is_empty() && old.unexpected.is_empty());
+
+        let invalid = diff_shape(
+            &expected,
+            &shape(&["index deadlines_claimable on deadlines invalid"]),
+        );
+        assert_eq!(
+            invalid.lazy,
+            ["index deadlines_claimable on deadlines invalid"]
+        );
+        assert!(invalid.outdated.is_empty() && invalid.unexpected.is_empty());
+
+        let leftover = diff_shape(
+            &expected,
+            &shape(&[
+                "index deadlines_claimable on deadlines",
+                "index deadlines_due on deadlines",
+            ]),
+        );
+        assert_eq!(leftover.lazy, ["index deadlines_due on deadlines"]);
+
+        let foreign = diff_shape(
+            &expected,
+            &shape(&[
+                "index deadlines_claimable on deadlines foreign",
+                "index deadlines_due on deadlines",
+            ]),
+        );
+        assert!(foreign.lazy.is_empty(), "{:?}", foreign.lazy);
+        assert!(foreign.missing.is_empty() && foreign.drops.is_empty());
+        assert_eq!(
+            foreign.unexpected,
+            [
+                "index deadlines_claimable on deadlines foreign",
+                "index deadlines_due on deadlines"
+            ]
+        );
+
+        let foreign_old = diff_shape(
+            &expected,
+            &shape(&[
+                "index deadlines_claimable on deadlines",
+                "index deadlines_due on deadlines foreign",
+            ]),
+        );
+        assert!(foreign_old.lazy.is_empty());
+        assert_eq!(
+            foreign_old.unexpected,
+            ["index deadlines_due on deadlines foreign"]
+        );
+
+        let current = diff_shape(
+            &expected,
+            &shape(&["index deadlines_claimable on deadlines"]),
+        );
+        assert!(current.lazy.is_empty() && current.unexpected.is_empty());
+    }
+
+    #[test]
+    fn concurrent_index_work_names_what_is_done() {
+        assert_eq!(
+            concurrent_index_work("index deadlines_claimable on deadlines"),
+            Some((
+                "deadlines",
+                "builds index deadlines_claimable concurrently".to_string()
+            ))
+        );
+        assert!(
+            concurrent_index_work("index deadlines_claimable on deadlines invalid")
+                .is_some_and(|(_, what)| what.starts_with("rebuilds index deadlines_claimable"))
+        );
+        assert_eq!(
+            concurrent_index_work("index deadlines_due on deadlines"),
+            Some((
+                "deadlines",
+                "drops index deadlines_due concurrently".to_string()
+            ))
+        );
+        assert_eq!(
+            concurrent_index_work("column event_types.registered_by_version bigint null"),
+            None
+        );
+    }
+
+    /// The strongest lock on a table is the one reported: a plain index
+    /// build next to a concurrent one still blocks writes.
+    #[test]
+    fn lock_modes_rank_by_what_they_block() {
+        assert!(lock_rank("ACCESS EXCLUSIVE") > lock_rank("SHARE"));
+        assert!(lock_rank("SHARE") > lock_rank("SHARE UPDATE EXCLUSIVE"));
     }
 
     #[test]

@@ -176,6 +176,12 @@
       "count": 1
     },
     {
+      "file": "<registry>/hashbrown-0.17.1/src/set.rs",
+      "message": "call to method `hashbrown::map::HashMap::<K, V, S, A>::insert` which can panic",
+      "source": "self.map.insert(value, ()).is_none()",
+      "count": 1
+    },
+    {
       "file": "<registry>/jiff-0.2.46/src/timestamp.rs",
       "message": "call to associated function `<jiff::Timestamp as std::convert::TryFrom<std::time::SystemTime>>::try_from` which can panic",
       "source": "Timestamp::try_from(crate::now::system_time())",
@@ -296,6 +302,18 @@
       "count": 1
     },
     {
+      "file": "<registry>/tokio-1.54.1/src/macros/select.rs",
+      "message": "call to drop of `(&mut std::pin::Pin<&mut std::future::Pending<()>>, tokio::time::Sleep)` which can panic",
+      "source": "};",
+      "count": 1
+    },
+    {
+      "file": "<registry>/tokio-1.54.1/src/runtime/context.rs",
+      "message": "call to function `tokio::runtime::context::with_scheduler` which can panic",
+      "source": "with_scheduler(|maybe_scheduler| { if let Some(scheduler) = maybe_scheduler { scheduler.defer(waker); } else { // Called from outside of the runtime, immediately wake the // task. waker.wake_by_ref(); } });",
+      "count": 1
+    },
+    {
       "file": "<registry>/tracing-0.1.44/src/lib.rs",
       "message": "call to function `tracing::dispatcher::get_default` which can panic",
       "source": "interest.is_always() || crate::dispatcher::get_default(|default| default.enabled(meta))",
@@ -311,7 +329,7 @@
       "file": "<registry>/tracing-0.1.44/src/macros.rs",
       "message": "call to method `tracing::log::Log::enabled` which can panic",
       "source": "if logger.enabled(&log_meta) {",
-      "count": 2
+      "count": 3
     },
     {
       "file": "<registry>/tracing-0.1.44/src/span.rs",
@@ -572,6 +590,12 @@
       "count": 1
     },
     {
+      "file": "<rust>/library/core/src/iter/adapters/flatten.rs",
+      "message": "call to method `std::iter::adapters::flatten::FlattenCompat::<I, U>::iter_try_fold` which can panic",
+      "source": "self.iter_try_fold(init, flatten(fold))",
+      "count": 1
+    },
+    {
       "file": "<rust>/library/core/src/iter/adapters/peekable.rs",
       "message": "call to method `<std::iter::Filter<I, P> as std::iter::Iterator>::next` which can panic",
       "source": "None => self.iter.next(),",
@@ -617,7 +641,7 @@
       "file": "<rust>/library/core/src/macros/mod.rs",
       "message": "call to method `std::fmt::Formatter::<'a>::write_fmt` which can panic",
       "source": "$dst.write_fmt($crate::format_args_nl!($($arg)*))",
-      "count": 21
+      "count": 22
     },
     {
       "file": "<rust>/library/core/src/mem/mod.rs",
@@ -710,6 +734,12 @@
       "count": 1
     },
     {
+      "file": "<rust>/library/core/src/str/iter.rs",
+      "message": "call to method `core::str::iter::SplitInternal::<'a, P>::next` which can panic",
+      "source": "self.0.next()",
+      "count": 1
+    },
+    {
       "file": "<rust>/library/core/src/str/mod.rs",
       "message": "call to method `<&'b str as std::str::pattern::Pattern>::is_contained_in` which can panic",
       "source": "pat.is_contained_in(self)",
@@ -719,7 +749,7 @@
       "file": "<rust>/library/core/src/str/mod.rs",
       "message": "call to method `<char as std::str::pattern::Pattern>::into_searcher` which can panic",
       "source": "matcher: pat.into_searcher(self),",
-      "count": 1
+      "count": 2
     },
     {
       "file": "<rust>/library/core/src/str/mod.rs",
@@ -731,6 +761,12 @@
       "file": "<rust>/library/core/src/str/pattern.rs",
       "message": "call to associated function `std::str::pattern::TwoWaySearcher::new` which can panic",
       "source": "searcher: StrSearcherImpl::TwoWay(TwoWaySearcher::new( needle.as_bytes(), haystack.len(), )),",
+      "count": 1
+    },
+    {
+      "file": "<rust>/library/core/src/str/pattern.rs",
+      "message": "call to method `core::slice::<impl [T]>::ends_with` which can panic",
+      "source": "haystack.as_bytes().ends_with(self.as_bytes())",
       "count": 1
     },
     {
@@ -821,6 +857,12 @@
       "file": "<rust>/library/std/src/sys/time/unix.rs",
       "message": "call to method `std::sys::pal::unix::time::Timespec::sub_timespec` which can panic",
       "source": "self.t.sub_timespec(&other.t).ok()",
+      "count": 1
+    },
+    {
+      "file": "<rust>/library/std/src/thread/local.rs",
+      "message": "call to method `std::thread::LocalKey::<T>::try_with` which can panic",
+      "source": "match self.try_with(f) {",
       "count": 1
     },
     {
@@ -8642,6 +8684,438 @@
       "count": 1
     },
     {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"DROP INDEX CONCURRENTLY IF EXISTS {schema}.{}\",",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"index {}.{} is {state:?} after CREATE INDEX CONCURRENTLY\",",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "let key = format!(\"skilj_concurrent_index:{schema}.{}\", managed.name);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "let raw = format!(\"bc_{bounded_context}\");",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `std::time::Duration::try_from_secs_f64` which can panic",
+      "source": ".then(|| Duration::try_from_secs_f64(lock_timeout_ms / 1000.0).ok())",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `std::time::Instant::now` which can panic",
+      "source": "let left = deadline.saturating_duration_since(Instant::now());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `(std::string::String, &str)` which can panic",
+      "source": "states.insert((row.schema.clone(), spec.name), row.state(spec));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `(std::string::String, &str)` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `[std::string::String; 1]` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `db::concurrent_indexes::IndexStates` which can panic",
+      "source": "let state = IndexStates::for_schema(conn, raw).await?.get(raw, managed);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `db::concurrent_indexes::IndexStates` which can panic",
+      "source": "}",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::result::Result<(), sqlx::Error>` which can panic",
+      "source": "let _ = sqlx::Connection::close(conn).await;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": ".insert((bounded_context.to_string(), name.to_string()));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::sync::MutexGuard<'_, std::collections::HashSet<(std::string::String, std::string::String)>>` which can panic",
+      "source": ".insert((bounded_context.to_string(), name.to_string()));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::vec::Vec<&str>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::vec::Vec<db::concurrent_indexes::IndexRow>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `tracing::Span` which can panic",
+      "source": "}",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/concurrent_indexes.rs:215:1: 215:33}>` which can panic",
+      "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/concurrent_indexes.rs:321:1: 321:41}>` which can panic",
+      "source": "#[tracing::instrument(skip(pool, stop))]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async block@sqlx::Pool<sqlx::Postgres>::acquire::{closure#0}}` which can panic",
+      "source": "let mut conn = pool.acquire().await?.detach();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of <sqlx::PgConnection as sqlx::Connection>::close()}` which can panic",
+      "source": "let _ = sqlx::Connection::close(conn).await;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::RawSql::execute<'_, &mut sqlx::PgConnection, sqlx::Postgres>()}` which can panic",
+      "source": ".await?;",
+      "count": 3
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 5
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (bool,), sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String, f64), sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::concurrent_indexes::IndexRow, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `db::concurrent_indexes::warn_foreign_once` which can panic",
+      "source": "IndexState::Foreign => warn_foreign_once(bounded_context, replaced.name),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `db::concurrent_indexes::warn_foreign_once` which can panic",
+      "source": "warn_foreign_once(bounded_context, managed.name);",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "Ok(sqlx::query_as( \"SELECT n.nspname::text AS schema, i.relname::text AS name, i.relkind::text AS relkind, \\ t.relname::text AS table_name, x.indisvalid AS valid, x.indisunique AS is_unique, \\ am.amname::text AS amname, x.indnatts::int4 AS natts, \\ (x.indexprs IS NULL) AS no_exprs, (x.indpred IS NOT NULL) AS partial, \\ ARRAY(SELECT a.attname::text \\ FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) \\ JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum \\ ORDER BY k.ord) AS columns \\ FROM pg_class i \\ JOIN pg_namespace n ON n.oid = i.relnamespace \\ LEFT JOIN pg_index x ON x.indexrelid = i.oid \\ LEFT JOIN pg_class t ON t.oid = x.indrelid \\ LEFT JOIN pg_am am ON am.oid = i.relam \\ WHERE n.nspname = ANY($1) AND i.relname = ANY($2)\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let (got,): (bool,) = sqlx::query_as(\"SELECT pg_try_advisory_lock(hashtext($1))\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let (lock_timeout, lock_timeout_ms): (String, f64) = sqlx::query_as( \"SELECT current_setting('lock_timeout'), \\ (extract(epoch FROM current_setting('lock_timeout')::interval) * 1000)::float8\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let names: Vec<(String,)> = sqlx::query_as( \"SELECT bc.name FROM bounded_contexts bc \\ JOIN pg_namespace n ON n.nspname = 'bc_' || bc.name \\ JOIN pg_class t ON t.relnamespace = n.oid AND t.relname = 'deadlines' \\ AND t.relkind IN ('r', 'p') \\ ORDER BY bc.name\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(\"SELECT pg_advisory_lock(hashtext($1))\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(\"SELECT set_config('application_name', $1, false)\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(\"SELECT set_config('lock_timeout', $1, false)\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(\"SET lock_timeout = '1ms'\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(\"SET statement_timeout = 0\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `tokio::time::sleep` which can panic",
+      "source": "() = tokio::time::sleep(wait) => {}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
+      "source": "Self::read(&mut *conn, &[raw_schema.to_string()]).await",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<std::iter::Filter<I, P> as std::iter::Iterator>::next` which can panic",
+      "source": "for row in rows.iter().filter(|r| r.name == spec.name) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "if MANAGED_INDEXES .iter() .any(|(m, _)| states.get(&raw, m) == IndexState::Foreign)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for (managed, replaced) in MANAGED_INDEXES {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for (managed, replaced) in pending {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<std::string::String as std::clone::Clone>::clone` which can panic",
+      "source": "states.insert((row.schema.clone(), spec.name), row.state(spec));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexRow::state` which can panic",
+      "source": "states.insert((row.schema.clone(), spec.name), row.state(spec));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": ".any(|(m, _)| states.get(&raw, m) == IndexState::Foreign)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": "if states.get(&raw, managed) == IndexState::Foreign {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": "if states.get(raw, managed) != IndexState::Valid {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": "let state = IndexStates::for_schema(conn, raw).await?.get(raw, managed);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": "match IndexStates::for_schema(conn, raw).await?.get(raw, replaced) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": "match states.get(raw, managed) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": "replaced.map_or(IndexState::Absent, |r| states.get(&raw, &r)),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": "states.get(&raw, managed),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::pool::PoolConnection::<DB>::detach` which can panic",
+      "source": "let mut conn = pool.acquire().await?.detach();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query(\"SELECT pg_advisory_lock(hashtext($1))\") .bind(&key)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query(\"SELECT set_config('application_name', $1, false)\") .bind(CONCURRENT_INDEX_APPLICATION_NAME)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query(\"SELECT set_config('lock_timeout', $1, false)\") .bind(&lock_timeout)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "Ok(sqlx::query_as( \"SELECT n.nspname::text AS schema, i.relname::text AS name, i.relkind::text AS relkind, \\ t.relname::text AS table_name, x.indisvalid AS valid, x.indisunique AS is_unique, \\ am.amname::text AS amname, x.indnatts::int4 AS natts, \\ (x.indexprs IS NULL) AS no_exprs, (x.indpred IS NOT NULL) AS partial, \\ ARRAY(SELECT a.attname::text \\ FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) \\ JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum \\ ORDER BY k.ord) AS columns \\ FROM pg_class i \\ JOIN pg_namespace n ON n.oid = i.relnamespace \\ LEFT JOIN pg_index x ON x.indexrelid = i.oid \\ LEFT JOIN pg_class t ON t.oid = x.indrelid \\ LEFT JOIN pg_am am ON am.oid = i.relam \\ WHERE n.nspname = ANY($1) AND i.relname = ANY($2)\", ) .bind(schemas)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "Ok(sqlx::query_as( \"SELECT n.nspname::text AS schema, i.relname::text AS name, i.relkind::text AS relkind, \\ t.relname::text AS table_name, x.indisvalid AS valid, x.indisunique AS is_unique, \\ am.amname::text AS amname, x.indnatts::int4 AS natts, \\ (x.indexprs IS NULL) AS no_exprs, (x.indpred IS NOT NULL) AS partial, \\ ARRAY(SELECT a.attname::text \\ FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) \\ JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum \\ ORDER BY k.ord) AS columns \\ FROM pg_class i \\ JOIN pg_namespace n ON n.oid = i.relnamespace \\ LEFT JOIN pg_index x ON x.indexrelid = i.oid \\ LEFT JOIN pg_class t ON t.oid = x.indrelid \\ LEFT JOIN pg_am am ON am.oid = i.relam \\ WHERE n.nspname = ANY($1) AND i.relname = ANY($2)\", ) .bind(schemas) .bind(&names)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let (got,): (bool,) = sqlx::query_as(\"SELECT pg_try_advisory_lock(hashtext($1))\") .bind(&key)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::collections::BTreeMap::<K, V, A>::get` which can panic",
+      "source": "self.0 .get(&(raw_schema.to_string(), spec.name))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::collections::BTreeMap::<K, V, A>::insert` which can panic",
+      "source": "states.insert((row.schema.clone(), spec.name), row.state(spec));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field4_finish` which can panic",
+      "source": "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_fields_finish` which can panic",
+      "source": "#[derive(Debug, sqlx::FromRow)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_tuple_field1_finish` which can panic",
+      "source": "#[derive(Debug, Default)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let names: Vec<&str> = MANAGED_INDEXES .iter() .flat_map(|(managed, replaced)| { std::iter::once(managed.name).chain(replaced.map(|r| r.name)) }) .collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let pending: Vec<_> = MANAGED_INDEXES .iter() .filter(|(managed, replaced)| { if states.get(&raw, managed) == IndexState::Foreign { warn_foreign_once(bounded_context, managed.name); } needs_work( states.get(&raw, managed), replaced.map_or(IndexState::Absent, |r| states.get(&raw, &r)), ) }) .collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let schemas: Vec<String> = names.iter().map(|(name,)| format!(\"bc_{name}\")).collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::sync::Mutex::<T>::lock` which can panic",
+      "source": "let first = WARNED .get_or_init(Mutex::default) .lock()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `std::time::Instant::saturating_duration_since` which can panic",
+      "source": "let left = deadline.saturating_duration_since(Instant::now());",
+      "count": 1
+    },
+    {
       "file": "skilj-core/src/db/contexts.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "\"INSERT INTO bounded_contexts ({BOUNDED_CONTEXT_COLUMNS}) VALUES ($1,$2,$3,$4,$5,$6)\"",
@@ -9262,12 +9736,6 @@
     {
       "file": "skilj-core/src/db/deadlines.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "FROM {schema}.deadlines \\",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/deadlines.rs",
-      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "let id = format!(\"{}:{}\", schedule.name, event.sequence);",
       "count": 1
     },
@@ -9634,7 +10102,7 @@
     {
       "file": "skilj-core/src/db/deadlines.rs",
       "message": "call to function `sqlx::query_as` which can panic",
-      "source": "let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT id, schedule_name, fire_at, expires_at, tags, correlation_id, \\ target_bounded_context, \\ target_command_type, payload, attempt_count, first_failed_at, recurrence_schedule, \\ recurrence_policy, recurrence_start_at, recurrence_end_at, recurrence_valid_until, \\ recurrence_parent_id, recurrence_sequence \\ FROM {schema}.deadlines \\ WHERE (status = 'pending' OR (status = 'firing' AND firing_at <= $1)) AND fire_at <= $2 \\ AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \\ ORDER BY fire_at LIMIT {MAX_DUE_DEADLINES_PER_TICK}\" )))",
+      "source": "let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(due_deadlines_sql(&schema)))",
       "count": 1
     },
     {
@@ -10126,13 +10594,13 @@
     {
       "file": "skilj-core/src/db/deadlines.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT id, schedule_name, fire_at, expires_at, tags, correlation_id, \\ target_bounded_context, \\ target_command_type, payload, attempt_count, first_failed_at, recurrence_schedule, \\ recurrence_policy, recurrence_start_at, recurrence_end_at, recurrence_valid_until, \\ recurrence_parent_id, recurrence_sequence \\ FROM {schema}.deadlines \\ WHERE (status = 'pending' OR (status = 'firing' AND firing_at <= $1)) AND fire_at <= $2 \\ AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \\ ORDER BY fire_at LIMIT {MAX_DUE_DEADLINES_PER_TICK}\" ))) .bind(stale_cutoff.to_sqlx())",
+      "source": "let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(due_deadlines_sql(&schema))) .bind(stale_cutoff.to_sqlx())",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/deadlines.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT id, schedule_name, fire_at, expires_at, tags, correlation_id, \\ target_bounded_context, \\ target_command_type, payload, attempt_count, first_failed_at, recurrence_schedule, \\ recurrence_policy, recurrence_start_at, recurrence_end_at, recurrence_valid_until, \\ recurrence_parent_id, recurrence_sequence \\ FROM {schema}.deadlines \\ WHERE (status = 'pending' OR (status = 'firing' AND firing_at <= $1)) AND fire_at <= $2 \\ AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \\ ORDER BY fire_at LIMIT {MAX_DUE_DEADLINES_PER_TICK}\" ))) .bind(stale_cutoff.to_sqlx()) .bind(now.to_sqlx())",
+      "source": "let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(due_deadlines_sql(&schema))) .bind(stale_cutoff.to_sqlx()) .bind(now.to_sqlx())",
       "count": 1
     },
     {
@@ -15688,25 +16156,19 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "(\"ACCESS EXCLUSIVE\", table, format!(\"column {name}\"))",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/preflight.rs",
-      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "(\"ACCESS EXCLUSIVE\", table, format!(\"constraint {name}\"))",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/preflight.rs",
-      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "(\"SHARE\", table, format!(\"index {name}\"))",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/preflight.rs",
-      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": ".bind(format!(\"bc_{bounded_context}\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "Some(format!(\"column {name}\")),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "Some(format!(\"constraint {name}\")),",
       "count": 1
     },
     {
@@ -15742,7 +16204,13 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "reason: format!(\"adds {}\", adds.join(\", \")),",
+      "source": "note(table, \"SHARE\", Some(format!(\"index {name}\")), None);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "reason.push(format!(\"adds {}\", adds.join(\", \")));",
       "count": 1
     },
     {
@@ -15753,8 +16221,38 @@
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to closure `db::preflight::ddl_locks::{closure#0}::{closure#0}` which can panic",
+      "source": "note( table, \"ACCESS EXCLUSIVE\", Some(format!(\"column {name}\")), None, );",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to closure `db::preflight::ddl_locks::{closure#0}::{closure#0}` which can panic",
+      "source": "note( table, \"ACCESS EXCLUSIVE\", Some(format!(\"constraint {name}\")), None, );",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to closure `db::preflight::ddl_locks::{closure#0}::{closure#0}` which can panic",
+      "source": "note(table, \"SHARE UPDATE EXCLUSIVE\", None, Some(what));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to closure `db::preflight::ddl_locks::{closure#0}::{closure#0}` which can panic",
+      "source": "note(table, \"SHARE\", Some(format!(\"index {name}\")), None);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `access_trail::AccessHistory` which can panic",
       "source": "if !fold_access_events(&records, Timestamp::MAX).held {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `db::concurrent_indexes::IndexStates` which can panic",
+      "source": "}",
       "count": 1
     },
     {
@@ -15843,12 +16341,6 @@
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
-      "message": "call to drop of `std::collections::btree_map::Entry<'_, std::string::String, (&str, std::vec::Vec<std::string::String>)>` which can panic",
-      "source": ".or_insert((mode, Vec::new()));",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `std::option::Option<event_store::BoundedContext>` which can panic",
       "source": ".is_none()",
       "count": 1
@@ -15885,6 +16377,12 @@
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
+      "source": "};",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `std::result::Result<(), error::Error>` which can panic",
       "source": "}",
       "count": 1
@@ -15904,14 +16402,38 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `std::string::String` which can panic",
+      "source": ".any(|k| k.starts_with(&format!(\"index {} on \", spec.name)) && k.ends_with(\" foreign\"))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
       "source": "changed: stored.is_some_and(|s| s != current.as_str()),",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `std::string::String` which can panic",
+      "source": "for key in [old.clone(), format!(\"{old} invalid\")] {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "if line == index_line(managed) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "if line == index_line(replaced) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 2
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
@@ -15971,7 +16493,7 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `std::vec::Vec<std::string::String>` which can panic",
       "source": "}",
-      "count": 1
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
@@ -16372,12 +16894,6 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
-      "source": ".entry(table.to_string())",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/preflight.rs",
-      "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
       "source": "description: m.description.to_string(),",
       "count": 1
     },
@@ -16444,6 +16960,12 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "if lines.iter().any(|l| concurrent_index_name(l).is_some()) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
       "source": "let origin_kind_widened = checks .iter() .any(|(def,)| def.contains(\"origin_kind\") && def.contains(\"skilj_recorded\"));",
       "count": 1
     },
@@ -16486,6 +17008,12 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for line in lazy {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
       "source": "for line in missing {",
       "count": 1
     },
@@ -16509,6 +17037,12 @@
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::IterMut<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for line in &mut lines {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<std::str::Split<'a, P> as std::iter::Iterator>::next` which can panic",
       "source": "let column = rest.split(' ').next().unwrap_or(rest);",
       "count": 1
@@ -16523,6 +17057,12 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<std::string::String as std::clone::Clone>::clone` which can panic",
       "source": "event_types_to_register.push(wanted.name.clone());",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::vec::Vec<T, A> as std::iter::Extend<T>>::extend` which can panic",
+      "source": "reason.extend(work);",
       "count": 1
     },
     {
@@ -16570,7 +17110,7 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `core::str::<impl str>::strip_prefix` which can panic",
-      "source": "let (mode, table, what) = if let Some(rest) = line.strip_prefix(\"column \") {",
+      "source": "if let Some(rest) = line.strip_prefix(\"column \") {",
       "count": 1
     },
     {
@@ -16583,6 +17123,12 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `core::str::<impl str>::strip_prefix` which can panic",
       "source": "} else if let Some(rest) = line.strip_prefix(\"index \") {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": "match states.get(&raw, &spec) {",
       "count": 1
     },
     {
@@ -16726,12 +17272,6 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `std::collections::BTreeSet::<T, A>::contains` which can panic",
-      "source": "if !tables.contains(table) {",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/preflight.rs",
-      "message": "call to method `std::collections::BTreeSet::<T, A>::contains` which can panic",
       "source": "if tables.contains(\"events\") {",
       "count": 1
     },
@@ -16750,7 +17290,7 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `std::collections::btree_map::Entry::<'a, K, V, A>::or_insert` which can panic",
-      "source": "let entry = by_table .entry(table.to_string()) .or_insert((mode, Vec::new()));",
+      "source": "let entry = by_table .entry(table.to_string()) .or_insert((mode, Vec::new(), Vec::new()));",
       "count": 1
     },
     {
@@ -16786,7 +17326,13 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `std::slice::<impl [T]>::join` which can panic",
-      "source": "reason: format!(\"adds {}\", adds.join(\", \")),",
+      "source": "let mut reason = reason.join(\"; \");",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::slice::<impl [T]>::join` which can panic",
+      "source": "reason.push(format!(\"adds {}\", adds.join(\", \")));",
       "count": 1
     },
     {
@@ -16805,6 +17351,24 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `std::str::<impl str>::replace` which can panic",
       "source": "table.replace('\"', \"\\\"\\\"\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::string::String::push_str` which can panic",
+      "source": "reason.push_str(\"; writes go on\");",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::string::String::push_str` which can panic",
+      "source": "super::IndexState::Foreign => line.push_str(\" foreign\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::string::String::push_str` which can panic",
+      "source": "super::IndexState::Invalid => line.push_str(\" invalid\"),",
       "count": 1
     },
     {
@@ -16834,12 +17398,6 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
-      "source": "entry.1.push(what);",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/preflight.rs",
-      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
       "source": "event_types_to_register.push(wanted.name.clone());",
       "count": 1
     },
@@ -16858,7 +17416,13 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
-      "source": "locks.push(TableLock { table, mode: mode.into(), reason: format!(\"adds {}\", adds.join(\", \")), rows, });",
+      "source": "locks.push(TableLock { table, mode: mode.into(), reason, rows, });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "reason.push(format!(\"adds {}\", adds.join(\", \")));",
       "count": 1
     },
     {
@@ -21934,12 +22498,6 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "\"CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \\",
-      "count": 2
-    },
-    {
-      "file": "skilj-core/src/db/schema.rs",
-      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "\"CREATE INDEX IF NOT EXISTS deadlines_tags_gin ON {schema}.deadlines USING GIN (tags)\"",
       "count": 2
     },
@@ -22827,85 +23385,85 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1258:1: 1258:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1260:1: 1260:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1373:1: 1373:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1375:1: 1375:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1548:1: 1548:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1550:1: 1550:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1637:1: 1637:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1639:1: 1639:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2015:1: 2015:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2011:1: 2011:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2044:1: 2044:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2040:1: 2040:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2094:1: 2094:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2090:1: 2090:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2184:1: 2184:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2180:1: 2180:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2691:1: 2691:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2687:1: 2687:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2911:1: 2911:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2907:1: 2907:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2957:1: 2957:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2953:1: 2953:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3023:1: 3023:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3019:1: 3019:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3207:1: 3207:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3203:1: 3203:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3534:1: 3534:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3530:1: 3530:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -22949,7 +23507,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
-      "count": 57
+      "count": 56
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -23242,6 +23800,12 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(sqlx::AssertSqlSafe( super::concurrent_indexes::DEADLINES_CLAIMABLE.create_sql(&schema, false), ))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(add_columns_patch( &schema, \"access_tokens\", &[\"scope\"], format!(\"ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS scope TEXT\"), )))",
       "count": 1
     },
@@ -23476,12 +24040,6 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(create_index_patch( &schema, \"deadlines_due\", format!( \"CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \\ WHERE status = 'pending'\" ), )))",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/schema.rs",
-      "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(create_index_patch( &schema, \"deadlines_tags_gin\", format!( \"CREATE INDEX IF NOT EXISTS deadlines_tags_gin ON {schema}.deadlines USING GIN (tags)\" ), )))",
       "count": 1
     },
@@ -23543,12 +24101,6 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"ALTER TABLE {schema}.idempotency_keys \\ ADD PRIMARY KEY (command_type_name, client_id, idempotency_key)\" )))",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/schema.rs",
-      "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \\ WHERE status = 'pending'\" )))",
       "count": 1
     },
     {
@@ -28025,7 +28577,7 @@
       "file": "skilj-core/src/preflight.rs",
       "message": "call to drop of `error::Error` which can panic",
       "source": "}",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/preflight.rs",
@@ -28059,9 +28611,33 @@
     },
     {
       "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `std::option::Option<event_store::BoundedContext>` which can panic",
+      "source": "if crate::db::get_bounded_context(pool, &name).await?.is_some() {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": ")?;",
       "count": 3
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": ".map(|(table, what)| (table.to_string(), what))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to drop of `std::vec::Vec<(std::string::String, std::string::String)>` which can panic",
+      "source": "}",
+      "count": 1
     },
     {
       "file": "skilj-core/src/preflight.rs",

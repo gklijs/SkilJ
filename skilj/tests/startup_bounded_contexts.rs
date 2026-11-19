@@ -144,6 +144,7 @@ fn a_bounded_context_deleted_during_startup_is_skipped() {
 
         let started = delete_while_waiting(&pool, &name, "events", async move {
             Skilj::builder(database_url)
+                .concurrent_index_interval(None)
                 .pool_options(db::PgPoolOptions::new().max_connections(2))
                 .build()
                 .await
@@ -248,6 +249,7 @@ fn startup_takes_no_lock_on_an_up_to_date_bounded_context() {
         let started = tokio::time::timeout(
             std::time::Duration::from_secs(20),
             Skilj::builder(database_url)
+                .concurrent_index_interval(None)
                 .pool_options(db::PgPoolOptions::new().max_connections(2))
                 .build(),
         )
@@ -284,6 +286,7 @@ fn startup_still_adds_a_missing_column_and_index() {
         }
 
         Skilj::builder(database_url)
+            .concurrent_index_interval(None)
             .pool_options(db::PgPoolOptions::new().max_connections(2))
             .build()
             .await
@@ -375,6 +378,7 @@ fn reconciliation_runs_on_a_patched_bounded_context() {
         .unwrap();
         let start = || {
             Skilj::builder(database_url.clone())
+                .concurrent_index_interval(None)
                 .pool_options(db::PgPoolOptions::new().max_connections(2))
                 .bounded_context(name.clone())
                 .event_type::<MoneyDeposited>()
@@ -503,7 +507,7 @@ fn startup_upgrades_a_v0_0_1_bounded_context_to_the_current_schema() {
             .await
             .unwrap();
 
-        Skilj::builder(database_url)
+        Skilj::builder(database_url).concurrent_index_interval(None)
             .pool_options(db::PgPoolOptions::new().max_connections(2))
             .build()
             .await
@@ -539,6 +543,7 @@ fn build_refuses_a_pool_the_listener_would_take_whole() {
         let _serial = SERIAL.lock().await;
         for max_connections in [0, 1] {
             let err = Skilj::builder(database_url.clone())
+                .concurrent_index_interval(None)
                 .pool_options(db::PgPoolOptions::new().max_connections(max_connections))
                 .build()
                 .await
@@ -737,6 +742,7 @@ fn inspect_reports_a_v0_0_1_bounded_context_and_changes_nothing() {
         );
 
         Skilj::builder(database_url)
+            .concurrent_index_interval(None)
             .pool_options(db::PgPoolOptions::new().max_connections(2))
             .build()
             .await
@@ -882,6 +888,7 @@ fn refuse_mode_refuses_an_outdated_schema_and_starts_on_a_current_one() {
         let before = persistent_state(&pool, &old).await;
         let refusing = || {
             Skilj::builder(database_url.clone())
+                .concurrent_index_interval(None)
                 .pool_options(db::PgPoolOptions::new().max_connections(2))
                 .schema_changes(skilj::SchemaChanges::Refuse)
                 .build()
@@ -945,6 +952,7 @@ fn a_newer_releases_level_decides_whether_an_older_one_starts() {
         .unwrap();
         let start = || {
             Skilj::builder(database_url.clone())
+                .concurrent_index_interval(None)
                 .pool_options(db::PgPoolOptions::new().max_connections(2))
                 .build()
         };
@@ -1085,6 +1093,7 @@ fn builder_preflight_previews_registrations_and_writes_nothing() {
         let role = reconciler_for(&pool, &name).await;
         let builder = |version: u64| {
             Skilj::builder(database_url.clone())
+                .concurrent_index_interval(None)
                 .pool_options(db::PgPoolOptions::new().max_connections(2))
                 .bounded_context(name.clone())
                 .reconciliation_role(role.external_subject.clone())
@@ -1166,5 +1175,1034 @@ fn builder_preflight_previews_registrations_and_writes_nothing() {
         assert!(!incompatible.refusals.is_empty());
 
         assert_eq!(state().await, before, "the preflight changed something");
+    });
+}
+
+// --- docs/architecture.md §256: indexes built concurrently ---------------
+//
+// Every Skilj these tests build sets `concurrent_index_interval(None)` unless
+// the test is about the background task, and is shut down, so no loop
+// outlives its test and repairs what another test set up. Each test works on
+// bounded contexts of its own, hard-deleted by `Contexts` when it ends, also
+// when it panics.
+
+/// Bounded contexts a test created, hard-deleted on drop - on a thread of
+/// its own with its own runtime and connection, so it also runs while a
+/// panic unwinds.
+struct Contexts {
+    url: String,
+    names: Vec<String>,
+}
+
+impl Contexts {
+    fn new(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            names: Vec::new(),
+        }
+    }
+
+    async fn seed(&mut self, pool: &Pool) -> String {
+        let name = seed_bounded_context(pool).await;
+        self.names.push(name.clone());
+        name
+    }
+}
+
+impl Drop for Contexts {
+    fn drop(&mut self) {
+        let url = self.url.clone();
+        let names = std::mem::take(&mut self.names);
+        let _ = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let Ok(pool) = db::connect(&url).await else {
+                    return;
+                };
+                // Whatever a test left waiting (a barrier, a held key)
+                // goes with its connections; end them first.
+                let _ = sqlx::query(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE application_name = $1 AND pid <> pg_backend_pid()",
+                )
+                .bind(db::CONCURRENT_INDEX_APPLICATION_NAME)
+                .execute(&pool)
+                .await;
+                for name in names {
+                    let _ = db::hard_delete_bounded_context(&pool, &name).await;
+                }
+                pool.close().await;
+            });
+        })
+        .join();
+    }
+}
+
+/// A builder for these tests: a small pool, no background task.
+fn index_builder(url: &str) -> skilj::SkiljBuilder {
+    Skilj::builder(url.to_string())
+        .concurrent_index_interval(None)
+        .pool_options(db::PgPoolOptions::new().max_connections(2))
+}
+
+/// Puts a bounded context in the shape releases up to 0.4 left it in:
+/// `deadlines_due`, no `deadlines_claimable`.
+async fn old_index_set(pool: &Pool, name: &str) {
+    let schema = format!("\"bc_{name}\"");
+    for ddl in [
+        format!("DROP INDEX IF EXISTS {schema}.deadlines_claimable"),
+        format!(
+            "CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \
+             WHERE status = 'pending'"
+        ),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+/// `(oid, valid)` of an index of the bounded context, if there is one.
+async fn index_of(pool: &Pool, name: &str, index: &str) -> Option<(u32, bool)> {
+    let row: Option<(sqlx::postgres::types::Oid, bool)> = sqlx::query_as(
+        "SELECT x.indexrelid, x.indisvalid FROM pg_index x \
+         WHERE x.indexrelid = to_regclass($1)",
+    )
+    .bind(format!("\"bc_{name}\".{index}"))
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.map(|(oid, valid)| (oid.0, valid))
+}
+
+/// The catalog's view of `deadlines_claimable`: access method, key
+/// columns, uniqueness, validity and the predicate (deparsed: fine here,
+/// nothing holds the table).
+async fn claimable_definition(
+    pool: &Pool,
+    name: &str,
+) -> (String, Vec<String>, bool, bool, String) {
+    sqlx::query_as(
+        "SELECT am.amname::text, \
+                ARRAY(SELECT a.attname::text FROM unnest(x.indkey::int2[]) WITH ORDINALITY k(attnum, ord) \
+                      JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum ORDER BY k.ord), \
+                x.indisunique, x.indisvalid, pg_get_expr(x.indpred, x.indrelid) \
+           FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid JOIN pg_am am ON am.oid = c.relam \
+          WHERE x.indexrelid = to_regclass($1)",
+    )
+    .bind(format!("\"bc_{name}\".deadlines_claimable"))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// An open transaction with an uncommitted deadline in the bounded
+/// context: a concurrent build or drop waits for it, in a phase the test
+/// can see.
+async fn barrier(pool: &Pool, name: &str) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.unwrap();
+    insert_deadline(&mut *tx, name).await;
+    tx
+}
+
+async fn insert_deadline<'e>(executor: impl sqlx::PgExecutor<'e>, name: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO \"bc_{name}\".deadlines \
+         (id, schedule_name, fire_at, tags, target_bounded_context, target_command_type, \
+          payload, status, created_at) \
+         VALUES ($1, 's', now() + interval '1 hour', '{{}}', 'bc', 'Cmd', 'x', 'pending', now())"
+    )))
+    .bind(generate_token_id())
+    .execute(executor)
+    .await
+    .unwrap();
+}
+
+/// Waits until a statement starting with `prefix` waits on a lock, and
+/// returns its backend's pid.
+async fn waiting_statement(pool: &Pool, prefix: &str) -> i32 {
+    for _ in 0..200 {
+        let pid: Option<(i32,)> = sqlx::query_as(
+            "SELECT pid FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query LIKE $1 LIMIT 1",
+        )
+        .bind(format!("{prefix}%"))
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some((pid,)) = pid {
+            return pid;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("no '{prefix}' ever waited");
+}
+
+/// How many concurrent index build connections are open.
+async fn build_connections(pool: &Pool) -> i64 {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM pg_stat_activity WHERE application_name = $1")
+            .bind(db::CONCURRENT_INDEX_APPLICATION_NAME)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    n
+}
+
+/// A write from a connection of its own, which must commit within 5 s.
+async fn write_does_not_wait(url: &str, name: &str) {
+    let pool = db::connect(url).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        insert_deadline(&pool, name),
+    )
+    .await
+    .expect("a write waited on the concurrent index work");
+    pool.close().await;
+}
+
+/// Leaves an invalid `deadlines_claimable`: a concurrent build cancelled
+/// while it waits for a writer.
+async fn interrupt_a_build(pool: &Pool, url: &str, name: &str) {
+    let schema = format!("\"bc_{name}\"");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP INDEX IF EXISTS {schema}.deadlines_claimable"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+    let writer = barrier(pool, name).await;
+    let build_pool = db::connect(url).await.unwrap();
+    let ddl = format!(
+        "CREATE INDEX CONCURRENTLY deadlines_claimable ON {schema}.deadlines (fire_at) \
+         WHERE status IN ('pending', 'firing')"
+    );
+    let build = tokio::spawn(async move {
+        let result = sqlx::raw_sql(sqlx::AssertSqlSafe(ddl))
+            .execute(&build_pool)
+            .await;
+        build_pool.close().await;
+        result
+    });
+    let pid = waiting_statement(pool, "CREATE INDEX CONCURRENTLY deadlines_claimable").await;
+    sqlx::query("SELECT pg_cancel_backend($1)")
+        .bind(pid)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(build.await.unwrap().is_err(), "the build was not cancelled");
+    writer.rollback().await.unwrap();
+    assert_eq!(
+        index_of(pool, name, "deadlines_claimable")
+            .await
+            .map(|(_, v)| v),
+        Some(false),
+        "the cancelled build left no invalid index"
+    );
+}
+
+fn is_sqlstate(err: &skilj_core::Error, code: &str) -> bool {
+    matches!(err, skilj_core::Error::Database(e)
+        if e.as_database_error().and_then(|d| d.code()).as_deref() == Some(code))
+}
+
+/// The poll reads due deadlines through `deadlines_claimable`, not the
+/// whole table: on every CI major, with the poll's own query text (E1, E8,
+/// E9 in the issue #218 plan).
+#[test]
+fn deadline_poll_uses_deadlines_claimable() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let name = contexts.seed(&pool).await;
+        let schema = format!("\"bc_{name}\"");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.deadlines (id, schedule_name, fire_at, tags, target_bounded_context, \
+               target_command_type, payload, status, created_at, resolved_at) \
+             SELECT 'r' || g, 's', now() - interval '1 day' * random() * 30, '{{}}', 'bc', 'Cmd', \
+               repeat('x', 200), 'fired', now(), now() FROM generate_series(1, 100000) g; \
+             INSERT INTO {schema}.deadlines (id, schedule_name, fire_at, tags, target_bounded_context, \
+               target_command_type, payload, status, created_at) \
+             SELECT 'p' || g, 's', now() + interval '1 hour' * (random() * 10 - 5), '{{}}', 'bc', 'Cmd', \
+               'x', 'pending', now() FROM generate_series(1, 300) g; \
+             INSERT INTO {schema}.deadlines (id, schedule_name, fire_at, tags, target_bounded_context, \
+               target_command_type, payload, status, created_at, firing_at) \
+             SELECT 'f' || g, 's', now() - interval '1 hour', '{{}}', 'bc', 'Cmd', 'x', 'firing', \
+               now(), now() - interval '10 minutes' FROM generate_series(1, 5) g; \
+             ANALYZE {schema}.deadlines;"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let query = db::due_deadlines_sql(&schema)
+            .replace("$1", "(now() - interval '5 minutes')")
+            .replace("$2", "now()");
+        let (plan,): (serde_json::Value,) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN (FORMAT JSON) {query}")))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let plan = plan.to_string();
+        assert!(plan.contains("\"Index Name\":\"deadlines_claimable\""), "{plan}");
+        assert!(!plan.contains("\"Node Type\":\"Seq Scan\""), "{plan}");
+    });
+}
+
+/// A new bounded context gets `deadlines_claimable` at provisioning, and
+/// one from before gets the same index from startup, built concurrently,
+/// with `deadlines_due` dropped; a second start finds nothing to do.
+#[test]
+fn startup_replaces_deadlines_due_concurrently() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let fresh = contexts.seed(&pool).await;
+        let old = contexts.seed(&pool).await;
+        old_index_set(&pool, &old).await;
+
+        let skilj = index_builder(&database_url).build().await.unwrap().0;
+        skilj.shutdown(std::time::Duration::from_secs(20)).await;
+
+        for name in [&fresh, &old] {
+            let (am, columns, unique, valid, predicate) = claimable_definition(&pool, name).await;
+            assert_eq!(
+                (am.as_str(), columns, unique, valid),
+                ("btree", vec!["fire_at".to_string()], false, true)
+            );
+            assert!(
+                predicate.contains("pending") && predicate.contains("firing"),
+                "{predicate}"
+            );
+            assert_eq!(index_of(&pool, name, "deadlines_due").await, None);
+        }
+        assert!(!db::pending_concurrent_index_work(&pool)
+            .await
+            .unwrap()
+            .contains(&old));
+    });
+}
+
+/// docs/architecture.md §256: building the index waits for a write in
+/// flight but lets a later write through - a plain `CREATE INDEX` would
+/// queue it behind its `SHARE` lock.
+#[test]
+fn creating_the_index_does_not_block_writes() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let name = contexts.seed(&pool).await;
+        old_index_set(&pool, &name).await;
+        let writer = barrier(&pool, &name).await;
+
+        let build = tokio::spawn({
+            let pool = pool.clone();
+            let name = name.clone();
+            async move { db::build_concurrent_indexes(&pool, &name).await }
+        });
+        waiting_statement(&pool, "CREATE INDEX CONCURRENTLY").await;
+        write_does_not_wait(&database_url, &name).await;
+        writer.rollback().await.unwrap();
+        build.await.unwrap().unwrap();
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable")
+                .await
+                .map(|(_, v)| v),
+            Some(true)
+        );
+    });
+}
+
+/// The same for dropping `deadlines_due`.
+#[test]
+fn dropping_deadlines_due_does_not_block_writes() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let name = contexts.seed(&pool).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE INDEX deadlines_due ON \"bc_{name}\".deadlines (fire_at) WHERE status = 'pending'"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let writer = barrier(&pool, &name).await;
+
+        let build = tokio::spawn({
+            let pool = pool.clone();
+            let name = name.clone();
+            async move { db::build_concurrent_indexes(&pool, &name).await }
+        });
+        let pid = waiting_statement(&pool, "DROP INDEX CONCURRENTLY").await;
+        let (application_name,): (String,) =
+            sqlx::query_as("SELECT application_name FROM pg_stat_activity WHERE pid = $1")
+                .bind(pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // The drop runs on the build's own connection, never on one of the
+        // pool's (PLAN-23 in the issue #218 plan review).
+        assert_eq!(application_name, db::CONCURRENT_INDEX_APPLICATION_NAME);
+        write_does_not_wait(&database_url, &name).await;
+        writer.rollback().await.unwrap();
+        build.await.unwrap().unwrap();
+        assert_eq!(index_of(&pool, &name, "deadlines_due").await, None);
+    });
+}
+
+/// An interrupted build leaves an invalid index. During a first upgrade
+/// the recorded level still says so, and `Refuse` refuses until `migrate`
+/// finished; after one, it is concurrent index work: reported, no reason
+/// to refuse, repaired by the background task, by a default-mode start,
+/// and by `migrate`.
+#[test]
+fn an_interrupted_build_is_repaired() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let name = contexts.seed(&pool).await;
+        let migrate = || async {
+            skilj::preflight::migrate(&database_url, &skilj::preflight::MigrateOptions::new())
+                .await
+                .unwrap();
+        };
+        let inspect = || async {
+            skilj::preflight::inspect(&pool, &skilj::preflight::InspectOptions::new())
+                .await
+                .unwrap()
+        };
+        let refuse = || index_builder(&database_url).schema_changes(skilj::SchemaChanges::Refuse);
+
+        // (i) An interrupted first upgrade.
+        migrate().await;
+        interrupt_a_build(&pool, &database_url, &name).await;
+        let (oid, _) = index_of(&pool, &name, "deadlines_claimable").await.unwrap();
+        set_recorded_level(
+            &pool,
+            skilj::preflight::SCHEMA_LEVEL - 1,
+            skilj::preflight::MIN_COMPATIBLE_SCHEMA_LEVEL,
+        )
+        .await;
+        assert_eq!(
+            inspect().await.verdict,
+            skilj::preflight::Verdict::UpgradeNeeded
+        );
+        let err = refuse()
+            .build()
+            .await
+            .err()
+            .expect("Refuse started on an old level");
+        assert!(
+            matches!(err, skilj_core::Error::SchemaUpgradeRequired { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable").await,
+            Some((oid, false))
+        );
+        migrate().await;
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable")
+                .await
+                .map(|(_, v)| v),
+            Some(true)
+        );
+
+        // (ii) Damage after a finished upgrade.
+        interrupt_a_build(&pool, &database_url, &name).await;
+        let (oid, _) = index_of(&pool, &name, "deadlines_claimable").await.unwrap();
+        let report = inspect().await;
+        assert_eq!(
+            report.verdict,
+            skilj::preflight::Verdict::UpToDate,
+            "{report}"
+        );
+        let bc = report
+            .bounded_contexts
+            .iter()
+            .find(|bc| bc.name == name)
+            .unwrap();
+        assert!(!bc.needs_upgrade());
+        assert_eq!(
+            bc.lazy,
+            ["index deadlines_claimable on deadlines invalid".to_string()]
+        );
+        assert!(bc
+            .locks
+            .iter()
+            .any(|l| l.table == "deadlines" && l.mode == "SHARE UPDATE EXCLUSIVE"));
+        let text = report.to_string();
+        assert!(
+            text.contains("rebuilds index deadlines_claimable concurrently"),
+            "{text}"
+        );
+        // (a) A Refuse instance starts and builds nothing at startup.
+        let skilj = refuse().build().await.unwrap().0;
+        skilj.shutdown(std::time::Duration::from_secs(20)).await;
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable").await,
+            Some((oid, false))
+        );
+        // (b) Its background task repairs it.
+        let skilj = refuse()
+            .concurrent_index_interval(Some(std::time::Duration::from_secs(1)))
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let mut repaired = false;
+        for _ in 0..100 {
+            if index_of(&pool, &name, "deadlines_claimable")
+                .await
+                .is_some_and(|(o, v)| v && o != oid)
+            {
+                repaired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let report = skilj.shutdown(std::time::Duration::from_secs(20)).await;
+        assert!(repaired, "the background task did not rebuild the index");
+        assert!(report.stopped.contains(&"concurrent_indexes"), "{report:?}");
+        // (c) A default-mode start repairs it.
+        interrupt_a_build(&pool, &database_url, &name).await;
+        let skilj = index_builder(&database_url).build().await.unwrap().0;
+        skilj.shutdown(std::time::Duration::from_secs(20)).await;
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable")
+                .await
+                .map(|(_, v)| v),
+            Some(true)
+        );
+        // (d) So does migrate.
+        interrupt_a_build(&pool, &database_url, &name).await;
+        migrate().await;
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable")
+                .await
+                .map(|(_, v)| v),
+            Some(true)
+        );
+    });
+}
+
+/// docs/architecture.md §256 and §158: with nothing to do, the check is a
+/// catalog read - no lock on the table, not even the one deparsing an
+/// index definition takes, and not the build lock either.
+#[test]
+fn an_up_to_date_context_takes_no_lock_for_concurrent_indexes() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let name = contexts.seed(&pool).await;
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "LOCK TABLE \"bc_{name}\".deadlines IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!(
+                "skilj_concurrent_index:\"bc_{name}\".deadlines_claimable"
+            ))
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let checked = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let pending = db::pending_concurrent_index_work(&pool).await.unwrap();
+            let outcome = db::build_concurrent_indexes(&pool, &name).await.unwrap();
+            (pending, outcome)
+        })
+        .await;
+        holder.rollback().await.unwrap();
+        let (pending, outcome) = checked.expect("the check waited on a lock");
+        assert!(!pending.contains(&name));
+        assert_eq!(outcome, db::ConcurrentIndexOutcome::UpToDate);
+    });
+}
+
+/// Two builders at once: the second waits for the first's build lock by
+/// polling, then finds the index built. Both succeed; one index.
+#[test]
+fn racing_builders_build_one_index() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let name = contexts.seed(&pool).await;
+        old_index_set(&pool, &name).await;
+        let writer = barrier(&pool, &name).await;
+
+        let spawn = || {
+            let pool = pool.clone();
+            let name = name.clone();
+            tokio::spawn(async move { db::build_concurrent_indexes(&pool, &name).await })
+        };
+        let first = spawn();
+        let second = spawn();
+        waiting_statement(&pool, "CREATE INDEX CONCURRENTLY").await;
+        // Release only once the second builder is polling for the lock.
+        for _ in 0..200 {
+            if build_connections(&pool).await >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            build_connections(&pool).await >= 2,
+            "the builders never overlapped"
+        );
+        writer.rollback().await.unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable")
+                .await
+                .map(|(_, v)| v),
+            Some(true)
+        );
+        assert_eq!(index_of(&pool, &name, "deadlines_due").await, None);
+    });
+}
+
+/// `migrate`'s lock timeout bounds waiting for another process's build
+/// lock, and the build's own waits, failing the way every other lock
+/// timeout does (`55P03`); a rerun completes. A lock won by any path
+/// leaves the configured timeout, not the last attempt's 1 ms.
+#[test]
+fn migrate_times_out_waiting_for_an_index_build() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let name = contexts.seed(&pool).await;
+        let short = skilj::preflight::MigrateOptions::new()
+            .lock_timeout(std::time::Duration::from_millis(200));
+
+        // Another process holds the build lock.
+        old_index_set(&pool, &name).await;
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!(
+                "skilj_concurrent_index:\"bc_{name}\".deadlines_claimable"
+            ))
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            skilj::preflight::migrate(&database_url, &short),
+        )
+        .await
+        .expect("migrate waited past its lock timeout")
+        .expect_err("migrate got past a held build lock");
+        assert!(is_sqlstate(&err, "55P03"), "{err:?}");
+        holder.rollback().await.unwrap();
+        skilj::preflight::migrate(&database_url, &short)
+            .await
+            .unwrap();
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable")
+                .await
+                .map(|(_, v)| v),
+            Some(true)
+        );
+
+        // The build itself waits on a writer past the timeout.
+        old_index_set(&pool, &name).await;
+        let writer = barrier(&pool, &name).await;
+        let err = skilj::preflight::migrate(&database_url, &short)
+            .await
+            .expect_err("the build got past a write in flight");
+        assert!(is_sqlstate(&err, "55P03"), "{err:?}");
+        writer.rollback().await.unwrap();
+        skilj::preflight::migrate(&database_url, &short)
+            .await
+            .unwrap();
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable")
+                .await
+                .map(|(_, v)| v),
+            Some(true)
+        );
+
+        // A writer holding the build for ~300 ms, under a 2 s timeout.
+        old_index_set(&pool, &name).await;
+        let writer = barrier(&pool, &name).await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            writer.rollback().await.unwrap();
+        });
+        skilj::preflight::migrate(
+            &database_url,
+            &skilj::preflight::MigrateOptions::new()
+                .lock_timeout(std::time::Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+        release.await.unwrap();
+        assert_eq!(
+            index_of(&pool, &name, "deadlines_claimable")
+                .await
+                .map(|(_, v)| v),
+            Some(true)
+        );
+    });
+}
+
+/// Something other than the index this release creates, under the name of
+/// one it manages or replaces, is left alone and reported as unknown - not
+/// as work, and no reason to refuse.
+#[test]
+fn a_foreign_index_is_left_alone() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let full = contexts.seed(&pool).await;
+        let unique = contexts.seed(&pool).await;
+        for ddl in [
+            format!("DROP INDEX \"bc_{full}\".deadlines_claimable"),
+            format!("CREATE INDEX deadlines_claimable ON \"bc_{full}\".deadlines (fire_at)"),
+            format!("CREATE UNIQUE INDEX deadlines_due ON \"bc_{unique}\".deadlines (id)"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(ddl))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let before = (
+            index_of(&pool, &full, "deadlines_claimable").await,
+            index_of(&pool, &unique, "deadlines_due").await,
+        );
+
+        let skilj = index_builder(&database_url).build().await.unwrap().0;
+        skilj.shutdown(std::time::Duration::from_secs(20)).await;
+        skilj::preflight::migrate(&database_url, &skilj::preflight::MigrateOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                index_of(&pool, &full, "deadlines_claimable").await,
+                index_of(&pool, &unique, "deadlines_due").await,
+            ),
+            before
+        );
+        let report = skilj::preflight::inspect(&pool, &skilj::preflight::InspectOptions::new())
+            .await
+            .unwrap();
+        for name in [&full, &unique] {
+            let bc = report
+                .bounded_contexts
+                .iter()
+                .find(|bc| &bc.name == name)
+                .unwrap();
+            assert!(!bc.needs_upgrade(), "{bc:?}");
+            assert!(bc.lazy.is_empty(), "{bc:?}");
+            assert!(bc.locks.is_empty(), "{bc:?}");
+            assert!(
+                bc.unexpected.iter().any(|l| l.ends_with(" foreign")),
+                "{bc:?}"
+            );
+        }
+        index_builder(&database_url)
+            .schema_changes(skilj::SchemaChanges::Refuse)
+            .build()
+            .await
+            .unwrap()
+            .0
+            .shutdown(std::time::Duration::from_secs(20))
+            .await;
+    });
+}
+
+/// Several bounded contexts to upgrade, a two-connection pool: startup
+/// builds them one at a time, on one extra connection at most.
+#[test]
+fn several_old_contexts_with_a_small_pool() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            let name = contexts.seed(&pool).await;
+            old_index_set(&pool, &name).await;
+            names.push(name);
+        }
+        let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sampler = tokio::spawn({
+            let pool = pool.clone();
+            let sampling = sampling.clone();
+            async move {
+                let mut most = 0;
+                while sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                    most = most.max(build_connections(&pool).await);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                most
+            }
+        });
+        let skilj = index_builder(&database_url).build().await.unwrap().0;
+        sampling.store(false, std::sync::atomic::Ordering::Relaxed);
+        skilj.shutdown(std::time::Duration::from_secs(20)).await;
+        assert!(sampler.await.unwrap() <= 1);
+        for name in &names {
+            assert_eq!(
+                index_of(&pool, name, "deadlines_claimable")
+                    .await
+                    .map(|(_, v)| v),
+                Some(true)
+            );
+            assert_eq!(index_of(&pool, name, "deadlines_due").await, None);
+        }
+    });
+}
+
+/// A bounded context an older instance provisions after startup (or
+/// after the deploy job's migrate) gets its index from the background
+/// task; a `Refuse` instance starts without building anything and leaves
+/// it to its task.
+#[test]
+fn the_background_task_upgrades_a_context_provisioned_late() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let second = std::time::Duration::from_secs(1);
+        let upgraded = |name: String| {
+            let pool = pool.clone();
+            async move {
+                for _ in 0..100 {
+                    if index_of(&pool, &name, "deadlines_claimable")
+                        .await
+                        .is_some_and(|(_, v)| v)
+                        && index_of(&pool, &name, "deadlines_due").await.is_none()
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                false
+            }
+        };
+
+        // Default mode.
+        let skilj = index_builder(&database_url)
+            .concurrent_index_interval(Some(second))
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let late = contexts.seed(&pool).await;
+        old_index_set(&pool, &late).await;
+        assert!(
+            upgraded(late.clone()).await,
+            "the task did not upgrade {late}"
+        );
+        let report = skilj.shutdown(std::time::Duration::from_secs(20)).await;
+        assert!(report.stopped.contains(&"concurrent_indexes"), "{report:?}");
+
+        // The deploy-job setup: migrate, then a late context, then a
+        // Refuse instance - which must not build at startup (the build
+        // lock is held, so a synchronous build would block build()), and
+        // whose task then does.
+        skilj::preflight::migrate(&database_url, &skilj::preflight::MigrateOptions::new())
+            .await
+            .unwrap();
+        let late = contexts.seed(&pool).await;
+        old_index_set(&pool, &late).await;
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!(
+                "skilj_concurrent_index:\"bc_{late}\".deadlines_claimable"
+            ))
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let skilj = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            index_builder(&database_url)
+                .schema_changes(skilj::SchemaChanges::Refuse)
+                .concurrent_index_interval(Some(second))
+                .build(),
+        )
+        .await
+        .expect("a Refuse start waited on the index build")
+        .unwrap()
+        .0;
+        assert_eq!(index_of(&pool, &late, "deadlines_claimable").await, None);
+        holder.rollback().await.unwrap();
+        assert!(
+            upgraded(late.clone()).await,
+            "the task did not upgrade {late}"
+        );
+        skilj.shutdown(std::time::Duration::from_secs(20)).await;
+    });
+}
+
+/// Only the schemas of registered bounded contexts are touched, whatever
+/// another schema is called.
+#[test]
+fn a_schema_outside_the_registry_is_left_alone() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let schema = format!("bc_unregistered_{}", generate_token_id());
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA \"{schema}\"; \
+             CREATE TABLE \"{schema}\".deadlines (id text, status text, fire_at timestamptz); \
+             CREATE INDEX deadlines_due ON \"{schema}\".deadlines (fire_at) WHERE status = 'pending';"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let skilj = index_builder(&database_url).build().await.unwrap().0;
+        skilj.shutdown(std::time::Duration::from_secs(20)).await;
+        let (claimable, due): (bool, bool) = sqlx::query_as(
+            "SELECT to_regclass($1) IS NOT NULL, to_regclass($2) IS NOT NULL",
+        )
+        .bind(format!("\"{schema}\".deadlines_claimable"))
+        .bind(format!("\"{schema}\".deadlines_due"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA \"{schema}\" CASCADE")))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!((claimable, due), (false, true));
+    });
+}
+
+/// The build runs on a connection the pool's `after_connect` hook
+/// prepared (a deployment may switch role or search path there).
+#[test]
+fn the_build_connection_runs_the_pools_after_connect_hook() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let name = contexts.seed(&pool).await;
+        old_index_set(&pool, &name).await;
+        let hooked: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<i32>>> =
+            std::sync::Arc::default();
+        let options = db::PgPoolOptions::new().max_connections(2).after_connect({
+            let hooked = hooked.clone();
+            move |conn, _| {
+                let hooked = hooked.clone();
+                Box::pin(async move {
+                    let (pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    hooked.lock().unwrap().insert(pid);
+                    Ok(())
+                })
+            }
+        });
+        let writer = barrier(&pool, &name).await;
+        let start = tokio::spawn({
+            let url = database_url.clone();
+            async move {
+                Skilj::builder(url)
+                    .concurrent_index_interval(None)
+                    .pool_options(options)
+                    .build()
+                    .await
+            }
+        });
+        let pid = waiting_statement(&pool, "CREATE INDEX CONCURRENTLY").await;
+        assert!(
+            hooked.lock().unwrap().contains(&pid),
+            "the build ran on an unhooked connection"
+        );
+        writer.rollback().await.unwrap();
+        start
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .shutdown(std::time::Duration::from_secs(20))
+            .await;
+    });
+}
+
+/// A role that may create tables in a bounded context's schema but doesn't
+/// own its `deadlines` table can't build the index: the error is
+/// `insufficient_privilege`, which the background task reports once and
+/// leaves to a migrate run as the owner.
+#[test]
+fn a_role_that_does_not_own_the_table_gets_insufficient_privilege() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&database_url);
+        let name = contexts.seed(&pool).await;
+        old_index_set(&pool, &name).await;
+        let role = format!("skilj_app_{}", generate_token_id().to_lowercase());
+        let schema = format!("\"bc_{name}\"");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE ROLE \"{role}\" LOGIN PASSWORD 'app'; \
+             GRANT USAGE, CREATE ON SCHEMA {schema} TO \"{role}\"; \
+             GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO \"{role}\"; \
+             GRANT SELECT ON bounded_contexts TO \"{role}\";"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let options: sqlx::postgres::PgConnectOptions = database_url.parse().unwrap();
+        let app = db::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.username(&role).password("app"))
+            .await
+            .unwrap();
+        let result = db::build_concurrent_indexes(&app, &name).await;
+        app.close().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM \"{role}\"; \
+             REVOKE ALL ON SCHEMA {schema} FROM \"{role}\"; \
+             REVOKE ALL ON bounded_contexts FROM \"{role}\"; DROP ROLE \"{role}\";"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let err = result.expect_err("a non-owner built the index");
+        assert!(is_sqlstate(&err, "42501"), "{err:?}");
     });
 }

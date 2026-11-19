@@ -1613,6 +1613,7 @@ fn shutdown_finishes_ticks_aborts_at_the_timeout_and_drop_stops_nothing() {
                 "async_projections",
                 "blob_collection",
                 "cancel_deadlines",
+                "concurrent_indexes",
                 "cross_context_routes",
                 "cross_instance",
                 "deadline_retention",

@@ -25,12 +25,37 @@ README.md, "Status and stability").
   `jiff02` feature in place of `chrono04`. The JSON Schemas schemars derives
   for them are the same as chrono's, so registered event and command types
   stay compatible.
-- No schema change, and nothing to migrate: timestamps are stored as
-  before, GraphQL (`+00:00`) and REST (`Z`) render them as before, with 0, 3,
-  6 or 9 fractional digits, and input parses as before.
+- The jiff move changes no schema: timestamps are stored as before,
+  GraphQL (`+00:00`) and REST (`Z`) render them as before, with 0, 3, 6 or 9
+  fractional digits, and input parses as before.
+- The first startup (or `skilj::preflight::migrate`) builds a new index,
+  `deadlines_claimable`, on every bounded context's `deadlines` table with
+  `CREATE INDEX CONCURRENTLY`, then drops `deadlines_due` with `DROP INDEX
+  CONCURRENTLY`; writes go on meanwhile (docs/architecture.md §256). The
+  schema level goes to 2, and 0.4 (level 1) is declared compatible, so a
+  rolling deploy works. A 0.4 instance started in default mode against the
+  upgraded database builds `deadlines_due` again, with 0.4's write-blocking
+  `CREATE INDEX`, which the next 0.5 start or background tick drops again; in
+  `SchemaChanges::Refuse` mode 0.4 refuses until its own `migrate` rebuilt it.
+  To roll back, stop every 0.5 instance first (docs/deployment.md, "Upgrading
+  from 0.4 to 0.5").
+- A `SchemaChanges::Refuse` instance now has a `concurrent_indexes`
+  background task that builds and drops such indexes concurrently, and the
+  preflight lists that work under `lazy`, with a `SHARE UPDATE EXCLUSIVE`
+  lock entry, instead of refusing over it.
 
 ### Changed
 
+- The deadline poll reads due deadlines through `deadlines_claimable`
+  instead of scanning the table: 0.05 ms instead of 19.8 ms per tick on
+  300,000 resolved deadlines (docs/performance.md, "The deadline poll").
+- An index a startup patch adds to a table that grows with traffic is built
+  concurrently, by startup in default mode and `migrate`, one bounded context
+  at a time, and by the new `concurrent_indexes` background task in either
+  mode, which also rebuilds an index an interrupted build left invalid.
+  `MigrateOptions::lock_timeout` bounds its waits, failing with the same
+  `55P03`. The preflight report's `TableLock.mode` can be `SHARE UPDATE
+  EXCLUSIVE`, and its summary lists concurrent index work.
 - chrono → jiff 0.2 (`jiff::Timestamp`, `jiff::SignedDuration`), with
   `jiff-sqlx` for Postgres, and the `cron` crate → `jiff-cron`, its fork on
   jiff with the same 7-field expressions. Schedules still run in UTC.
@@ -39,6 +64,10 @@ README.md, "Status and stability").
 
 ### Added
 
+- `skilj_core::db::build_concurrent_indexes`, `build_concurrent_indexes_until`,
+  `pending_concurrent_index_work`, `ConcurrentIndexOutcome` and
+  `CONCURRENT_INDEX_APPLICATION_NAME`, and
+  `BoundedContextReport::concurrent_index_work` (docs/architecture.md §256).
 - A `skilj` plugin for Claude Code and Codex, from this repository's marketplace (`claude plugin
   marketplace add gklijs/SkilJ`, `codex plugin marketplace add gklijs/SkilJ`). Its
   `skilj-new-project` skill generates a project from the template, links the guides of its skilj

@@ -114,14 +114,15 @@ when the table exists.
 | B2 | `migrate_idempotency_keys_client_id_scoping` (§37) | advisory lock; `information_schema` check; replaces the primary key | no rows changed; `ACCESS EXCLUSIVE` on `idempotency_keys` while the key is rebuilt |
 | B3 | `ensure_projection_state_owner_columns`, `ensure_projection_state_as_of_sequence_columns`, `ensure_event_scoping_columns`, `ensure_private_field_columns`, `ensure_projection_owner_tag_key_column`, `ensure_projection_requires_capability_column` | catalog columns | no |
 | B4 | `ensure_private_field_grants_table`, `ensure_command_approval_tables`, `ensure_secret_tables` | catalog columns and indexes | no |
-| B5 | `ensure_cross_context_route_cursors_table`, `ensure_deadline_cursors_table`, `ensure_deadlines_table`, `ensure_projection_partition_progress_table`, `ensure_snapshot_partition_progress_table` | tables, catalog columns and indexes | no |
+| B5 | `ensure_cross_context_route_cursors_table`, `ensure_deadline_cursors_table`, `ensure_deadlines_table`, `ensure_projection_partition_progress_table`, `ensure_snapshot_partition_progress_table` | tables, catalog columns and indexes (`deadlines`' claim index moved to B13, §256) | no |
 | B6 | `ensure_read_cursors_checkout_column`, `ensure_external_message_cursors_table`, `ensure_external_message_keys_table` | tables, catalog columns and indexes | no |
 | B7 | `ensure_event_read_token_start_from_column` (§159) | catalog column, then catalog `CHECK` constraint | validates `access_tokens` once |
-| B8 | `ensure_correlation_causation_columns`, `ensure_cross_context_route_retry_columns` | catalog columns and indexes on `events` and the route cursors | no |
+| B8 | `ensure_correlation_causation_columns`, `ensure_cross_context_route_retry_columns` | catalog columns and indexes on `events` and the route cursors; a missing `events_by_correlation_id` is built with a plain `CREATE INDEX`, which blocks event writes while it builds (kept for older schemas; a new index on a traffic table goes in B13, §256) | no rows changed; `SHARE` on `events` while a missing index builds |
 | B9 | `ensure_parked_deliveries_table`, then `migrate_parked_deliveries_dedup_and_unique_index` (§56, §64) | advisory lock; `pg_indexes` check | **deletes** duplicate parked deliveries, keeping the newest, then adds a unique index |
 | B10 | `ensure_registrations_generation` (§189) | advisory lock; counter table, trigger | inserts the counter row |
 | B11 | `make_bounded_context_current` (§200, §204): owner tag key column, `ensure_consistency_query_column`, `ensure_event_tags_index`, `ensure_blind_tags_table`, `ensure_encryption_key_provider_columns`, `ensure_payload_limit_columns`, `ensure_blob_tables`, `ensure_blob_field_columns`, `ensure_private_field_columns`, `ensure_source_content_protection`, `drop_events_by_tags_index` | mixed, below | see below |
 | B12 | `EventCache::warm` | none (reads) | no |
+| B13 | `build_concurrent_indexes` (§256), after B1-B12 for every bounded context, one at a time, default mode only; in both modes also the `concurrent_indexes` background task | `CREATE INDEX CONCURRENTLY` of `deadlines_claimable`, then `DROP INDEX CONCURRENTLY` of `deadlines_due`; catalog check first, build lock polled | no; `SHARE UPDATE EXCLUSIVE` on `deadlines`, writes go on; waits for older transactions database-wide |
 
 The heavy ones in B11:
 
@@ -145,7 +146,9 @@ The heavy ones in B11:
 A bounded context created **after** startup is provisioned at the current
 shape. One created by an older instance during a rolling deploy is brought up
 to date by the first newer instance to touch it (`ensure_bounded_context_current`,
-§200), on the command path or in a background tick, not only at startup.
+§200), on the command path or in a background tick, not only at startup. Its
+concurrently built indexes (B13) come from the `concurrent_indexes` background
+task alone, within about a minute, never from the command path (§256).
 
 Every per-bounded-context step can be previewed from the catalog, plus row
 counts for the data-rewriting ones (duplicate parked deliveries, protected
@@ -204,7 +207,7 @@ unreachable, bounded context deleted mid-walk), never as a pass.
 **Entry points.**
 
 - `skilj::preflight::inspect(&pool) -> PreflightReport`: DB only (G1-G4,
-  B1-B11). Works from any binary that links skilj, including a deploy job
+  B1-B11, B13). Works from any binary that links skilj, including a deploy job
   that doesn't declare the application's types.
 - `SkiljBuilder::preflight(self) -> Result<PreflightReport>`: everything
   above plus config and registration checks (G5, G6, R1-R4), using exactly
@@ -274,7 +277,7 @@ operator already has. `format` versions the report itself.
 The default stays: `build()` migrates, patches and reconciles, as now.
 
 **Explicit migration.** `skilj::preflight::migrate(&pool, &MigrateOptions) ->
-MigrationReport` runs G1-G4 and B1-B11 (the DB-only part) and nothing else:
+MigrationReport` runs G1-G4, B1-B11 and B13 (the DB-only part) and nothing else:
 no registrations, no background tasks, no provider. It suits a deploy job or
 an init container that owns the schema change, with its own `lock_timeout`
 (`MigrateOptions::lock_timeout`, applied with `SET LOCAL` per patch
@@ -294,7 +297,10 @@ otherwise take a long lock at startup fails fast instead.
 
 Bounded contexts created at runtime by an older instance still get patched by
 a newer one on first touch (§200), in both modes. That is row and column
-work on a new, small schema, which is why it stays allowed.
+work on a new, small schema, which is why it stays allowed. The same goes for
+B13's concurrent index work, done by the background task in both modes: it
+blocks no writes, so the preflight lists it as `lazy`, and `Refuse` doesn't
+refuse over it (§256).
 
 ## Supported upgrades (proposed policy)
 
@@ -318,7 +324,7 @@ table, `skilj_schema_compatibility`, with one row: `level` (an integer
 skilj bumps with every release that changes the schema, global or per
 bounded context), `min_compatible_level` (the oldest level whose binaries may
 run against the schema as it is now), `upgraded_by` (the release) and
-`upgraded_at`. The migrating binary writes it after G1 and B1-B11 complete for
+`upgraded_at`. The migrating binary writes it after G1, B1-B11 and B13 complete for
 every bounded context. Each binary embeds its own `LEVEL`; at startup it
 refuses with `schema_too_new` (naming `upgraded_by`) when
 `min_compatible_level > LEVEL`, and otherwise runs.
@@ -354,7 +360,9 @@ and the documented procedure is stop, upgrade, start.
 - **Locks:** name the patches that take table locks (B2, B7, B9, B11's tag
   dictionary and source-content scrub), what each blocks, and how
   `lock_timeout` behaves: the patch fails, nothing partial is committed for
-  that patch, rerun.
+  that patch, rerun. A concurrent index build (B13) is the exception: cut
+  short, it leaves an invalid index, which the preflight lists and the rerun
+  rebuilds (§256).
 - **Interrupted migration:** each global migration and each patch commits on
   its own; a crash leaves earlier ones done and later ones pending, and the
   next run continues (a preflight shows where). A failed sqlx migration
@@ -376,8 +384,8 @@ found a startup race, fixed with it.
 1. **Document today's facts** (in this change): the `VersionMissing`
    behavior and the missing `lock_timeout` in docs/deployment.md, with the
    test that pins the former.
-2. **DB-only preflight** (`skilj::preflight::inspect`): G1-G4 and
-   B1-B11 as read-only checks in one read-only transaction, the report type
+2. **DB-only preflight** (`skilj::preflight::inspect`): G1-G4,
+   B1-B11 and B13 as read-only checks in one read-only transaction, the report type
    and its JSON. Tests: v0.0.1 fixture reports its missing objects, and
    reports nothing after `build()`; the preflight changes nothing. A new
    patch without a check is caught the way a new object without a patch is

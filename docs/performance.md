@@ -209,6 +209,25 @@ refolded from its history with one read for every such row in the chunk
 The refold reads the reset rows' histories through `event_tags` (docs/architecture.md
 §198), which keeps each tag value's events in sequence order.
 
+## The deadline poll
+
+Every instance polls every bounded context's due deadlines every 500 ms
+(`deadline_poll_interval`). Its predicate, `pending` or a stale `firing` claim,
+is implied by `deadlines_claimable`'s (`status IN ('pending', 'firing')`), so
+the poll reads through that index; the `deadlines_due` index it replaced
+covered `pending` only, and the poll scanned the table, including 30 days of
+resolved deadlines (docs/architecture.md §256). Measured on PostgreSQL 17 with
+300,000 resolved and 305 pending or firing rows:
+
+| index | plan | buffers | time per tick |
+|---|---|---|---|
+| `deadlines_due` | parallel sequential scan | 1,970 | 19.8 ms |
+| `deadlines_claimable` | index scan | 59 | 0.05 ms |
+
+With the poll's own `LIMIT 1000` above the number due, PostgreSQL 15, 17 and 18
+all choose a bitmap scan on `deadlines_claimable` plus a sort; the test
+`deadline_poll_uses_deadlines_claimable` checks the plan on every CI major.
+
 ## What a co-resident application loses
 
 skilj is meant to share the application's own Postgres (docs/architecture.md
@@ -386,6 +405,7 @@ Every `Skilj` instance has one pool. What skilj itself takes from it
 | cross-context route ticks | one each; at most half the pool |
 | parked-delivery retries | one each; at most half the pool |
 | background ticks (projection catch-up, snapshots, deadlines, retention, scheduler) | one per bounded context being worked on, up to 16 per loop |
+| concurrent index builds (startup, `migrate`, the `concurrent_indexes` task) | one, taken from the pool and detached, while a build runs |
 | GraphQL/REST reads | one per request in flight |
 
 Nothing that holds a lock waits for a second connection, so any pool of 2

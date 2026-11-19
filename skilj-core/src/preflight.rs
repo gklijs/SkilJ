@@ -22,12 +22,20 @@ use std::time::Duration;
 
 /// This release's schema level: raised by every release that changes the
 /// schema, global or per bounded context.
-pub const SCHEMA_LEVEL: i64 = 1;
+pub const SCHEMA_LEVEL: i64 = 2;
 
 /// The oldest schema level whose binaries may keep running against a
 /// database this release has upgraded. Equal to [`SCHEMA_LEVEL`] unless a
 /// release pair has been declared compatible and tested
 /// (docs/upgrade-preflight-design.md, "Supported upgrades").
+///
+/// Level 2 (issue #218) declares level 1 (0.4) compatible: it swaps the
+/// deadline poll's index, which 0.4 reads no differently. A 0.4 instance
+/// started in default mode against an upgraded database builds
+/// `deadlines_due` again, with its write-blocking `CREATE INDEX`, which the
+/// next newer start or background tick drops again; in
+/// `SchemaChanges::Refuse` mode it refuses until 0.4's own `migrate` has
+/// rebuilt it (docs/architecture.md §256).
 pub const MIN_COMPATIBLE_SCHEMA_LEVEL: i64 = 1;
 
 /// The version of [`PreflightReport`]'s own layout.
@@ -88,7 +96,11 @@ impl MigrateOptions {
     /// before it stays done, and running [`migrate`] again carries on from
     /// there. It also applies to the advisory locks that serialize
     /// concurrent migrations, so a second migration running at the same
-    /// time can fail the same way.
+    /// time can fail the same way, and to waiting for another process's
+    /// concurrent index build and to the build's own waits
+    /// (docs/architecture.md §256): those fail with the same `55P03` lock
+    /// timeout, and a build cut short leaves an invalid index the rerun
+    /// rebuilds.
     pub fn lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = Some(timeout);
         self
@@ -147,6 +159,17 @@ async fn migrate_pool(pool: &Pool) -> crate::error::Result<MigrationReport> {
                 .await?
                 .is_some()
             {
+                return Err(err);
+            }
+        }
+    }
+    // docs/architecture.md §256: indexes on tables that grow with
+    // traffic, built concurrently once every bounded context is patched,
+    // and before the level is recorded, so it means they exist.
+    for name in crate::db::pending_concurrent_index_work(pool).await? {
+        if let Err(err) = crate::db::build_concurrent_indexes(pool, &name).await {
+            // Deleted since the listing (docs/architecture.md §157).
+            if crate::db::get_bounded_context(pool, &name).await?.is_some() {
                 return Err(err);
             }
         }
@@ -236,6 +259,19 @@ impl PreflightReport {
                 "{} bounded context(s) to patch: {}",
                 patched.len(),
                 patched.join(", ")
+            ));
+        }
+        let indexing: Vec<&str> = self
+            .bounded_contexts
+            .iter()
+            .filter(|bc| !bc.concurrent_index_work().is_empty())
+            .map(|bc| bc.name.as_str())
+            .collect();
+        if !indexing.is_empty() {
+            parts.push(format!(
+                "{} bounded context(s) with indexes to build or drop concurrently: {}",
+                indexing.len(),
+                indexing.join(", ")
             ));
         }
         if parts.is_empty() {
@@ -367,16 +403,24 @@ pub struct BoundedContextReport {
     /// Functions whose body startup replaces.
     pub outdated: Vec<String>,
     /// Objects this release doesn't know: a newer release's, or a manual
-    /// change. Startup leaves them alone.
+    /// change - including something other than the index this release
+    /// creates under the name of one it builds concurrently (marked
+    /// ` foreign`). Startup leaves them alone.
     pub unexpected: Vec<String>,
     /// Objects of an older release that startup removes.
     pub drops: Vec<String>,
-    /// Columns added on first use rather than at startup.
+    /// Work that is no reason to refuse: columns added on first use rather
+    /// than at startup, and concurrent index work (docs/architecture.md
+    /// §256) - an index to build, one an interrupted build left invalid
+    /// (marked ` invalid`) to rebuild, or the index it replaces to drop -
+    /// which startup in default mode and the background task in either
+    /// mode do without blocking writes.
     pub lazy: Vec<String>,
     /// Patches that rewrite or delete rows, or lock writes out while they
     /// work through a table.
     pub rewrites: Vec<Rewrite>,
-    /// The table locks the missing columns, indexes and constraints take.
+    /// The table locks the missing columns, indexes and constraints take,
+    /// and the concurrent index work in `lazy`.
     pub locks: Vec<TableLock>,
 }
 
@@ -387,6 +431,16 @@ impl BoundedContextReport {
             || !self.outdated.is_empty()
             || !self.drops.is_empty()
             || !self.rewrites.is_empty()
+    }
+
+    /// The concurrent index work among [`Self::lazy`]: per entry, the
+    /// table and what is done to it.
+    pub fn concurrent_index_work(&self) -> Vec<(String, String)> {
+        self.lazy
+            .iter()
+            .filter_map(|line| crate::db::concurrent_index_work(line))
+            .map(|(table, what)| (table.to_string(), what))
+            .collect()
     }
 }
 
@@ -414,10 +468,11 @@ pub struct TableLock {
     /// The table.
     pub table: String,
     /// The strongest lock taken: `ACCESS EXCLUSIVE` (columns, constraints;
-    /// brief, except a constraint validating every row) or `SHARE`
-    /// (indexes; blocks writes while the index builds).
+    /// brief, except a constraint validating every row), `SHARE`
+    /// (indexes; blocks writes while the index builds) or `SHARE UPDATE
+    /// EXCLUSIVE` (indexes built or dropped concurrently; writes go on).
     pub mode: String,
-    /// What is added.
+    /// What is added, built or dropped.
     pub reason: String,
     /// How many rows the table holds.
     pub rows: RowCount,
@@ -574,7 +629,12 @@ impl fmt::Display for PreflightReport {
             }
         }
         for bc in &self.bounded_contexts {
-            if !bc.needs_upgrade() && bc.unexpected.is_empty() && !bc.schema_missing {
+            let index_work = bc.concurrent_index_work();
+            if !bc.needs_upgrade()
+                && bc.unexpected.is_empty()
+                && !bc.schema_missing
+                && index_work.is_empty()
+            {
                 continue;
             }
             writeln!(f, "  bounded context {}:", bc.name)?;
@@ -592,6 +652,9 @@ impl fmt::Display for PreflightReport {
             }
             for line in &bc.unexpected {
                 writeln!(f, "    not known to this release: {line}")?;
+            }
+            for (table, what) in &index_work {
+                writeln!(f, "    {what} on {table}")?;
             }
             for r in &bc.rewrites {
                 writeln!(

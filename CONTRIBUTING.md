@@ -143,6 +143,20 @@ far as a test exercises them, and some aren't checked at all
   shape matches what provisioning creates. `scripts/check-upgrade-pair.sh`
   (CI) upgrades a real database written by the previous release, as
   separate processes.
+- **Indexes built concurrently** (§256): the same file checks that the
+  deadline poll uses `deadlines_claimable` (`EXPLAIN` on the poll's own
+  query, on every CI major), that building it and dropping `deadlines_due`
+  let a later write through, that an interrupted build is rebuilt (and,
+  during a first upgrade, refused in `Refuse` mode until `migrate`), that an
+  up-to-date bounded context takes no lock, that racing builders build one
+  index, that `migrate`'s lock timeout bounds the build, that a foreign
+  index is left alone, that a late bounded context gets its index from the
+  background task, and that the build runs on a hooked pool connection.
+  A new startup patch that adds an index to a table that grows with
+  traffic (`events`, `commands`, `deadlines`, the key tables, parked
+  deliveries) adds it to `MANAGED_INDEXES`, built concurrently, not through
+  `create_index_patch`, whose `SHARE` lock blocks writes while it builds;
+  a changed definition takes a new name.
 - **Known races**: a targeted test each, often using a trigger to force
   the interleaving. A property test checks `UniqueReadCursorPerToken` in
   `skilj-core/tests/event_fetch_surface.rs`.
