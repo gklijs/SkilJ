@@ -4621,6 +4621,7 @@ impl SkiljBuilder {
         // not wait on other transactions or need to own the tables; its
         // background task picks up whatever is left.
         if self.schema_changes == SchemaChanges::Apply {
+            skilj_core::db::check_required_approval_indexes(&pool, false).await?;
             for name in skilj_core::db::pending_concurrent_index_work(&pool).await? {
                 if let Err(err) = skilj_core::db::build_concurrent_indexes(&pool, &name).await {
                     // docs/architecture.md §157.
@@ -4632,6 +4633,7 @@ impl SkiljBuilder {
                     }
                 }
             }
+            skilj_core::db::check_required_approval_indexes(&pool, true).await?;
         }
 
         // The access trail (docs/architecture.md §229): after the patches

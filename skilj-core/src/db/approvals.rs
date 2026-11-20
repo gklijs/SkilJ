@@ -1,6 +1,10 @@
 //! Persistence for approvals rule groups.
 
+use super::concurrent_indexes::OPEN_PROPOSAL_KEY_PREDICATE;
 use super::*;
+use crate::event_store::CommandAuthorised;
+use crate::payload_limits::PayloadLimits;
+use std::collections::HashMap;
 
 // --- Command approvals (issue #98) ---
 
@@ -80,9 +84,211 @@ pub async fn set_command_approval_policy(
     Ok(())
 }
 
+/// What an already authorised submission resolves to at the approval gate.
+#[non_exhaustive]
+pub enum ApprovalSubmission {
+    /// Continue with ordinary command submission.
+    Ordinary,
+    /// The ID of a new or existing open proposal.
+    Proposal(String),
+    /// The original acceptance, read from the same snapshot as the routing decision.
+    Deduplicated(Vec<i64>),
+}
+
+#[derive(Default)]
+struct ApprovalKey {
+    proposal_id: Option<String>,
+    sequences: Option<Vec<i64>>,
+}
+
+/// The approval policy and matching keys from one statement snapshot.
+pub struct ApprovalRouting {
+    policy: Option<CommandApprovalPolicy>,
+    keys: HashMap<String, ApprovalKey>,
+}
+
+impl ApprovalRouting {
+    /// Whether routing this item may write a proposal before returning.
+    pub fn may_write_proposal(&self, key: Option<&str>) -> bool {
+        self.policy.is_some()
+            && key
+                .and_then(|key| self.keys.get(key))
+                .is_none_or(|hit| hit.proposal_id.is_none() && hit.sequences.is_none())
+    }
+
+    fn resolved(&self, key: Option<&str>) -> Option<ApprovalSubmission> {
+        if let Some(hit) = key.and_then(|key| self.keys.get(key)) {
+            if let Some(id) = &hit.proposal_id {
+                return Some(ApprovalSubmission::Proposal(id.clone()));
+            }
+            if let Some(sequences) = &hit.sequences {
+                return Some(ApprovalSubmission::Deduplicated(sequences.clone()));
+            }
+        }
+        // With no policy, the batcher still handles retained keys.
+        // Keep unmatched submissions on that path to preserve ordinary
+        // command and batch ordering.
+        if self.policy.is_none() {
+            Some(ApprovalSubmission::Ordinary)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ApprovalRoutingRow {
+    has_policy: bool,
+    approver_role: Option<String>,
+    deadline_seconds: Option<i64>,
+    allow_self_approval: Option<bool>,
+    key: Option<String>,
+    proposal_id: Option<String>,
+    sequences: Option<Vec<i64>>,
+}
+
+/// Read the policy, open proposals and retained command outcomes for one
+/// authorised type and client, including a batch's keys, in one snapshot.
+pub async fn approval_routing(
+    pool: &Pool,
+    command_type: &CommandType,
+    client_id: &str,
+    keys: &[&str],
+) -> crate::error::Result<ApprovalRouting> {
+    let schema = schema_ident(&command_type.bounded_context.name);
+    let rows: Vec<ApprovalRoutingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT policy.command_type_name IS NOT NULL AS has_policy,
+                policy.approver_role, policy.deadline_seconds, policy.allow_self_approval,
+                input.key, proposal.id AS proposal_id, accepted.triggered_event_sequences AS sequences
+           FROM (VALUES ($1::text)) AS requested(command_type_name)
+           LEFT JOIN {schema}.command_approval_policies policy USING (command_type_name)
+           LEFT JOIN unnest($3::text[]) AS input(key) ON true
+           LEFT JOIN LATERAL (
+               SELECT id FROM {schema}.command_proposals
+               WHERE command_type_name = requested.command_type_name AND metadata_client_id = $2
+                 AND idempotency_key = input.key AND {OPEN_PROPOSAL_KEY_PREDICATE}
+           ) proposal ON true
+           LEFT JOIN {schema}.idempotency_keys accepted
+             ON policy.command_type_name IS NOT NULL
+            AND accepted.command_type_name = requested.command_type_name
+            AND accepted.client_id = $2 AND accepted.idempotency_key = input.key"
+    )))
+    .bind(&command_type.name)
+    .bind(client_id)
+    .bind(keys)
+    .fetch_all(pool)
+    .await?;
+    let policy = rows.first().filter(|row| row.has_policy).map(|row| {
+        CommandApprovalPolicy::new(row.approver_role.clone(), row.deadline_seconds)
+            .allowing_self_approval(row.allow_self_approval.unwrap_or_default())
+    });
+    let keys = rows
+        .into_iter()
+        .filter_map(|row| {
+            row.key.map(|key| {
+                (
+                    key,
+                    ApprovalKey {
+                        proposal_id: row.proposal_id,
+                        sequences: row.sequences,
+                    },
+                )
+            })
+        })
+        .collect();
+    Ok(ApprovalRouting { policy, keys })
+}
+
+const APPROVAL_ROUTING_ATTEMPTS: usize = 4;
+
+fn routing_changed_too_often() -> crate::error::Error {
+    sqlx::Error::Protocol(
+        "the approval policy or proposal changed repeatedly during submission; retry".into(),
+    )
+    .into()
+}
+
+/// Route a command after the caller's authorisation. A retained accepted
+/// outcome is returned directly and must not be submitted to the batcher.
+pub async fn route_approval_submission(
+    pool: &Pool,
+    authorised: &CommandAuthorised,
+    key: Option<&str>,
+    key_service: Option<&KeyService>,
+    payload_limits: PayloadLimits,
+    now: Timestamp,
+) -> crate::error::Result<ApprovalSubmission> {
+    let keys: Vec<_> = key.into_iter().collect();
+    let routing =
+        approval_routing(pool, &authorised.command_type, &authorised.client_id, &keys).await?;
+    route_approval_submission_with(
+        pool,
+        authorised,
+        key,
+        key_service,
+        payload_limits,
+        now,
+        &routing,
+    )
+    .await
+}
+
+/// Route using an initial shared snapshot. A mutation still checks the
+/// policy under lock and refreshes the decision when a concurrent change wins.
+pub async fn route_approval_submission_with(
+    pool: &Pool,
+    authorised: &CommandAuthorised,
+    key: Option<&str>,
+    key_service: Option<&KeyService>,
+    payload_limits: PayloadLimits,
+    now: Timestamp,
+    routing: &ApprovalRouting,
+) -> crate::error::Result<ApprovalSubmission> {
+    let command_type = &authorised.command_type;
+    let mut fresh = None;
+    for _ in 0..APPROVAL_ROUTING_ATTEMPTS {
+        let current = fresh.as_ref().unwrap_or(routing);
+        if let Some(result) = current.resolved(key) {
+            return Ok(result);
+        }
+        if let Some(policy) = &current.policy {
+            match write_proposal(
+                pool,
+                command_type,
+                authorised,
+                policy,
+                key,
+                key_service,
+                payload_limits,
+                now,
+                true,
+            )
+            .await?
+            {
+                ProposalWrite::Proposed(proposal) => {
+                    return Ok(ApprovalSubmission::Proposal(proposal.id))
+                }
+                ProposalWrite::Deduplicated(sequences) => {
+                    return Ok(ApprovalSubmission::Deduplicated(sequences))
+                }
+                ProposalWrite::Refresh => {}
+            }
+        }
+        let keys: Vec<_> = key.into_iter().collect();
+        fresh = Some(approval_routing(pool, command_type, &authorised.client_id, &keys).await?);
+    }
+    Err(routing_changed_too_often())
+}
+
+enum ProposalWrite {
+    Proposed(Box<CommandProposal>),
+    Deduplicated(Vec<i64>),
+    Refresh,
+}
+
 /// Inserts a proposal for an already-authorised submission. The payload is
 /// encrypted at rest with the command type's own sensitive fields, exactly
-/// as a real command's is. With an idempotency key, a repeated pending
+/// as a real command's is. With an idempotency key, a repeated open
 /// submission for the same `(command type, client, key)` returns the
 /// original proposal rather than creating a second one.
 #[allow(
@@ -100,6 +306,43 @@ pub async fn propose_command(
     payload_limits: crate::payload_limits::PayloadLimits,
     now: Timestamp,
 ) -> crate::error::Result<CommandProposal> {
+    for _ in 0..APPROVAL_ROUTING_ATTEMPTS {
+        match write_proposal(
+            pool,
+            command_type,
+            authorised,
+            policy,
+            idempotency_key,
+            key_service,
+            payload_limits,
+            now,
+            false,
+        )
+        .await?
+        {
+            ProposalWrite::Proposed(proposal) => return Ok(*proposal),
+            ProposalWrite::Refresh => {}
+            ProposalWrite::Deduplicated(_) => return Err(routing_changed_too_often()),
+        }
+    }
+    Err(routing_changed_too_often())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shares authorised proposal writes with the legacy core entry point"
+)]
+async fn write_proposal(
+    pool: &Pool,
+    command_type: &CommandType,
+    authorised: &CommandAuthorised,
+    policy: &CommandApprovalPolicy,
+    idempotency_key: Option<&str>,
+    key_service: Option<&KeyService>,
+    payload_limits: PayloadLimits,
+    now: Timestamp,
+    recheck_routing: bool,
+) -> crate::error::Result<ProposalWrite> {
     let bounded_context_name = &command_type.bounded_context.name;
     let schema = schema_ident(bounded_context_name);
 
@@ -163,23 +406,40 @@ pub async fn propose_command(
     // so two proposals of one blob queue rather than deadlock on upgrading
     // the check's shared lock.
     let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await?;
+    let deadline_seconds = if recheck_routing {
+        let policy: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT deadline_seconds FROM {schema}.command_approval_policies
+             WHERE command_type_name = $1 FOR SHARE"
+        )))
+        .bind(&command_type.name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((deadline_seconds,)) = policy else {
+            tx.rollback().await?;
+            return Ok(ProposalWrite::Refresh);
+        };
+        deadline_seconds
+    } else {
+        policy.deadline_seconds
+    };
     hold_blobs_for_pin(&mut tx, bounded_context_name, &blob_ids, now).await?;
     check_blob_claims(&mut tx, bounded_context_name, &blob_claims).await?;
 
     let id = crate::shared::try_generate_token_id()?;
-    let expires_at = policy
-        .deadline_seconds
-        .map(|seconds| now + jiff::SignedDuration::from_secs(seconds));
-    let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let expires_at = deadline_seconds.map(|seconds| now + jiff::SignedDuration::from_secs(seconds));
+    let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.command_proposals \
          (id, command_type_name, payload, metadata_version, metadata_client_id, \
           metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \
           idempotency_key, created_at, expires_at) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \
          ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \
-             WHERE status = 'pending' AND idempotency_key IS NOT NULL \
+             WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \
          DO NOTHING \
-         RETURNING id"
+         RETURNING {PROPOSAL_COLUMNS}"
     )))
     .bind(&id)
     .bind(&command_type.name)
@@ -194,8 +454,23 @@ pub async fn propose_command(
     .fetch_optional(&mut *tx)
     .await?;
 
-    if inserted.is_some() {
-        // Held until an approver decides, however long that takes.
+    let row = if let Some(row) = inserted {
+        // The earlier proposal may have finished between routing and this
+        // insert. Its command is committed before its row leaves the index.
+        if let Some(key) = idempotency_key.filter(|_| recheck_routing) {
+            if let Some(sequences) = lookup_idempotency_key(
+                &mut *tx,
+                &schema,
+                &command_type.name,
+                &authorised.client_id,
+                key,
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok(ProposalWrite::Deduplicated(sequences));
+            }
+        }
         pin_held_blobs(
             &mut tx,
             bounded_context_name,
@@ -204,30 +479,30 @@ pub async fn propose_command(
             &blob_ids,
         )
         .await?;
-    }
-    tx.commit().await?;
-
-    let proposal_id = match inserted {
-        Some((id,)) => id,
-        None => {
-            let key = idempotency_key
-                .ok_or_else(|| crate::error::Error::Database(sqlx::Error::RowNotFound))?;
-            let (id,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT id FROM {schema}.command_proposals \
-                 WHERE command_type_name = $1 AND metadata_client_id = $2 \
-                   AND idempotency_key = $3 AND status = 'pending'"
-            )))
-            .bind(&command_type.name)
-            .bind(&authorised.client_id)
-            .bind(key)
-            .fetch_one(pool)
-            .await?;
-            id
-        }
+        row
+    } else {
+        // A fresh statement sees a competing insert that committed while
+        // the INSERT waited. If it has already finished, route again.
+        let existing: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {PROPOSAL_COLUMNS} FROM {schema}.command_proposals
+             WHERE command_type_name = $1 AND metadata_client_id = $2
+               AND idempotency_key = $3 AND {OPEN_PROPOSAL_KEY_PREDICATE}"
+        )))
+        .bind(&command_type.name)
+        .bind(&authorised.client_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = existing else {
+            tx.rollback().await?;
+            return Ok(ProposalWrite::Refresh);
+        };
+        row
     };
-    get_command_proposal(pool, bounded_context_name, &proposal_id)
-        .await?
-        .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: proposal_id }.into())
+    tx.commit().await?;
+    Ok(ProposalWrite::Proposed(Box::new(
+        row.into_domain(command_type.bounded_context.clone()),
+    )))
 }
 
 /// Marks pending proposals whose deadline has passed as expired, then
@@ -634,8 +909,8 @@ pub async fn claim_command_proposal(
 ///   proposal is finished `Expired`, and `ProposalExpired` is returned;
 /// - otherwise `Ok(false)`: nothing happened yet, decide as normal.
 ///
-/// For a fresh `pending` claim this is always `Ok(false)`: no command can
-/// exist under the key yet, and an expired proposal cannot be claimed.
+/// A fresh pending claim can also find a retained acceptance under a
+/// caller key, for example when settling legacy duplicate proposals.
 pub(super) async fn settle_reclaimed_proposal(
     pool: &Pool,
     bounded_context: &str,
@@ -926,7 +1201,7 @@ pub async fn reject_command_proposal(
 /// is then handled by this call: a proposal is created under the internal
 /// caller's own `client_id` and reserved `idempotency_key` (or, after a
 /// crash between a prior call and the caller's cursor/resolution update,
-/// the existing pending proposal is found again by that key; or, if that
+/// the existing open proposal is found again by that key; or, if that
 /// proposal was already approved, nothing is proposed twice). Returns
 /// `false` when the type has no approval policy, and the caller submits as
 /// before.
@@ -949,23 +1224,6 @@ pub async fn propose_if_approval_required(
     key_service: Option<&KeyService>,
     now: Timestamp,
 ) -> crate::error::Result<bool> {
-    let bounded_context = &command_type.bounded_context.name;
-    let Some(policy) =
-        get_command_approval_policy(pool, bounded_context, &command_type.name).await?
-    else {
-        return Ok(false);
-    };
-    if idempotency_key_already_used(
-        pool,
-        bounded_context,
-        &command_type.name,
-        client_id,
-        idempotency_key,
-    )
-    .await?
-    {
-        return Ok(true);
-    }
     let authorised = crate::event_store::CommandAuthorised {
         command_type: command_type.clone(),
         payload: payload.to_string(),
@@ -973,25 +1231,16 @@ pub async fn propose_if_approval_required(
         correlation_id: correlation_id.map(str::to_string),
         causation_id: causation_id.map(str::to_string),
     };
-    let proposal = propose_command(
+    let outcome = route_approval_submission(
         pool,
-        command_type,
         &authorised,
-        &policy,
         Some(idempotency_key),
         key_service,
-        crate::payload_limits::PayloadLimits::default(),
+        PayloadLimits::default(),
         now,
     )
     .await?;
-    tracing::info!(
-        bounded_context = %bounded_context,
-        command_type = %command_type.name,
-        client_id,
-        proposal_id = %proposal.id,
-        "internal submission of an approval-required command became a proposal"
-    );
-    Ok(true)
+    Ok(!matches!(outcome, ApprovalSubmission::Ordinary))
 }
 
 /// What approving a proposal did: the proposal after its final update,

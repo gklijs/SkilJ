@@ -122,7 +122,7 @@ when the table exists.
 | B10 | `ensure_registrations_generation` (§189) | advisory lock; counter table, trigger | inserts the counter row |
 | B11 | `make_bounded_context_current` (§200, §204): owner tag key column, `ensure_consistency_query_column`, `ensure_event_tags_index`, `ensure_blind_tags_table`, `ensure_encryption_key_provider_columns`, `ensure_payload_limit_columns`, `ensure_blob_tables`, `ensure_blob_field_columns`, `ensure_private_field_columns`, `ensure_source_content_protection`, `drop_events_by_tags_index` | mixed, below | see below |
 | B12 | `EventCache::warm` | none (reads) | no |
-| B13 | `build_concurrent_indexes` (§256), after B1-B12 for every bounded context, one at a time, default mode only; in both modes also the `concurrent_indexes` background task | `CREATE INDEX CONCURRENTLY` of `deadlines_claimable`, then `DROP INDEX CONCURRENTLY` of `deadlines_due`; catalog check first, build lock polled | no; `SHARE UPDATE EXCLUSIVE` on `deadlines`, writes go on; waits for older transactions database-wide |
+| B13 | `build_concurrent_indexes` (§256), after B1-B12 for every bounded context, one at a time, default mode only; in both modes also the `concurrent_indexes` background task | `CREATE INDEX CONCURRENTLY` installs the required open-proposal index and the deadline index. Each old index is dropped concurrently after its replacement is valid. Preflight checks duplicate open groups and the required predicate | no row rewrites; `SHARE UPDATE EXCLUSIVE` on `command_proposals` and `deadlines`; waits for older transactions database-wide |
 
 The heavy ones in B11:
 

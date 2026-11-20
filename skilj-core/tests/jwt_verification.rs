@@ -585,3 +585,112 @@ fn expired_cached_keys_refresh_and_fail_closed() {
         server.abort();
     });
 }
+
+#[allow(
+    dead_code,
+    reason = "the integration test calls the same operation as the standalone example's CLI"
+)]
+#[path = "../examples/reject_duplicate_proposal.rs"]
+mod proposal_maintenance;
+
+#[test]
+fn maintenance_uses_the_authenticated_admin_and_preserves_owner_scope() {
+    use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
+    use skilj_core::approvals::{CommandApprovalPolicy, CommandProposalStatus};
+    use skilj_core::bootstrap::ContextCreator;
+    use skilj_core::db;
+    use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
+    use skilj_core::shared::generate_token_id;
+
+    runtime().block_on(async {
+        let Some(url) = skilj_test_support::database_url("proposal_maintenance").await else { return };
+        let pool = db::connect(&url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let now = jiff::Timestamp::now();
+        let context = BoundedContext {
+            name: "recovery_test".into(),
+            status: BoundedContextStatus::Active,
+            created_at: now,
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &context).await.unwrap();
+        let seed_role = |subject: &'static str, name: &'static str, level| {
+            let pool = &pool;
+            let context = &context;
+            async move {
+                let role = Role {
+                    id: generate_token_id(),
+                    external_subject: subject.into(),
+                    name: name.into(),
+                    superadmin: false,
+                    status: RoleStatus::Active,
+                    created_at: now,
+                    revoked_at: None,
+                };
+                db::insert_role(pool, &role).await.unwrap();
+                let mapping = RoleAccessMapping {
+                    role: role.clone(),
+                    bounded_context: context.clone(),
+                    level,
+                    can_read_sensitive: false,
+                    scope: Some("A".to_string()),
+                    capabilities: Default::default(),
+                    delegable: Default::default(),
+                    status: RoleStatus::Active,
+                    created_at: now,
+                    revoked_at: None,
+                };
+                db::insert_role_access_mapping(pool, &mapping).await.unwrap();
+                role
+            }
+        };
+        let admin = seed_role("settler", "Approver", AccessLevel::Admin).await;
+        seed_role("non-admin", "Approver", AccessLevel::Read).await;
+        seed_role("wrong-role", "Other", AccessLevel::Admin).await;
+        sqlx::raw_sql(
+            r#"INSERT INTO bc_recovery_test.command_types
+                (name, schema, schema_version, rest_trigger_allowed, owner_tag_key, tag_mappings)
+             VALUES ('Transfer', '{}', 1, true, 'owner', '[{"key":"owner","field":"owner","blind":false}]');
+             INSERT INTO bc_recovery_test.command_proposals
+                (id, command_type_name, payload, metadata_version, metadata_client_id,
+                 metadata_created_at, status, created_at)
+             VALUES ('scope-a', 'Transfer', '{"owner":"A"}', 1, 'client', now(), 'pending', now()),
+                    ('scope-b', 'Transfer', '{"owner":"B"}', 1, 'client', now(), 'pending', now())"#
+        ).execute(&pool).await.unwrap();
+        db::set_command_approval_policy(
+            &pool, &context.name, "Transfer",
+            Some(&CommandApprovalPolicy::new(Some("Approver".to_string()), None)),
+        ).await.unwrap();
+        let jwks = serve_jwks().await;
+        let config = idp_config(&jwks).with_subject_claim("uid");
+        let token = |subject, issuer| sign_jwt("uid", subject, TEST_KID, issuer, TEST_PRIVATE_KEY_PEM, false);
+        let settle = |credential: String, id: &'static str| {
+            let pool = &pool;
+            let config = &config;
+            let name = &context.name;
+            async move {
+                proposal_maintenance::settle(pool, config, &credential, name, id, "legacy duplicate").await
+            }
+        };
+        assert_eq!(settle(token("non-admin", TEST_ISSUER), "scope-a")
+            .await.unwrap_err().code(), "grant_not_active");
+        assert_eq!(settle(token("wrong-role", TEST_ISSUER), "scope-a")
+            .await.unwrap_err().code(), "insufficient_approval_role");
+        assert_eq!(settle(token("settler", "https://other.example.test/"), "scope-a")
+            .await.unwrap_err().code(), "jwt_verification_failed");
+        assert_eq!(settle(sign_jwt_with_audience(Some(json!("other"))), "scope-a")
+            .await.unwrap_err().code(), "jwt_verification_failed");
+        for id in ["scope-b", "missing"] {
+            assert_eq!(settle(token("settler", TEST_ISSUER), id)
+                .await.unwrap_err().code(), "command_proposal_not_found");
+        }
+        assert_eq!(settle(token("settler", TEST_ISSUER), "scope-a")
+            .await.unwrap(), CommandProposalStatus::Rejected);
+        let a = db::get_command_proposal(&pool, &context.name, "scope-a").await.unwrap().unwrap();
+        let b = db::get_command_proposal(&pool, &context.name, "scope-b").await.unwrap().unwrap();
+        assert_eq!(a.decided_by_role_id.as_deref(), Some(admin.id.as_str()));
+        assert_eq!(b.status, CommandProposalStatus::Pending);
+        assert!(b.decided_by_role_id.is_none());
+    });
+}

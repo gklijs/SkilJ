@@ -1592,12 +1592,7 @@ fn an_interrupted_build_is_repaired() {
         migrate().await;
         interrupt_a_build(&pool, &database_url, &name).await;
         let (oid, _) = index_of(&pool, &name, "deadlines_claimable").await.unwrap();
-        set_recorded_level(
-            &pool,
-            skilj::preflight::SCHEMA_LEVEL - 1,
-            skilj::preflight::MIN_COMPATIBLE_SCHEMA_LEVEL,
-        )
-        .await;
+        set_recorded_level(&pool, 1, 1).await;
         assert_eq!(
             inspect().await.verdict,
             skilj::preflight::Verdict::UpgradeNeeded
@@ -2204,5 +2199,97 @@ fn a_role_that_does_not_own_the_table_gets_insufficient_privilege() {
         .unwrap();
         let err = result.expect_err("a non-owner built the index");
         assert!(is_sqlstate(&err, "42501"), "{err:?}");
+    });
+}
+
+#[test]
+fn required_proposal_index_refuses_duplicates_and_recovers() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_database().await else { return };
+        let _serial = SERIAL.lock().await;
+        let mut contexts = Contexts::new(&url);
+        let name = contexts.seed(&pool).await;
+        let schema = format!("\"bc_{name}\"");
+        let open = "command_proposals_open_idempotency";
+        let old = "command_proposals_pending_idempotency";
+        assert!(index_of(&pool, &name, open).await.unwrap().1);
+        let run = |statement| {
+            let pool = &pool;
+            async move { sqlx::raw_sql(sqlx::AssertSqlSafe(statement)).execute(pool).await.unwrap() }
+        };
+        run(format!(
+            "DROP INDEX {schema}.{open};
+             CREATE UNIQUE INDEX {old} ON {schema}.command_proposals (command_type_name, metadata_client_id, idempotency_key)
+              WHERE status = 'pending' AND idempotency_key IS NOT NULL;
+             INSERT INTO {schema}.command_types (name, schema, schema_version, rest_trigger_allowed)
+              VALUES ('Transfer', '{{}}', 1, true);
+             INSERT INTO {schema}.command_proposals
+              (id, command_type_name, payload, metadata_version, metadata_client_id, metadata_created_at,
+               status, idempotency_key, created_at)
+              VALUES ('first', 'Transfer', '{{}}', 1, 'caller', now(), 'approving', 'shared', now()),
+                     ('second', 'Transfer', '{{}}', 1, 'caller', now(), 'pending', 'shared', now()),
+                     ('other', 'Transfer', '{{}}', 1, 'caller', now(), 'pending', 'separate', now())",
+        )).await;
+        set_recorded_level(&pool, 2, 1).await;
+        let report = skilj::preflight::inspect(&pool, &skilj::preflight::InspectOptions::new()).await.unwrap();
+        assert_eq!(report.verdict, skilj::preflight::Verdict::Refused);
+        let duplicate = report.refusals.iter().find(|item| item.code == "duplicate_open_proposals").unwrap();
+        assert!(duplicate.detail.contains("first (approving)"), "{duplicate:?}");
+        assert!(duplicate.detail.contains("second (pending)"), "{duplicate:?}");
+        assert!(!duplicate.detail.contains("other (pending)"), "{duplicate:?}");
+        let refusal = index_builder(&url).schema_changes(skilj::SchemaChanges::Refuse)
+            .build().await.err().expect("the required index is missing").to_string();
+        assert!(refusal.contains("first (approving)"), "{refusal}");
+        assert!(refusal.contains("minimum compatible schema level 2"), "{refusal}");
+        let options = skilj::preflight::MigrateOptions::new();
+        let err = skilj::preflight::migrate(&url, &options).await.unwrap_err();
+        assert!(err.to_string().contains("second (pending)"), "{err}");
+        assert!(index_of(&pool, &name, old).await.unwrap().1);
+        assert_eq!(index_of(&pool, &name, open).await, None);
+
+        let late = db::build_concurrent_indexes(&pool, &name).await.unwrap_err();
+        assert!(late.to_string().contains("first (approving)"), "{late}");
+        assert!(!index_of(&pool, &name, open).await.unwrap().1);
+        assert!(index_of(&pool, &name, old).await.unwrap().1);
+        let role = skilj_core::access_control::Role {
+            id: generate_token_id(),
+            external_subject: generate_token_id(),
+            name: "Admin".into(),
+            superadmin: false,
+            status: skilj_core::access_control::RoleStatus::Active,
+            created_at: Timestamp::now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let mapping = skilj_core::access_control::RoleAccessMapping {
+            role,
+            bounded_context: db::get_bounded_context(&pool, &name).await.unwrap().unwrap(),
+            level: skilj_core::access_control::AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            capabilities: Default::default(),
+            delegable: Default::default(),
+            status: skilj_core::access_control::RoleStatus::Active,
+            created_at: Timestamp::now(),
+            revoked_at: None,
+        };
+        let rejected = db::reject_command_proposal(&pool, &name, "second", &mapping, None, Timestamp::now()).await.unwrap();
+        assert_eq!(rejected.status, skilj_core::approvals::CommandProposalStatus::Rejected);
+        let upgraded = skilj::preflight::migrate(&url, &options).await.unwrap();
+        assert_eq!(upgraded.after.compatibility.recorded.unwrap().min_compatible_level, 2);
+        assert!(index_of(&pool, &name, open).await.unwrap().1);
+        assert_eq!(index_of(&pool, &name, old).await, None);
+        let (app, _) = index_builder(&url).schema_changes(skilj::SchemaChanges::Refuse)
+            .build().await.unwrap();
+        app.shutdown(std::time::Duration::from_secs(5)).await;
+
+        run(format!(
+            "DROP INDEX {schema}.{open};
+             CREATE UNIQUE INDEX {open} ON {schema}.command_proposals
+                 (command_type_name, metadata_client_id, idempotency_key)
+              WHERE status = 'pending' AND idempotency_key IS NOT NULL"
+        )).await;
+        let report = skilj::preflight::inspect(&pool, &skilj::preflight::InspectOptions::new()).await.unwrap();
+        assert!(report.refusals.iter().any(|item| item.code == "approval_index_foreign"));
     });
 }

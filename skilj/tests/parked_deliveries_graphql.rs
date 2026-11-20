@@ -1294,6 +1294,44 @@ fn retrying_a_parked_trigger_whose_original_attempt_committed_is_deduplicated() 
             .await
             .unwrap()
             .is_empty());
+        db::set_command_approval_policy(
+            &pool, &bc_name, "Deposit",
+            Some(&skilj_core::approvals::CommandApprovalPolicy::new(None, None)),
+        ).await.unwrap();
+        let posted = post("/v1/commands/trigger", Some("orders:0:10"), original.clone())
+            .await.unwrap();
+        let proposal: serde_json::Value = serde_json::from_slice(
+            &posted.into_body().collect().await.unwrap().to_bytes(),
+        ).unwrap();
+        let id = proposal["proposalId"].as_str().expect("proposal ID");
+        let mut report_body = report("orders:0:10");
+        report_body["identifier"] = json!("orders:0:10");
+        let retry_report = || post("/v1/parked-deliveries", None, report_body.clone());
+        for rejected in [false, true] {
+            if rejected {
+                db::reject_command_proposal(&pool, &bc_name, id, &mapping, None, test_now())
+                    .await.unwrap();
+            }
+            let response = retry_report().await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let parked_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+                .as_str().unwrap().to_string();
+            let response = graphql_request(
+                &router, Some(&sign_jwt(&admin_subject)),
+                "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+                json!({"bc": bc_name, "id": parked_id}),
+            ).await;
+            assert!(response.get("errors").is_none(), "{response}");
+            let proposals = db::list_command_proposals(&pool, &bc_name, None, None, None, test_now())
+                .await.unwrap();
+            assert_eq!(proposals.len(), if rejected { 2 } else { 1 });
+            let pending = proposals.iter().find(|p| p.status == skilj_core::approvals::CommandProposalStatus::Pending)
+                .expect("redrive left a pending proposal");
+            assert_eq!(pending.id == id, !rejected);
+            assert_eq!(db::list_commands_for_bounded_context(&pool, &bc_name).await.unwrap().len(), 1);
+        }
+
     });
 }
 

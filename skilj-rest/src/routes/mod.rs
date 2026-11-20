@@ -1538,22 +1538,17 @@ async fn post_commands_trigger(
     span.record("bounded_context", bounded_context_name.as_str());
     span.record("command_type", authorised.command_type.name.as_str());
 
-    // issue #98: an approval-required command becomes a pending
-    // proposal; `decide()` runs only when an approver accepts it. A key
-    // that already produced an accepted command (an earlier proposal was
-    // approved) falls through to the ordinary dedup path below.
-    if let Some(policy) = db::get_command_approval_policy(
+    let approval = db::route_approval_submission(
         &state.pool,
-        &bounded_context_name,
-        &authorised.command_type.name,
+        &authorised,
+        idempotency_key,
+        state.key_service.as_ref(),
+        state.projection_dispatcher.payload_limits(),
+        Timestamp::now(),
     )
-    .await?
-    {
-        if let Some(proposed) =
-            propose_unless_key_used(&state, &authorised, &policy, idempotency_key).await?
-        {
-            return Ok(Json(proposed));
-        }
+    .await?;
+    if let Some(resolved) = approval_response(approval)? {
+        return Ok(Json(resolved));
     }
 
     // The full "optimistic decide, then locked submit" sequence -
@@ -1628,79 +1623,159 @@ async fn post_commands_trigger_batch(
     span.record("command_type", command_type.name.as_str());
     span.record("commands", body.commands.len());
 
-    // One command type per call, so one policy for every command in it.
-    let approval_policy = if body.commands.is_empty() {
-        None
+    // A batch is scoped to one token and command type. Preserve per-item
+    // authorisation, then look up eligible keys in a single snapshot.
+    let stop = body.stop_at_first_failure;
+    let items: Vec<_> = body
+        .commands
+        .into_iter()
+        .map(|item| {
+            let payload = serde_json::to_string(&item.payload)
+                .expect("serde_json::Value serialization is infallible");
+            let authorised =
+                event_store::reject_reserved_idempotency_key(item.idempotency_key.as_deref())
+                    .and_then(|()| {
+                        event_store::authorise_command_trigger(
+                            &token,
+                            payload,
+                            item.correlation_id,
+                            item.causation_id,
+                        )
+                    });
+            (authorised, item.idempotency_key)
+        })
+        .collect();
+    let routing = if let Some(authorised) = items
+        .iter()
+        .find_map(|(authorised, _)| authorised.as_ref().ok())
+    {
+        let keys: Vec<_> = items
+            .iter()
+            .filter_map(|(authorised, key)| {
+                authorised.as_ref().ok()?;
+                key.as_deref().filter(|key| !key.contains('\0'))
+            })
+            .collect();
+        Some(db::approval_routing(&state.pool, command_type, &authorised.client_id, &keys).await?)
     } else {
-        db::get_command_approval_policy(&state.pool, &bounded_context_name, &command_type.name)
-            .await?
+        None
     };
 
-    // Each command authorised as a single trigger would be, in order. A
-    // refused one is answered with its error; an approval-required one
-    // becomes its proposal; the rest go to the batcher together.
-    let stop_at_first_failure = body.stop_at_first_failure;
-    let mut outcomes: Vec<Option<Result<CommandTriggerResponse, RestError>>> = Vec::new();
+    let mut outcomes: Vec<Option<Result<CommandTriggerResponse, RestError>>> =
+        Vec::with_capacity(items.len());
     let mut queued = Vec::new();
-    for item in body.commands {
-        if stop_at_first_failure && outcomes.iter().any(|o| matches!(o, Some(Err(_)))) {
-            outcomes.push(Some(Err(skilj_core::error::Error::NotProcessed.into())));
+    let mut failed = false;
+    for (authorised, key) in items {
+        if stop && failed {
+            outcomes.push(Some(Err(skilj_core::Error::NotProcessed.into())));
             continue;
         }
-        let payload = serde_json::to_string(&item.payload)
-            .expect("serde_json::Value serialization is infallible");
-        let authorised = event_store::reject_reserved_idempotency_key(
-            item.idempotency_key.as_deref(),
-        )
-        .and_then(|()| {
-            event_store::authorise_command_trigger(
-                &token,
-                payload,
-                item.correlation_id,
-                item.causation_id,
-            )
-        });
         let authorised = match authorised {
             Ok(authorised) => authorised,
-            Err(e) => {
-                outcomes.push(Some(Err(e.into())));
+            Err(err) => {
+                outcomes.push(Some(Err(err.into())));
+                failed = true;
                 continue;
             }
         };
-        if let Some(policy) = &approval_policy {
-            match propose_unless_key_used(
-                &state,
+        let result = if key.as_deref().is_some_and(|key| key.contains('\0')) {
+            // Preserve the isolated database error for this item without
+            // putting its key in the shared text[] lookup.
+            db::route_approval_submission(
+                &state.pool,
                 &authorised,
-                policy,
-                item.idempotency_key.as_deref(),
+                key.as_deref(),
+                state.key_service.as_ref(),
+                state.projection_dispatcher.payload_limits(),
+                Timestamp::now(),
             )
             .await
+            .map_err(RestError::from)
+            .and_then(approval_response)
+        } else {
+            let routing = routing
+                .as_ref()
+                .expect("valid items have an approval snapshot");
+            if stop
+                && routing.may_write_proposal(key.as_deref())
+                && !queued.is_empty()
+                && finish_trigger_batch(
+                    &state,
+                    &bounded_context_name,
+                    &mut outcomes,
+                    &mut queued,
+                    stop,
+                )
+                .await
             {
-                Ok(Some(proposed)) => {
-                    outcomes.push(Some(Ok(proposed)));
-                    continue;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    outcomes.push(Some(Err(e)));
-                    continue;
-                }
+                outcomes.push(Some(Err(skilj_core::Error::NotProcessed.into())));
+                failed = true;
+                continue;
+            }
+            db::route_approval_submission_with(
+                &state.pool,
+                &authorised,
+                key.as_deref(),
+                state.key_service.as_ref(),
+                state.projection_dispatcher.payload_limits(),
+                Timestamp::now(),
+                routing,
+            )
+            .await
+            .map_err(RestError::from)
+            .and_then(approval_response)
+        };
+        match result {
+            Ok(None) => {
+                queued.push((
+                    outcomes.len(),
+                    skilj_core::command_batcher::CommandBatchItem {
+                        command_type: authorised.command_type,
+                        payload: authorised.payload,
+                        client_id: authorised.client_id,
+                        correlation_id: authorised.correlation_id,
+                        causation_id: authorised.causation_id,
+                        idempotency_key: key,
+                    },
+                ));
+                outcomes.push(None);
+            }
+            Ok(Some(resolved)) => outcomes.push(Some(Ok(resolved))),
+            Err(err) => {
+                outcomes.push(Some(Err(err)));
+                failed = true;
             }
         }
-        queued.push(skilj_core::command_batcher::CommandBatchItem {
-            command_type: authorised.command_type,
-            payload: authorised.payload,
-            client_id: authorised.client_id,
-            correlation_id: authorised.correlation_id,
-            causation_id: authorised.causation_id,
-            idempotency_key: item.idempotency_key,
-        });
-        outcomes.push(None);
     }
 
-    let mut submitted = state
+    if !queued.is_empty() {
+        finish_trigger_batch(
+            &state,
+            &bounded_context_name,
+            &mut outcomes,
+            &mut queued,
+            stop,
+        )
+        .await;
+    }
+    let outcomes = outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("every batch item has an outcome").into())
+        .collect();
+    Ok(Json(CommandTriggerBatchResponse { outcomes }))
+}
+
+async fn finish_trigger_batch(
+    state: &AppState,
+    bounded_context: &str,
+    outcomes: &mut [Option<Result<CommandTriggerResponse, RestError>>],
+    queued: &mut Vec<(usize, skilj_core::command_batcher::CommandBatchItem)>,
+    stop: bool,
+) -> bool {
+    let (positions, items): (Vec<_>, Vec<_>) = queued.drain(..).unzip();
+    let (submitted, failure) = state
         .command_batcher
-        .decide_and_submit_many(
+        .decide_and_submit_many_with_preparation_failure(
             &state.pool,
             &state.dispatcher,
             &state.projection_dispatcher,
@@ -1708,70 +1783,56 @@ async fn post_commands_trigger_batch(
             &state.event_broadcaster,
             &state.event_cache,
             state.key_service.as_ref(),
-            &bounded_context_name,
-            queued,
-            stop_at_first_failure,
+            bounded_context,
+            items,
+            stop,
         )
-        .await
-        .into_iter();
-    let outcomes = outcomes
-        .into_iter()
-        .map(|outcome| {
-            outcome
-                .unwrap_or_else(|| {
-                    let outcome = submitted.next().expect("one outcome per queued command");
-                    outcome.map_err(RestError::from).and_then(trigger_response)
-                })
-                .into()
-        })
-        .collect();
-    Ok(Json(CommandTriggerBatchResponse { outcomes }))
-}
-
-/// issue #98 for one command: a pending proposal for an approval-required
-/// command, unless its key already produced an accepted command (an
-/// earlier proposal was approved), which then goes to the batcher for
-/// its deduplicated outcome - `None`.
-async fn propose_unless_key_used(
-    state: &AppState,
-    authorised: &event_store::CommandAuthorised,
-    policy: &skilj_core::approvals::CommandApprovalPolicy,
-    idempotency_key: Option<&str>,
-) -> Result<Option<CommandTriggerResponse>, RestError> {
-    if let Some(key) = idempotency_key {
-        if db::idempotency_key_already_used(
-            &state.pool,
-            &authorised.command_type.bounded_context.name,
-            &authorised.command_type.name,
-            &authorised.client_id,
-            key,
-        )
-        .await?
-        {
-            return Ok(None);
+        .await;
+    if stop {
+        if let Some(failed_index) = failure {
+            // Results already computed after this position are reads. The
+            // batcher will account separately for commands it prepared.
+            for outcome in &mut outcomes[positions[failed_index] + 1..] {
+                if matches!(outcome, Some(Ok(_))) {
+                    *outcome = Some(Err(skilj_core::Error::NotProcessed.into()));
+                }
+            }
         }
     }
-    let proposal = db::propose_command(
-        &state.pool,
-        &authorised.command_type,
-        authorised,
-        policy,
-        idempotency_key,
-        state.key_service.as_ref(),
-        state.projection_dispatcher.payload_limits(),
-        Timestamp::now(),
-    )
-    .await?;
-    Ok(Some(CommandTriggerResponse {
-        accepted: false,
-        triggered_event_sequences: None,
-        rejection_reason: None,
-        rejection_kind: None,
-        deduplicated: false,
-        correlation_id: None,
-        pending_approval: true,
-        proposal_id: Some(proposal.id),
-    }))
+    for (index, result) in positions.into_iter().zip(submitted) {
+        outcomes[index] = Some(result.map_err(RestError::from).and_then(trigger_response));
+    }
+    failure.is_some()
+}
+
+fn approval_response(
+    approval: db::ApprovalSubmission,
+) -> Result<Option<CommandTriggerResponse>, RestError> {
+    use db::ApprovalSubmission;
+    Ok(match approval {
+        ApprovalSubmission::Ordinary => None,
+        ApprovalSubmission::Deduplicated(triggered_event_sequences) => {
+            Some(trigger_response(db::SubmitCommandOutcome::Deduplicated {
+                triggered_event_sequences,
+            })?)
+        }
+        ApprovalSubmission::Proposal(id) => Some(CommandTriggerResponse {
+            accepted: false,
+            triggered_event_sequences: None,
+            rejection_reason: None,
+            rejection_kind: None,
+            deduplicated: false,
+            correlation_id: None,
+            pending_approval: true,
+            proposal_id: Some(id),
+        }),
+        _ => {
+            return Err(skilj_core::Error::Unsupported {
+                what: "ApprovalSubmission",
+            }
+            .into())
+        }
+    })
 }
 
 /// What `POST /v1/commands/trigger` answers for one command's outcome,

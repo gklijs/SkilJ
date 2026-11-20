@@ -99,8 +99,9 @@ from a deploy job or init container. Then start the application with
 `.schema_changes(SchemaChanges::Refuse)`, so an instance that would otherwise
 upgrade fails with `schema_upgrade_required` instead. A `Refuse` instance changes
 no schema at startup. Its `concurrent_indexes` background task still builds and
-drops indexes concurrently, which blocks no writes (below), so the preflight
-lists that work as `lazy` and doesn't make `Refuse` refuse over it.
+drops optional indexes concurrently. Preflight calls that work `lazy`. The
+open-proposal index is required for submission and must be ready before
+`Refuse` starts.
 
 A schema change that has real work to do waits for every open transaction on
 its table, and queries on that table queue behind it. Startup itself sets no
@@ -109,7 +110,8 @@ reporting queries, no idle `psql` sessions. `migrate`'s `lock_timeout` turns a
 long wait into a failure. The step that waited is not committed, and the steps
 before it stay done.
 
-Indexes on tables that grow with traffic (from 0.5, `deadlines_claimable`) are
+Indexes on tables that grow with traffic (from 0.5, `deadlines_claimable`
+and `command_proposals_open_idempotency`) are
 built with `CREATE INDEX CONCURRENTLY` instead, and the indexes they replace
 dropped with `DROP INDEX CONCURRENTLY` (docs/architecture.md §256). Writes go on
 while they work, unless a conflicting schema change such as a bounded context's
@@ -142,24 +144,68 @@ synchronous projection refuses writes with `live_fold_paused`.
 
 ### Upgrading from 0.4 to 0.5
 
-The first startup (or `migrate`) builds `deadlines_claimable` concurrently on
-every bounded context and then drops `deadlines_due`; writes go on. 0.4 may keep
-running against the upgraded database (schema level 2, compatible with 1), so a
-rolling deploy works. Two things to know:
+0.5 builds the open-proposal uniqueness index and the deadline polling
+index concurrently. Both ship at schema level 2, which requires 0.5.
+Stop every 0.4 instance before upgrading. Keep a backup from the
+quiesced database for a rollback to 0.4.
 
-- A 0.4 instance that starts in default mode, an old replica restarting during
-  the rollout or a rollback, builds `deadlines_due` again with its
-  write-blocking `CREATE INDEX`. The next 0.5 start, or within a minute a 0.5
-  instance's background task, drops it again.
-- A bounded context a 0.4 instance creates during the rollout has only
-  `deadlines_due`. The 0.5 instances' background task builds its index within
-  about a minute, in either mode.
+1. Run 0.5 preflight while 0.4 still serves its Admin operations. If it
+   reports duplicate open proposals, record all IDs in each group before
+   changing any row. Settle unwanted proposals with an authorized Admin.
+2. Stop submission traffic and all application processes, including route,
+   deadline, approval, and retention workers. Take the backup and run
+   `skilj::preflight::migrate`. Start 0.5 after migration succeeds.
+3. If a duplicate is found during the offline upgrade, use the release's
+   worker-free maintenance command below. Keep writers and retention
+   stopped. If a late concurrent build left a confirmed invalid but ready
+   `command_proposals_open_idempotency` and its uniqueness enforcement
+   blocks settlement, the schema owner can drop that invalid index
+   concurrently. Keep the old unique index in place and retry migration
+   after settling the groups.
 
-To roll back to 0.4, stop every 0.5 instance first; a running one drops
-`deadlines_due` again. Check that no `DROP INDEX CONCURRENTLY` is still running
-(`pg_stat_activity`), then start 0.4. With `SchemaChanges::Refuse`, run 0.4's
-`migrate` before starting it: 0.4 refuses a database without `deadlines_due`
-until its own `migrate` has rebuilt it.
+### Settling an open-proposal group offline
+
+Use the SkilJ 0.5 source tree with the deployment's database credentials
+and an existing scoped Admin's current JWT. The maintenance command reads
+the JWT from stdin. It verifies that token against the trusted deployment
+configuration and uses the existing claim and rejection operation. It
+starts no application workers. The host needs access to the trusted IdP's
+JWKS endpoint. The database credential and selected IdP settings are
+trusted operator inputs. Supply the same settings that the application
+uses, including all accepted audiences and any custom subject claim.
+
+Set `DATABASE_URL` in the operator environment and point
+`SKILJ_RECOVERY_IDP_CONFIG` to a protected JSON file with these fields:
+
+```json
+{
+  "jwks_endpoint": "https://issuer.example/jwks",
+  "issuer": "https://issuer.example/",
+  "audiences": ["skilj"],
+  "signing_algorithm": "RS256",
+  "subject_claim": "sub"
+}
+```
+
+Pipe the Admin's token from your credential provider into this command:
+
+```sh
+cargo run -p skilj-core --example reject_duplicate_proposal -- \
+  banking proposal-id "legacy duplicate during the 0.5 upgrade"
+```
+
+Repeat for each ID that needs settlement. An approving claim becomes
+eligible for takeover after ten minutes. If a retained key proves the
+command committed, settle every ID from the original group, including the
+would-be survivor, while the key still exists. The command can report
+`approved` because the key proves acceptance, or `expired` if a pending
+proposal already reached its deadline. This recovery command never executes
+the command. If there is no retained key and the previous result is
+ambiguous, leave the proposals unapproved and reject the remaining
+siblings. A missing key or a missing match in history is insufficient
+evidence that no command ran. Leave a survivor open for later approval only
+when there is affirmative evidence the operation never executed. Confirm
+the final status for every recorded ID before rerunning migration.
 
 ### Upgrading from 0.2 to 0.3
 

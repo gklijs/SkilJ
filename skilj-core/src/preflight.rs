@@ -29,14 +29,9 @@ pub const SCHEMA_LEVEL: i64 = 2;
 /// release pair has been declared compatible and tested
 /// (docs/upgrade-preflight-design.md, "Supported upgrades").
 ///
-/// Level 2 (issue #218) declares level 1 (0.4) compatible: it swaps the
-/// deadline poll's index, which 0.4 reads no differently. A 0.4 instance
-/// started in default mode against an upgraded database builds
-/// `deadlines_due` again, with its write-blocking `CREATE INDEX`, which the
-/// next newer start or background tick drops again; in
-/// `SchemaChanges::Refuse` mode it refuses until 0.4's own `migrate` has
-/// rebuilt it (docs/architecture.md §256).
-pub const MIN_COMPATIBLE_SCHEMA_LEVEL: i64 = 1;
+/// Level 2 requires an index that also covers approving proposals. The
+/// level-1 submission lookup cannot handle that conflict (docs/architecture.md §256).
+pub const MIN_COMPATIBLE_SCHEMA_LEVEL: i64 = 2;
 
 /// The version of [`PreflightReport`]'s own layout.
 pub const REPORT_FORMAT: u32 = 1;
@@ -166,6 +161,7 @@ async fn migrate_pool(pool: &Pool) -> crate::error::Result<MigrationReport> {
     // docs/architecture.md §256: indexes on tables that grow with
     // traffic, built concurrently once every bounded context is patched,
     // and before the level is recorded, so it means they exist.
+    crate::db::check_required_approval_indexes(pool, false).await?;
     for name in crate::db::pending_concurrent_index_work(pool).await? {
         if let Err(err) = crate::db::build_concurrent_indexes(pool, &name).await {
             // Deleted since the listing (docs/architecture.md §157).
@@ -174,6 +170,7 @@ async fn migrate_pool(pool: &Pool) -> crate::error::Result<MigrationReport> {
             }
         }
     }
+    crate::db::check_required_approval_indexes(pool, true).await?;
     crate::db::ensure_access_trail(pool).await?;
     crate::db::record_schema_level(pool).await?;
     let after = inspect(pool, &InspectOptions::new()).await?;
@@ -223,7 +220,12 @@ impl PreflightReport {
         let mut parts: Vec<String> = self
             .refusals
             .iter()
-            .map(|r| format!("refused: {}", r.code))
+            .map(|r| match r.code.as_str() {
+                "duplicate_open_proposals" | "approval_index_foreign" => {
+                    format!("refused: {} ({})", r.code, r.detail)
+                }
+                _ => format!("refused: {}", r.code),
+            })
             .collect();
         if !self.global.pending.is_empty() {
             parts.push(format!(
@@ -241,6 +243,14 @@ impl PreflightReport {
                 "schema level {} not recorded yet",
                 self.compatibility.binary_level
             ));
+        }
+        if let Some(recorded) = &self.compatibility.recorded {
+            if recorded.min_compatible_level < self.compatibility.binary_min_compatible_level {
+                parts.push(format!(
+                    "minimum compatible schema level {} not recorded yet",
+                    self.compatibility.binary_min_compatible_level
+                ));
+            }
         }
         let admin = &self.admin_context;
         if !admin.exists {
@@ -433,11 +443,12 @@ impl BoundedContextReport {
             || !self.rewrites.is_empty()
     }
 
-    /// The concurrent index work among [`Self::lazy`]: per entry, the
+    /// The concurrent index work among the required and lazy changes: per entry, the
     /// table and what is done to it.
     pub fn concurrent_index_work(&self) -> Vec<(String, String)> {
-        self.lazy
+        self.missing
             .iter()
+            .chain(&self.lazy)
             .filter_map(|line| crate::db::concurrent_index_work(line))
             .map(|(table, what)| (table.to_string(), what))
             .collect()

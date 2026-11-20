@@ -125,7 +125,7 @@ pub fn submit_command_field(n: &Naming) -> Field {
                 )
                 .await?
                 {
-                    Prepared::Proposed(proposed) => {
+                    Prepared::Resolved(proposed) => {
                         return Ok(Some(FieldValue::owned_any(proposed)))
                     }
                     Prepared::Queued(item) => item,
@@ -221,9 +221,9 @@ struct CommandArgs {
 }
 
 /// A command authorised for submission: either already answered, as a
-/// pending proposal, or ready for the batcher.
+/// proposal or retained acceptance, or ready for the batcher.
 enum Prepared {
-    Proposed(SubmitCommandResult),
+    Resolved(SubmitCommandResult),
     Queued(Box<CommandBatchItem>),
 }
 
@@ -279,55 +279,49 @@ async fn prepare_command(
         Some(_) => {}
     }
 
-    // issue #98: an approval-required command becomes a pending proposal.
-    // Nothing is decided yet; the approver runs the ordinary pipeline at
-    // approval time. A key that already produced an accepted command (a
-    // proposal approved earlier) falls through to the batcher, which
-    // returns the cached deduplicated outcome.
-    let approval_policy = skilj_core::db::get_command_approval_policy(
+    use skilj_core::db::ApprovalSubmission;
+    let approval = skilj_core::db::route_approval_submission(
         &state.pool,
-        bounded_context_name,
-        &args.command_type_name,
+        &authorised,
+        args.idempotency_key.as_deref(),
+        state.key_service.as_ref(),
+        state.projection_dispatcher.payload_limits(),
+        Timestamp::now(),
     )
     .await
     .map_err(to_graphql_error)?;
-    let key_already_used = match (&approval_policy, args.idempotency_key.as_deref()) {
-        (Some(_), Some(key)) => skilj_core::db::idempotency_key_already_used(
-            &state.pool,
-            bounded_context_name,
-            &args.command_type_name,
-            &authorised.client_id,
-            key,
-        )
-        .await
-        .map_err(to_graphql_error)?,
-        _ => false,
-    };
-    if let Some(policy) = approval_policy.filter(|_| !key_already_used) {
-        let proposal = skilj_core::db::propose_command(
-            &state.pool,
-            &authorised.command_type,
-            &authorised,
-            &policy,
-            args.idempotency_key.as_deref(),
-            state.key_service.as_ref(),
-            state.projection_dispatcher.payload_limits(),
-            Timestamp::now(),
-        )
-        .await
-        .map_err(to_graphql_error)?;
-        return Ok(Prepared::Proposed(SubmitCommandResult {
-            accepted: false,
-            triggered_event_sequences: None,
-            rejection_reason: None,
-            rejection_kind: None,
-            matching_events: None,
-            matching_events_truncated: None,
-            deduplicated: false,
-            correlation_id: None,
-            pending_approval: true,
-            proposal_id: Some(proposal.id),
-        }));
+    match approval {
+        ApprovalSubmission::Ordinary => {}
+        ApprovalSubmission::Proposal(id) => {
+            return Ok(Prepared::Resolved(SubmitCommandResult {
+                accepted: false,
+                triggered_event_sequences: None,
+                rejection_reason: None,
+                rejection_kind: None,
+                matching_events: None,
+                matching_events_truncated: None,
+                deduplicated: false,
+                correlation_id: None,
+                pending_approval: true,
+                proposal_id: Some(id),
+            }));
+        }
+        ApprovalSubmission::Deduplicated(triggered_event_sequences) => {
+            let result = submit_result(
+                state,
+                access_mapping,
+                skilj_core::db::SubmitCommandOutcome::Deduplicated {
+                    triggered_event_sequences,
+                },
+            )
+            .await?;
+            return Ok(Prepared::Resolved(result));
+        }
+        _ => {
+            return Err(to_graphql_error(skilj_core::Error::Unsupported {
+                what: "ApprovalSubmission",
+            }))
+        }
     }
 
     Ok(Prepared::Queued(Box::new(CommandBatchItem {
@@ -504,7 +498,7 @@ pub fn submit_commands_field(n: &Naming) -> Field {
                 let mut queued = Vec::new();
                 for prepared in prepared {
                     answers.push(match prepared {
-                        Ok(Prepared::Proposed(proposed)) => Some(Ok(proposed)),
+                        Ok(Prepared::Resolved(proposed)) => Some(Ok(proposed)),
                         Ok(Prepared::Queued(item)) => {
                             queued.push(*item);
                             None

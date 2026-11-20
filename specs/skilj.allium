@@ -4828,6 +4828,10 @@ rule ProcessCommand {
     requires:
         approved = true
         or not exists CommandApprovalPolicy{command_type: command_type}
+    requires: approved = true or idempotency_key = null or
+        (CommandProposals where this.command_type = command_type
+            and this.client_id = client_id and this.idempotency_key = idempotency_key
+            and (status = "pending" or status = "approving")).count = 0
 
     -- Idempotency. idempotency_key is a value the caller chooses and
     -- supplies itself, carried here untouched from whichever surface
@@ -5149,10 +5153,14 @@ rule AnswerCommand {
             command_type, payload, client_id, idempotency_key?,
             correlation_id?, causation_id?)
 
-    requires: not exists CommandApprovalPolicy{command_type: command_type}
     requires: valid_idempotency_key(idempotency_key)
+    requires: idempotency_key = null or
+        (CommandProposals where this.command_type = command_type
+            and this.client_id = client_id and this.idempotency_key = idempotency_key
+            and (status = "pending" or status = "approving")).count = 0
 
     let prior_outcome = recorded_acceptance(command_type, client_id, idempotency_key)
+    requires: prior_outcome != null or not exists CommandApprovalPolicy{command_type: command_type}
     let is_duplicate = prior_outcome != null
 
     let consistency_tags = derive_tags(command_type, payload)
@@ -5238,22 +5246,25 @@ rule ProposeCommand {
             command_type, payload, client_id, idempotency_key?,
             correlation_id?, causation_id?, approved?)
     requires: approved != true
-    requires: exists CommandApprovalPolicy{command_type: command_type}
-
     let policy = CommandApprovalPolicy{command_type: command_type}
     let protected = protect_sensitive_fields(command_type, payload)
-    let prior =
-        CommandProposal{
-            bounded_context: command_type.bounded_context,
-            command_type: command_type,
-            client_id: client_id,
-            idempotency_key: idempotency_key,
-            status: "pending"
-        }
+    let pending = CommandProposal{
+        bounded_context: command_type.bounded_context, command_type: command_type,
+        client_id: client_id, idempotency_key: idempotency_key, status: "pending"
+    }
+    let approving = CommandProposal{
+        bounded_context: command_type.bounded_context, command_type: command_type,
+        client_id: client_id, idempotency_key: idempotency_key, status: "approving"
+    }
+    requires:
+        (idempotency_key != null and (exists pending or exists approving))
+        or (exists policy and recorded_acceptance(command_type, client_id, idempotency_key) = null)
 
     ensures:
-        if exists prior:
-            ProposalPending(proposal: prior)
+        if idempotency_key != null and exists pending:
+            ProposalPending(proposal: pending)
+        else if idempotency_key != null and exists approving:
+            ProposalPending(proposal: approving)
         else:
             CommandProposal.created(
                 id: generate_id(),
@@ -5309,19 +5320,18 @@ rule ApproveCommand {
     requires: proposal.expires_at = null or now <= proposal.expires_at
 
     ensures:
-        proposal.status = "approved"
+        proposal.status = "approving"
         proposal.decided_at = now
         proposal.decided_by = access_mapping.role
         CommandAuthorised(
             command_type: proposal.command_type,
             payload: decrypt_proposal(proposal),
             client_id: proposal.client_id,
-            idempotency_key: "skilj-approval:" + proposal.id,
+            idempotency_key: proposal.idempotency_key ?? ("skilj-approval:" + proposal.id),
             correlation_id: proposal.correlation_id,
             causation_id: proposal.causation_id,
             approved: true
         )
-        CommandProposalApproved(proposal: proposal, approver: access_mapping.role)
 
     @guidance
         -- Approval re-runs ProcessCommand with the proposal's decrypted
@@ -5335,13 +5345,36 @@ rule ApproveCommand {
         -- time is recorded on the proposal as rejection_reason/kind.
 }
 
+rule FinishCommandApproval {
+    when: FinishCommandApproval(proposal, outcome)
+    requires: proposal.status = "approving"
+    requires: outcome.kind in {accepted, duplicate, rejected}
+
+    ensures:
+        if outcome.kind = rejected:
+            proposal.status = "rejected"
+            proposal.rejection_reason = outcome.rejection_reason
+            proposal.rejection_kind = outcome.rejection_kind
+        else:
+            proposal.status = "approved"
+            proposal.command = outcome.command
+
+    @guidance
+        -- The command and its idempotency key commit before finalization.
+        -- A retry can still see the approving proposal in that interval.
+}
+
 rule RejectCommand {
     when: RejectCommand(access_mapping, proposal, reason)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = proposal.bounded_context
     requires: proposal.status = "pending"
-    requires: proposal.expires_at = null or now <= proposal.expires_at
+        or (proposal.status = "approving" and proposal.decided_at != null
+            and proposal.decided_at <= now - 10.minutes)
+    let expired = proposal.expires_at != null and proposal.expires_at <= now
+    let key = proposal.idempotency_key ?? ("skilj-approval:" + proposal.id)
+    let accepted = recorded_acceptance(proposal.command_type, proposal.client_id, key) != null
 
     let policy = CommandApprovalPolicy{command_type: proposal.command_type}
     requires: policy.approver_role = null or access_mapping.role.name = policy.approver_role
@@ -5350,16 +5383,27 @@ rule RejectCommand {
         or proposal_owner_scope_satisfied(proposal, access_mapping.scope)
 
     ensures:
-        proposal.status = "rejected"
-        proposal.decided_at = now
-        proposal.decided_by = access_mapping.role
-        proposal.rejection_reason = reason
-        proposal.rejection_kind = "rejected_by_approver"
-        CommandProposalRejected(proposal: proposal, approver: access_mapping.role, reason: reason)
+        if proposal.status = "pending" and expired:
+            proposal.status = "expired"
+        else:
+            proposal.decided_at = now
+            proposal.decided_by = access_mapping.role
+            if accepted:
+                proposal.status = "approved"
+            else if expired:
+                proposal.status = "expired"
+            else:
+                proposal.status = "rejected"
+                proposal.rejection_reason = reason
+                CommandProposalRejected(proposal: proposal, approver: access_mapping.role, reason: reason)
 
     @guidance
         -- Rejecting one's own proposal - withdrawing it - is always
         -- allowed, even where self-approval is not.
+        -- An expired pending row is never claimed. Once a row is claimed,
+        -- a retained acceptance proves approval even for a pending legacy
+        -- sibling. GraphQL labels an ordinary rejection rejected_by_approver
+        -- in the response; that kind is not stored by this operation.
 }
 
 -- Paged like ParkedDeliveries (docs/architecture.md §218): at most
@@ -11157,10 +11201,10 @@ surface CommandApproval {
         -- context. A proposal from another context is invisible here.
 
     @guarantee ProposalIsPendingOnce
-        -- A submission of an approval-required type creates at most one
-        -- pending proposal per (command type, proposing caller,
-        -- idempotency key), and resubmitting with that key answers the
-        -- original proposal rather than a second one. A proposal may be
+        -- A submission creates at most one pending or approving proposal
+        -- per (command type, proposing caller, non-null idempotency key).
+        -- A retry answers the original proposal while it is open, even
+        -- if its approval policy has since been removed. A proposal may be
         -- approved or rejected exactly once: the claim moves it out of
         -- pending before the command runs, so two approvers cannot both
         -- accept it. A crash after the claim is recoverable under the same

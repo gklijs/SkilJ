@@ -641,6 +641,42 @@ impl CommandBatcher {
         commands: Vec<CommandBatchItem>,
         stop_at_first_failure: bool,
     ) -> Vec<Result<SubmitCommandOutcome>> {
+        self.decide_and_submit_many_with_preparation_failure(
+            pool,
+            dispatcher,
+            projection_dispatcher,
+            snapshot_dispatcher,
+            broadcaster,
+            event_cache,
+            key_service,
+            bounded_context_name,
+            commands,
+            stop_at_first_failure,
+        )
+        .await
+        .0
+    }
+
+    /// Also returns the position of the first failure before queueing.
+    /// Callers merging previously resolved items use it to retain the
+    /// distinction between preparation and queued write failures.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "same arguments as decide_and_submit_many"
+    )]
+    pub async fn decide_and_submit_many_with_preparation_failure(
+        &self,
+        pool: &Pool,
+        dispatcher: &Arc<dyn CommandDispatcher>,
+        projection_dispatcher: &Arc<dyn ProjectionDispatcher>,
+        snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+        broadcaster: &EventBroadcaster,
+        event_cache: &EventCache,
+        key_service: Option<&KeyService>,
+        bounded_context_name: &str,
+        commands: Vec<CommandBatchItem>,
+        stop_at_first_failure: bool,
+    ) -> (Vec<Result<SubmitCommandOutcome>>, Option<usize>) {
         use futures_util::StreamExt;
 
         let prepared: Vec<Result<BatchedCommand>> = futures_util::stream::iter(commands)
@@ -664,6 +700,7 @@ impl CommandBatcher {
             .collect()
             .await;
 
+        let first_failure = prepared.iter().position(Result::is_err);
         let mut queued = Vec::new();
         let mut failed = false;
         let mut results: Vec<Option<Result<SubmitCommandOutcome>>> = prepared
@@ -697,10 +734,11 @@ impl CommandBatcher {
             let reply = replies.next().expect("one reply per queued command");
             *result = Some(await_reply(reply).await);
         }
-        results
+        let results = results
             .into_iter()
             .map(|r| r.expect("every command has a result"))
-            .collect()
+            .collect();
+        (results, first_failure)
     }
 
     /// The batched drop-in replacement for `db::decide_and_submit_command` -

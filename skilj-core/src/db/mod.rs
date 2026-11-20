@@ -407,8 +407,8 @@ pub use schema::*;
 
 mod concurrent_indexes;
 pub use concurrent_indexes::{
-    build_concurrent_indexes, build_concurrent_indexes_until, pending_concurrent_index_work,
-    ConcurrentIndexOutcome, CONCURRENT_INDEX_APPLICATION_NAME,
+    build_concurrent_indexes, build_concurrent_indexes_until, check_required_approval_indexes,
+    pending_concurrent_index_work, ConcurrentIndexOutcome, CONCURRENT_INDEX_APPLICATION_NAME,
 };
 pub(crate) use concurrent_indexes::{IndexState, IndexStates, MANAGED_INDEXES};
 
