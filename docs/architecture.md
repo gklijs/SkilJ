@@ -12403,9 +12403,21 @@ be, and inserted into `{schema}.command_proposals` with the submitter's
 `client_id`, correlation/causation ids and optional caller idempotency
 key. REST answers `accepted: false, pendingApproval: true,
 proposalId`; GraphQL's `SubmitCommandPayload` gains the same
-`pendingApproval`/`proposalId` pair. A repeated pending submission with
-the same idempotency key returns the original proposal (a partial unique
-index on the pending row does the deduplication).
+`pendingApproval`/`proposalId` pair. A keyed retry by the same client for
+the same command type returns the original ID while the proposal is
+`pending` or `approving`, even if an administrator removed the policy or
+the command has committed while approval finalization is still pending.
+A partial unique index covers both open states. GraphQL Admins can read
+the current status through `commandProposals`. After finalization, a retained
+accepted key returns the original event sequences. A rejected proposal
+without an accepted command leaves the key free for a new proposal.
+
+The routing lookup reads the open proposal and retained acceptance from
+one PostgreSQL snapshot. An accepted outcome is returned directly. A
+proposal write rechecks the policy under a row lock and checks for a
+retained acceptance before committing a new proposal. A command already
+routed for ordinary submission before an administrator enables a policy
+can still commit while a retry under the new policy creates a proposal.
 
 **Approval, not a second command type.** GraphQL adds
 `commandProposals(boundedContext, commandTypeName, status, after)` (paged, §218),
@@ -12452,7 +12464,9 @@ the deadline or route occurrence counts as handled. Without this, anyone
 able to cause the *source* event - an agent allowed to create one, say -
 would get the command executed with no approver. A crash between
 proposing and the deadline/route recording its progress re-finds the
-same pending proposal by that key. A deadline's `DeadlineContext` is not
+same open proposal by that key. Parked command redrives use the same
+approval check with the redrive's client and key. An open or newly
+created proposal counts as handled. A deadline's `DeadlineContext` is not
 carried onto the proposal: the command runs when it is approved, and
 deciding late is the approver's call.
 
@@ -14027,9 +14041,9 @@ Found in a schema review, checked on PostgreSQL 15, 17 and 18. Two problems, one
 
 **The rule.** An index a startup patch adds to a table that grows with traffic (`events`, `commands`, `deadlines`, the key tables, parked deliveries...) goes in `db::concurrent_indexes::MANAGED_INDEXES`, with the index it replaces if any, and is built concurrently. A small table may keep `create_index_patch`. A managed index's definition never changes under its name: changing it means a new name, replacing the old one.
 
-**The build** (`build_concurrent_indexes_until`). The catalog is read by columns only (`pg_index`, `pg_am`, `pg_attribute`): `pg_get_indexdef` and `pg_get_expr` take a lock on the table and wait behind any `ACCESS EXCLUSIVE` holder, which was checked. What sits under a managed name is the index (valid or invalid) when it is a btree on that single column, partial and not unique, on that table; anything else is foreign and left alone, with a warning once per process, and so is the index it would replace. The predicate itself can't be compared without deparsing it, so a same-shaped index with another predicate passes; only a manual change makes one. When nothing is left to do, that read is all it costs. Otherwise it takes a connection from the pool and detaches it, so the pool's `after_connect` hook (a role switch, a search path) has run on it and the pool opens a replacement, and does everything on it, outside any transaction: wait for the build lock, drop an index an interrupted build left invalid, `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, check the result, and only then drop the replaced index with `DROP INDEX CONCURRENTLY`. The drop runs there too, so it never holds one of a small pool's connections while it waits. `statement_timeout` is 0 on that connection: a timeout would cancel a long build every time, leaving an invalid index to rebuild. `lock_timeout` is set back to the configured value before the DDL whichever way the build lock was won.
+**The build** (`build_concurrent_indexes_until`). The catalog is read by columns only (`pg_index`, `pg_am`, `pg_attribute`): `pg_get_indexdef` and `pg_get_expr` take a lock on the table and wait behind any `ACCESS EXCLUSIVE` holder, which was checked. The background discovery checks the table, ordered key columns, uniqueness, and partial btree shape. Foreign deadline indexes are left alone. The required approval index also checks its deparsed predicate during startup and preflight readiness, and before the old approval index is dropped. The deadline background check stays catalog-only. Otherwise it takes a connection from the pool and detaches it, so the pool's `after_connect` hook (a role switch, a search path) has run on it and the pool opens a replacement, and does everything on it, outside any transaction: wait for the build lock, drop an index an interrupted build left invalid, `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, check the result, and only then drop the replaced index with `DROP INDEX CONCURRENTLY`. The drop runs there too, so it never holds one of a small pool's connections while it waits. `statement_timeout` is 0 on that connection: a timeout would cancel a long build every time, leaving an invalid index to rebuild. `lock_timeout` is set back to the configured value before the DDL whichever way the build lock was won.
 
-**The build lock** is a session advisory lock per index, taken with `pg_try_advisory_lock` and polled every 200 ms. A blocking `pg_advisory_lock` was tried: the waiting session holds a snapshot that the build holding the lock waits for, and Postgres resolved that as a deadlock, aborting the build and leaving an invalid index. With a `lock_timeout` (migrate's option), the poll ends after that long with one blocking attempt under a 1 ms timeout: it fails with `55P03` like every other lock timeout, so callers see one error shape, or wins the lock. Without one, it polls until the lock is free, or until a background task's stop request.
+**The build lock** is a session advisory lock per index, taken with `pg_try_advisory_lock` and polled every 200 ms. A blocking `pg_advisory_lock` was tried: the waiting session holds a snapshot that the build holding the lock waits for, and Postgres resolved that as a deadlock, aborting the build and leaving an invalid index. With a `lock_timeout` (migrate's option), each index gets its own lock wait. The poll ends after that long with one blocking attempt under a 1 ms timeout: it fails with `55P03` like every other lock timeout, so callers see one error shape, or wins the lock. Without one, it polls until the lock is free, or until a background task's stop request.
 
 **What it waits for.** A concurrent build waits for transactions already writing the table, and for every transaction with an older snapshot anywhere in the database - a build on one bounded context waited for a writer on another's table. Writes started meanwhile go on (a write committed in 0.13 s while a build and, separately, a drop waited), unless a conflicting DDL statement queues behind the build - a hard delete's `DROP SCHEMA` - and they queue behind that. Against such a statement, or a 0.4 instance's `create_index_patch` during a mixed-version rollout, the build can also lose a deadlock (`40P01`). A build that is interrupted - a timeout, a cancel, a crash - leaves an invalid index, which the next run rebuilds. A client that goes away doesn't stop a build already running: the server finishes it and holds the build lock until then.
 
@@ -14037,8 +14051,20 @@ Found in a schema review, checked on PostgreSQL 15, 17 and 18. Two problems, one
 
 **The background task** `concurrent_indexes` runs in both modes, every minute (first tick immediately in `Refuse` mode, after a minute in default mode): one catalog query over the schemas of the bounded contexts in `bounded_contexts` - never another schema, whatever its name - finds those with work left, which it then does one at a time. It covers a bounded context an older instance provisions during a rolling deploy, with `deadlines_due` only, and an index an interrupted build left invalid. A failure stays with its bounded context: `40P01` and `55P03` are retried next tick, a bounded context deleted meanwhile is skipped, and `42501` (the instance's role doesn't own the table) is warned about once - run `migrate` as the schema owner - and that bounded context skipped for the rest of the process. Its lock poll watches the stop request, so shutdown reports it stopped.
 
-**The preflight.** The shape marks a managed or replaced index by its catalog state: ` invalid`, ` foreign`. A managed index missing or invalid, and a replaced one still there, are `lazy`: reported, with a `SHARE UPDATE EXCLUSIVE` lock entry ("writes go on") and in the summary, but no reason to refuse. A foreign object is `unexpected`. An interrupted first upgrade still refuses, through the recorded level. So `Refuse` never refuses over work its own background task does without blocking writes, nor for good over an operator's index.
+**The preflight.** The deadline index build and legacy index cleanup are
+lazy concurrent work. A missing or invalid `command_proposals_open_idempotency`
+is a required upgrade because proposal insertion uses it as an arbiter.
+An unexpected replacement definition stops the upgrade. When it scans an
+existing proposal table without a ready index, preflight reports duplicate
+open groups by proposal IDs and statuses. Startup and explicit migration
+check all such groups before swapping indexes. If a writer races the check,
+PostgreSQL's unique build still rejects the duplicate and leaves the old
+index in place. The concurrent lock is `SHARE UPDATE EXCLUSIVE`.
 
-**Compatibility.** `SCHEMA_LEVEL` is 2. `MIN_COMPATIBLE_SCHEMA_LEVEL` stays 1, by the user's decision: 0.4 reads nothing that changed, and its poll can use `deadlines_claimable`. A 0.4 instance started in default mode - a rollback, or an old replica restarting mid-rollout - builds `deadlines_due` again with its plain `CREATE INDEX`, which the next newer start or background tick drops again. In `Refuse` mode 0.4 refuses until its own `migrate` rebuilt it. A rollback therefore stops every newer instance first, checks that no `DROP INDEX CONCURRENTLY` is still running, and then runs 0.4's `migrate` (docs/deployment.md).
+**Compatibility.** The deadline index swap and approval index swap ship
+together at `SCHEMA_LEVEL = 2` and `MIN_COMPATIBLE_SCHEMA_LEVEL = 2`. A 0.4
+retry can conflict with an approving proposal under the new index, then
+fail to find it. Stop 0.4 before migration. Follow the deployment runbook
+for settling legacy duplicates and for rollback.
 
 Tests (`skilj/tests/startup_bounded_contexts.rs`, each on bounded contexts of its own, hard-deleted when it ends, with the background task off unless it is the subject): `deadline_poll_uses_deadlines_claimable`; `startup_replaces_deadlines_due_concurrently` (the index's catalog definition on a new and an upgraded bounded context); `creating_the_index_does_not_block_writes` and `dropping_deadlines_due_does_not_block_writes` (a write commits while the build or drop waits on an open writer; the drop runs on the build's connection); `an_interrupted_build_is_repaired` (an interrupted first upgrade refuses until `migrate`; after one, the inspection lists the rebuild as lazy, a `Refuse` start builds nothing, and its background task, a default start and `migrate` each rebuild it); `an_up_to_date_context_takes_no_lock_for_concurrent_indexes` (under `ACCESS EXCLUSIVE` and a held build lock); `racing_builders_build_one_index`; `migrate_times_out_waiting_for_an_index_build` (`55P03` for a held build lock and for a build waiting on a writer, and a build held 300 ms under a 2 s timeout succeeds); `a_foreign_index_is_left_alone`; `several_old_contexts_with_a_small_pool`; `the_background_task_upgrades_a_context_provisioned_late` (default mode, and a `Refuse` start that returns while the build lock is held, then its task builds); `a_schema_outside_the_registry_is_left_alone`; `the_build_connection_runs_the_pools_after_connect_hook`; `a_role_that_does_not_own_the_table_gets_insufficient_privilege`.

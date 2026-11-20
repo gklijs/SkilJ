@@ -28,21 +28,18 @@ README.md, "Status and stability").
 - The jiff move changes no schema: timestamps are stored as before,
   GraphQL (`+00:00`) and REST (`Z`) render them as before, with 0, 3, 6 or 9
   fractional digits, and input parses as before.
-- The first startup (or `skilj::preflight::migrate`) builds a new index,
-  `deadlines_claimable`, on every bounded context's `deadlines` table with
-  `CREATE INDEX CONCURRENTLY`, then drops `deadlines_due` with `DROP INDEX
-  CONCURRENTLY`; writes go on meanwhile (docs/architecture.md §256). The
-  schema level goes to 2, and 0.4 (level 1) is declared compatible, so a
-  rolling deploy works. A 0.4 instance started in default mode against the
-  upgraded database builds `deadlines_due` again, with 0.4's write-blocking
-  `CREATE INDEX`, which the next 0.5 start or background tick drops again; in
-  `SchemaChanges::Refuse` mode 0.4 refuses until its own `migrate` rebuilt it.
-  To roll back, stop every 0.5 instance first (docs/deployment.md, "Upgrading
-  from 0.4 to 0.5").
-- A `SchemaChanges::Refuse` instance now has a `concurrent_indexes`
-  background task that builds and drops such indexes concurrently, and the
-  preflight lists that work under `lazy`, with a `SHARE UPDATE EXCLUSIVE`
-  lock entry, instead of refusing over it.
+- Keyed command retries reuse the original proposal while it is pending or
+  approving, including after a parked command redrive and while a committed
+  approval is being finalized. The REST and GraphQL response fields stay
+  the same. (#219)
+- The upgrade builds `deadlines_claimable` and
+  `command_proposals_open_idempotency` concurrently, then drops the old
+  indexes. Both the schema level and minimum compatible level are 2.
+  Stop 0.4 before running migration. Preflight identifies legacy duplicate
+  proposal groups for administrative settlement before retrying the
+  upgrade. See the 0.5 procedure in `docs/deployment.md`. (#218, #219)
+- `SchemaChanges::Refuse` requires the valid open-proposal index. Optional
+  deadline index work still runs in the concurrent index background task.
 
 ### Changed
 

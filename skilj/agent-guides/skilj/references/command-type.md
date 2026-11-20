@@ -298,7 +298,8 @@ fn approval_deadline_seconds() -> Option<i64> { Some(86_400) }    // optional
 
 A submission, over REST or GraphQL, is then stored as a proposal and
 answers `accepted: false, pendingApproval: true` with a `proposalId`;
-`decide()` doesn't run. A Role with an Admin grant on the bounded context
+`decide()` doesn't run. A keyed retry returns that same `proposalId`
+while the proposal is pending or approving. A Role with an Admin grant on the bounded context
 runs `approveCommand` or `rejectCommand` over GraphQL, and
 `commandProposals` lists what is waiting. Approval runs the ordinary
 submission, so `decide()` sees the state at approval time and can still

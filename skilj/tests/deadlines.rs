@@ -1647,26 +1647,36 @@ fn a_deadline_targeting_an_approval_required_command_proposes_it() {
 
         // A crash before the row was marked fired: the next tick fires it
         // again, and must find the same proposal, not make a second one.
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE {}.deadlines SET status = 'pending', resolved_at = NULL WHERE id = $1",
-            race_schema(&source)
-        )))
-        .bind(&deadline_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        fire().await.unwrap();
-        assert_eq!(deadline_status().await, "fired");
-        assert_eq!(
-            db::list_command_proposals(&pool, &target, None, None, None, now)
+        for remove_policy in [false, true] {
+            if remove_policy {
+                db::set_command_approval_policy(
+                    &pool,
+                    &target,
+                    &proposals[0].command_type_name,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {}.deadlines SET status = 'pending', resolved_at = NULL WHERE id = $1",
+                race_schema(&source)
+            )))
+            .bind(&deadline_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            fire().await.unwrap();
+            assert_eq!(deadline_status().await, "fired");
+            let after = db::list_command_proposals(&pool, &target, None, None, None, now)
+                .await
+                .unwrap();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].id, proposals[0].id);
+            assert!(db::list_events_for_bounded_context(&pool, &target)
                 .await
                 .unwrap()
-                .len(),
-            1
-        );
-        assert!(db::list_events_for_bounded_context(&pool, &target)
-            .await
-            .unwrap()
-            .is_empty());
+                .is_empty());
+        }
     });
 }

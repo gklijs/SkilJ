@@ -245,7 +245,12 @@ authorization, then report what the decision would be and write nothing (§185).
 ## 6. Commands that need approval
 
 A command type can declare that a submission is only a proposal, held until an admin approves it
-(issue #98, §214). The decision is made against the state at approval time, not at proposal time.
+(issue #98, §214). Approval evaluates the command against the state at
+approval time. A retry with the same caller's idempotency key returns the
+original `proposalId` while it is pending or approving, including while
+the approval outcome is being finalized. An Admin on the bounded context
+can see the current status in GraphQL `commandProposals`. REST submission
+continues to return `pendingApproval` and `proposalId`.
 
 ```mermaid
 sequenceDiagram

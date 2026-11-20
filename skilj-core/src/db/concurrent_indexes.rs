@@ -12,9 +12,9 @@
 //!
 //! The catalog is read by columns only (`pg_index`, `pg_am`,
 //! `pg_attribute`): `pg_get_indexdef`/`pg_get_expr` take a lock on the
-//! table and wait behind any `ACCESS EXCLUSIVE` holder. So the predicate
-//! is not compared: a btree on the same single column, partial and not
-//! unique, under a managed name, is taken to be the managed index.
+//! table and wait behind any `ACCESS EXCLUSIVE` holder. The background
+//! discovery uses only catalog shape. Approval index readiness checks its
+//! predicate separately because command submission needs it as an arbiter.
 
 use super::{schema_ident, Pool};
 use std::collections::{BTreeMap, HashSet};
@@ -28,8 +28,10 @@ pub(crate) struct IndexSpec {
     pub table: &'static str,
     /// Its name.
     pub name: &'static str,
-    /// Its single key column.
-    pub key_column: &'static str,
+    /// Its key columns, in index order.
+    pub key_columns: &'static [&'static str],
+    /// Whether the index is unique.
+    pub unique: bool,
     /// Its `WHERE` clause.
     pub predicate: &'static str,
 }
@@ -40,7 +42,8 @@ pub(crate) struct IndexSpec {
 pub(crate) const DEADLINES_CLAIMABLE: IndexSpec = IndexSpec {
     table: "deadlines",
     name: "deadlines_claimable",
-    key_column: "fire_at",
+    key_columns: &["fire_at"],
+    unique: false,
     predicate: "status IN ('pending', 'firing')",
 };
 
@@ -49,16 +52,41 @@ pub(crate) const DEADLINES_CLAIMABLE: IndexSpec = IndexSpec {
 pub(crate) const DEADLINES_DUE: IndexSpec = IndexSpec {
     table: "deadlines",
     name: "deadlines_due",
-    key_column: "fire_at",
+    key_columns: &["fire_at"],
+    unique: false,
     predicate: "status = 'pending'",
 };
+
+pub(super) const OPEN_PROPOSAL_KEY_PREDICATE: &str =
+    "status IN ('pending', 'approving') AND idempotency_key IS NOT NULL";
+
+pub(super) const OPEN_PROPOSAL_INDEX: IndexSpec = IndexSpec {
+    table: "command_proposals",
+    name: "command_proposals_open_idempotency",
+    key_columns: &["command_type_name", "metadata_client_id", "idempotency_key"],
+    unique: true,
+    predicate: OPEN_PROPOSAL_KEY_PREDICATE,
+};
+
+const PENDING_PROPOSAL_INDEX: IndexSpec = IndexSpec {
+    name: "command_proposals_pending_idempotency",
+    predicate: "status = 'pending' AND idempotency_key IS NOT NULL",
+    ..OPEN_PROPOSAL_INDEX
+};
+
+/// PostgreSQL's expression deparse for the predicate we provision, checked
+/// on the supported server majors.
+const OPEN_PROPOSAL_INDEX_EXPRESSION: &str =
+    "((status = ANY (ARRAY['pending'::text, 'approving'::text])) AND (idempotency_key IS NOT NULL))";
 
 /// Indexes built concurrently, each with the index it replaces, dropped
 /// concurrently once the new one is valid. A changed definition needs a
 /// new name: an index found under a managed name is never rebuilt for
 /// having another predicate.
-pub(crate) const MANAGED_INDEXES: &[(IndexSpec, Option<IndexSpec>)] =
-    &[(DEADLINES_CLAIMABLE, Some(DEADLINES_DUE))];
+pub(crate) const MANAGED_INDEXES: &[(IndexSpec, Option<IndexSpec>)] = &[
+    (OPEN_PROPOSAL_INDEX, Some(PENDING_PROPOSAL_INDEX)),
+    (DEADLINES_CLAIMABLE, Some(DEADLINES_DUE)),
+];
 
 impl IndexSpec {
     /// `CREATE INDEX` for it in `schema` (an already-quoted identifier),
@@ -66,11 +94,12 @@ impl IndexSpec {
     /// transaction).
     pub(crate) fn create_sql(&self, schema: &str, concurrently: bool) -> String {
         format!(
-            "CREATE INDEX {}IF NOT EXISTS {} ON {schema}.{} ({}) WHERE {}",
+            "CREATE {}INDEX {}IF NOT EXISTS {} ON {schema}.{} ({}) WHERE {}",
+            if self.unique { "UNIQUE " } else { "" },
             if concurrently { "CONCURRENTLY " } else { "" },
             self.name,
             self.table,
-            self.key_column,
+            self.key_columns.join(", "),
             self.predicate
         )
     }
@@ -111,11 +140,11 @@ impl IndexRow {
         let shaped = self.relkind == "i"
             && self.table_name.as_deref() == Some(spec.table)
             && self.amname.as_deref() == Some("btree")
-            && self.natts == Some(1)
+            && self.natts == i32::try_from(spec.key_columns.len()).ok()
             && self.no_exprs == Some(true)
             && self.partial == Some(true)
-            && self.is_unique == Some(false)
-            && self.columns == [spec.key_column];
+            && self.is_unique == Some(spec.unique)
+            && self.columns == spec.key_columns;
         match (shaped, self.valid) {
             (true, Some(true)) => IndexState::Valid,
             (true, _) => IndexState::Invalid,
@@ -214,29 +243,40 @@ fn needs_work(managed: IndexState, replaced: IndexState) -> bool {
 /// another schema, whatever its name.
 #[tracing::instrument(skip_all)]
 pub async fn pending_concurrent_index_work(pool: &Pool) -> crate::error::Result<Vec<String>> {
-    let names: Vec<(String,)> = sqlx::query_as(
-        "SELECT bc.name FROM bounded_contexts bc \
+    let names: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT bc.name, d.oid IS NOT NULL, p.oid IS NOT NULL FROM bounded_contexts bc \
            JOIN pg_namespace n ON n.nspname = 'bc_' || bc.name \
-           JOIN pg_class t ON t.relnamespace = n.oid AND t.relname = 'deadlines' \
-                AND t.relkind IN ('r', 'p') \
+           LEFT JOIN pg_class d ON d.relnamespace = n.oid AND d.relname = 'deadlines' \
+                AND d.relkind IN ('r', 'p') \
+           LEFT JOIN pg_class p ON p.relnamespace = n.oid AND p.relname = 'command_proposals' \
+                AND p.relkind IN ('r', 'p') \
           ORDER BY bc.name",
     )
     .fetch_all(pool)
     .await?;
-    let schemas: Vec<String> = names.iter().map(|(name,)| format!("bc_{name}")).collect();
+    let schemas: Vec<String> = names
+        .iter()
+        .map(|(name, _, _)| format!("bc_{name}"))
+        .collect();
     let states = IndexStates::read(pool, &schemas).await?;
     Ok(names
         .into_iter()
-        .filter(|(name,)| {
+        .filter(|(name, deadlines, proposals)| {
             let raw = format!("bc_{name}");
             MANAGED_INDEXES.iter().any(|(managed, replaced)| {
-                needs_work(
-                    states.get(&raw, managed),
-                    replaced.map_or(IndexState::Absent, |r| states.get(&raw, &r)),
-                )
+                let present = if *managed == OPEN_PROPOSAL_INDEX {
+                    *proposals
+                } else {
+                    *deadlines
+                };
+                present
+                    && needs_work(
+                        states.get(&raw, managed),
+                        replaced.map_or(IndexState::Absent, |r| states.get(&raw, &r)),
+                    )
             })
         })
-        .map(|(name,)| name)
+        .map(|(name, _, _)| name)
         .collect())
 }
 
@@ -383,14 +423,17 @@ async fn build_on(
     .fetch_one(&mut *conn)
     .await?;
     // A timeout too large to represent waits as long as none would.
-    let deadline = (lock_timeout_ms > 0.0)
+    let lock_wait = (lock_timeout_ms > 0.0)
         .then(|| Duration::try_from_secs_f64(lock_timeout_ms / 1000.0).ok())
-        .flatten()
-        .and_then(|timeout| Instant::now().checked_add(timeout));
+        .flatten();
     let mut stop = std::pin::pin!(stop);
     let mut changed = false;
 
     for (managed, replaced) in pending {
+        if !table_present(conn, raw, managed.table).await? {
+            continue;
+        }
+        let deadline = lock_wait.and_then(|wait| Instant::now().checked_add(wait));
         let key = format!("skilj_concurrent_index:{schema}.{}", managed.name);
         loop {
             let (got,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock(hashtext($1))")
@@ -434,7 +477,18 @@ async fn build_on(
             .await?;
 
         let states = IndexStates::for_schema(conn, raw).await?;
-        match states.get(raw, managed) {
+        let state = states.get(raw, managed);
+        if *managed == OPEN_PROPOSAL_INDEX
+            && (state == IndexState::Foreign
+                || (matches!(state, IndexState::Valid | IndexState::Invalid)
+                    && !approval_predicate_matches(conn, raw).await?))
+        {
+            return Err(approval_index_error(
+                bounded_context,
+                "the replacement index has an unexpected definition",
+            ));
+        }
+        match state {
             IndexState::Foreign => {
                 warn_foreign_once(bounded_context, managed.name);
                 continue;
@@ -451,9 +505,19 @@ async fn build_on(
             IndexState::Absent | IndexState::Valid => {}
         }
         if states.get(raw, managed) != IndexState::Valid {
-            sqlx::raw_sql(sqlx::AssertSqlSafe(managed.create_sql(schema, true)))
+            let build = sqlx::raw_sql(sqlx::AssertSqlSafe(managed.create_sql(schema, true)))
                 .execute(&mut *conn)
-                .await?;
+                .await;
+            if let Err(err) = build {
+                if *managed == OPEN_PROPOSAL_INDEX
+                    && err.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505")
+                {
+                    let groups = duplicate_proposal_groups(conn, bounded_context).await?;
+                    let detail = duplicate_message(&groups);
+                    return Err(approval_index_error(bounded_context, &detail));
+                }
+                return Err(err.into());
+            }
             changed = true;
             let state = IndexStates::for_schema(conn, raw).await?.get(raw, managed);
             if state != IndexState::Valid {
@@ -486,6 +550,154 @@ async fn build_on(
     } else {
         ConcurrentIndexOutcome::UpToDate
     })
+}
+
+async fn table_present(
+    conn: &mut sqlx::PgConnection,
+    raw_schema: &str,
+    table: &str,
+) -> crate::error::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p'))",
+    )
+    .bind(raw_schema)
+    .bind(table)
+    .fetch_one(conn)
+    .await?)
+}
+
+async fn approval_predicate_matches(
+    conn: &mut sqlx::PgConnection,
+    raw_schema: &str,
+) -> crate::error::Result<bool> {
+    let matches = sqlx::query_scalar(
+        "SELECT pg_get_expr(x.indpred, x.indrelid, false) = $3
+         FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
+         JOIN pg_namespace n ON n.oid = i.relnamespace
+         WHERE n.nspname = $1 AND i.relname = $2",
+    )
+    .bind(raw_schema)
+    .bind(OPEN_PROPOSAL_INDEX.name)
+    .bind(OPEN_PROPOSAL_INDEX_EXPRESSION)
+    .fetch_optional(conn)
+    .await?;
+    Ok(matches.unwrap_or(false))
+}
+
+async fn duplicate_proposal_groups(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<Vec<String>>> {
+    let schema = schema_ident(bounded_context);
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT array_agg(id || ' (' || status || ')' ORDER BY id)
+         FROM {schema}.command_proposals
+         WHERE {OPEN_PROPOSAL_KEY_PREDICATE}
+         GROUP BY command_type_name, metadata_client_id, idempotency_key
+         HAVING count(*) > 1
+         ORDER BY min(id)"
+    )))
+    .fetch_all(conn)
+    .await?)
+}
+
+fn duplicate_message(groups: &[Vec<String>]) -> String {
+    let groups: Vec<_> = groups
+        .iter()
+        .map(|ids| format!("[{}]", ids.join(", ")))
+        .collect();
+    format!(
+        "duplicate open proposals block the upgrade: {}. Settle the proposals and retry (docs/deployment.md)",
+        groups.join(", ")
+    )
+}
+
+fn approval_index_error(bounded_context: &str, detail: &str) -> crate::error::Error {
+    crate::error::Error::SchemaUpgradeRequired {
+        pending: format!("bounded context {bounded_context}: {detail}"),
+    }
+}
+
+pub(super) async fn approval_index_status(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+) -> crate::error::Result<(IndexState, Option<String>)> {
+    let raw = format!("bc_{bounded_context}");
+    if !table_present(conn, &raw, OPEN_PROPOSAL_INDEX.table).await? {
+        return Ok((IndexState::Absent, None));
+    }
+    let state = IndexStates::for_schema(conn, &raw)
+        .await?
+        .get(&raw, &OPEN_PROPOSAL_INDEX);
+    if state == IndexState::Foreign
+        || (matches!(state, IndexState::Valid | IndexState::Invalid)
+            && !approval_predicate_matches(conn, &raw).await?)
+    {
+        return Ok((
+            IndexState::Foreign,
+            Some(format!(
+                "bounded context {bounded_context}: {} has an unexpected definition",
+                OPEN_PROPOSAL_INDEX.name
+            )),
+        ));
+    }
+    if state != IndexState::Valid {
+        let groups = duplicate_proposal_groups(conn, bounded_context).await?;
+        if !groups.is_empty() {
+            return Ok((
+                state,
+                Some(format!(
+                    "bounded context {bounded_context}: {}",
+                    duplicate_message(&groups)
+                )),
+            ));
+        }
+    }
+    Ok((state, None))
+}
+
+/// Checks all provisioned approval tables before and after the concurrent
+/// upgrade. Before it, duplicates and foreign indexes must stop the swap.
+/// After it, every approval table must have a valid arbiter before serving.
+pub async fn check_required_approval_indexes(pool: &Pool, ready: bool) -> crate::error::Result<()> {
+    let mut conn = pool.acquire().await?;
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT bc.name FROM bounded_contexts bc
+         JOIN pg_namespace n ON n.nspname = 'bc_' || bc.name
+         JOIN pg_class p ON p.relnamespace = n.oid AND p.relname = 'command_proposals'
+             AND p.relkind IN ('r', 'p')
+         ORDER BY bc.name",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for name in names {
+        match approval_index_status(&mut conn, &name).await {
+            Ok((state, detail)) => {
+                if let Some(pending) = detail {
+                    return Err(crate::error::Error::SchemaUpgradeRequired { pending });
+                }
+                if ready
+                    && state != IndexState::Valid
+                    && table_present(&mut conn, &format!("bc_{name}"), OPEN_PROPOSAL_INDEX.table)
+                        .await?
+                {
+                    return Err(approval_index_error(
+                        &name,
+                        "the open proposal index is missing or invalid",
+                    ));
+                }
+            }
+            Err(err) => {
+                if table_present(&mut conn, &format!("bc_{name}"), OPEN_PROPOSAL_INDEX.table)
+                    .await?
+                {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

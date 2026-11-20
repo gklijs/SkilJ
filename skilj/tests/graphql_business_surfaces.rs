@@ -19,7 +19,7 @@ use skilj::{
 };
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
-use skilj_core::db::Pool;
+use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
 use skilj_core::plugin::BoundedContextEvent;
 use skilj_core::shared::{generate_token_id, CommandDecision, EventSpec, TagMapping};
@@ -768,7 +768,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 async fn test_database_url() -> Option<String> {
     TEST_DB
-        .get_or_init(provision)
+        .get_or_init(|| provision("skilj_graphql_business_surfaces_test"))
         .await
         .as_ref()
         .map(|db| db.database_url.clone())
@@ -789,8 +789,8 @@ async fn check_reachable(database_url: &str, label: &str) -> bool {
     }
 }
 
-async fn provision() -> Option<TestDb> {
-    let url = skilj_test_support::database_url("skilj_graphql_business_surfaces_test").await?;
+async fn provision(database_name: &str) -> Option<TestDb> {
+    let url = skilj_test_support::database_url(database_name).await?;
     if !check_reachable(&url, "the test database").await {
         return None;
     }
@@ -875,9 +875,16 @@ async fn setup_with(
     let database_url = test_database_url()
         .await
         .expect("test_database_url() must be Some - caller already checked");
+    setup_in_database(&database_url, configure).await
+}
+
+async fn setup_in_database(
+    database_url: &str,
+    configure: impl FnOnce(skilj::SkiljBuilder) -> skilj::SkiljBuilder,
+) -> (Skilj, Pool, String, String, Role) {
     let jwks_url = serve_jwks().await;
 
-    let pool = skilj_core::db::connect(&database_url).await.unwrap();
+    let pool = skilj_core::db::connect(database_url).await.unwrap();
 
     let admin_subject = unique_name("admin");
     let role = Role {
@@ -922,7 +929,7 @@ async fn setup_with(
     // Small per-instance pool: every test leaks a live `Skilj`, so the default
     // 10-connection pools of ~10 tests exhaust the shared embedded Postgres's
     // 100 connections and the last `build()` fails with `PoolTimedOut`.
-    let builder = Skilj::builder(database_url.clone())
+    let builder = Skilj::builder(database_url)
         .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
         .identity_provider(IdpConfig::new(
             jwks_url.parse().unwrap(),
@@ -1482,13 +1489,40 @@ fn an_external_read_token_never_sees_a_private_field() {
 #[test]
 fn command_approval_lifecycle_end_to_end() {
     runtime().block_on(async {
-        if test_database_url().await.is_none() {
+        // This test recreates legacy duplicates. Startup in another test
+        // would see them because it scans every bounded context in its database.
+        let Some(db) = provision("skilj_graphql_approval_lifecycle_test").await else {
             return;
-        }
-        let (skilj, pool, bc_name, jwt, role) = setup().await;
+        };
+        let (skilj, pool, bc_name, jwt, role) = setup_in_database(&db.database_url, |builder| {
+            builder.concurrent_index_interval(None)
+        })
+        .await;
         let router = skilj.graphql_router().await.unwrap();
         let payload = json!({ "amount": 42 }).to_string();
 
+        let command_type = db::get_command_type(&pool, &bc_name, "TransferMoney")
+            .await.unwrap().unwrap();
+        let stale_routing = db::approval_routing(&pool, &command_type, &role.id, &["transfer-1"])
+            .await.unwrap();
+        let retry_from_initial_miss = || {
+            let authorised = skilj_core::event_store::CommandAuthorised {
+                command_type: command_type.clone(),
+                payload: payload.clone(),
+                client_id: role.id.clone(),
+                correlation_id: None,
+                causation_id: None,
+            };
+            let pool = &pool;
+            let routing = &stale_routing;
+            async move {
+                db::route_approval_submission_with(
+                    pool, &authorised, Some("transfer-1"), None,
+                    skilj_core::payload_limits::PayloadLimits::default(),
+                    jiff::Timestamp::now(), routing,
+                ).await.unwrap()
+            }
+        };
         let submitted = graphql_request(
             &router,
             Some(&jwt),
@@ -1570,6 +1604,23 @@ fn command_approval_lifecycle_end_to_end() {
         assert_eq!(list[0]["payload"], json!(payload));
         assert_eq!(list[0]["commandId"], serde_json::Value::Null);
 
+        let mapping = db::get_active_role_access_mapping(&pool, &role.id, &bc_name)
+            .await.unwrap().unwrap();
+        db::claim_command_proposal(
+            &pool, &bc_name, &proposal_id, &mapping,
+            skilj_core::approvals::ProposalDecision::Approve, jiff::Timestamp::now(),
+        ).await.unwrap();
+        let approving = graphql_request(
+            &router, Some(&jwt), SUBMIT_COMMAND_MUTATION_WITH_PROPOSAL,
+            json!({"bc": bc_name, "name": "TransferMoney", "payload": payload, "key": "transfer-1"}),
+        ).await;
+        assert_eq!(approving["data"]["submitCommand"]["proposalId"], json!(proposal_id), "{approving}");
+        let proposals = db::list_command_proposals(&pool, &bc_name, None, None, None, jiff::Timestamp::now())
+            .await.unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].status, skilj_core::approvals::CommandProposalStatus::Approving);
+        leave_claim_behind(&pool, &bc_name, &proposal_id, jiff::SignedDuration::from_mins(11)).await;
+
         let approved = graphql_request(
             &router,
             Some(&jwt),
@@ -1615,9 +1666,35 @@ fn command_approval_lifecycle_end_to_end() {
             "{again}"
         );
 
+        // The command has committed. Simulate a crash before finalization
+        // and assert that the visible open proposal still wins.
+        leave_claim_behind(&pool, &bc_name, &proposal_id, jiff::SignedDuration::from_mins(11)).await;
+        let before_finalization = graphql_request(
+            &router, Some(&jwt), SUBMIT_COMMAND_MUTATION_WITH_PROPOSAL,
+            json!({"bc": bc_name, "name": "TransferMoney", "payload": payload, "key": "transfer-1"}),
+        ).await;
+        assert_eq!(before_finalization["data"]["submitCommand"]["proposalId"], json!(proposal_id), "{before_finalization}");
+        assert!(matches!(
+            retry_from_initial_miss().await,
+            db::ApprovalSubmission::Proposal(id) if id == proposal_id
+        ));
+        let settled = graphql_request(
+            &router, Some(&jwt), APPROVE_MUTATION,
+            json!({"bc": bc_name, "id": proposal_id}),
+        ).await;
+        assert_eq!(settled["data"]["approveCommand"]["proposal"]["status"], json!("APPROVED"), "{settled}");
+        assert_eq!(transfer_command_count(&router, &jwt, &bc_name).await, 1);
+
+        assert!(matches!(
+            retry_from_initial_miss().await,
+            db::ApprovalSubmission::Deduplicated(sequences)
+                if json!(sequences) == approved["triggeredEventSequences"]
+        ));
+        assert_eq!(db::list_command_proposals(
+            &pool, &bc_name, None, None, None, jiff::Timestamp::now(),
+        ).await.unwrap().len(), 1);
         // The key that proposal was submitted under now names an accepted
-        // command: the duplicate goes through the ordinary dedup path, not
-        // a second proposal.
+        // command: the duplicate returns the retained result directly.
         let duplicate = graphql_request(
             &router,
             Some(&jwt),
@@ -1713,7 +1790,56 @@ fn command_approval_lifecycle_end_to_end() {
         assert_eq!(transfer["approvalPolicy"]["deadlineSeconds"], serde_json::Value::Null);
         assert_eq!(transfer["approvalPolicy"]["allowsSelfApproval"], json!(true));
 
-        let _ = pool;
+        // Re-create a group the 0.4 pending-only index permitted. The
+        // shared key already names the one command that committed above.
+        let schema = format!("\"bc_{bc_name}\"");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP INDEX {schema}.command_proposals_open_idempotency;
+             CREATE UNIQUE INDEX command_proposals_pending_idempotency ON {schema}.command_proposals
+                (command_type_name, metadata_client_id, idempotency_key)
+             WHERE status = 'pending' AND idempotency_key IS NOT NULL"
+        ))).execute(&pool).await.unwrap();
+        leave_claim_behind(&pool, &bc_name, &proposal_id, jiff::SignedDuration::from_mins(11)).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.command_proposals
+                 (id, command_type_name, payload, metadata_version, metadata_client_id,
+                  metadata_created_at, status, idempotency_key, created_at, expires_at, decided_at)
+             SELECT sibling.id, proposal.command_type_name, proposal.payload, proposal.metadata_version,
+                 proposal.metadata_client_id, proposal.metadata_created_at, sibling.status,
+                 proposal.idempotency_key, proposal.created_at, now() - interval '1 second',
+                 now() - interval '11 minutes'
+             FROM {schema}.command_proposals proposal CROSS JOIN
+                 (VALUES ('expired-sibling', 'pending'), ('stale-sibling', 'approving')) AS sibling(id, status)
+             WHERE proposal.id = $1"
+        ))).bind(&proposal_id).execute(&pool).await.unwrap();
+        let ids = [proposal_id.as_str(), "expired-sibling", "stale-sibling"];
+        use skilj_core::approvals::{CommandProposalStatus, Error as ApprovalError};
+        for (id, status) in ids.into_iter().zip([
+            CommandProposalStatus::Approved,
+            CommandProposalStatus::Expired,
+            CommandProposalStatus::Approved,
+        ]) {
+            let result = db::reject_command_proposal(
+                &pool, &bc_name, id, &mapping, Some("legacy sibling"), jiff::Timestamp::now(),
+            ).await;
+            match status {
+                CommandProposalStatus::Approved => assert!(matches!(
+                    result, Err(skilj_core::Error::Approvals(ApprovalError::ProposalNotPending { status: "approved" }))
+                ), "{result:?}"),
+                CommandProposalStatus::Expired => assert!(matches!(
+                    result, Err(skilj_core::Error::Approvals(ApprovalError::ProposalExpired))
+                ), "{result:?}"),
+                _ => unreachable!("the retained-key settlement has one of two outcomes"),
+            }
+            let proposal = db::get_command_proposal(&pool, &bc_name, id).await.unwrap().unwrap();
+            assert_eq!(proposal.status, status);
+        }
+        assert_eq!(db::delete_expired_idempotency_keys(
+            &pool, &bc_name, jiff::Timestamp::now() + jiff::SignedDuration::from_secs(1), 100,
+        ).await.unwrap(), 1);
+        assert_eq!(transfer_command_count(&router, &jwt, &bc_name).await, 1);
+        assert_eq!(db::list_events_for_bounded_context(&pool, &bc_name).await.unwrap().len(), 1);
+        db::build_concurrent_indexes(&pool, &bc_name).await.unwrap();
     });
 }
 

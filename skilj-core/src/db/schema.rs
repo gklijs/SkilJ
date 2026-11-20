@@ -743,11 +743,9 @@ pub(super) async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE UNIQUE INDEX command_proposals_pending_idempotency \
-         ON {schema}.command_proposals (command_type_name, metadata_client_id, idempotency_key) \
-         WHERE status = 'pending' AND idempotency_key IS NOT NULL"
-    )))
+    sqlx::query(sqlx::AssertSqlSafe(
+        super::concurrent_indexes::OPEN_PROPOSAL_INDEX.create_sql(&schema, false),
+    ))
     .execute(&mut **tx)
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -927,17 +925,8 @@ pub async fn ensure_command_approval_tables(
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
-        &schema,
-        "command_proposals_pending_idempotency",
-        format!(
-            "CREATE UNIQUE INDEX command_proposals_pending_idempotency \
-             ON {schema}.command_proposals (command_type_name, metadata_client_id, idempotency_key) \
-             WHERE status = 'pending' AND idempotency_key IS NOT NULL"
-        ),
-    )))
-    .execute(pool)
-    .await?;
+    // The required open-proposal index is built by the concurrent upgrade
+    // before the database can serve command submissions (docs/architecture.md §256).
     // `commandProposals`' page order (docs/architecture.md §218).
     sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
         &schema,

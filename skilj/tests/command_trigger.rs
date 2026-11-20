@@ -355,16 +355,19 @@ fn an_approval_required_trigger_creates_a_pending_proposal() {
         db::insert_command_token(&pool, &token).await.unwrap();
         let credential = format!("{}.{}", token.id, token.secret);
 
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/commands/trigger")
-            .header("authorization", format!("Bearer {credential}"))
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({ "payload": { "amount": 7 } }).to_string(),
-            ))
-            .unwrap();
-        let response = skilj.rest_router().oneshot(request).await.unwrap();
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/commands/trigger")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "proposal-key")
+                .body(Body::from(
+                    serde_json::json!({ "payload": { "amount": 7 } }).to_string(),
+                ))
+                .unwrap()
+        };
+        let response = skilj.rest_router().oneshot(request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -384,6 +387,171 @@ fn an_approval_required_trigger_creates_a_pending_proposal() {
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].id, proposal_id);
         assert_eq!(proposals[0].payload, r#"{"amount":7}"#);
+        let claimed = db::claim_command_proposal(
+            &pool,
+            &bc_name,
+            proposal_id,
+            &mapping,
+            skilj_core::approvals::ProposalDecision::Approve,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claimed.status,
+            skilj_core::approvals::CommandProposalStatus::Approving
+        );
+        let schema = format!("\"bc_{bc_name}\"");
+        // A retry with an open match must not attempt an INSERT at all,
+        // even one that would end in ON CONFLICT DO NOTHING.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {schema}.unexpected_proposal_write() RETURNS trigger
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'unexpected proposal write'; END $$;
+             CREATE TRIGGER unexpected_proposal_write BEFORE INSERT ON {schema}.command_proposals
+             FOR EACH ROW EXECUTE FUNCTION {schema}.unexpected_proposal_write()"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let response = skilj.rest_router().oneshot(request()).await.unwrap();
+        let retry: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(retry["proposalId"], proposal_id, "{retry}");
+
+        let stale_routing = db::approval_routing(&pool, &command_type, &token.id, &["fresh1"])
+            .await
+            .unwrap();
+        db::set_command_approval_policy(&pool, &bc_name, "TransferMoney", None)
+            .await
+            .unwrap();
+        let ordinary = skilj_core::event_store::authorise_command_trigger(
+            &token,
+            r#"{"amount":3}"#.to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            db::route_approval_submission_with(
+                &pool,
+                &ordinary,
+                Some("fresh1"),
+                None,
+                skilj_core::payload_limits::PayloadLimits::default(),
+                Timestamp::now(),
+                &stale_routing,
+            )
+            .await
+            .unwrap(),
+            db::ApprovalSubmission::Ordinary
+        ));
+        let router = skilj.rest_router();
+
+        // A queued item's warm-up fails reading the event type. The open
+        // match in the next slot is already resolved but must still stop.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {schema}.event_types RENAME TO event_types_for_retry_test"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (status, stopped) = trigger_batch(
+            &router,
+            &credential,
+            serde_json::json!({
+                "stopAtFirstFailure": true,
+                "commands": [
+                    {"payload":{"amount":3},"idempotencyKey":"fresh1"},
+                    {"payload":{"amount":7},"idempotencyKey":"proposal-key"}
+                ]
+            }),
+        )
+        .await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {schema}.event_types_for_retry_test RENAME TO event_types"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            stopped["outcomes"][0]["error"]["code"], "database_error",
+            "{stopped}"
+        );
+        assert_eq!(
+            stopped["outcomes"][1]["error"]["code"], "not_processed",
+            "{stopped}"
+        );
+
+        // Once the commands are queued, a write failure does not stop a
+        // later queued command, even in stop mode.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {schema}.fail_selected_write() RETURNS trigger
+             LANGUAGE plpgsql AS $$ BEGIN
+                 IF NEW.payload::jsonb ->> 'amount' = '666' THEN
+                     RAISE EXCEPTION 'intentional test write failure';
+                 END IF;
+                 RETURN NEW;
+             END $$;
+             CREATE TRIGGER fail_selected_write BEFORE INSERT ON {schema}.events
+             FOR EACH ROW EXECUTE FUNCTION {schema}.fail_selected_write()"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (status, continued) = trigger_batch(
+            &router,
+            &credential,
+            serde_json::json!({
+                "stopAtFirstFailure": true,
+                "commands": [
+                    {"payload":{"amount":666},"idempotencyKey":"write-fails"},
+                    {"payload":{"amount":7},"idempotencyKey":"proposal-key"},
+                    {"payload":{"amount":4},"idempotencyKey":"write-continues"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            continued["outcomes"][0]["error"]["code"], "database_error",
+            "{continued}"
+        );
+        assert_eq!(
+            continued["outcomes"][1]["proposalId"], proposal_id,
+            "{continued}"
+        );
+        assert_eq!(continued["outcomes"][2]["accepted"], true, "{continued}");
+
+        let (status, batch) = trigger_batch(
+            &router,
+            &credential,
+            serde_json::json!({
+                "commands": [
+                    {"payload":{"amount":3},"idempotencyKey":"fresh1"},
+                    {"payload":{"amount":5},"idempotencyKey":"bad\0key"},
+                    {"payload":{"amount":7},"idempotencyKey":"proposal-key"},
+                    {"payload":{"amount":9},"idempotencyKey":"fresh2"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(batch["outcomes"][0]["accepted"], true, "{batch}");
+        assert_eq!(
+            batch["outcomes"][1]["error"]["code"], "database_error",
+            "{batch}"
+        );
+        assert_eq!(batch["outcomes"][2]["proposalId"], proposal_id, "{batch}");
+        assert_eq!(batch["outcomes"][3]["accepted"], true, "{batch}");
+        assert_eq!(
+            db::list_command_proposals(&pool, &bc_name, None, None, None, Timestamp::now())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     });
 }
 

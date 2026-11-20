@@ -399,8 +399,8 @@ index blobs_to_remove on blobs
 index command_approval_policies_pkey on command_approval_policies
 index command_encryption_keys_pkey on command_encryption_keys
 index command_proposals_by_status on command_proposals
+index command_proposals_open_idempotency on command_proposals
 index command_proposals_page_order on command_proposals
-index command_proposals_pending_idempotency on command_proposals
 index command_proposals_pkey on command_proposals
 index command_types_pkey on command_types
 index commands_by_correlation_id on commands

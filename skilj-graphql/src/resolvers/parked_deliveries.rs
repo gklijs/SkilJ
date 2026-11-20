@@ -123,6 +123,16 @@ async fn redrive_parked_delivery(
                 None,
             )
             .expect("CrossContextRoute/Deadline-kind redrives always carry an idempotency key");
+            let authorised = skilj_core::event_store::CommandAuthorised {
+                command_type: target_command_type,
+                payload,
+                client_id,
+                correlation_id: None,
+                causation_id: None,
+            };
+            if redrive_requires_approval(state, &authorised, &idempotency_key).await? {
+                return Ok(());
+            }
             // issue #32 (round two): routed through
             // `state.command_batcher` rather than calling
             // `db::decide_and_submit_command` directly - a redrive is
@@ -137,9 +147,9 @@ async fn redrive_parked_delivery(
                     state.snapshot_dispatcher.as_ref(),
                     &state.event_broadcaster,
                     &state.event_cache,
-                    &target_command_type,
-                    &payload,
-                    &client_id,
+                    &authorised.command_type,
+                    &authorised.payload,
+                    &authorised.client_id,
                     None,
                     None,
                     state.key_service.as_ref(),
@@ -236,7 +246,7 @@ async fn redrive_parked_delivery(
             let redrive: CommandTriggerRedrive = decode_request(&delivery.request_json)?;
             let payload = serde_json::to_string(&redrive.payload)
                 .expect("serde_json::Value serialization is infallible");
-            let authorised = skilj_core::event_store::authorise_command_trigger(
+            let mut authorised = skilj_core::event_store::authorise_command_trigger(
                 &token,
                 payload,
                 redrive.correlation_id,
@@ -253,6 +263,10 @@ async fn redrive_parked_delivery(
                 redrive.idempotency_key.as_deref(),
             )
             .expect("CommandTrigger-kind redrives always carry an idempotency key");
+            authorised.client_id = client_id;
+            if redrive_requires_approval(state, &authorised, &idempotency_key).await? {
+                return Ok(());
+            }
             // issue #32 (round two) - see the identical comment
             // on the `CrossContextRoute` branch above.
             state
@@ -266,7 +280,7 @@ async fn redrive_parked_delivery(
                     &state.event_cache,
                     &authorised.command_type,
                     &authorised.payload,
-                    &client_id,
+                    &authorised.client_id,
                     authorised.correlation_id.as_deref(),
                     authorised.causation_id.as_deref(),
                     state.key_service.as_ref(),
@@ -282,6 +296,32 @@ async fn redrive_parked_delivery(
         }
     }
     Ok(())
+}
+
+/// A proposal or retained acceptance handles the delivery without running
+/// the command through the ordinary submission path.
+async fn redrive_requires_approval(
+    state: &GraphqlState,
+    authorised: &skilj_core::event_store::CommandAuthorised,
+    key: &str,
+) -> skilj_core::error::Result<bool> {
+    use db::ApprovalSubmission;
+    match db::route_approval_submission(
+        &state.pool,
+        authorised,
+        Some(key),
+        state.key_service.as_ref(),
+        state.projection_dispatcher.payload_limits(),
+        Timestamp::now(),
+    )
+    .await?
+    {
+        ApprovalSubmission::Ordinary => Ok(false),
+        ApprovalSubmission::Proposal(_) | ApprovalSubmission::Deduplicated(_) => Ok(true),
+        _ => Err(skilj_core::Error::Unsupported {
+            what: "ApprovalSubmission",
+        }),
+    }
 }
 
 /// `parkedDeliveries(boundedContext: String!, after: String): [ParkedDelivery!]!`

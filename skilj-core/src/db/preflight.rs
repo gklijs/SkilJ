@@ -194,14 +194,19 @@ pub(crate) fn diff_shape(expected: &[&str], actual: &[String]) -> ShapeDiff {
             continue;
         }
         handled.insert(line.clone());
+        let work = if *managed == super::concurrent_indexes::OPEN_PROPOSAL_INDEX {
+            &mut diff.missing
+        } else {
+            &mut diff.lazy
+        };
         let invalid = format!("{line} invalid");
         if actual_keys.contains_key(line.as_str()) {
             // Valid: only the replaced index may be left to drop.
         } else if actual_keys.contains_key(invalid.as_str()) {
-            diff.lazy.push(invalid.clone());
+            work.push(invalid.clone());
             handled.insert(invalid);
         } else if !foreign(managed) {
-            diff.lazy.push(line.clone());
+            work.push(line.clone());
         }
         if let Some(replaced) = replaced {
             let old = index_line(replaced);
@@ -349,7 +354,9 @@ pub async fn record_schema_level(pool: &Pool) -> crate::error::Result<()> {
          ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \
              min_compatible_level = EXCLUDED.min_compatible_level, \
              upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \
-         WHERE skilj_schema_compatibility.level < EXCLUDED.level",
+         WHERE skilj_schema_compatibility.level < EXCLUDED.level
+            OR (skilj_schema_compatibility.level = EXCLUDED.level
+                AND skilj_schema_compatibility.min_compatible_level < EXCLUDED.min_compatible_level)",
     )
     .bind(SCHEMA_LEVEL)
     .bind(MIN_COMPATIBLE_SCHEMA_LEVEL)
@@ -562,7 +569,9 @@ async fn ddl_locks(
         entry.2.extend(work);
     };
     for line in missing {
-        if let Some(rest) = line.strip_prefix("column ") {
+        if let Some((table, what)) = concurrent_index_work(line) {
+            note(table, "SHARE UPDATE EXCLUSIVE", None, Some(what));
+        } else if let Some(rest) = line.strip_prefix("column ") {
             let column = rest.split(' ').next().unwrap_or(rest);
             let Some((table, name)) = column.split_once('.') else {
                 continue;
@@ -869,6 +878,19 @@ pub(crate) async fn inspect(
                 detail: format!("bounded context {name} is registered but its schema is gone"),
             });
         }
+        let (approval_state, approval_issue) =
+            super::concurrent_indexes::approval_index_status(conn, name).await?;
+        if let Some(detail) = approval_issue {
+            let code = if approval_state == super::IndexState::Foreign {
+                "approval_index_foreign"
+            } else {
+                "duplicate_open_proposals"
+            };
+            refusals.push(Refusal {
+                code: code.into(),
+                detail,
+            });
+        }
         bounded_contexts.push(report);
     }
     let admin_report = bounded_contexts
@@ -879,10 +901,10 @@ pub(crate) async fn inspect(
     tx.rollback().await?;
 
     let upgrade_needed = !global.pending.is_empty()
-        || compatibility
-            .recorded
-            .as_ref()
-            .is_none_or(|r| r.level < SCHEMA_LEVEL)
+        || compatibility.recorded.as_ref().is_none_or(|r| {
+            r.level < SCHEMA_LEVEL
+                || (r.level == SCHEMA_LEVEL && r.min_compatible_level < MIN_COMPATIBLE_SCHEMA_LEVEL)
+        })
         || !admin_context.exists
         || !admin_context.origin_kind_widened
         || !admin_context.event_types_to_register.is_empty()

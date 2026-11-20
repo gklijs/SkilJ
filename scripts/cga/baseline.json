@@ -323,7 +323,7 @@
       "file": "<registry>/tracing-0.1.44/src/macros.rs",
       "message": "call to associated function `tracing::level_filters::LevelFilter::current` which can panic",
       "source": "&& $lvl <= $crate::level_filters::LevelFilter::current()",
-      "count": 138
+      "count": 137
     },
     {
       "file": "<registry>/tracing-0.1.44/src/macros.rs",
@@ -455,7 +455,7 @@
       "file": "<rust>/library/alloc/src/macros.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "$crate::fmt::format($crate::__export::format_args!($($arg)*))",
-      "count": 16
+      "count": 19
     },
     {
       "file": "<rust>/library/alloc/src/macros.rs",
@@ -2980,13 +2980,19 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "\"SELECT id FROM {schema}.command_proposals \\",
+      "source": "\"SELECT deadline_seconds FROM {schema}.command_approval_policies",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "\"SELECT id, command_type_name, payload FROM {schema}.command_proposals \\",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"SELECT {PROPOSAL_COLUMNS} FROM {schema}.command_proposals",
       "count": 1
     },
     {
@@ -3039,8 +3045,20 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "LEFT JOIN {schema}.idempotency_keys accepted",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to associated function `db::approvals::CommandProposalCursor::of` which can panic",
       "source": "after = Some(CommandProposalCursor::of(&proposal));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to associated function `std::boxed::Box::<T>::new` which can panic",
+      "source": "Ok(ProposalWrite::Proposed(Box::new( row.into_domain(command_type.bounded_context.clone()), )))",
       "count": 1
     },
     {
@@ -3075,21 +3093,45 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `approvals::CommandApprovalPolicy` which can panic",
-      "source": "}",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `approvals::CommandProposal` which can panic",
       "source": "}",
       "count": 5
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `db::approvals::ApprovalRouting` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `db::approvals::ProposalRow` which can panic",
       "source": "for proposal in rows.into_iter().map(|row| row.into_domain(bc.clone())) {",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `db::approvals::ProposalRow` which can panic",
+      "source": "row.into_domain(command_type.bounded_context.clone()),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `db::approvals::ProposalRow` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `db::approvals::ProposalRow` which can panic",
+      "source": "} else {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `db::approvals::ProposalRow` which can panic",
+      "source": "};",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
@@ -3107,6 +3149,18 @@
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `event_store::BoundedContext` which can panic",
       "source": ".map(|ct| ct.sensitive_fields);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `event_store::BoundedContext` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `event_store::CommandAuthorised` which can panic",
+      "source": "}",
       "count": 1
     },
     {
@@ -3141,26 +3195,26 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>` which can panic",
-      "source": ".bind(expires_at.map(|t| t.to_sqlx()))",
+      "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".execute(&mut *tx)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, (std::option::Option<i64>,), sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".fetch_optional(&mut *tx)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".bind(now.to_sqlx())",
-      "count": 2
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>` which can panic",
-      "source": ".bind(stale_cutoff.to_sqlx())",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>` which can panic",
-      "source": ".fetch_optional(&mut *tx)",
+      "source": ".bind(stale_cutoff.to_sqlx())",
       "count": 1
     },
     {
@@ -3178,7 +3232,25 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, db::approvals::ProposalRow, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".bind(expires_at.map(|t| t.to_sqlx()))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, db::approvals::ProposalRow, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".bind(now.to_sqlx())",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, db::approvals::ProposalRow, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".bind(status.map(CommandProposalStatus::as_str))",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, db::approvals::ProposalRow, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".fetch_optional(&mut *tx)",
       "count": 2
     },
     {
@@ -3202,6 +3274,18 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `std::option::Option<access_control::Role>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `std::option::Option<db::approvals::ApprovalRouting>` which can panic",
+      "source": "fresh = Some(approval_routing(pool, command_type, &authorised.client_id, &keys).await?);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `std::option::Option<db::approvals::ApprovalRouting>` which can panic",
       "source": "}",
       "count": 1
     },
@@ -3249,6 +3333,12 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
+      "source": "})",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `std::option::Option<std::vec::Vec<shared::SensitiveField>>` which can panic",
       "source": "}",
       "count": 1
@@ -3281,11 +3371,17 @@
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 9
+      "count": 10
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `std::vec::IntoIter<blob::DeclaredBlobRef>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `std::vec::Vec<&str>` which can panic",
       "source": "}",
       "count": 1
     },
@@ -3309,25 +3405,31 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `std::vec::Vec<i64>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `tracing::Span` which can panic",
       "source": "}",
       "count": 7
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:1170:1: 1170:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:11:1: 11:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:423:1: 423:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:1419:1: 1419:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:7:1: 7:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:698:1: 698:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -3341,6 +3443,18 @@
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::commit()}` which can panic",
       "source": "tx.commit().await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::rollback()}` which can panic",
+      "source": "tx.rollback().await?;",
+      "count": 3
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
       "count": 1
     },
     {
@@ -3363,6 +3477,12 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::option::Option<i64>,), sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::option::Option<std::string::String>, std::option::Option<i64>, bool), sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
       "count": 1
@@ -3375,25 +3495,25 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
-      "source": ".await?;",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
-      "source": ".await?;",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::approvals::ApprovalRoutingRow, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::approvals::ProposalRow, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": ".await?;",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::approvals::ProposalRow, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
       "count": 2
     },
@@ -3478,19 +3598,25 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to function `sqlx::query_as` which can panic",
-      "source": "let (id,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT id FROM {schema}.command_proposals \\ WHERE command_type_name = $1 AND metadata_client_id = $2 \\ AND idempotency_key = $3 AND status = 'pending'\" )))",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to function `sqlx::query_as` which can panic",
       "source": "let claimed: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.command_proposals \\ SET status = 'approving', decided_at = $2, decided_by_role_id = $3 \\ WHERE id = $1 AND ( \\ (status = 'pending' AND (expires_at IS NULL OR expires_at > $2)) \\ OR (status = 'approving' AND decided_at <= $4)) \\ RETURNING id\" )))",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to function `sqlx::query_as` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" )))",
+      "source": "let existing: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT {PROPOSAL_COLUMNS} FROM {schema}.command_proposals WHERE command_type_name = $1 AND metadata_client_id = $2 AND idempotency_key = $3 AND {OPEN_PROPOSAL_KEY_PREDICATE}\" )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let policy: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT deadline_seconds FROM {schema}.command_approval_policies WHERE command_type_name = $1 FOR SHARE\" )))",
       "count": 1
     },
     {
@@ -3503,6 +3629,12 @@
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to function `sqlx::query_as` which can panic",
       "source": "let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT id, command_type_name, payload FROM {schema}.command_proposals \\ WHERE status = 'pending' AND id > $1 ORDER BY id LIMIT $2\" )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let rows: Vec<ApprovalRoutingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT policy.command_type_name IS NOT NULL AS has_policy, policy.approver_role, policy.deadline_seconds, policy.allow_self_approval, input.key, proposal.id AS proposal_id, accepted.triggered_event_sequences AS sequences FROM (VALUES ($1::text)) AS requested(command_type_name) LEFT JOIN {schema}.command_approval_policies policy USING (command_type_name) LEFT JOIN unnest($3::text[]) AS input(key) ON true LEFT JOIN LATERAL ( SELECT id FROM {schema}.command_proposals WHERE command_type_name = requested.command_type_name AND metadata_client_id = $2 AND idempotency_key = input.key AND {OPEN_PROPOSAL_KEY_PREDICATE} ) proposal ON true LEFT JOIN {schema}.idempotency_keys accepted ON policy.command_type_name IS NOT NULL AND accepted.command_type_name = requested.command_type_name AND accepted.client_id = $2 AND accepted.idempotency_key = input.key\" )))",
       "count": 1
     },
     {
@@ -3539,6 +3671,12 @@
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "let row = sqlx::query(sqlx::AssertSqlSafe(format!( \"SELECT {}, {} FROM {schema}.command_types ct \\ JOIN bounded_contexts bc ON bc.name = $1 {HYDRATED_BOUNDED_CONTEXT_JOINS} \\ WHERE ct.name = $2\", hydrated_bounded_context_columns(), COMMAND_TYPE_COLUMNS .split(\", \") .map(|column| format!(\"ct.{}\", column.trim())) .collect::<Vec<_>>() .join(\", \") )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(\"SET TRANSACTION ISOLATION LEVEL READ COMMITTED\")",
       "count": 1
     },
     {
@@ -3597,6 +3735,12 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `<event_store::BoundedContext as std::clone::Clone>::clone` which can panic",
+      "source": "row.into_domain(command_type.bounded_context.clone()),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `<event_store::CommandType as std::clone::Clone>::clone` which can panic",
       "source": "command_type: command_type.clone(),",
       "count": 1
@@ -3616,13 +3760,31 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
-      "source": ".fetch_optional(&mut *tx)",
+      "source": "&mut *tx,",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": ".execute(&mut *tx)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": ".fetch_optional(&mut *tx)",
+      "count": 3
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "check_blob_claims(&mut tx, bounded_context_name, &blob_claims).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `<std::boxed::Box<T, A> as std::ops::Drop>::drop` which can panic",
+      "source": "ProposalWrite::Proposed(proposal) => return Ok(*proposal),",
       "count": 1
     },
     {
@@ -3687,6 +3849,12 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `db::approvals::ApprovalRouting::resolved` which can panic",
+      "source": "if let Some(result) = current.resolved(key) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `db::approvals::ProposalRow::into_domain` which can panic",
       "source": "Ok(Some(row.into_domain(bc)))",
       "count": 1
@@ -3696,6 +3864,12 @@
       "message": "call to method `db::approvals::ProposalRow::into_domain` which can panic",
       "source": "for proposal in rows.into_iter().map(|row| row.into_domain(bc.clone())) {",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `db::approvals::ProposalRow::into_domain` which can panic",
+      "source": "row.into_domain(command_type.bounded_context.clone()),",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
@@ -3832,24 +4006,6 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let (id,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT id FROM {schema}.command_proposals \\ WHERE command_type_name = $1 AND metadata_client_id = $2 \\ AND idempotency_key = $3 AND status = 'pending'\" ))) .bind(&command_type.name)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let (id,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT id FROM {schema}.command_proposals \\ WHERE command_type_name = $1 AND metadata_client_id = $2 \\ AND idempotency_key = $3 AND status = 'pending'\" ))) .bind(&command_type.name) .bind(&authorised.client_id)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let (id,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT id FROM {schema}.command_proposals \\ WHERE command_type_name = $1 AND metadata_client_id = $2 \\ AND idempotency_key = $3 AND status = 'pending'\" ))) .bind(&command_type.name) .bind(&authorised.client_id) .bind(key)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "let claimed: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.command_proposals \\ SET status = 'approving', decided_at = $2, decided_by_role_id = $3 \\ WHERE id = $1 AND ( \\ (status = 'pending' AND (expires_at IS NULL OR expires_at > $2)) \\ OR (status = 'approving' AND decided_at <= $4)) \\ RETURNING id\" ))) .bind(id)",
       "count": 1
     },
@@ -3874,61 +4030,85 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id)",
+      "source": "let existing: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT {PROPOSAL_COLUMNS} FROM {schema}.command_proposals WHERE command_type_name = $1 AND metadata_client_id = $2 AND idempotency_key = $3 AND {OPEN_PROPOSAL_KEY_PREDICATE}\" ))) .bind(&command_type.name)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id) .bind(&command_type.name)",
+      "source": "let existing: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT {PROPOSAL_COLUMNS} FROM {schema}.command_proposals WHERE command_type_name = $1 AND metadata_client_id = $2 AND idempotency_key = $3 AND {OPEN_PROPOSAL_KEY_PREDICATE}\" ))) .bind(&command_type.name) .bind(&authorised.client_id)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload)",
+      "source": "let existing: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT {PROPOSAL_COLUMNS} FROM {schema}.command_proposals WHERE command_type_name = $1 AND metadata_client_id = $2 AND idempotency_key = $3 AND {OPEN_PROPOSAL_KEY_PREDICATE}\" ))) .bind(&command_type.name) .bind(&authorised.client_id) .bind(idempotency_key)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64)",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id)",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id) .bind(&command_type.name)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx())",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx()) .bind(&authorised.correlation_id)",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx()) .bind(&authorised.correlation_id) .bind(&authorised.causation_id)",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx()) .bind(&authorised.correlation_id) .bind(&authorised.causation_id) .bind(idempotency_key)",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx())",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL \\ DO NOTHING \\ RETURNING id\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx()) .bind(&authorised.correlation_id) .bind(&authorised.causation_id) .bind(idempotency_key) .bind(expires_at.map(|t| t.to_sqlx()))",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx()) .bind(&authorised.correlation_id)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx()) .bind(&authorised.correlation_id) .bind(&authorised.causation_id)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx()) .bind(&authorised.correlation_id) .bind(&authorised.causation_id) .bind(idempotency_key)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let inserted: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.command_proposals \\ (id, command_type_name, payload, metadata_version, metadata_client_id, \\ metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \\ idempotency_key, created_at, expires_at) \\ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \\ ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \\ WHERE {OPEN_PROPOSAL_KEY_PREDICATE} \\ DO NOTHING \\ RETURNING {PROPOSAL_COLUMNS}\" ))) .bind(&id) .bind(&command_type.name) .bind(&protected.payload) .bind(1_i64) .bind(&authorised.client_id) .bind(now.to_sqlx()) .bind(&authorised.correlation_id) .bind(&authorised.causation_id) .bind(idempotency_key) .bind(expires_at.map(|t| t.to_sqlx()))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let policy: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT deadline_seconds FROM {schema}.command_approval_policies WHERE command_type_name = $1 FOR SHARE\" ))) .bind(&command_type.name)",
       "count": 1
     },
     {
@@ -3947,6 +4127,24 @@
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT id, command_type_name, payload FROM {schema}.command_proposals \\ WHERE status = 'pending' AND id > $1 ORDER BY id LIMIT $2\" ))) .bind(&after) .bind(PAGE)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let rows: Vec<ApprovalRoutingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT policy.command_type_name IS NOT NULL AS has_policy, policy.approver_role, policy.deadline_seconds, policy.allow_self_approval, input.key, proposal.id AS proposal_id, accepted.triggered_event_sequences AS sequences FROM (VALUES ($1::text)) AS requested(command_type_name) LEFT JOIN {schema}.command_approval_policies policy USING (command_type_name) LEFT JOIN unnest($3::text[]) AS input(key) ON true LEFT JOIN LATERAL ( SELECT id FROM {schema}.command_proposals WHERE command_type_name = requested.command_type_name AND metadata_client_id = $2 AND idempotency_key = input.key AND {OPEN_PROPOSAL_KEY_PREDICATE} ) proposal ON true LEFT JOIN {schema}.idempotency_keys accepted ON policy.command_type_name IS NOT NULL AND accepted.command_type_name = requested.command_type_name AND accepted.client_id = $2 AND accepted.idempotency_key = input.key\" ))) .bind(&command_type.name)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let rows: Vec<ApprovalRoutingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT policy.command_type_name IS NOT NULL AS has_policy, policy.approver_role, policy.deadline_seconds, policy.allow_self_approval, input.key, proposal.id AS proposal_id, accepted.triggered_event_sequences AS sequences FROM (VALUES ($1::text)) AS requested(command_type_name) LEFT JOIN {schema}.command_approval_policies policy USING (command_type_name) LEFT JOIN unnest($3::text[]) AS input(key) ON true LEFT JOIN LATERAL ( SELECT id FROM {schema}.command_proposals WHERE command_type_name = requested.command_type_name AND metadata_client_id = $2 AND idempotency_key = input.key AND {OPEN_PROPOSAL_KEY_PREDICATE} ) proposal ON true LEFT JOIN {schema}.idempotency_keys accepted ON policy.command_type_name IS NOT NULL AND accepted.command_type_name = requested.command_type_name AND accepted.client_id = $2 AND accepted.idempotency_key = input.key\" ))) .bind(&command_type.name) .bind(client_id)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let rows: Vec<ApprovalRoutingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT policy.command_type_name IS NOT NULL AS has_policy, policy.approver_role, policy.deadline_seconds, policy.allow_self_approval, input.key, proposal.id AS proposal_id, accepted.triggered_event_sequences AS sequences FROM (VALUES ($1::text)) AS requested(command_type_name) LEFT JOIN {schema}.command_approval_policies policy USING (command_type_name) LEFT JOIN unnest($3::text[]) AS input(key) ON true LEFT JOIN LATERAL ( SELECT id FROM {schema}.command_proposals WHERE command_type_name = requested.command_type_name AND metadata_client_id = $2 AND idempotency_key = input.key AND {OPEN_PROPOSAL_KEY_PREDICATE} ) proposal ON true LEFT JOIN {schema}.idempotency_keys accepted ON policy.command_type_name IS NOT NULL AND accepted.command_type_name = requested.command_type_name AND accepted.client_id = $2 AND accepted.idempotency_key = input.key\" ))) .bind(&command_type.name) .bind(client_id) .bind(keys)",
       "count": 1
     },
     {
@@ -4065,6 +4263,24 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let keys = rows .into_iter() .filter_map(|row| { row.key.map(|key| { ( key, ApprovalKey { proposal_id: row.proposal_id, sequences: row.sequences, }, ) }) }) .collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `std::iter::Iterator::collect` which can panic",
+      "source": "let keys: Vec<_> = key.into_iter().collect();",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `std::iter::range::<impl std::iter::Iterator for std::ops::Range<A>>::next` which can panic",
+      "source": "for _ in 0..APPROVAL_ROUTING_ATTEMPTS {",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `std::option::Option::<&T>::cloned` which can panic",
       "source": "let mut after = after.cloned();",
       "count": 1
@@ -4078,7 +4294,13 @@
     {
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `std::option::Option::<T>::map` which can panic",
-      "source": "let expires_at = policy .deadline_seconds .map(|seconds| now + jiff::SignedDuration::from_secs(seconds));",
+      "source": "let expires_at = deadline_seconds.map(|seconds| now + jiff::SignedDuration::from_secs(seconds));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `std::option::Option::<T>::map` which can panic",
+      "source": "let policy = rows.first().filter(|row| row.has_policy).map(|row| { CommandApprovalPolicy::new(row.approver_role.clone(), row.deadline_seconds) .allowing_self_approval(row.allow_self_approval.unwrap_or_default()) });",
       "count": 1
     },
     {
@@ -4086,12 +4308,6 @@
       "message": "call to method `std::option::Option::<T>::ok_or_else` which can panic",
       "source": "get_command_proposal(pool, bounded_context, id) .await? .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: id.to_string() }.into())",
       "count": 2
-    },
-    {
-      "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to method `std::option::Option::<T>::ok_or_else` which can panic",
-      "source": "get_command_proposal(pool, bounded_context_name, &proposal_id) .await? .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: proposal_id }.into())",
-      "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
@@ -8692,7 +8908,37 @@
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"bounded context {bounded_context}: {} has an unexpected definition\",",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"bounded context {bounded_context}: {}\",",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "\"index {}.{} is {state:?} after CREATE INDEX CONCURRENTLY\",",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "&& table_present(&mut conn, &format!(\"bc_{name}\"), OPEN_PROPOSAL_INDEX.table)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "FROM {schema}.command_proposals",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "if table_present(&mut conn, &format!(\"bc_{name}\"), OPEN_PROPOSAL_INDEX.table)",
       "count": 1
     },
     {
@@ -8705,7 +8951,7 @@
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "let raw = format!(\"bc_{bounded_context}\");",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
@@ -8740,6 +8986,12 @@
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to drop of `db::concurrent_indexes::IndexStates` which can panic",
+      "source": ".get(&raw, &OPEN_PROPOSAL_INDEX);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `db::concurrent_indexes::IndexStates` which can panic",
       "source": "let state = IndexStates::for_schema(conn, raw).await?.get(raw, managed);",
       "count": 1
     },
@@ -8751,9 +9003,45 @@
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `error::Error` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `sqlx::Error` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `sqlx::pool::PoolConnection<sqlx::Postgres>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".fetch_all(&mut *conn)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::option::Option<std::borrow::Cow<'_, str>>` which can panic",
+      "source": "&& err.as_database_error().and_then(|e| e.code()).as_deref() == Some(\"23505\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to drop of `std::result::Result<(), sqlx::Error>` which can panic",
       "source": "let _ = sqlx::Connection::close(conn).await;",
       "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": ".await?",
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
@@ -8765,12 +9053,18 @@
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 1
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to drop of `std::sync::MutexGuard<'_, std::collections::HashSet<(std::string::String, std::string::String)>>` which can panic",
       "source": ".insert((bounded_context.to_string(), name.to_string()));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::vec::IntoIter<std::string::String>` which can panic",
+      "source": "}",
       "count": 1
     },
     {
@@ -8787,19 +9081,31 @@
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::vec::Vec<std::string::String>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `std::vec::Vec<std::vec::Vec<std::string::String>>` which can panic",
+      "source": "}",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to drop of `tracing::Span` which can panic",
       "source": "}",
       "count": 2
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/concurrent_indexes.rs:215:1: 215:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/concurrent_indexes.rs:244:1: 244:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/concurrent_indexes.rs:321:1: 321:41}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/concurrent_indexes.rs:361:1: 361:41}>` which can panic",
       "source": "#[tracing::instrument(skip(pool, stop))]",
       "count": 1
     },
@@ -8811,6 +9117,12 @@
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async block@sqlx::Pool<sqlx::Postgres>::acquire::{closure#0}}` which can panic",
+      "source": "let mut conn = pool.acquire().await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to drop of `{async fn body of <sqlx::PgConnection as sqlx::Connection>::close()}` which can panic",
       "source": "let _ = sqlx::Connection::close(conn).await;",
       "count": 1
@@ -8818,8 +9130,14 @@
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to drop of `{async fn body of sqlx::RawSql::execute<'_, &mut sqlx::PgConnection, sqlx::Postgres>()}` which can panic",
+      "source": ".await;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::RawSql::execute<'_, &mut sqlx::PgConnection, sqlx::Postgres>()}` which can panic",
       "source": ".await?;",
-      "count": 3
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
@@ -8835,19 +9153,43 @@
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String, bool, bool), sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String, f64), sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
-      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::concurrent_indexes::IndexRow, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, bool, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, bool, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
-      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::concurrent_indexes::IndexRow, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::vec::Vec<std::string::String>, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?)",
       "count": 1
     },
@@ -8884,7 +9226,31 @@
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to function `sqlx::query_as` which can panic",
-      "source": "let names: Vec<(String,)> = sqlx::query_as( \"SELECT bc.name FROM bounded_contexts bc \\ JOIN pg_namespace n ON n.nspname = 'bc_' || bc.name \\ JOIN pg_class t ON t.relnamespace = n.oid AND t.relname = 'deadlines' \\ AND t.relkind IN ('r', 'p') \\ ORDER BY bc.name\", )",
+      "source": "let names: Vec<(String, bool, bool)> = sqlx::query_as( \"SELECT bc.name, d.oid IS NOT NULL, p.oid IS NOT NULL FROM bounded_contexts bc \\ JOIN pg_namespace n ON n.nspname = 'bc_' || bc.name \\ LEFT JOIN pg_class d ON d.relnamespace = n.oid AND d.relname = 'deadlines' \\ AND d.relkind IN ('r', 'p') \\ LEFT JOIN pg_class p ON p.relnamespace = n.oid AND p.relname = 'command_proposals' \\ AND p.relkind IN ('r', 'p') \\ ORDER BY bc.name\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "Ok(sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p'))\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!( \"SELECT array_agg(id || ' (' || status || ')' ORDER BY id) FROM {schema}.command_proposals WHERE {OPEN_PROPOSAL_KEY_PREDICATE} GROUP BY command_type_name, metadata_client_id, idempotency_key HAVING count(*) > 1 ORDER BY min(id)\" )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let matches = sqlx::query_scalar( \"SELECT pg_get_expr(x.indpred, x.indrelid, false) = $3 FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = $1 AND i.relname = $2\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let names: Vec<String> = sqlx::query_scalar( \"SELECT bc.name FROM bounded_contexts bc JOIN pg_namespace n ON n.nspname = 'bc_' || bc.name JOIN pg_class p ON p.relnamespace = n.oid AND p.relname = 'command_proposals' AND p.relkind IN ('r', 'p') ORDER BY bc.name\", )",
       "count": 1
     },
     {
@@ -8927,6 +9293,36 @@
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
       "source": "Self::read(&mut *conn, &[raw_schema.to_string()]).await",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<db::concurrent_indexes::IndexSpec as std::cmp::PartialEq>::eq` which can panic",
+      "source": "if *managed == OPEN_PROPOSAL_INDEX",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<sqlx::pool::PoolConnection<DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "&& table_present(&mut conn, &format!(\"bc_{name}\"), OPEN_PROPOSAL_INDEX.table)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<sqlx::pool::PoolConnection<DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": ".fetch_all(&mut *conn)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<sqlx::pool::PoolConnection<DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "if table_present(&mut conn, &format!(\"bc_{name}\"), OPEN_PROPOSAL_INDEX.table)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `<sqlx::pool::PoolConnection<DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "match approval_index_status(&mut conn, &name).await {",
       "count": 1
     },
     {
@@ -8986,19 +9382,25 @@
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
+      "source": "let state = IndexStates::for_schema(conn, &raw) .await? .get(&raw, &OPEN_PROPOSAL_INDEX);",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
       "source": "let state = IndexStates::for_schema(conn, raw).await?.get(raw, managed);",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
-      "source": "match IndexStates::for_schema(conn, raw).await?.get(raw, replaced) {",
+      "source": "let state = states.get(raw, managed);",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
-      "source": "match states.get(raw, managed) {",
+      "source": "match IndexStates::for_schema(conn, raw).await?.get(raw, replaced) {",
       "count": 1
     },
     {
@@ -9011,6 +9413,12 @@
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to method `db::concurrent_indexes::IndexStates::get` which can panic",
       "source": "states.get(&raw, managed),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::error::DatabaseError::code` which can panic",
+      "source": "&& err.as_database_error().and_then(|e| e.code()).as_deref() == Some(\"23505\")",
       "count": 1
     },
     {
@@ -9057,6 +9465,36 @@
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "Ok(sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p'))\", ) .bind(raw_schema)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "Ok(sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p'))\", ) .bind(raw_schema) .bind(table)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let matches = sqlx::query_scalar( \"SELECT pg_get_expr(x.indpred, x.indrelid, false) = $3 FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = $1 AND i.relname = $2\", ) .bind(raw_schema)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let matches = sqlx::query_scalar( \"SELECT pg_get_expr(x.indpred, x.indrelid, false) = $3 FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = $1 AND i.relname = $2\", ) .bind(raw_schema) .bind(OPEN_PROPOSAL_INDEX.name)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let matches = sqlx::query_scalar( \"SELECT pg_get_expr(x.indpred, x.indrelid, false) = $3 FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = $1 AND i.relname = $2\", ) .bind(raw_schema) .bind(OPEN_PROPOSAL_INDEX.name) .bind(OPEN_PROPOSAL_INDEX_EXPRESSION)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to method `std::collections::BTreeMap::<K, V, A>::get` which can panic",
       "source": "self.0 .get(&(raw_schema.to_string(), spec.name))",
       "count": 1
@@ -9069,7 +9507,7 @@
     },
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
-      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field4_finish` which can panic",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_struct_field5_finish` which can panic",
       "source": "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
       "count": 1
     },
@@ -9100,7 +9538,7 @@
     {
       "file": "skilj-core/src/db/concurrent_indexes.rs",
       "message": "call to method `std::iter::Iterator::collect` which can panic",
-      "source": "let schemas: Vec<String> = names.iter().map(|(name,)| format!(\"bc_{name}\")).collect();",
+      "source": "let schemas: Vec<String> = names .iter() .map(|(name, _, _)| format!(\"bc_{name}\")) .collect();",
       "count": 1
     },
     {
@@ -16235,7 +16673,7 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to closure `db::preflight::ddl_locks::{closure#0}::{closure#0}` which can panic",
       "source": "note(table, \"SHARE UPDATE EXCLUSIVE\", None, Some(what));",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
@@ -16433,7 +16871,7 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 3
+      "count": 4
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
@@ -16756,7 +17194,7 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level\", )",
+      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level OR (skilj_schema_compatibility.level = EXCLUDED.level AND skilj_schema_compatibility.min_compatible_level < EXCLUDED.min_compatible_level)\", )",
       "count": 1
     },
     {
@@ -16817,6 +17255,12 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
       "source": "code: \"schema_too_new\".into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "code: code.into(),",
       "count": 1
     },
     {
@@ -16913,6 +17357,12 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
       "source": "skilj_version: env!(\"CARGO_PKG_VERSION\").to_string(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<db::concurrent_indexes::IndexSpec as std::cmp::PartialEq>::eq` which can panic",
+      "source": "let work = if *managed == super::concurrent_indexes::OPEN_PROPOSAL_INDEX {",
       "count": 1
     },
     {
@@ -17110,7 +17560,7 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `core::str::<impl str>::strip_prefix` which can panic",
-      "source": "if let Some(rest) = line.strip_prefix(\"column \") {",
+      "source": "} else if let Some(rest) = line.strip_prefix(\"column \") {",
       "count": 1
     },
     {
@@ -17158,19 +17608,19 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level\", ) .bind(SCHEMA_LEVEL)",
+      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level OR (skilj_schema_compatibility.level = EXCLUDED.level AND skilj_schema_compatibility.min_compatible_level < EXCLUDED.min_compatible_level)\", ) .bind(SCHEMA_LEVEL)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level\", ) .bind(SCHEMA_LEVEL) .bind(MIN_COMPATIBLE_SCHEMA_LEVEL)",
+      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level OR (skilj_schema_compatibility.level = EXCLUDED.level AND skilj_schema_compatibility.min_compatible_level < EXCLUDED.min_compatible_level)\", ) .bind(SCHEMA_LEVEL) .bind(MIN_COMPATIBLE_SCHEMA_LEVEL)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level\", ) .bind(SCHEMA_LEVEL) .bind(MIN_COMPATIBLE_SCHEMA_LEVEL) .bind(env!(\"CARGO_PKG_VERSION\"))",
+      "source": "sqlx::query( \"INSERT INTO skilj_schema_compatibility \\ (id, level, min_compatible_level, upgraded_by, upgraded_at) \\ VALUES (1, $1, $2, $3, now()) \\ ON CONFLICT (id) DO UPDATE SET level = EXCLUDED.level, \\ min_compatible_level = EXCLUDED.min_compatible_level, \\ upgraded_by = EXCLUDED.upgraded_by, upgraded_at = EXCLUDED.upgraded_at \\ WHERE skilj_schema_compatibility.level < EXCLUDED.level OR (skilj_schema_compatibility.level = EXCLUDED.level AND skilj_schema_compatibility.min_compatible_level < EXCLUDED.min_compatible_level)\", ) .bind(SCHEMA_LEVEL) .bind(MIN_COMPATIBLE_SCHEMA_LEVEL) .bind(env!(\"CARGO_PKG_VERSION\"))",
       "count": 1
     },
     {
@@ -17447,6 +17897,12 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
       "source": "refusals.push(Refusal { code: \"schema_too_new\".into(), detail: err.to_string(), });",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "refusals.push(Refusal { code: code.into(), detail, });",
       "count": 1
     },
     {
@@ -22858,12 +23314,6 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "ON {schema}.command_proposals (command_type_name, metadata_client_id, idempotency_key) \\",
-      "count": 2
-    },
-    {
-      "file": "skilj-core/src/db/schema.rs",
-      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "ON {schema}.command_proposals (created_at, id)\"",
       "count": 2
     },
@@ -23385,85 +23835,85 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1260:1: 1260:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1249:1: 1249:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1375:1: 1375:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1364:1: 1364:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1550:1: 1550:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1539:1: 1539:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1639:1: 1639:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1628:1: 1628:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2011:1: 2011:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2000:1: 2000:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2040:1: 2040:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2029:1: 2029:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2090:1: 2090:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2079:1: 2079:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2180:1: 2180:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2169:1: 2169:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2687:1: 2687:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2676:1: 2676:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2907:1: 2907:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2896:1: 2896:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2953:1: 2953:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2942:1: 2942:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3019:1: 3019:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3008:1: 3008:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3203:1: 3203:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3192:1: 3192:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3530:1: 3530:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3519:1: 3519:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -23507,7 +23957,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
-      "count": 56
+      "count": 55
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -23806,6 +24256,12 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(sqlx::AssertSqlSafe( super::concurrent_indexes::OPEN_PROPOSAL_INDEX.create_sql(&schema, false), ))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(add_columns_patch( &schema, \"access_tokens\", &[\"scope\"], format!(\"ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS scope TEXT\"), )))",
       "count": 1
     },
@@ -24023,12 +24479,6 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(create_index_patch( &schema, \"command_proposals_page_order\", format!( \"CREATE INDEX command_proposals_page_order \\ ON {schema}.command_proposals (created_at, id)\" ), )))",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/schema.rs",
-      "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(create_index_patch( &schema, \"command_proposals_pending_idempotency\", format!( \"CREATE UNIQUE INDEX command_proposals_pending_idempotency \\ ON {schema}.command_proposals (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL\" ), )))",
       "count": 1
     },
     {
@@ -24299,12 +24749,6 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"CREATE TABLE {schema}.snapshots ( snapshot_name TEXT NOT NULL, tag_key TEXT NOT NULL, tag_value TEXT NOT NULL, snapshot_version BIGINT NOT NULL, as_of_sequence BIGINT NOT NULL, state JSONB NOT NULL, owner TEXT, updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (snapshot_name, tag_key, tag_value) )\" )))",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/schema.rs",
-      "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"CREATE UNIQUE INDEX command_proposals_pending_idempotency \\ ON {schema}.command_proposals (command_type_name, metadata_client_id, idempotency_key) \\ WHERE status = 'pending' AND idempotency_key IS NOT NULL\" )))",
       "count": 1
     },
     {
@@ -27849,14 +28293,14 @@
     },
     {
       "file": "skilj-core/src/event_store/mod.rs",
-      "message": "call to closure `db::approvals::propose_command::{closure#0}::{closure#0}::{closure#0}` which can panic",
-      "source": "let (key, data_key) = resolve_key(&sf.subject_key, &subject_value);",
+      "message": "call to closure `db::approvals::reveal_command_proposal_payload::{closure#0}::{closure#0}` which can panic",
+      "source": "resolve_key(&sf.subject_key, &subject_value).ok_or(Error::EncryptionKeyNotActive)?;",
       "count": 1
     },
     {
       "file": "skilj-core/src/event_store/mod.rs",
-      "message": "call to closure `db::approvals::reveal_command_proposal_payload::{closure#0}::{closure#0}` which can panic",
-      "source": "resolve_key(&sf.subject_key, &subject_value).ok_or(Error::EncryptionKeyNotActive)?;",
+      "message": "call to closure `db::approvals::write_proposal::{closure#0}::{closure#0}` which can panic",
+      "source": "let (key, data_key) = resolve_key(&sf.subject_key, &subject_value);",
       "count": 1
     },
     {
