@@ -66,6 +66,10 @@ pub async fn bounded_context_shape(
            FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \
            AND c.relkind IN ('r', 'p', 'v') \
          UNION ALL \
+         SELECT 'replica identity full on event_tag_refs' FROM pg_class c
+           WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relname = 'event_tag_refs'
+           AND c.relreplident = 'f' \
+         UNION ALL \
          SELECT 'column ' || c.relname || '.' || a.attname || ' ' \
              || format_type(a.atttypid, a.atttypmod) \
              || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \
@@ -78,7 +82,11 @@ pub async fn bounded_context_shape(
            JOIN pg_class t ON t.oid = x.indrelid \
            WHERE t.relnamespace = (SELECT oid FROM ns) \
          UNION ALL \
-         SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' \
+         SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')'
+             || CASE WHEN NOT con.convalidated AND con.contype = 'c'
+                         AND (con.conname = ANY($3)
+                              OR (c.relname = 'sequence' AND con.conname = 'sequence_id_check'))
+                     THEN ' unvalidated' ELSE '' END \
            FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \
            WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \
          UNION ALL \
@@ -92,6 +100,7 @@ pub async fn bounded_context_shape(
     )
     .bind(&raw)
     .bind(&quoted)
+    .bind(super::STATUS_CHECKS.map(|(_, name, _)| name).as_slice())
     .fetch_all(&mut *conn)
     .await?;
     let mut lines: Vec<String> = lines.into_iter().map(|(line,)| line).collect();
@@ -135,6 +144,9 @@ fn index_line(spec: &super::concurrent_indexes::IndexSpec) -> String {
 /// The key of a shape line: a function's line without its body hash, so a
 /// changed body is told apart from a missing function.
 fn shape_key(line: &str) -> &str {
+    if let Some(key) = line.strip_suffix(" unvalidated") {
+        return key;
+    }
     if line.starts_with("function ") {
         line.rsplit_once(' ').map_or(line, |(key, _)| key)
     } else {
@@ -547,8 +559,7 @@ fn lock_rank(mode: &str) -> u8 {
 async fn ddl_locks(
     conn: &mut PgConnection,
     bounded_context: &str,
-    missing: &[String],
-    lazy: &[String],
+    diff: &ShapeDiff,
     tables: &BTreeSet<String>,
     exact: bool,
 ) -> crate::error::Result<Vec<TableLock>> {
@@ -568,8 +579,15 @@ async fn ddl_locks(
         entry.1.extend(add);
         entry.2.extend(work);
     };
-    for line in missing {
-        if let Some((table, what)) = concurrent_index_work(line) {
+    for line in &diff.missing {
+        if line == "replica identity full on event_tag_refs" {
+            note(
+                "event_tag_refs",
+                "ACCESS EXCLUSIVE",
+                None,
+                Some("sets replica identity FULL".into()),
+            );
+        } else if let Some((table, what)) = concurrent_index_work(line) {
             note(table, "SHARE UPDATE EXCLUSIVE", None, Some(what));
         } else if let Some(rest) = line.strip_prefix("column ") {
             let column = rest.split(' ').next().unwrap_or(rest);
@@ -596,11 +614,31 @@ async fn ddl_locks(
                 table,
                 "ACCESS EXCLUSIVE",
                 Some(format!("constraint {name}")),
-                None,
+                super::STATUS_CHECKS
+                    .iter()
+                    .any(|(managed_table, managed_name, _)| {
+                        table == *managed_table && name == *managed_name
+                    })
+                    .then(|| format!("validates constraint {name} under SHARE UPDATE EXCLUSIVE")),
             );
         }
     }
-    for line in lazy {
+    for line in &diff.outdated {
+        if let Some((name, table)) = crate::preflight::check_shape_line(line) {
+            let mode = if table == "sequence" {
+                "ACCESS EXCLUSIVE"
+            } else {
+                "SHARE UPDATE EXCLUSIVE"
+            };
+            note(
+                table,
+                mode,
+                None,
+                Some(format!("validates constraint {name}")),
+            );
+        }
+    }
+    for line in &diff.lazy {
         if let Some((table, what)) = concurrent_index_work(line) {
             note(table, "SHARE UPDATE EXCLUSIVE", None, Some(what));
         }
@@ -646,7 +684,7 @@ async fn inspect_bounded_context(
     } else {
         (
             rewrites(conn, name, &tables, exact).await?,
-            ddl_locks(conn, name, &diff.missing, &diff.lazy, &tables, exact).await?,
+            ddl_locks(conn, name, &diff, &tables, exact).await?,
         )
     };
     Ok(BoundedContextReport {
@@ -1181,6 +1219,7 @@ async fn upgrade_bounded_context_once(
     // its own transaction (§200). Always run here, not
     // skipped for one this process already saw (§204).
     super::make_bounded_context_current(pool, bc).await?;
+    super::ensure_bounded_context_constraints(pool, &bc.name).await?;
     Ok(())
 }
 

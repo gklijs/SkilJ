@@ -1131,6 +1131,85 @@ const CREATE_FROM_TEMPLATE: &str = "\
             level: ADMIN, canReadSensitive: false) { name } \
     }";
 
+#[test]
+fn commands_erasure_and_rotation_work_in_an_all_tables_publication() {
+    runtime().block_on(async {
+        // A FOR ALL TABLES publication is database-wide.
+        let Some(url) = skilj_test_support::database_url("skilj_published_blind_tags").await else {
+            return;
+        };
+        let pool = db::connect(&url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let (bc, subject) = bounded_context(&pool).await;
+        let jwks_url = serve_jwks().await;
+        let idp = IdpConfig::new(
+            jwks_url.parse().unwrap(),
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            SigningAlgorithm::Rs256,
+        );
+        let (skilj, _) = customer_types(&url, &bc, &subject)
+            .blind_tag::<ErasedEmail>()
+            .blind_index_key(blind_key())
+            .identity_provider(idp)
+            .build()
+            .await
+            .unwrap();
+        let crm = Crm {
+            skilj,
+            pool,
+            bc,
+            cache: EventCache::new(1000),
+            subject,
+        };
+        sqlx::query("CREATE PUBLICATION skilj_publish_all FOR ALL TABLES")
+            .execute(&crm.pool)
+            .await
+            .expect("the publication regression requires a PostgreSQL superuser");
+
+        let (erased, kept) = (id("c"), id("c"));
+        assert_eq!(crm.register(&erased, "alice@example.com").await, "accepted");
+        assert_eq!(crm.register(&kept, "bob@example.com").await, "accepted");
+        let before = crm.stored_hashes().await;
+        assert_eq!(before.len(), 2);
+        let router = crm.skilj.graphql_router().await.unwrap();
+        let response = graphql_request(
+            &router,
+            Some(&sign_jwt(&crm.subject)),
+            "mutation($bc: String!, $subject: String!) {
+                forgetSubject(boundedContext: $bc, subjectKey: \"customer\", subjectValue: $subject) {
+                    status
+                }
+            }",
+            json!({ "bc": crm.bc, "subject": erased }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(response["data"]["forgetSubject"]["status"], "DESTROYED");
+        let remaining = crm.stored_hashes().await;
+        assert_eq!(remaining.len(), 1);
+        let erased_hash = before.iter().find(|hash| !remaining.contains(hash)).unwrap();
+        assert!(!crm.stores(erased_hash).await);
+
+        let (rotated, report) = customer_types(&url, &crm.bc, &crm.subject)
+            .blind_tag::<ErasedEmail>()
+            .blind_index_key(new_blind_key())
+            .previous_blind_index_keys([blind_key()])
+            .build()
+            .await
+            .unwrap();
+        assert!(report.skipped_no_access.is_empty(), "{report:?}");
+        let rotated = crm.served_by(rotated);
+        assert_eq!(stored_generation(&rotated).await.0, 1);
+        assert_eq!(rotated.stored_hashes().await.len(), 1);
+        assert!(!rotated.stores(&remaining[0]).await);
+        assert_eq!(rotated.register(&id("c"), "bob@example.com").await, "email_taken");
+        assert_eq!(rotated.register(&id("c"), "alice@example.com").await, "accepted");
+        rotated.skilj.shutdown(std::time::Duration::from_secs(10)).await;
+        crm.skilj.shutdown(std::time::Duration::from_secs(10)).await;
+    });
+}
+
 /// A tenant made from a bounded context with a blind tag records the key
 /// fingerprint of its own constraint, not its template's, hashes the same
 /// address differently, and is checked at startup like any other.

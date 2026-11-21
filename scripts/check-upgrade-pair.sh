@@ -6,7 +6,9 @@
 #   1. the older release's generated template starts on an empty database and
 #      takes four deposits of 100 into wallet "w1";
 #   2. it stops, and this workspace's template starts on the same database:
-#      the upgrade. A withdrawal of 350 is accepted - it can only be, if the
+#      the upgrade. It installs the bounded-context constraints and replica
+#      identity without replacing the events relation or its existing rows.
+#      A withdrawal of 350 is accepted - it can only be, if the
 #      older release's deposits came through - and one of 500 is rejected as
 #      insufficient_funds;
 #   3. it stops, and the older release starts again. When the older release's
@@ -135,6 +137,8 @@ if $prepare_only; then
     echo "check-upgrade-pair: prepared $old_app ($from)"
     exit 0
 fi
+command -v psql >/dev/null ||
+    { echo 'check-upgrade-pair: PostgreSQL client (psql) is required' >&2; exit 2; }
 (cd "$old_app" && CARGO_TARGET_DIR="$old_target" cargo build --bin server)
 old_server="$old_target/debug/server"
 
@@ -176,7 +180,8 @@ start() {
     local server="$1" name="$2"
     log="$work/$name.log"
     port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-    env -u DATABASE_URL PORT="$port" SKILJ_LOCAL_DATA_DIR="$data" "$server" >"$log" 2>&1 &
+    env -u DATABASE_URL PORT="$port" SKILJ_LOCAL_DATA_DIR="$data" \
+        SKILJ_LOCAL_DATABASE=skilj "$server" >"$log" 2>&1 &
     server_pid=$!
     # Long enough for the first run's Postgres download and initdb.
     for _ in $(seq 1 300); do
@@ -205,6 +210,21 @@ stop() {
     [[ $status -eq 0 ]] || fail "the server exited with status $status on Ctrl-C"
 }
 
+# Query the embedded cluster the current server started. Local mode
+# stores its temporary password in an owner-only file outside PGDATA.
+wallet_sql() {
+    local pg_port
+    pg_port="$(sed -n '4p' "$data/postmaster.pid")"
+    [[ "$pg_port" =~ ^[0-9]+$ ]] || fail "could not find the local PostgreSQL port"
+    PGPASSWORD="$(<"$data.pgpass")" psql -X -w -h 127.0.0.1 -p "$pg_port" \
+        -U postgres -d skilj -qAt -v ON_ERROR_STOP=1 -c "$1"
+}
+
+events_snapshot() {
+    wallet_sql "SELECT pg_relation_filenode('bc_wallet.events');
+                SELECT sequence, xmin::text FROM bc_wallet.events ORDER BY sequence;"
+}
+
 # Runs the printed command for $1 (DEPOSIT or WITHDRAW) with amount $2.
 send() {
     local variable="$1" amount="$2" command
@@ -221,10 +241,27 @@ for _ in 1 2 3 4; do
     reply="$(send DEPOSIT 100)"
     [[ "$reply" == *'"accepted":true'* ]] || fail "$from rejected a deposit: $reply"
 done
+events_before="$(events_snapshot)" || fail "could not record the previous release's events"
+[[ "$events_before" == *$'\n'* ]] || fail "the previous release recorded no events"
 stop
 
 echo "check-upgrade-pair: this workspace upgrades it"
 start "$new_server" new || fail "this workspace didn't start on $from's database"
+events_after="$(events_snapshot)" || fail "could not inspect events after the upgrade"
+[[ "$events_after" == "$events_before" ]] || fail "the upgrade rewrote existing wallet events"
+constraints="$(wallet_sql "
+    SELECT count(*) FROM pg_constraint
+    WHERE convalidated AND (conrelid, conname, contype) IN (
+        ('bc_wallet.sequence'::regclass, 'sequence_pkey', 'p'),
+        ('bc_wallet.sequence'::regclass, 'sequence_id_check', 'c'),
+        ('bc_wallet.deadlines'::regclass, 'deadlines_status_check', 'c'),
+        ('bc_wallet.blobs'::regclass, 'blobs_state_check', 'c'),
+        ('bc_wallet.blob_pins'::regclass, 'blob_pins_holder_kind_check', 'c')
+    );")" || fail "could not inspect the upgraded wallet constraints"
+[[ "$constraints" == 5 ]] || fail "the upgrade did not install all five wallet constraints"
+identity="$(wallet_sql "SELECT relreplident FROM pg_class WHERE oid = 'bc_wallet.event_tag_refs'::regclass")" ||
+    fail "could not inspect event_tag_refs replica identity"
+[[ "$identity" == f ]] || fail "event_tag_refs does not have REPLICA IDENTITY FULL"
 reply="$(send WITHDRAW 350)"
 [[ "$reply" == *'"accepted":true'* ]] ||
     fail "withdrawing 350 of the 400 deposited by $from wasn't accepted: $reply"

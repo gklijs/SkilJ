@@ -17,6 +17,8 @@ use futures_util::StreamExt;
 /// reads the same whichever store holds them. All three go with the
 /// schema when the bounded context is deleted.
 pub(super) fn blob_tables_ddl(schema: &str) -> String {
+    let state_check = super::check_ddl(super::BLOB_STATE_CHECK);
+    let holder_check = super::check_ddl(super::BLOB_PIN_HOLDER_KIND_CHECK);
     format!(
         "CREATE TABLE IF NOT EXISTS {schema}.blobs (
             id TEXT PRIMARY KEY,
@@ -24,7 +26,7 @@ pub(super) fn blob_tables_ddl(schema: &str) -> String {
             size BIGINT NOT NULL CHECK (size >= 0),
             media_type TEXT NOT NULL,
             storage_key TEXT NOT NULL,
-            state TEXT NOT NULL,
+            state TEXT NOT NULL {state_check},
             subject_key TEXT,
             subject_value TEXT,
             created_at TIMESTAMPTZ NOT NULL,
@@ -41,7 +43,7 @@ pub(super) fn blob_tables_ddl(schema: &str) -> String {
             WHERE subject_key IS NOT NULL;
         CREATE TABLE IF NOT EXISTS {schema}.blob_pins (
             blob_id TEXT NOT NULL REFERENCES {schema}.blobs (id),
-            holder_kind TEXT NOT NULL,
+            holder_kind TEXT NOT NULL {holder_check},
             holder_id TEXT NOT NULL,
             PRIMARY KEY (blob_id, holder_kind, holder_id)
         );

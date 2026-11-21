@@ -55,6 +55,12 @@ Temporal tests download their own test server. A local run can pass with
 service-dependent tests skipped. `bash scripts/ci-test.sh` reproduces CI's
 setup and no-skip guard; it requires the service prerequisites.
 
+The all-tables publication test in `blind_tags` requires a superuser. Run it
+against a disposable server as `postgres`, for example
+`DATABASE_URL=postgres://postgres:postgres@127.0.0.1:15415/postgres cargo test -p skilj --test blind_tags`
+using the container in [the PostgreSQL compatibility guide](docs/postgres-compatibility.md).
+The release-pair check also uses `psql` to inspect its embedded database.
+
 For embedded-server libraries, Docker connectivity, Temporal downloads,
 CI database diagnostics and disk-space problems, see
 [environment troubleshooting](docs/troubleshooting.md).

@@ -38,6 +38,11 @@ README.md, "Status and stability").
   Stop 0.4 before running migration. Preflight identifies legacy duplicate
   proposal groups for administrative settlement before retrying the
   upgrade. See the 0.5 procedure in `docs/deployment.md`. (#218, #219)
+- The same level-2 upgrade installs the bounded-context sequence primary key,
+  replica identity for tag references, and validated checks on deadline
+  statuses, blob states and blob pin kinds. If PostgreSQL reports invalid
+  legacy data during validation, correct the affected rows and retry
+  migration. (#220)
 - `SchemaChanges::Refuse` requires the valid open-proposal index. Optional
   deadline index work still runs in the concurrent index background task.
 
@@ -83,6 +88,8 @@ README.md, "Status and stability").
 
 ### Fixed
 
+- Command writes, subject erasure and blind-key rotation work with a
+  PostgreSQL publication that includes every table. (#220)
 - `GREATER_THAN`/`LESS_THAN` filters now work on every date and time field
   schemars derives a schema for (docs/architecture.md §255). A time-only
   field (`jiff::civil::Time`, `format: partial-time`) used to be refused as

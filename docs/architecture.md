@@ -10033,6 +10033,16 @@ The consequence for the older version's own code: a kept sensitive field is ciph
 
 Test: `an_older_version_never_removes_a_newer_versions_protections` (`skilj/tests/reconciliation.rs`): v2 with all three protections, then v1 without them. The report lists the type under `kept_protections`, and the stored registration still has `email` sensitive, `note` private and `company` as owner key. Without the merge, the sensitive field is gone. This test and §101's build `Skilj` with a 2-connection pool: every build leaks its pool (§63), and the extra builds tipped the file over embedded Postgres' connection limit.
 
+Bounded-context database checks have their own upgrade rule. To permit new
+status values in a later release, keep the managed constraint name and
+replace the check atomically under a migration lock in the shared startup
+and explicit migration path. Follow the `ensure_admin_events_origin_kind`
+precedent and compare the predicate with `pg_get_constraintdef` in both the
+patch and preflight. The recorded schema shape captures constraint names and
+kinds, so preflight needs that probe to report a pending swap and its lock.
+Revisit the minimum compatible schema level if an older binary cannot work
+with a newly permitted value.
+
 <a id="projection-startup-can-tell"></a>
 ## 103. The same for projections - and what startup can't tell
 
@@ -10826,6 +10836,14 @@ Tests in `skilj/tests/startup_bounded_contexts.rs` (renamed from `startup_delete
 - `startup_still_adds_a_missing_column_and_index` drops `events.metadata_causation_id` and `events_by_correlation_id`, and requires `build()` to put both back. With the old order it fails with `42703`.
 
 `create_index_patch` still builds a missing index with a plain `CREATE INDEX`, whose `SHARE` lock blocks writes for the whole build. For a table that grows with traffic that is the wrong trade; §256 adds a concurrent build for those.
+
+The singleton sequence key is added only when its column, key or check is
+missing. The patch takes the table lock and rechecks the catalogs under the
+lock so simultaneous upgrades can both finish. Deadline and blob checks are
+added `NOT VALID` in one statement and validated in a separate statement
+under `SHARE UPDATE EXCLUSIVE`, which allows writes. A failed validation
+leaves the check installed. The next startup or migration retries validation
+after the data is corrected.
 
 <a id="v0-0-1-upgrade"></a>
 ## 159. A bounded context from v0.0.1 upgrades to the current schema
@@ -13764,6 +13782,11 @@ hashes a scalar sub-select, so each tag is one probe of the dictionary's
 unique index. The unique constraint is `NULLS NOT DISTINCT`, so the
 sub-select returns at most one row, for a null value too.
 
+`event_tag_refs` uses `REPLICA IDENTITY FULL` to allow deletes while an
+all-tables publication is active. Two references can contain the same tag
+and event, so the lookup index remains non-unique. Existing dictionaries
+get a catalog-gated identity change without rebuilding the index.
+
 **Measured** on PostgreSQL 18.6, two cores, with the trigger and tables
 copied out of `event_tag_dictionary.sql`: 2,000 single-event inserts in one
 transaction, two tags each, against a dictionary of the given size with
@@ -13911,6 +13934,12 @@ The sensitive-field task is the one that needs more than the domain module: with
 The issue asks for a read-only preflight, an explicit migration step, a verify-only startup, declared upgrade combinations and a runbook, and for a reviewed design and inventory first. That design is [`upgrade-preflight-design.md`](upgrade-preflight-design.md). It is a proposal: nothing it calls proposed is built. This section records what writing it found and decided.
 
 **What startup changes.** `Skilj::build()` changes the database in four groups: the global sqlx migrations; global data steps (the epoch, the admin context, the access trail, the key version in use, the blind-index key fingerprint); about thirty-five patches on every bounded context's schema, three of which rewrite or delete rows (`migrate_parked_deliveries_dedup_and_unique_index` deletes duplicates, §56; the tag dictionary build reads every event's tags under a write-blocking lock, §245; the source-content scrub rewrites protected provenance, §240); and, with a reconciliation role, registration changes, including blind-tag rotation (§209), which rewrites stored tag values, and projection rebuilds staged for the background. The first three groups need only the database, which is why the design separates them: a preflight and an explicit migration job can cover them from any binary, while the registration group needs the application's own builder.
+
+The release-pair test compares the wallet `events` relation file number and
+its ordered event row versions before and after the upgrade. This checks
+that installing the sequence key, tag replica identity and status checks
+preserves the original events. Preflight reports a pending identity change
+and distinguishes a missing check from one that still needs validation.
 
 **An older release refuses a migrated database.** The design depends on this fact, and the documentation hadn't stated it. sqlx's migrator runs with `ignore_missing = false`, so when `_sqlx_migrations` records a version the binary doesn't embed, `db::migrate` fails with `VersionMissing` and `build()` with it, before anything else runs. After any release that adds a global migration (0.0.2, 0.0.3, 0.0.9, 0.0.10, 0.2.0, 0.3.0), an instance of the previous release can't restart against that database, whether mid-rollout or as a rollback. Running instances are unaffected. The per-bounded-context patches have no such guard: nothing records which release patched a schema. A first test pinned this. Releases up to 0.3.0 keep this behavior, which `scripts/check-upgrade-pair.sh` checks against the real 0.3.0. From this release on, the compatibility level below decides instead.
 

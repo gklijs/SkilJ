@@ -765,6 +765,243 @@ fn inspect_reports_a_v0_0_1_bounded_context_and_changes_nothing() {
     });
 }
 
+async fn assert_managed_checks(pool: &Pool, schema: &str) {
+    let refs = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.event_tag_refs (tag_id, event_type_name, sequence)
+         VALUES (1, 'example', 0), (1, 'example', 0)"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(refs.rows_affected(), 2);
+
+    for (statement, code, constraint) in [
+        (
+            format!("INSERT INTO {schema}.sequence(id, next_value) VALUES (false, 0)"),
+            "23514",
+            "sequence_id_check",
+        ),
+        (
+            format!("INSERT INTO {schema}.sequence(next_value) VALUES (0)"),
+            "23505",
+            "sequence_pkey",
+        ),
+        (
+            format!(
+                "INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key,
+                created_at, grace_from, state)
+                VALUES ('bad', '', 0, '', '', now(), now(), 'unknown')"
+            ),
+            "23514",
+            "blobs_state_check",
+        ),
+        (
+            format!(
+                "INSERT INTO {schema}.blob_pins (blob_id, holder_kind, holder_id)
+                VALUES ('test_blob', 'unknown', 'holder')"
+            ),
+            "23514",
+            "blob_pins_holder_kind_check",
+        ),
+        (
+            format!("UPDATE {schema}.deadlines SET status = 'unknown' WHERE id = 'forgotten'"),
+            "23514",
+            "deadlines_status_check",
+        ),
+    ] {
+        let err = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(pool)
+            .await
+            .unwrap_err();
+        assert_constraint(&err, code, constraint);
+    }
+}
+
+fn assert_constraint(err: &sqlx::Error, code: &str, constraint: &str) {
+    let db = err.as_database_error().unwrap();
+    assert_eq!(db.code().as_deref(), Some(code), "{err}");
+    assert_eq!(db.constraint(), Some(constraint), "{err}");
+}
+
+#[test]
+fn bounded_context_checks_validate_and_retry_after_legacy_data_is_corrected() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let fresh = seed_bounded_context(&pool).await;
+        let old = seed_bounded_context(&pool).await;
+        let fresh_schema = format!("\"bc_{fresh}\"");
+        let old_schema = format!("\"bc_{old}\"");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {old_schema}.sequence DROP COLUMN id;
+             ALTER TABLE {old_schema}.event_tag_refs REPLICA IDENTITY DEFAULT;
+             ALTER TABLE {old_schema}.deadlines DROP CONSTRAINT deadlines_status_check;
+             ALTER TABLE {old_schema}.blobs DROP CONSTRAINT blobs_state_check;
+             ALTER TABLE {old_schema}.blob_pins DROP CONSTRAINT blob_pins_holder_kind_check;"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for schema in [&fresh_schema, &old_schema] {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key,
+                    created_at, grace_from, state)
+                 VALUES ('test_blob', '', 0, '', '', now(), now(), 'referenced');
+                 INSERT INTO {schema}.deadlines (
+                    id, schedule_name, fire_at, tags, target_bounded_context, target_command_type,
+                    payload, status, created_at)
+                 VALUES ('forgotten', 'test', now(), '[]', 'test', 'test', '{{}}', 'forgotten', now());"
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_managed_checks(&pool, &fresh_schema).await;
+
+        let details = skilj::preflight::InspectOptions::new();
+        let options = skilj::preflight::MigrateOptions::new();
+        let report = skilj::preflight::inspect(&pool, &details).await.unwrap();
+        let pending = report_for(&report, &old);
+        assert!(pending.needs_upgrade(), "{report}");
+        assert!(pending.locks.iter().any(|lock| {
+            lock.table == "event_tag_refs"
+                && lock.mode == "ACCESS EXCLUSIVE"
+                && lock.reason.contains("sets replica identity FULL")
+        }), "{report}");
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {old_schema}.deadlines (
+                id, schedule_name, fire_at, tags, target_bounded_context, target_command_type,
+                payload, status, created_at)
+             VALUES ('bad', 'test', now(), '[]', 'test', 'test', '{{}}', 'unknown', now())"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = skilj::preflight::migrate(&url, &options).await.unwrap_err();
+        let skilj_core::Error::Database(err) = err else {
+            panic!("expected validation error, got {err}");
+        };
+        assert_constraint(&err, "23514", "deadlines_status_check");
+        let report = skilj::preflight::inspect(&pool, &details).await.unwrap();
+        let pending = report_for(&report, &old);
+        assert!(pending.needs_upgrade(), "{report}");
+        assert!(pending.unexpected.is_empty(), "{report}");
+        assert!(pending.locks.iter().any(|lock| {
+            lock.table == "deadlines"
+                && lock.mode == "SHARE UPDATE EXCLUSIVE"
+                && lock.reason == "validates constraint deadlines_status_check; writes go on"
+        }), "{report}");
+        assert!(report.to_string().contains("validates constraint deadlines_status_check on deadlines"));
+        let refused = Skilj::builder(&url)
+            .schema_changes(skilj::SchemaChanges::Refuse)
+            .build()
+            .await;
+        assert!(matches!(refused, Err(skilj_core::Error::SchemaUpgradeRequired { .. })));
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {old_schema}.deadlines SET status = 'cancelled' WHERE id = 'bad'"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let migration = skilj::preflight::migrate(&url, &options).await.unwrap();
+        assert!(!report_for(&migration.after, &old).needs_upgrade(), "{}", migration.after);
+        assert_eq!(shape(&pool, &old).await, shape(&pool, &fresh).await);
+        assert_managed_checks(&pool, &old_schema).await;
+        let status: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT status FROM {old_schema}.deadlines WHERE id = 'forgotten'"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "forgotten");
+        skilj::preflight::migrate(&url, &options).await.unwrap();
+    });
+}
+
+#[test]
+fn concurrent_upgrades_install_the_sequence_singleton() {
+    runtime().block_on(async {
+        let Some((_, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let name = seed_bounded_context(&pool).await;
+        let schema = format!("\"bc_{name}\"");
+        let sql = |sql: &str| sqlx::AssertSqlSafe(sql.replace("{schema}", &schema));
+        sqlx::query(sql("ALTER TABLE {schema}.sequence DROP COLUMN id"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(sql("LOCK TABLE {schema}.sequence IN SHARE MODE"))
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let bc = db::get_bounded_context(&pool, &name)
+            .await
+            .unwrap()
+            .unwrap();
+        let contenders = (0..2)
+            .map(|_| {
+                let (pool, bc) = (pool.clone(), bc.clone());
+                tokio::spawn(async move { db::upgrade_bounded_context(&pool, &bc).await })
+            })
+            .collect::<Vec<_>>();
+        let relation = format!("{schema}.sequence");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1)
+                     AND mode = 'AccessExclusiveLock' AND NOT granted",
+                )
+                .bind(&relation)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both upgrades should wait for the singleton table lock");
+        blocker.commit().await.unwrap();
+        for contender in contenders {
+            contender.await.unwrap().unwrap();
+        }
+        let seed: (bool, i64) = sqlx::query_as(sql("SELECT id, next_value FROM {schema}.sequence"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(seed, (true, -1));
+
+        // An upgrade must also restore a missing true-only check even if
+        // the primary key is already present.
+        sqlx::query(sql(
+            "ALTER TABLE {schema}.sequence DROP CONSTRAINT sequence_id_check",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        db::upgrade_bounded_context(&pool, &bc).await.unwrap();
+        let err = sqlx::query(sql(
+            "INSERT INTO {schema}.sequence(id, next_value) VALUES (false, 0)",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_constraint(&err, "23514", "sequence_id_check");
+    });
+}
+
 /// A database no release has touched: everything is pending, and the
 /// preflight leaves it without a single table.
 #[test]

@@ -605,7 +605,7 @@ pub fn due_deadlines_sql(schema: &str) -> String {
 /// had already been submitted - see [docs/architecture.md §55](../../../docs/architecture.md#55-closing-the-canceldeadline-fire-vs-cancel-race).
 /// Each row is therefore atomically claimed (`'pending'` -> `'firing'`)
 /// immediately before submitting, via the same `UPDATE ... WHERE
-/// status = 'pending' RETURNING` shape `mark_deadline_resolved` already
+/// status = 'pending' RETURNING` shape `mark_deadline_fired` already
 /// uses to make its own write idempotent. `catch_up_cancel_deadline`'s
 /// own `UPDATE ... WHERE status = 'pending'` then naturally loses the
 /// race once a row is `'firing'` - no change needed there, only a
@@ -618,7 +618,7 @@ pub fn due_deadlines_sql(schema: &str) -> String {
 /// `CommandType` isn't registered" case. No claim needed on that path:
 /// no side effect has happened yet, so losing a race with a concurrent
 /// cancel there is just ordinary "cancelled before it fired" - the
-/// correct outcome, not a bug - so `mark_deadline_resolved` is called
+/// correct outcome, not a bug - so `mark_deadline_fired` is called
 /// directly against the still-`'pending'` row. A `Target` command that
 /// *is* submitted but gets rejected by its own `decide()` is marked
 /// `fired` too - a legitimate business outcome (`ScheduleDeadline`'s own
@@ -712,7 +712,7 @@ pub async fn fire_due_deadlines(
             .as_ref()
             .is_some_and(|recurrence| now > recurrence.valid_until.unwrap_or(jiff::Timestamp::MAX))
         {
-            mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
+            mark_deadline_fired(pool, &schema, &row.id, now).await?;
             continue;
         }
         let Some(target_command_type) =
@@ -724,7 +724,7 @@ pub async fn fire_due_deadlines(
                 target_command_type = %row.target_command_type,
                 "deadline's own target CommandType isn't registered - marking fired without submitting"
             );
-            mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
+            mark_deadline_fired(pool, &schema, &row.id, now).await?;
             continue;
         };
         // docs/architecture.md §96: an archived target refuses the command
@@ -740,7 +740,7 @@ pub async fn fire_due_deadlines(
                 target_command_type = %row.target_command_type,
                 "deadline's own target bounded context is archived - marking fired without submitting"
             );
-            mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
+            mark_deadline_fired(pool, &schema, &row.id, now).await?;
             continue;
         }
         // Claims a `'pending'` row outright, or reclaims a `'firing'` one
@@ -864,7 +864,7 @@ pub async fn fire_due_deadlines(
         // marked `fired`, so a crash between the two re-fires idempotently
         // and re-inserts the same next id as a no-op.
         advance_deadline_chain(pool, &schema, &row, recurrence.as_ref(), now).await?;
-        mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
+        mark_deadline_fired(pool, &schema, &row.id, now).await?;
     }
     Ok(())
 }
@@ -1071,18 +1071,16 @@ pub(super) async fn record_deadline_failure(
     Ok(())
 }
 
-pub(super) async fn mark_deadline_resolved(
+pub(super) async fn mark_deadline_fired(
     pool: &Pool,
     schema: &str,
     id: &str,
-    status: &str,
     now: Timestamp,
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "UPDATE {schema}.deadlines SET status = $1, resolved_at = $2, payload = '{{}}' \
-         WHERE id = $3 AND status IN ('pending', 'firing')"
+        "UPDATE {schema}.deadlines SET status = 'fired', resolved_at = $1, payload = '{{}}' \
+         WHERE id = $2 AND status IN ('pending', 'firing')"
     )))
-    .bind(status)
     .bind(now.to_sqlx())
     .bind(id)
     .execute(pool)
