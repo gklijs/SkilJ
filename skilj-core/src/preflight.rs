@@ -575,6 +575,12 @@ fn rows(count: &RowCount) -> String {
     }
 }
 
+pub(crate) fn check_shape_line(line: &str) -> Option<(&str, &str)> {
+    line.strip_prefix("constraint ")?
+        .strip_suffix(" (c)")?
+        .split_once(" on ")
+}
+
 impl fmt::Display for PreflightReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let verdict = match self.verdict {
@@ -653,10 +659,18 @@ impl fmt::Display for PreflightReport {
                 writeln!(f, "    schema missing")?;
             }
             for line in &bc.missing {
-                writeln!(f, "    adds {line}")?;
+                if line == "replica identity full on event_tag_refs" {
+                    writeln!(f, "    sets replica identity FULL on event_tag_refs")?;
+                } else {
+                    writeln!(f, "    adds {line}")?;
+                }
             }
             for line in &bc.outdated {
-                writeln!(f, "    replaces {line}")?;
+                if let Some((name, table)) = check_shape_line(line) {
+                    writeln!(f, "    validates constraint {name} on {table}")?;
+                } else {
+                    writeln!(f, "    replaces {line}")?;
+                }
             }
             for line in &bc.drops {
                 writeln!(f, "    drops {line}")?;

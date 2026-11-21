@@ -173,6 +173,136 @@ pub(super) fn add_constraint_patch(schema: &str, table: &str, name: &str, ddl: S
     )
 }
 
+pub(super) const DEADLINE_STATUS_CHECK: (&str, &str, &str) = (
+    "deadlines",
+    "deadlines_status_check",
+    "status IN ('pending', 'firing', 'fired', 'cancelled', 'parked', 'forgotten')",
+);
+pub(super) const BLOB_STATE_CHECK: (&str, &str, &str) = (
+    "blobs",
+    "blobs_state_check",
+    "state IN ('pending', 'referenced', 'deleted')",
+);
+pub(super) const BLOB_PIN_HOLDER_KIND_CHECK: (&str, &str, &str) = (
+    "blob_pins",
+    "blob_pins_holder_kind_check",
+    "holder_kind IN ('parked_delivery', 'command_proposal')",
+);
+pub(super) const STATUS_CHECKS: [(&str, &str, &str); 3] = [
+    DEADLINE_STATUS_CHECK,
+    BLOB_STATE_CHECK,
+    BLOB_PIN_HOLDER_KIND_CHECK,
+];
+
+pub(super) fn check_ddl((_, name, condition): (&str, &str, &str)) -> String {
+    format!("CONSTRAINT {name} CHECK ({condition})")
+}
+
+/// Add the checks in short transactions, then scan existing rows under
+/// the weaker validation lock. A failed or interrupted validation leaves
+/// the check enforcing new writes and is retried on the next upgrade.
+pub(super) async fn ensure_status_checks(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    for check @ (table, name, _) in STATUS_CHECKS {
+        let ddl = check_ddl(check);
+        sqlx::query(sqlx::AssertSqlSafe(add_constraint_patch(
+            &schema,
+            table,
+            name,
+            format!("ALTER TABLE {schema}.{table} ADD {ddl} NOT VALID"),
+        )))
+        .execute(pool)
+        .await?;
+        let relation = sql_literal(&format!("{schema}.{table}"));
+        let constraint = sql_literal(name);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DO $patch$ BEGIN
+                IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass({relation})
+                           AND conname = {constraint} AND NOT convalidated) THEN
+                    ALTER TABLE {schema}.{table} VALIDATE CONSTRAINT {name};
+                END IF;
+             END $patch$"
+        )))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+const SEQUENCE_ID_CHECK: &str = "CONSTRAINT sequence_id_check CHECK (id)";
+const SEQUENCE_PKEY: &str = "CONSTRAINT sequence_pkey PRIMARY KEY (id)";
+
+/// The managed key and true-only check are checked independently. On a
+/// missing-object path, serialize the check and DDL with concurrent upgrades.
+async fn ensure_sequence_identity(pool: &Pool, schema: &str) -> crate::error::Result<()> {
+    let table = sql_literal(&format!("{schema}.sequence"));
+    let has_key = "EXISTS (SELECT 1 FROM pg_constraint p JOIN pg_attribute a
+         ON a.attrelid = p.conrelid AND a.attname = 'id' AND NOT a.attisdropped
+         WHERE p.conrelid = relation AND p.contype = 'p' AND p.conname = 'sequence_pkey'
+         AND p.conkey = ARRAY[a.attnum])";
+    let has_check = "EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = relation
+         AND contype = 'c' AND conname = 'sequence_id_check' AND convalidated)";
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DO $patch$
+         DECLARE relation regclass := to_regclass({table});
+                 existing_key text;
+         BEGIN
+            IF {has_key} AND {has_check} THEN RETURN; END IF;
+            LOCK TABLE {schema}.sequence IN ACCESS EXCLUSIVE MODE;
+            IF NOT {has_key} THEN
+                SELECT conname INTO existing_key FROM pg_constraint
+                    WHERE conrelid = relation AND contype = 'p';
+                IF FOUND THEN
+                    RAISE EXCEPTION 'cannot install singleton key on %: conflicting primary key %',
+                        relation, existing_key USING ERRCODE = '42P16';
+                END IF;
+                ALTER TABLE {schema}.sequence ADD COLUMN IF NOT EXISTS id boolean NOT NULL DEFAULT true;
+                ALTER TABLE {schema}.sequence ADD {SEQUENCE_PKEY};
+            END IF;
+            IF NOT {has_check} THEN
+                IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = relation
+                           AND contype = 'c' AND conname = 'sequence_id_check') THEN
+                    ALTER TABLE {schema}.sequence VALIDATE CONSTRAINT sequence_id_check;
+                ELSE
+                    ALTER TABLE {schema}.sequence ADD {SEQUENCE_ID_CHECK};
+                END IF;
+            END IF;
+         END $patch$"
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_event_tag_refs_identity(pool: &Pool, schema: &str) -> crate::error::Result<()> {
+    let table = sql_literal(&format!("{schema}.event_tag_refs"));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DO $patch$ BEGIN
+            IF EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass({table})
+                       AND relreplident <> 'f') THEN
+                ALTER TABLE {schema}.event_tag_refs REPLICA IDENTITY FULL;
+            END IF;
+         END $patch$"
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Apply the identity and CHECK patches after all their tables exist.
+pub(super) async fn ensure_bounded_context_constraints(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    ensure_sequence_identity(pool, &schema).await?;
+    ensure_event_tag_refs_identity(pool, &schema).await?;
+    ensure_status_checks(pool, bounded_context).await
+}
+
 // --- per-bounded-context schema provisioning / hard deletion ---
 
 /// Every `CREATE TABLE` a bounded context's own schema needs, in
@@ -543,7 +673,8 @@ pub(super) async fn provision_bounded_context_schema(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.sequence (next_value BIGINT NOT NULL, \
          max_payload_bytes BIGINT CHECK (max_payload_bytes >= 0), \
-         warn_payload_bytes BIGINT CHECK (warn_payload_bytes >= 0))"
+         warn_payload_bytes BIGINT CHECK (warn_payload_bytes >= 0), \
+         id BOOLEAN NOT NULL DEFAULT true, {SEQUENCE_ID_CHECK}, {SEQUENCE_PKEY})"
     )))
     .execute(&mut **tx)
     .await?;
@@ -1836,6 +1967,7 @@ pub async fn ensure_snapshot_partition_progress_table<'e>(
 /// one DDL string, not two copies to keep in sync, the identical split
 /// `private_field_grants_table_ddl` already uses for the same reason.
 pub(super) fn deadlines_table_ddl(schema: &str) -> String {
+    let status_check = check_ddl(DEADLINE_STATUS_CHECK);
     format!(
         "CREATE TABLE IF NOT EXISTS {schema}.deadlines (
             id TEXT PRIMARY KEY,
@@ -1847,7 +1979,7 @@ pub(super) fn deadlines_table_ddl(schema: &str) -> String {
             target_bounded_context TEXT NOT NULL,
             target_command_type TEXT NOT NULL,
             payload TEXT NOT NULL,
-            status TEXT NOT NULL,
+            status TEXT NOT NULL {status_check},
             created_at TIMESTAMPTZ NOT NULL,
             resolved_at TIMESTAMPTZ,
             firing_at TIMESTAMPTZ,

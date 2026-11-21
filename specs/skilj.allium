@@ -1184,9 +1184,9 @@ entity Deadline {
     parent: Deadline?              -- the occurrence that begat this one, null for the
                                     -- first; ids are deterministic so a crash re-inserts
                                     -- the same next row idempotently
-    -- pending, fired, cancelled or parked. A String, like CommandProposal's
-    -- status: the transitions are the rules' contract and the wire
-    -- spelling stays deferred.
+    -- Stored states include pending, firing, fired, cancelled, parked and
+    -- forgotten. Firing is the poller's claim and forgotten records erasure.
+    -- The transition rules define the contract and wire spelling stays deferred.
     status: String
     attempt_count: Integer
     first_failed_at: Timestamp?

@@ -74,6 +74,8 @@ BEGIN
         event_type_name TEXT NOT NULL,
         sequence BIGINT NOT NULL
     );
+    -- References can repeat, so there is no key to use as replica identity.
+    ALTER TABLE @SCHEMA@.event_tag_refs REPLICA IDENTITY FULL;
     CREATE OR REPLACE FUNCTION @SCHEMA@.event_tag_id(TEXT, TEXT) RETURNS BIGINT
     LANGUAGE sql STABLE AS $id$
         SELECT id FROM @SCHEMA@.event_tag_values WHERE tag_key = $1 AND tag_value = $2

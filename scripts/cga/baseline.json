@@ -641,7 +641,7 @@
       "file": "<rust>/library/core/src/macros/mod.rs",
       "message": "call to method `std::fmt::Formatter::<'a>::write_fmt` which can panic",
       "source": "$dst.write_fmt($crate::format_args_nl!($($arg)*))",
-      "count": 22
+      "count": 24
     },
     {
       "file": "<rust>/library/core/src/mem/mod.rs",
@@ -4733,7 +4733,7 @@
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 11
+      "count": 12
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
@@ -10132,7 +10132,7 @@
     {
       "file": "skilj-core/src/db/deadlines.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "\"UPDATE {schema}.deadlines SET status = $1, resolved_at = $2, payload = '{{}}' \\",
+      "source": "\"UPDATE {schema}.deadlines SET status = 'fired', resolved_at = $1, payload = '{{}}' \\",
       "count": 1
     },
     {
@@ -10582,7 +10582,7 @@
     {
       "file": "skilj-core/src/db/deadlines.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.deadlines SET status = $1, resolved_at = $2, payload = '{{}}' \\ WHERE id = $3 AND status IN ('pending', 'firing')\" )))",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.deadlines SET status = 'fired', resolved_at = $1, payload = '{{}}' \\ WHERE id = $2 AND status IN ('pending', 'firing')\" )))",
       "count": 1
     },
     {
@@ -10906,19 +10906,13 @@
     {
       "file": "skilj-core/src/db/deadlines.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.deadlines SET status = $1, resolved_at = $2, payload = '{{}}' \\ WHERE id = $3 AND status IN ('pending', 'firing')\" ))) .bind(status)",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.deadlines SET status = 'fired', resolved_at = $1, payload = '{{}}' \\ WHERE id = $2 AND status IN ('pending', 'firing')\" ))) .bind(now.to_sqlx())",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/deadlines.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.deadlines SET status = $1, resolved_at = $2, payload = '{{}}' \\ WHERE id = $3 AND status IN ('pending', 'firing')\" ))) .bind(status) .bind(now.to_sqlx())",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/deadlines.rs",
-      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.deadlines SET status = $1, resolved_at = $2, payload = '{{}}' \\ WHERE id = $3 AND status IN ('pending', 'firing')\" ))) .bind(status) .bind(now.to_sqlx()) .bind(id)",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"UPDATE {schema}.deadlines SET status = 'fired', resolved_at = $1, payload = '{{}}' \\ WHERE id = $2 AND status IN ('pending', 'firing')\" ))) .bind(now.to_sqlx()) .bind(id)",
       "count": 1
     },
     {
@@ -16612,6 +16606,12 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "Some(format!(\"validates constraint {name}\")),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "WHERE conrelid = to_regclass('{}.events') AND contype = 'c'\",",
       "count": 1
     },
@@ -16660,13 +16660,25 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to closure `db::preflight::ddl_locks::{closure#0}::{closure#0}` which can panic",
+      "source": "note( \"event_tag_refs\", \"ACCESS EXCLUSIVE\", None, Some(\"sets replica identity FULL\".into()), );",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to closure `db::preflight::ddl_locks::{closure#0}::{closure#0}` which can panic",
       "source": "note( table, \"ACCESS EXCLUSIVE\", Some(format!(\"column {name}\")), None, );",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to closure `db::preflight::ddl_locks::{closure#0}::{closure#0}` which can panic",
-      "source": "note( table, \"ACCESS EXCLUSIVE\", Some(format!(\"constraint {name}\")), None, );",
+      "source": "note( table, \"ACCESS EXCLUSIVE\", Some(format!(\"constraint {name}\")), super::STATUS_CHECKS .iter() .any(|(managed_table, managed_name, _)| { table == *managed_table && name == *managed_name }) .then(|| format!(\"validates constraint {name} under SHARE UPDATE EXCLUSIVE\")), );",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to closure `db::preflight::ddl_locks::{closure#0}::{closure#0}` which can panic",
+      "source": "note( table, mode, None, Some(format!(\"validates constraint {name}\")), );",
       "count": 1
     },
     {
@@ -16761,6 +16773,12 @@
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String,), sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".bind(super::STATUS_CHECKS.map(|(_, name, _)| name).as_slice())",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `sqlx::query::QueryScalar<'_, sqlx::Postgres, f32, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".bind(format!(\"bc_{bounded_context}\"))",
       "count": 1
@@ -16800,6 +16818,12 @@
       "message": "call to drop of `std::option::Option<std::borrow::Cow<'_, str>>` which can panic",
       "source": "}",
       "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
+      "source": ");",
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
@@ -17110,7 +17134,7 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to function `sqlx::query_as` which can panic",
-      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", )",
+      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'replica identity full on event_tag_refs' FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relname = 'event_tag_refs' AND c.relreplident = 'f' \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' || CASE WHEN NOT con.convalidated AND con.contype = 'c' AND (con.conname = ANY($3) OR (c.relname = 'sequence' AND con.conname = 'sequence_id_check')) THEN ' unvalidated' ELSE '' END \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", )",
       "count": 1
     },
     {
@@ -17207,6 +17231,12 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(\"SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY\")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "Some(\"sets replica identity FULL\".into()),",
       "count": 1
     },
     {
@@ -17422,6 +17452,12 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "super::STATUS_CHECKS .iter() .any(|(managed_table, managed_name, _)| { table == *managed_table && name == *managed_name })",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
       "source": "|| admin_report .rewrites .iter() .any(|r| r.name == \"tag_dictionary\")",
       "count": 1
     },
@@ -17458,13 +17494,19 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
-      "source": "for line in lazy {",
+      "source": "for line in &diff.lazy {",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
-      "source": "for line in missing {",
+      "source": "for line in &diff.missing {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::next` which can panic",
+      "source": "for line in &diff.outdated {",
       "count": 1
     },
     {
@@ -17632,13 +17674,19 @@
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", ) .bind(&raw)",
+      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'replica identity full on event_tag_refs' FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relname = 'event_tag_refs' AND c.relreplident = 'f' \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' || CASE WHEN NOT con.convalidated AND con.contype = 'c' AND (con.conname = ANY($3) OR (c.relname = 'sequence' AND con.conname = 'sequence_id_check')) THEN ' unvalidated' ELSE '' END \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", ) .bind(&raw)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", ) .bind(&raw) .bind(&quoted)",
+      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'replica identity full on event_tag_refs' FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relname = 'event_tag_refs' AND c.relreplident = 'f' \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' || CASE WHEN NOT con.convalidated AND con.contype = 'c' AND (con.conname = ANY($3) OR (c.relname = 'sequence' AND con.conname = 'sequence_id_check')) THEN ' unvalidated' ELSE '' END \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", ) .bind(&raw) .bind(&quoted)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let lines: Vec<(String,)> = sqlx::query_as( \"WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = $1) \\ SELECT CASE c.relkind WHEN 'v' THEN 'view ' ELSE 'table ' END || c.relname \\ FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) \\ AND c.relkind IN ('r', 'p', 'v') \\ UNION ALL \\ SELECT 'replica identity full on event_tag_refs' FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relname = 'event_tag_refs' AND c.relreplident = 'f' \\ UNION ALL \\ SELECT 'column ' || c.relname || '.' || a.attname || ' ' \\ || format_type(a.atttypid, a.atttypmod) \\ || CASE WHEN a.attnotnull THEN ' not null' ELSE ' null' END \\ FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND c.relkind IN ('r', 'p', 'v') \\ AND a.attnum > 0 AND NOT a.attisdropped \\ UNION ALL \\ SELECT 'index ' || i.relname || ' on ' || t.relname \\ FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \\ JOIN pg_class t ON t.oid = x.indrelid \\ WHERE t.relnamespace = (SELECT oid FROM ns) \\ UNION ALL \\ SELECT 'constraint ' || con.conname || ' on ' || c.relname || ' (' || con.contype::text || ')' || CASE WHEN NOT con.convalidated AND con.contype = 'c' AND (con.conname = ANY($3) OR (c.relname = 'sequence' AND con.conname = 'sequence_id_check')) THEN ' unvalidated' ELSE '' END \\ FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND con.contype <> 'n' \\ UNION ALL \\ SELECT 'trigger ' || t.tgname || ' on ' || c.relname \\ FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \\ WHERE c.relnamespace = (SELECT oid FROM ns) AND NOT t.tgisinternal \\ UNION ALL \\ SELECT 'function ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) \\ || ') ' || left(md5(replace(replace(p.prosrc, $2, '@SCHEMA@'), $1, '@SCHEMA@')), 12) \\ FROM pg_proc p WHERE p.pronamespace = (SELECT oid FROM ns)\", ) .bind(&raw) .bind(&quoted) .bind(super::STATUS_CHECKS.map(|(_, name, _)| name).as_slice())",
       "count": 1
     },
     {
@@ -17693,6 +17741,12 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "sqlx::query_scalar::<_, bool>(\"SELECT to_regclass($1) IS NOT NULL\") .bind(name)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/preflight.rs",
+      "message": "call to method `std::array::<impl [T; N]>::map` which can panic",
+      "source": ".bind(super::STATUS_CHECKS.map(|(_, name, _)| name).as_slice())",
       "count": 1
     },
     {
@@ -23296,6 +23350,12 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "DECLARE relation regclass := to_regclass({table});",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "DROP TRIGGER IF EXISTS protect_existing_external_sources ON {schema}.event_types;\"",
       "count": 1
     },
@@ -23309,6 +23369,18 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "FROM {schema}.event_types et WHERE e.event_type_name = et.name \\",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "IF EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass({table})",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass({relation})",
       "count": 1
     },
     {
@@ -23470,6 +23542,12 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "format!(\"ALTER TABLE {schema}.{table} ADD {ddl} NOT VALID\"),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "function = sql_literal(&format!(\"{schema}.bump_registrations_generation()\")),",
       "count": 1
     },
@@ -23483,6 +23561,24 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "let raw_schema = format!(\"bc_{bounded_context}\");",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "let relation = sql_literal(&format!(\"{schema}.{table}\"));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "let table = sql_literal(&format!(\"{schema}.event_tag_refs\"));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "let table = sql_literal(&format!(\"{schema}.sequence\"));",
       "count": 1
     },
     {
@@ -23739,6 +23835,12 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `std::array::IntoIter<(&str, &str, &str), 3>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `std::borrow::Cow<'_, str>` which can panic",
       "source": ".is_some_and(|code| code == \"42P01\" || code == \"3F000\"))",
       "count": 1
@@ -23764,6 +23866,24 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `std::string::String` which can panic",
+      "source": "let relation = sql_literal(&format!(\"{schema}.{table}\"));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "let table = sql_literal(&format!(\"{schema}.event_tag_refs\"));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "let table = sql_literal(&format!(\"{schema}.sequence\"));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to drop of `std::string::String` which can panic",
       "source": "let table = sql_literal(&format!(\"{schema}.{table}\"));",
       "count": 1
     },
@@ -23771,7 +23891,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 39
+      "count": 45
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -23835,85 +23955,85 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1249:1: 1249:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1380:1: 1380:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1364:1: 1364:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1495:1: 1495:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1539:1: 1539:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1670:1: 1670:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1628:1: 1628:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:1759:1: 1759:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2000:1: 2000:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2132:1: 2132:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2029:1: 2029:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2161:1: 2161:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2079:1: 2079:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2211:1: 2211:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2169:1: 2169:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2301:1: 2301:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2676:1: 2676:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2808:1: 2808:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2896:1: 2896:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3028:1: 3028:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:2942:1: 2942:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3074:1: 3074:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3008:1: 3008:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3140:1: 3140:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3192:1: 3192:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3324:1: 3324:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3519:1: 3519:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3651:1: 3651:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -23957,7 +24077,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
-      "count": 55
+      "count": 59
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -24460,6 +24580,12 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(add_constraint_patch( &schema, table, name, format!(\"ALTER TABLE {schema}.{table} ADD {ddl} NOT VALID\"), )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(command_approval_policies_table_ddl( &schema, )))",
       "count": 1
     },
@@ -24736,7 +24862,7 @@
     {
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"CREATE TABLE {schema}.sequence (next_value BIGINT NOT NULL, \\ max_payload_bytes BIGINT CHECK (max_payload_bytes >= 0), \\ warn_payload_bytes BIGINT CHECK (warn_payload_bytes >= 0))\" )))",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"CREATE TABLE {schema}.sequence (next_value BIGINT NOT NULL, \\ max_payload_bytes BIGINT CHECK (max_payload_bytes >= 0), \\ warn_payload_bytes BIGINT CHECK (warn_payload_bytes >= 0), \\ id BOOLEAN NOT NULL DEFAULT true, {SEQUENCE_ID_CHECK}, {SEQUENCE_PKEY})\" )))",
       "count": 1
     },
     {
@@ -24767,6 +24893,24 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"DELETE FROM {schema}.event_tag_values v USING skilj_blind_rotation r \\ WHERE v.tag_key = $1 AND v.tag_value = r.old \\ AND NOT EXISTS (SELECT 1 FROM {schema}.event_tag_refs refs WHERE refs.tag_id = v.id OFFSET 0)\" )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"DO $patch$ BEGIN IF EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass({table}) AND relreplident <> 'f') THEN ALTER TABLE {schema}.event_tag_refs REPLICA IDENTITY FULL; END IF; END $patch$\" )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"DO $patch$ BEGIN IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass({relation}) AND conname = {constraint} AND NOT convalidated) THEN ALTER TABLE {schema}.{table} VALIDATE CONSTRAINT {name}; END IF; END $patch$\" )))",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/schema.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query(sqlx::AssertSqlSafe(format!( \"DO $patch$ DECLARE relation regclass := to_regclass({table}); existing_key text; BEGIN IF {has_key} AND {has_check} THEN RETURN; END IF; LOCK TABLE {schema}.sequence IN ACCESS EXCLUSIVE MODE; IF NOT {has_key} THEN SELECT conname INTO existing_key FROM pg_constraint WHERE conrelid = relation AND contype = 'p'; IF FOUND THEN RAISE EXCEPTION 'cannot install singleton key on %: conflicting primary key %', relation, existing_key USING ERRCODE = '42P16'; END IF; ALTER TABLE {schema}.sequence ADD COLUMN IF NOT EXISTS id boolean NOT NULL DEFAULT true; ALTER TABLE {schema}.sequence ADD {SEQUENCE_PKEY}; END IF; IF NOT {has_check} THEN IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = relation AND contype = 'c' AND conname = 'sequence_id_check') THEN ALTER TABLE {schema}.sequence VALIDATE CONSTRAINT sequence_id_check; ELSE ALTER TABLE {schema}.sequence ADD {SEQUENCE_ID_CHECK}; END IF; END IF; END $patch$\" )))",
       "count": 1
     },
     {
@@ -29111,6 +29255,12 @@
       "file": "skilj-core/src/preflight.rs",
       "message": "call to method `core::str::<impl str>::parse` which can panic",
       "source": "let mut connect: sqlx::postgres::PgConnectOptions = database_url.parse()?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/preflight.rs",
+      "message": "call to method `core::str::<impl str>::split_once` which can panic",
+      "source": "line.strip_prefix(\"constraint \")? .strip_suffix(\" (c)\")? .split_once(\" on \")",
       "count": 1
     },
     {

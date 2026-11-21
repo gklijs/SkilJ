@@ -271,6 +271,7 @@ column secret_versions.revoked_at timestamp with time zone null
 column secret_versions.rotated_at timestamp with time zone null
 column secret_versions.status text not null
 column secret_versions.version bigint not null
+column sequence.id boolean not null
 column sequence.max_payload_bytes bigint null
 column sequence.next_value bigint not null
 column sequence.warn_payload_bytes bigint null
@@ -298,12 +299,14 @@ constraint access_tokens_status_check on access_tokens (c)
 constraint blind_tags_pkey on blind_tags (p)
 constraint blob_bytes_pkey on blob_bytes (p)
 constraint blob_pins_blob_id_fkey on blob_pins (f)
+constraint blob_pins_holder_kind_check on blob_pins (c)
 constraint blob_pins_pkey on blob_pins (p)
 constraint blob_references_blob_id_fkey on blob_references (f)
 constraint blob_references_check on blob_references (c)
 constraint blob_references_pkey on blob_references (p)
 constraint blobs_pkey on blobs (p)
 constraint blobs_size_check on blobs (c)
+constraint blobs_state_check on blobs (c)
 constraint command_approval_policies_command_type_name_fkey on command_approval_policies (f)
 constraint command_approval_policies_deadline_seconds_check on command_approval_policies (c)
 constraint command_approval_policies_pkey on command_approval_policies (p)
@@ -323,6 +326,7 @@ constraint cross_context_route_cursors_pkey on cross_context_route_cursors (p)
 constraint deadline_cursors_pkey on deadline_cursors (p)
 constraint deadlines_pkey on deadlines (p)
 constraint deadlines_recurrence_policy_check on deadlines (c)
+constraint deadlines_status_check on deadlines (c)
 constraint encryption_keys_pkey on encryption_keys (p)
 constraint encryption_keys_status_check on encryption_keys (c)
 constraint event_encryption_keys_encryption_key_id_fkey on event_encryption_keys (f)
@@ -375,7 +379,9 @@ constraint secret_versions_encryption_key_id_fkey on secret_versions (f)
 constraint secret_versions_name_version_key on secret_versions (u)
 constraint secret_versions_pkey on secret_versions (p)
 constraint secret_versions_status_check on secret_versions (c)
+constraint sequence_id_check on sequence (c)
 constraint sequence_max_payload_bytes_check on sequence (c)
+constraint sequence_pkey on sequence (p)
 constraint sequence_warn_payload_bytes_check on sequence (c)
 constraint snapshot_partition_progress_pkey on snapshot_partition_progress (p)
 constraint snapshot_progress_pkey on snapshot_progress (p)
@@ -448,9 +454,11 @@ index secret_versions_by_name on secret_versions
 index secret_versions_name_version_key on secret_versions
 index secret_versions_pkey on secret_versions
 index secret_versions_unique_active on secret_versions
+index sequence_pkey on sequence
 index snapshot_partition_progress_pkey on snapshot_partition_progress
 index snapshot_progress_pkey on snapshot_progress
 index snapshots_pkey on snapshots
+replica identity full on event_tag_refs
 table access_tokens
 table blind_tags
 table blob_bytes

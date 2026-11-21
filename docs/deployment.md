@@ -145,7 +145,9 @@ synchronous projection refuses writes with `live_fold_paused`.
 ### Upgrading from 0.4 to 0.5
 
 0.5 builds the open-proposal uniqueness index and the deadline polling
-index concurrently. Both ship at schema level 2, which requires 0.5.
+index concurrently. It also installs replica identity and database checks for
+deadline statuses, blob states and blob pin kinds. These changes ship together
+at schema level 2, which requires 0.5.
 Stop every 0.4 instance before upgrading. Keep a backup from the
 quiesced database for a rollback to 0.4.
 
@@ -162,6 +164,25 @@ quiesced database for a rollback to 0.4.
    blocks settlement, the schema owner can drop that invalid index
    concurrently. Keep the old unique index in place and retry migration
    after settling the groups.
+
+If an existing row violates a new deadline or blob constraint, PostgreSQL
+reports the constraint and migration stops. Correct the affected values using
+the application data and retry migration. PostgreSQL enforces an installed
+check on new writes even when validation of existing rows is still pending.
+If a manually added `sequence` primary key conflicts with the built-in
+singleton key, migration reports its schema and constraint name. Review
+the conflicting constraint and any dependencies before retrying.
+
+### Logical replication and blue-green upgrades
+
+Bounded-context tables can be included in a `FOR ALL TABLES` publication.
+The `sequence` row has a singleton primary key, and the derived
+`event_tag_refs` table uses `REPLICA IDENTITY FULL` because one event can have
+duplicate tag references. Command submission, subject erasure and blind-key
+rotation can update or delete those rows while the publication is active.
+This applies to all-table publishers used by systems such as RDS and Aurora
+blue-green upgrades. The publisher still needs `wal_level=logical` for actual
+replication.
 
 ### Settling an open-proposal group offline
 

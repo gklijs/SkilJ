@@ -39,8 +39,9 @@ benchmark defaults, broker tests and Temporal tests retain their coverage.
 ## Reproduce locally
 
 Install `psql` and `pg_isready` on PATH and use a disposable PostgreSQL server.
-Every binary drops and recreates its own named database; the role must have
-`CREATEDB`. For example, from the repository root:
+Every binary drops and recreates its own named database. Use a superuser
+because the `blind_tags` test creates a `FOR ALL TABLES` publication.
+For example, from the repository root:
 
 ```sh
 docker run --rm -d --name skilj-pg15 -e POSTGRES_PASSWORD=postgres \

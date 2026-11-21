@@ -162,6 +162,7 @@ jobs:
       # then refusing the upgraded database - as separate processes, on one
       # embedded Postgres (docs/architecture.md §249). Before the agent-guide
       # solutions, which change the generated app this reuses.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
       - run: >-
           scripts/check-upgrade-pair.sh --prepared --cache-dir target/upgrade-pair
           --new-cache target/template-check
