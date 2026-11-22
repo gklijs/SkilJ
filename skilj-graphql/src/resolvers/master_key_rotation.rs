@@ -108,25 +108,19 @@ pub fn rotate_master_key_field(n: &Naming) -> Field {
                 let state = ctx.data::<GraphqlState>()?;
                 let key_service = key_service(state)?;
                 let retire_immediately = optional_bool(&ctx, "retireImmediately")?;
-                let key = match optional_string(&ctx, "boundedContext")? {
+                let bounded_context = optional_string(&ctx, "boundedContext")?;
+                let key = match &bounded_context {
                     // A name given must name a bounded context: one that
                     // doesn't would otherwise read as "no key of its own"
-                    // and rotate the default key everyone shares.
-                    Some(bounded_context) => {
-                        let exists = !bounded_context.is_empty()
-                            && skilj_core::db::get_bounded_context(&state.pool, &bounded_context)
-                                .await
-                                .map_err(to_graphql_error)?
-                                .is_some();
-                        if !exists {
-                            return Err(
-                                to_graphql_error(skilj_core::error::Error::row_not_found()),
-                            );
-                        }
-                        skilj_core::db::bounded_context_key(&state.pool, &bounded_context)
-                            .await
-                            .map_err(to_graphql_error)?
+                    // and rotate the default key everyone shares. One
+                    // query reads the context and its key together, so a
+                    // deletion between two reads cannot look like one.
+                    Some(name) if name.is_empty() => {
+                        return Err(to_graphql_error(skilj_core::error::Error::row_not_found()));
                     }
+                    Some(name) => skilj_core::db::existing_bounded_context_key(&state.pool, name)
+                        .await
+                        .map_err(to_graphql_error)?,
                     None => None,
                 };
                 let provider = key_service
@@ -150,16 +144,33 @@ pub fn rotate_master_key_field(n: &Naming) -> Field {
                         ));
                     }
                 }
-                skilj_core::db::rotate_master_key(
-                    &state.pool,
-                    provider.as_ref(),
-                    key.as_deref(),
-                    Rotation::Rotate(RotationReason::Requested),
-                    retire_immediately,
-                    Some(&caller.id),
-                    None,
-                )
-                .await
+                // The bounded context is read again under the key's lock:
+                // one deleted since, or given another key, is refused.
+                match &bounded_context {
+                    Some(name) => {
+                        skilj_core::db::rotate_master_key_for_bounded_context(
+                            &state.pool,
+                            provider.as_ref(),
+                            name,
+                            key.as_deref(),
+                            retire_immediately,
+                            Some(&caller.id),
+                        )
+                        .await
+                    }
+                    None => {
+                        skilj_core::db::rotate_master_key(
+                            &state.pool,
+                            provider.as_ref(),
+                            None,
+                            Rotation::Rotate(RotationReason::Requested),
+                            retire_immediately,
+                            Some(&caller.id),
+                            None,
+                        )
+                        .await
+                    }
+                }
                 .map_err(to_graphql_error)?;
                 Ok(Some(
                     overview_of(state, key_service, provider.name()).await?,

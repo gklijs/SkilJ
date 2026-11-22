@@ -392,11 +392,24 @@ pub async fn upload_blob(
         subject.map(|s| s.subject_key),
         subject.map(|s| s.subject_value),
     );
+    // An encrypted blob's row is stored only in the lifetime of the
+    // bounded context its data key was read or provisioned in
+    // (docs/architecture.md §230), read before the key - an existing one
+    // too.
+    let generation = match subject {
+        Some(_) => Some(context_generation(pool, bounded_context).await?),
+        None => None,
+    };
     let (bytes, store_limit) = match subject {
         Some(subject) => {
-            let (_, _, data_key) = get_or_create_encryption_key(
-                pool,
-                bounded_context,
+            if secrets::is_reserved_subject_key(subject.subject_key) {
+                return Err(secrets::Error::ReservedSubjectKey.into());
+            }
+            let bc = require_bounded_context(pool, bounded_context).await?;
+            let (_, _, data_key) = provision_encryption_key(
+                Db::Pool(pool),
+                bc,
+                generation.as_ref(),
                 subject.subject_key,
                 subject.subject_value,
                 subject.key_service,
@@ -425,21 +438,23 @@ pub async fn upload_blob(
         stored.size
     };
     let schema = schema_ident(bounded_context);
-    let inserted = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \
-         subject_key, subject_value, created_at, grace_from) \
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)"
-    )))
-    .bind(&id)
-    .bind(&stored.sha256)
-    .bind(i64::try_from(size).unwrap_or(i64::MAX))
-    .bind(media_type)
-    .bind(&stored.storage_key)
-    .bind(subject_key)
-    .bind(subject_value)
-    .bind(now.to_sqlx())
-    .execute(pool)
+    let inserted = insert_uploaded_blob(
+        pool,
+        &schema,
+        bounded_context,
+        generation.as_ref(),
+        &id,
+        &stored,
+        size,
+        media_type,
+        subject_key,
+        subject_value,
+        now,
+    )
     .await;
+    // A row the bounded context's lifetime refused is cleaned up like one
+    // that failed to insert: the bytes were stored for a context that is
+    // gone.
     if let Err(e) = inserted {
         if let Err(cleanup) = store.delete(bounded_context, &stored.storage_key).await {
             tracing::warn!(
@@ -448,7 +463,7 @@ pub async fn upload_blob(
                 "an uploaded blob's bytes could not be removed after its row failed to insert"
             );
         }
-        return Err(e.into());
+        return Err(e);
     }
     Ok(BlobRef {
         id,
@@ -456,6 +471,52 @@ pub async fn upload_blob(
         size,
         media_type: media_type.to_string(),
     })
+}
+
+/// Inserts an uploaded blob's `pending` row. An encrypted one, whose data
+/// key belongs to the bounded context's lifetime `generation`, in a
+/// transaction that takes the bounded context's row first and refuses
+/// another lifetime with the missing-row error (docs/architecture.md §230).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per column the row stores"
+)]
+async fn insert_uploaded_blob(
+    pool: &Pool,
+    schema: &str,
+    bounded_context: &str,
+    generation: Option<&ContextGeneration>,
+    id: &str,
+    stored: &crate::blob::StoredBlob,
+    size: u64,
+    media_type: &str,
+    subject_key: Option<&str>,
+    subject_value: Option<&str>,
+    now: Timestamp,
+) -> crate::error::Result<()> {
+    let insert = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \
+         subject_key, subject_value, created_at, grace_from) \
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)"
+    )))
+    .bind(id)
+    .bind(&stored.sha256)
+    .bind(i64::try_from(size).unwrap_or(i64::MAX))
+    .bind(media_type)
+    .bind(&stored.storage_key)
+    .bind(subject_key)
+    .bind(subject_value)
+    .bind(now.to_sqlx());
+    // Nothing encrypted: one statement, as before.
+    let Some(generation) = generation else {
+        insert.execute(pool).await?;
+        return Ok(());
+    };
+    let mut tx = pool.begin().await?;
+    lock_expected_generation(&mut tx, bounded_context, generation).await?;
+    insert.execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// A blob's metadata, if `bounded_context` has it.

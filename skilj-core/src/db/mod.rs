@@ -32,14 +32,19 @@
 //! what's deliberately not here yet (`EncryptionKey`).
 
 mod master_key;
+#[allow(
+    deprecated,
+    reason = "the deprecated no-op stays exported for source compatibility"
+)]
 pub use master_key::{
     assign_encryption_key, bounded_context_key, check_data_key_wraps,
     contexts_with_data_keys_below, data_keys_behind, delete_unused_key, encryption_key_assignments,
+    encryption_key_assignments_predating_context, existing_bounded_context_key,
     forget_assignments_of_deleted_contexts, key_in_use, mark_data_keys_behind,
     mark_data_keys_rewrapped, master_key_state, master_key_states, register_known_keys,
     register_master_key_event_types, retire_master_key_versions, rewrap_data_keys,
-    rewrap_data_keys_once, rotate_master_key, schedule_key_deletion, DataKeyWraps, MasterKeyState,
-    RewrapOutcome, Rotation,
+    rewrap_data_keys_once, rotate_master_key, rotate_master_key_for_bounded_context,
+    schedule_key_deletion, DataKeyWraps, MasterKeyState, RewrapOutcome, Rotation,
 };
 
 use crate::access_control::{

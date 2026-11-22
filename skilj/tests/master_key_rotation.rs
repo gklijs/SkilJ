@@ -3662,3 +3662,811 @@ fn move_measurement() {
         }
     });
 }
+
+// --- An assignment lives and dies with its bounded context (#221) ---
+
+/// A bounded context named `name`, created now.
+async fn insert_named_bounded_context(pool: &Pool, name: &str) {
+    let bc = BoundedContext {
+        name: name.to_string(),
+        status: BoundedContextStatus::Active,
+        created_at: test_now(),
+        created_by: ContextCreator::SystemCreator,
+        template: None,
+    };
+    db::insert_bounded_context(pool, &bc).await.unwrap();
+}
+
+fn is_row_not_found(err: &skilj_core::Error) -> bool {
+    matches!(err, skilj_core::Error::Database(sqlx::Error::RowNotFound))
+}
+
+/// A provider whose `wrap` wraps, says so on `entered`, and then waits for
+/// a permit of `gate` before answering: a wrap made, but not yet stored,
+/// while the test changes what it was made for. Its other keys
+/// ([`KeyProvider::key`]) are gated alike.
+#[derive(Clone)]
+struct Gated {
+    inner: Arc<dyn KeyProvider>,
+    entered: Arc<tokio::sync::Semaphore>,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl Gated {
+    fn new(inner: InMemoryKeyProvider) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    /// Waits until a wrap is made and waiting.
+    async fn wrapped(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.entered.acquire())
+            .await
+            .expect("a wrap within 10 s")
+            .unwrap()
+            .forget();
+    }
+
+    fn release(&self, wraps: usize) {
+        self.gate.add_permits(wraps);
+    }
+}
+
+impl KeyProvider for Gated {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn wrap<'a>(
+        &'a self,
+        data_key: &'a [u8; 32],
+    ) -> skilj::BoxFuture<'a, Result<WrappedDataKey, encryption::Error>> {
+        Box::pin(async move {
+            let wrapped = self.inner.wrap(data_key).await;
+            self.entered.add_permits(1);
+            self.gate.acquire().await.unwrap().forget();
+            wrapped
+        })
+    }
+    fn unwrap<'a>(
+        &'a self,
+        wrapped: &'a WrappedDataKey,
+    ) -> skilj::BoxFuture<'a, Result<[u8; 32], encryption::Error>> {
+        self.inner.unwrap(wrapped)
+    }
+    fn versions(&self) -> skilj::BoxFuture<'_, Result<skilj::KeyVersions, encryption::Error>> {
+        self.inner.versions()
+    }
+    fn rotate(&self) -> skilj::BoxFuture<'_, Result<u32, encryption::Error>> {
+        self.inner.rotate()
+    }
+    fn retire_below(&self, version: u32) -> skilj::BoxFuture<'_, Result<(), encryption::Error>> {
+        self.inner.retire_below(version)
+    }
+    fn key(&self, key: &str) -> Result<Arc<dyn KeyProvider>, encryption::Error> {
+        Ok(Arc::new(Gated {
+            inner: self.inner.key(key)?,
+            entered: Arc::clone(&self.entered),
+            gate: Arc::clone(&self.gate),
+        }))
+    }
+    fn create(&self) -> skilj::BoxFuture<'_, Result<bool, encryption::Error>> {
+        self.inner.create()
+    }
+    fn delete(&self) -> skilj::BoxFuture<'_, Result<(), encryption::Error>> {
+        self.inner.delete()
+    }
+}
+
+#[test]
+fn a_deleted_contexts_assignment_goes_with_it_and_its_name_starts_on_the_default_key() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_assignment_lifetime_test").await else {
+            return;
+        };
+        let keys = KeyService::new(InMemoryKeyProvider::new());
+        // The admin context, and no tick running from here on: nothing but
+        // the deletion itself can remove an assignment.
+        settled(&url, &keys).await;
+
+        // Both deletions, each with a context given a key of its own.
+        for trail in [false, true] {
+            let bc = insert_bounded_context(&pool).await;
+            let key = format!("tenant{}", u8::from(trail));
+            db::assign_encryption_key(&pool, &keys, &bc, Some(&key), true, None)
+                .await
+                .unwrap();
+            // Archiving ends nothing: the context is still there.
+            sqlx::query("UPDATE bounded_contexts SET status = 'archived' WHERE name = $1")
+                .bind(&bc)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                db::encryption_key_assignments(&pool)
+                    .await
+                    .unwrap()
+                    .get(&bc),
+                Some(&key),
+                "kept on archive"
+            );
+            if trail {
+                db::hard_delete_bounded_context_with_trail(&pool, &bc, "someone")
+                    .await
+                    .unwrap();
+            } else {
+                db::hard_delete_bounded_context(&pool, &bc).await.unwrap();
+            }
+            assert!(
+                !db::encryption_key_assignments(&pool)
+                    .await
+                    .unwrap()
+                    .contains_key(&bc),
+                "gone with the context, before any tick"
+            );
+
+            // The name taken again: the default key wraps its first data key.
+            insert_named_bounded_context(&pool, &bc).await;
+            assert_eq!(
+                db::existing_bounded_context_key(&pool, &bc).await.unwrap(),
+                None
+            );
+            seal_for(&pool, &bc, "1", &keys).await;
+            let stored = wraps(&pool, &bc).await;
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].1.as_deref(), Some(keys.provider_name()));
+
+            // An explicit assignment of the new context works as for any.
+            db::assign_encryption_key(&pool, &keys, &bc, Some(&key), false, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                db::encryption_key_assignments(&pool)
+                    .await
+                    .unwrap()
+                    .get(&bc),
+                Some(&key)
+            );
+        }
+
+        // A key nobody uses is deleted only once its grace period is over.
+        let bc = insert_bounded_context(&pool).await;
+        let (unused, _, _) = assign(&pool, &keys, &bc, "unused").await;
+        // Scheduling waits while the key is assigned...
+        db::schedule_key_deletion(&pool, unused.name(), jiff::Timestamp::now())
+            .await
+            .unwrap();
+        let state = db::master_key_state(&pool, unused.name())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.delete_after, None, "not scheduled while assigned");
+        db::hard_delete_bounded_context(&pool, &bc).await.unwrap();
+        // ...and from then on starts a positive grace period.
+        let due = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
+        db::schedule_key_deletion(&pool, unused.name(), due)
+            .await
+            .unwrap();
+        assert!(!db::delete_unused_key(&pool, &keys, unused.as_ref())
+            .await
+            .unwrap());
+        assert!(
+            unused.versions().await.is_ok(),
+            "kept through the grace period"
+        );
+        sqlx::query(
+            "UPDATE encryption_master_keys SET delete_after = now() - interval '1 minute' \
+             WHERE provider = $1",
+        )
+        .bind(unused.name())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(db::delete_unused_key(&pool, &keys, unused.as_ref())
+            .await
+            .unwrap());
+        assert!(unused.versions().await.is_err(), "deleted once due");
+    });
+}
+
+#[test]
+fn a_provisioning_that_read_a_deleted_context_stores_nothing_under_its_name_again() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_stale_provisioning_test").await else {
+            return;
+        };
+        let gated = Gated::new(InMemoryKeyProvider::new());
+        let keys = KeyService::new(gated.clone());
+        settled(&url, &keys).await;
+        let bc = insert_bounded_context(&pool).await;
+        db::assign_encryption_key(&pool, &keys, &bc, Some("tenant"), true, None)
+            .await
+            .unwrap();
+
+        // A write's provisioning read the context and its key, and is at
+        // the provider...
+        let provisioning = {
+            let (pool, keys, bc) = (pool.clone(), keys.clone(), bc.clone());
+            tokio::spawn(async move {
+                db::get_or_create_encryption_key(&pool, &bc, "user", "1", &keys).await
+            })
+        };
+        gated.wrapped().await;
+        // ...while the context is deleted and another one takes its name.
+        db::hard_delete_bounded_context(&pool, &bc).await.unwrap();
+        insert_named_bounded_context(&pool, &bc).await;
+        gated.release(1);
+        let Err(err) = provisioning.await.unwrap() else {
+            panic!("stored a data key of the deleted context");
+        };
+        assert!(is_row_not_found(&err), "{err:?}");
+        assert!(
+            wraps(&pool, &bc).await.is_empty(),
+            "nothing of the deleted context's key in the new one"
+        );
+
+        // The new context's own first data key is the default key's.
+        gated.release(1);
+        seal_for(&pool, &bc, "1", &keys).await;
+        let stored = wraps(&pool, &bc).await;
+        assert_eq!(stored[0].1.as_deref(), Some(keys.provider_name()));
+    });
+}
+
+#[test]
+fn a_wrap_under_a_version_retired_while_the_provider_answered_is_made_again() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_stale_version_test").await else {
+            return;
+        };
+        let inner = InMemoryKeyProvider::new();
+        let gated = Gated::new(inner.clone());
+        let keys = KeyService::new(gated.clone());
+        settled(&url, &keys).await;
+        let bc = insert_bounded_context(&pool).await;
+        let default = keys.provider();
+
+        let provisioning = {
+            let (pool, keys, bc) = (pool.clone(), keys.clone(), bc.clone());
+            tokio::spawn(async move {
+                db::get_or_create_encryption_key(&pool, &bc, "user", "1", &keys).await
+            })
+        };
+        // Wrapped under version 1; the key rotates and version 1 retires
+        // before it is stored.
+        gated.wrapped().await;
+        let version = db::rotate_master_key(
+            &pool,
+            default,
+            None,
+            db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            db::retire_master_key_versions(&pool, &keys, default, version)
+                .await
+                .unwrap()
+        );
+        // Two wraps: the stale one, then the one made again.
+        gated.release(2);
+        provisioning.await.unwrap().unwrap();
+        let stored = wraps(&pool, &bc).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].2,
+            Some(version as i32),
+            "wrapped again under the new version"
+        );
+        // Read with nothing cached: what is stored unwraps.
+        let fresh = KeyService::new(inner);
+        let ciphertext = seal_for(&pool, &bc, "1", &keys).await;
+        assert_eq!(
+            open_for(&pool, &bc, "1", &fresh, &ciphertext).await,
+            "1@example.com"
+        );
+    });
+}
+
+#[test]
+fn a_wrap_by_a_key_deleted_and_created_again_under_its_name_is_made_again() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_stale_incarnation_test").await else {
+            return;
+        };
+        let inner = InMemoryKeyProvider::new();
+        let gated = Gated::new(inner.clone());
+        let keys = KeyService::new(gated.clone());
+        settled(&url, &keys).await;
+        let bc = insert_bounded_context(&pool).await;
+        db::assign_encryption_key(&pool, &keys, &bc, Some("tenant"), true, None)
+            .await
+            .unwrap();
+        let tenant = keys.provider_for(Some("tenant")).unwrap();
+
+        let provisioning = {
+            let (pool, keys, bc) = (pool.clone(), keys.clone(), bc.clone());
+            tokio::spawn(async move {
+                db::get_or_create_encryption_key(&pool, &bc, "user", "1", &keys).await
+            })
+        };
+        gated.wrapped().await;
+        // The context leaves the key, the key is deleted, and the context
+        // is given a new key under the same name: version 1 again, other
+        // material.
+        db::assign_encryption_key(&pool, &keys, &bc, None, false, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE encryption_master_keys SET delete_after = now() - interval '1 minute' \
+             WHERE provider = $1",
+        )
+        .bind(tenant.name())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(db::delete_unused_key(&pool, &keys, tenant.as_ref())
+            .await
+            .unwrap());
+        let again = db::assign_encryption_key(&pool, &keys, &bc, Some("tenant"), true, None)
+            .await
+            .unwrap();
+        assert_eq!(again.version, 1);
+
+        gated.release(2);
+        provisioning.await.unwrap().unwrap();
+        // The stored data key is the new key's: it unwraps with nothing
+        // cached. The stale wrap, under the deleted material, would not.
+        let fresh = KeyService::new(inner);
+        db::register_known_keys(&pool, &fresh).await.unwrap();
+        let ciphertext = seal_for(&pool, &bc, "1", &keys).await;
+        assert_eq!(
+            open_for(&pool, &bc, "1", &fresh, &ciphertext).await,
+            "1@example.com"
+        );
+    });
+}
+
+#[test]
+fn a_context_scoped_rotation_of_a_context_deleted_meanwhile_leaves_the_default_key_alone() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_scoped_rotation_test").await else {
+            return;
+        };
+        let keys = KeyService::new(InMemoryKeyProvider::new());
+        settled(&url, &keys).await;
+        let default = keys.provider();
+        let before = db::master_key_state(&pool, default.name())
+            .await
+            .unwrap()
+            .unwrap();
+        let rotations = admin_events(&pool, "EncryptionMasterKeyRotated")
+            .await
+            .len();
+
+        // Read as using the default key, then deleted before the rotation.
+        let bc = insert_bounded_context(&pool).await;
+        let read = db::existing_bounded_context_key(&pool, &bc).await.unwrap();
+        assert_eq!(read, None);
+        db::hard_delete_bounded_context(&pool, &bc).await.unwrap();
+        let err = db::rotate_master_key_for_bounded_context(
+            &pool,
+            default,
+            &bc,
+            read.as_deref(),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(is_row_not_found(&err), "{err:?}");
+        let after = db::master_key_state(&pool, default.name())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (after.version, after.rotated_at),
+            (before.version, before.rotated_at)
+        );
+        assert_eq!(
+            admin_events(&pool, "EncryptionMasterKeyRotated")
+                .await
+                .len(),
+            rotations,
+            "no rotation recorded"
+        );
+        // A name that is no bounded context is refused when read, too.
+        assert!(is_row_not_found(
+            &db::existing_bounded_context_key(&pool, &bc)
+                .await
+                .unwrap_err()
+        ));
+
+        // Given a key of its own since the read: refused as well.
+        let moved = insert_bounded_context(&pool).await;
+        db::assign_encryption_key(&pool, &keys, &moved, Some("tenant"), true, None)
+            .await
+            .unwrap();
+        let err =
+            db::rotate_master_key_for_bounded_context(&pool, default, &moved, None, false, None)
+                .await
+                .unwrap_err();
+        assert!(is_row_not_found(&err), "{err:?}");
+
+        // A live context with no key of its own rotates the default key.
+        let live = insert_bounded_context(&pool).await;
+        let rotated =
+            db::rotate_master_key_for_bounded_context(&pool, default, &live, None, false, None)
+                .await
+                .unwrap();
+        assert_eq!(rotated, Some(before.version + 1));
+    });
+}
+
+#[test]
+fn a_delayed_check_does_not_record_a_deleted_bounded_context_key_again() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_delayed_record_test").await else {
+            return;
+        };
+        let keys = KeyService::new(InMemoryKeyProvider::new());
+        settled(&url, &keys).await;
+        let tenant = keys.provider_for(Some("tenant")).unwrap();
+        tenant.create().await.unwrap();
+        let recorded = |provider: String| {
+            let pool = pool.clone();
+            async move {
+                admin_events(&pool, "EncryptionMasterKeyRotated")
+                    .await
+                    .into_iter()
+                    .filter(|e| e["provider"] == json!(provider))
+                    .count()
+            }
+        };
+        // A check that read the key before it was deleted records nothing:
+        // a bounded-context key's state row is made by its assignment only.
+        let adopted = db::rotate_master_key(
+            &pool,
+            tenant.as_ref(),
+            Some("tenant"),
+            db::Rotation::Record(skilj_core::encryption::trail::RotationReason::Adopted),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(adopted, None);
+        assert_eq!(
+            db::master_key_state(&pool, tenant.name()).await.unwrap(),
+            None
+        );
+        assert_eq!(recorded(tenant.name().to_string()).await, 0);
+        let masters: Vec<String> = db::master_key_states(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.provider)
+            .collect();
+        assert!(!masters.contains(&tenant.name().to_string()));
+        // A delayed scheduled rotation does nothing either; one someone
+        // asked for is refused rather than answered as done.
+        let scheduled = db::rotate_master_key(
+            &pool,
+            tenant.as_ref(),
+            Some("tenant"),
+            db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Scheduled),
+            false,
+            None,
+            Some(jiff::SignedDuration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scheduled, None);
+        let err = db::rotate_master_key(
+            &pool,
+            tenant.as_ref(),
+            Some("tenant"),
+            db::Rotation::Rotate(skilj_core::encryption::trail::RotationReason::Requested),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(is_row_not_found(&err), "{err:?}");
+        assert_eq!(
+            tenant.versions().await.unwrap().latest,
+            1,
+            "not rotated at the provider"
+        );
+        assert_eq!(
+            db::master_key_state(&pool, tenant.name()).await.unwrap(),
+            None
+        );
+        assert_eq!(recorded(tenant.name().to_string()).await, 0);
+
+        // The default key is still adopted by a check.
+        let default = keys.provider();
+        sqlx::query("DELETE FROM encryption_master_keys WHERE provider = $1")
+            .bind(default.name())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let adopted = db::rotate_master_key(
+            &pool,
+            default,
+            None,
+            db::Rotation::Record(skilj_core::encryption::trail::RotationReason::Adopted),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(adopted.is_some());
+        assert!(db::master_key_state(&pool, default.name())
+            .await
+            .unwrap()
+            .is_some());
+    });
+}
+
+/// Warnings recorded by a test's own subscriber: each event's message and
+/// its `bounded_context` field.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<(String, String)>>>);
+
+#[derive(Default)]
+struct WarningFields {
+    message: String,
+    bounded_context: String,
+}
+
+impl tracing::field::Visit for WarningFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "bounded_context" {
+            self.bounded_context = value.to_string();
+        }
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "bounded_context" => self.bounded_context = format!("{value:?}"),
+            _ => {}
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut fields = WarningFields::default();
+        event.record(&mut fields);
+        self.0.lock().unwrap().push((
+            fields.message,
+            fields.bounded_context.trim_matches('"').to_string(),
+        ));
+    }
+}
+
+impl Warnings {
+    /// The bounded contexts warned about for an assignment older than them.
+    fn predating(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(message, _)| message.contains("older than the bounded context"))
+            .map(|(_, bounded_context)| bounded_context.clone())
+            .collect()
+    }
+}
+
+#[test]
+fn migration_0011_removes_orphans_and_keeps_live_and_suspect_assignments_which_startup_warns_about()
+{
+    use tracing_subscriber::layer::SubscriberExt;
+    let warnings = Warnings::default();
+    let subscriber = tracing_subscriber::registry().with(warnings.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        runtime().block_on(async {
+            let Some((url, pool)) = test_db("skilj_master_key_migration_0011_test").await else {
+                return;
+            };
+            let keys = KeyService::new(InMemoryKeyProvider::new());
+            settled(&url, &keys).await;
+            let live = insert_bounded_context(&pool).await;
+            let suspect = insert_bounded_context(&pool).await;
+            for (bc, key) in [(&live, "live"), (&suspect, "suspect")] {
+                db::assign_encryption_key(&pool, &keys, bc, Some(key), true, None)
+                    .await
+                    .unwrap();
+            }
+            keys.provider_for(Some("orphan"))
+                .unwrap()
+                .create()
+                .await
+                .unwrap();
+
+            // The schema as 0.4 left it: no foreign key, no generation or
+            // incarnation, 0011 not applied, level 1 recorded - with an
+            // orphan, a live and a suspect assignment, and deadlines set.
+            sqlx::raw_sql(
+                "ALTER TABLE encryption_key_assignments \
+                     DROP CONSTRAINT encryption_key_assignments_bounded_context_fkey; \
+                 ALTER TABLE bounded_contexts DROP COLUMN generation; \
+                 ALTER TABLE encryption_master_keys DROP COLUMN incarnation; \
+                 DELETE FROM _sqlx_migrations WHERE version = 11; \
+                 UPDATE skilj_schema_compatibility SET level = 1, min_compatible_level = 1; \
+                 INSERT INTO encryption_master_keys (provider, key, version, rotated_at, \
+                     retired_below, created_by_skilj, delete_after) \
+                     VALUES ('in-memory:orphan', 'orphan', 1, now(), 0, true, \
+                     now() - interval '1 day'); \
+                 UPDATE encryption_master_keys SET delete_after = now() + interval '1 day' \
+                     WHERE key IS NOT NULL;",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO encryption_key_assignments (bounded_context, key, provider, \
+                 assigned_at) VALUES ('deleted_tenant', 'orphan', 'in-memory:orphan', now())",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE encryption_key_assignments a SET assigned_at = c.created_at - \
+                 interval '1 hour' FROM bounded_contexts c \
+                 WHERE c.name = a.bounded_context AND a.bounded_context = $1",
+            )
+            .bind(&suspect)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            // The preflight names the suspect one before the upgrade.
+            let report = skilj::preflight::inspect(&pool, &skilj::preflight::InspectOptions::new())
+                .await
+                .unwrap();
+            assert_eq!(report.key_assignments_to_check, vec![suspect.clone()]);
+            assert!(report.to_string().contains(&suspect), "{report}");
+
+            // The upgrade, by a starting instance.
+            warnings.0.lock().unwrap().clear();
+            let upgraded_from = test_now();
+            settled(&url, &keys).await;
+            let assignments = db::encryption_key_assignments(&pool).await.unwrap();
+            assert!(
+                !assignments.contains_key("deleted_tenant"),
+                "the orphan is gone"
+            );
+            assert_eq!(assignments.get(&live).map(String::as_str), Some("live"));
+            assert_eq!(
+                assignments.get(&suspect).map(String::as_str),
+                Some("suspect")
+            );
+            // Every deadline starts over: none for an assigned key, and the
+            // orphan's key scheduled again by the tick, from now.
+            let deadline = |provider: &'static str| {
+                let pool = pool.clone();
+                async move {
+                    db::master_key_state(&pool, provider)
+                        .await
+                        .unwrap()
+                        .and_then(|state| state.delete_after)
+                }
+            };
+            assert_eq!(deadline("in-memory:live").await, None);
+            assert_eq!(deadline("in-memory:suspect").await, None);
+            assert!(
+                deadline("in-memory:orphan")
+                    .await
+                    .is_none_or(|at| at >= upgraded_from),
+                "the orphan's old deadline is not kept"
+            );
+            let levels: (i64, i64) = sqlx::query_as(
+                "SELECT level, min_compatible_level FROM skilj_schema_compatibility",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(levels, (2, 2));
+            let refused = sqlx::query(
+                "INSERT INTO encryption_key_assignments (bounded_context, key, provider, \
+                 assigned_at) VALUES ('nobody', 'live', 'in-memory:live', now())",
+            )
+            .execute(&pool)
+            .await
+            .unwrap_err();
+            assert_eq!(
+                refused
+                    .as_database_error()
+                    .and_then(|e| e.code())
+                    .as_deref(),
+                Some("23503"),
+                "the foreign key holds"
+            );
+            assert_eq!(
+                warnings.predating(),
+                vec![suspect.clone()],
+                "warned at the upgrade"
+            );
+
+            // Every start warns, not only the one that migrated.
+            warnings.0.lock().unwrap().clear();
+            settled(&url, &keys).await;
+            assert_eq!(warnings.predating(), vec![suspect.clone()], "warned again");
+
+            // Assigning it again settles it.
+            db::assign_encryption_key(&pool, &keys, &suspect, Some("suspect"), false, None)
+                .await
+                .unwrap();
+            assert!(db::encryption_key_assignments_predating_context(&pool)
+                .await
+                .unwrap()
+                .is_empty());
+            warnings.0.lock().unwrap().clear();
+            settled(&url, &keys).await;
+            assert!(
+                warnings.predating().is_empty(),
+                "no warning once assigned again"
+            );
+            let report = skilj::preflight::inspect(&pool, &skilj::preflight::InspectOptions::new())
+                .await
+                .unwrap();
+            assert!(report.key_assignments_to_check.is_empty());
+        });
+    });
+}
+
+#[test]
+fn a_rewrap_chosen_for_a_deleted_contexts_key_leaves_the_context_under_its_name_alone() {
+    runtime().block_on(async {
+        let Some((url, pool)) = test_db("skilj_master_key_stale_rewrap_test").await else {
+            return;
+        };
+        let keys = KeyService::new(InMemoryKeyProvider::new());
+        settled(&url, &keys).await;
+        let bc = insert_bounded_context(&pool).await;
+        // What a check read: the context uses `tenant`, which it should be
+        // rewrapped to.
+        let (tenant, version, rotated_at) = assign(&pool, &keys, &bc, "tenant").await;
+        // Deleted, and the name taken again by a context on the default key
+        // with data keys of its own.
+        db::hard_delete_bounded_context(&pool, &bc).await.unwrap();
+        insert_named_bounded_context(&pool, &bc).await;
+        seed(&pool, &bc, keys.provider(), "s", 3).await;
+        let before = wraps(&pool, &bc).await;
+
+        let outcome = db::rewrap_data_keys(
+            &pool,
+            &bc,
+            &keys,
+            tenant.as_ref(),
+            version,
+            rotated_at,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, db::RewrapOutcome::default());
+        assert_eq!(
+            wraps(&pool, &bc).await,
+            before,
+            "nothing moved to the old key"
+        );
+        assert!(events_about(&pool, "EncryptionDataKeysRewrapped", &bc)
+            .await
+            .is_empty());
+    });
+}

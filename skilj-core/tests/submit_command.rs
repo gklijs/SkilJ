@@ -1591,6 +1591,7 @@ fn batched(
         idempotency_key: None,
         event_types_by_name: std::collections::HashMap::new(),
         resolved: std::collections::HashMap::new(),
+        generation: None,
     }
 }
 
@@ -2486,5 +2487,180 @@ fn a_slow_decide_again_under_the_lock_warns() {
             "{}",
             logged[0]
         );
+    });
+}
+
+/// `ShipOrder` with `email` encrypted under the `customer_id` subject's
+/// key: a command whose warm-up resolves a key.
+async fn seed_sensitive_ship_order(pool: &Pool, bc: &BoundedContext) -> CommandType {
+    let ct = CommandType {
+        sensitive_fields: vec![skilj_core::shared::SensitiveField::new(
+            "email",
+            "customer",
+            "customer_id",
+        )],
+        ..seed_command_type(pool, bc, "ShipOrder").await
+    };
+    db::upsert_command_type(pool, &ct).await.unwrap();
+    ct
+}
+
+/// A batch whose first command was warmed up - its key resolved - before
+/// its bounded context was deleted and created again under the same name
+/// (docs/architecture.md §230). That command alone is refused, before it
+/// takes a sequence number; its batch-mates commit with gapless sequences,
+/// whether the batch is written as a set or replayed one command at a
+/// time after a batch-mate's failure.
+#[test]
+fn submit_command_batch_refuses_alone_a_command_prepared_for_a_deleted_bounded_context() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let keys = skilj_core::encryption::KeyService::new(
+            skilj_core::encryption::InMemoryKeyProvider::new(),
+        );
+        let dispatcher = TestCommandDispatcher::new();
+        for replayed in [false, true] {
+            let bc = seed_bounded_context(&pool).await;
+            seed_order_shipped_event_type(&pool, &bc).await;
+            let ship_order = seed_sensitive_ship_order(&pool, &bc).await;
+            let stale_payload = r#"{"order_id":"A","customer_id":"c1","email":"a@example.com"}"#;
+            let stale_decision = dispatcher
+                .dispatch(&bc.name, &ship_order.name, stale_payload, &[])
+                .unwrap()
+                .unwrap();
+            let (event_types, resolved, generation) = db::warm_up_event_types_and_encryption_keys(
+                &pool,
+                &bc.name,
+                &ship_order,
+                stale_payload,
+                &stale_decision,
+                Some(&keys),
+            )
+            .await
+            .unwrap();
+            assert!(generation.is_some(), "a key was resolved");
+            let stale = db::BatchedCommand {
+                event_types_by_name: event_types,
+                resolved,
+                generation,
+                ..batched(
+                    &ship_order,
+                    stale_payload,
+                    stale_decision,
+                    vec![Tag {
+                        key: "order".to_string(),
+                        value: Some("A".to_string()),
+                    }],
+                )
+            };
+
+            // Deleted, and the name taken again.
+            db::hard_delete_bounded_context(&pool, &bc.name)
+                .await
+                .unwrap();
+            db::insert_bounded_context(&pool, &bc).await.unwrap();
+            seed_order_shipped_event_type(&pool, &bc).await;
+            let ship_order = seed_sensitive_ship_order(&pool, &bc).await;
+
+            let fresh_payload = r#"{"order_id":"B","customer_id":"c2","email":"b@example.com"}"#;
+            let fresh_decision = dispatcher
+                .dispatch(&bc.name, &ship_order.name, fresh_payload, &[])
+                .unwrap()
+                .unwrap();
+            let (event_types, resolved, generation) = db::warm_up_event_types_and_encryption_keys(
+                &pool,
+                &bc.name,
+                &ship_order,
+                fresh_payload,
+                &fresh_decision,
+                Some(&keys),
+            )
+            .await
+            .unwrap();
+            let fresh = db::BatchedCommand {
+                event_types_by_name: event_types,
+                resolved,
+                generation,
+                ..batched(
+                    &ship_order,
+                    fresh_payload,
+                    fresh_decision,
+                    vec![Tag {
+                        key: "order".to_string(),
+                        value: Some("B".to_string()),
+                    }],
+                )
+            };
+
+            let mut batch = vec![stale];
+            if replayed {
+                // A batch-mate whose second event a sync projection
+                // refuses: the set write fails and the batch is replayed.
+                seed_poison_event_type(&pool, &bc).await;
+                let trigger_two = seed_command_type(&pool, &bc, "TriggerTwoEvents").await;
+                db::upsert_projection(
+                    &pool,
+                    &Projection {
+                        bounded_context: bc.clone(),
+                        name: "Poisonable".to_string(),
+                        schema: r#"{"properties":{}}"#.to_string(),
+                        schema_version: 1,
+                        consumed_event_types: Vec::new(),
+                        sync: true,
+                        caught_up_to: None,
+                        owner_tag_key: None,
+                        requires_capability: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let poison_decision = dispatcher
+                    .dispatch(&bc.name, &trigger_two.name, "{}", &[])
+                    .unwrap()
+                    .unwrap();
+                batch.push(batched(&trigger_two, "{}", poison_decision, Vec::new()));
+            }
+            batch.push(fresh);
+
+            let results = db::submit_command_batch(
+                &pool,
+                &dispatcher,
+                &TestProjectionDispatcher,
+                Some(&keys),
+                &bc.name,
+                batch,
+            )
+            .await
+            .unwrap();
+            let mut results = results.into_iter();
+            let stale = results.next().unwrap();
+            assert!(
+                matches!(
+                    stale,
+                    Err(skilj_core::Error::Database(sqlx::Error::RowNotFound))
+                ),
+                "replayed: {replayed}: {stale:?}"
+            );
+            if replayed {
+                assert!(
+                    results.next().unwrap().is_err(),
+                    "the poison pill fails alone"
+                );
+            }
+            match results.next().unwrap().unwrap() {
+                SubmitCommandOutcome::Accepted { events, .. } => {
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(events[0].sequence, 0, "replayed: {replayed}");
+                }
+                other => panic!("replayed: {replayed}: expected accepted, got {other:?}"),
+            }
+            let events = db::list_events_for_bounded_context(&pool, &bc.name)
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1, "replayed: {replayed}");
+            assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 1);
+        }
     });
 }

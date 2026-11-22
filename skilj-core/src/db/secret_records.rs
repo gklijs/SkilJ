@@ -273,9 +273,15 @@ pub async fn put_secret_value(
     now: Timestamp,
 ) -> crate::error::Result<Secret> {
     secrets::validate_secret_name(name).map_err(crate::error::Error::from)?;
+    let generation = context_generation(pool, bounded_context).await?;
     let bc = require_bounded_context(pool, bounded_context).await?;
     let schema = schema_ident(bounded_context);
     let mut tx = pool.begin().await?;
+    // The bounded context's row first, as every writer takes it before the
+    // context's tables and the key's state row (docs/architecture.md
+    // §230): its deletion waits for this, and a context created again
+    // under the name since the read above is refused.
+    lock_expected_generation(&mut tx, bounded_context, &generation).await?;
     acquire_secret_lock(&mut tx, bounded_context, name).await?;
 
     // Retire and shred the currently-active version, if there is one. Read
@@ -312,6 +318,7 @@ pub async fn put_secret_value(
     let (_key, key_id, data_key) = get_or_create_encryption_key_on(
         &mut tx,
         bc.clone(),
+        Some(&generation),
         secrets::SUBJECT_KEY,
         &subject_value,
         key_service,

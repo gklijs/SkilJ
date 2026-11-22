@@ -458,6 +458,94 @@ fn revoking_a_role_records_one_event_per_ended_grant() {
     });
 }
 
+/// A role's revocation takes every one of its mapping rows before the
+/// admin context's `sequence`, as every other writer does. It used to take
+/// the second row while holding the sequence lock from the first row's
+/// event, which deadlocked with a baseline holding that second row and
+/// waiting for the sequence (`40P01`).
+#[test]
+fn revoking_a_role_waits_for_a_baseline_holding_one_of_its_rows_without_holding_the_sequence() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool).await;
+        let actor = seed_role(&pool).await;
+        let (first, second) = (
+            seed_bounded_context(&pool).await,
+            seed_bounded_context(&pool).await,
+        );
+        let (first, second) = if first.name < second.name {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let mut revoked_mappings = Vec::new();
+        let revoked_at = now();
+        for bc in [&first, &second] {
+            let granted = mapping(&role, bc, AccessLevel::Read);
+            db::grant_role_access_mapping_with_trail(&pool, &granted, Some(&actor.id))
+                .await
+                .unwrap();
+            revoked_mappings.push(RoleAccessMapping {
+                status: RoleStatus::Revoked,
+                revoked_at: Some(revoked_at),
+                ..granted
+            });
+        }
+
+        // A baseline at the second row: holding it, about to take the
+        // sequence.
+        let mut baseline = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT 1 FROM role_access_mappings \
+             WHERE role_id = $1 AND bounded_context = $2 AND status = 'active' FOR UPDATE",
+        )
+        .bind(&role.id)
+        .bind(&second.name)
+        .execute(&mut *baseline)
+        .await
+        .unwrap();
+        let revocation = {
+            let pool = pool.clone();
+            let revoked_role = Role {
+                status: RoleStatus::Revoked,
+                revoked_at: Some(revoked_at),
+                ..role.clone()
+            };
+            let actor = actor.id.clone();
+            tokio::spawn(async move {
+                db::revoke_role_and_mappings(&pool, &revoked_role, &revoked_mappings, &actor).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!revocation.is_finished(), "waits for the baseline's row");
+        // The baseline gets the sequence: the revocation holds no sequence
+        // lock while it waits.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT next_value FROM \"bc_{ADMIN_BOUNDED_CONTEXT_NAME}\".sequence FOR UPDATE"
+            )))
+            .execute(&mut *baseline),
+        )
+        .await
+        .expect("the sequence is free")
+        .unwrap();
+        baseline.rollback().await.unwrap();
+        revocation.await.unwrap().unwrap();
+        for bc in [&first, &second] {
+            assert_eq!(
+                kinds(&trail(&pool, &role, bc).await),
+                vec![
+                    AccessEventKind::AccessGranted,
+                    AccessEventKind::AccessRevoked
+                ]
+            );
+        }
+    });
+}
+
 #[test]
 fn the_admin_log_stays_gapless_across_many_writers() {
     runtime().block_on(async {

@@ -45,9 +45,44 @@ README.md, "Status and stability").
   migration. (#220)
 - `SchemaChanges::Refuse` requires the valid open-proposal index. Optional
   deadline index work still runs in the concurrent index background task.
+- Global migration 0011 ties encryption key assignments to their bounded
+  context (#221). It deletes assignments whose bounded context no longer
+  exists, adds a foreign key that removes an assignment with its bounded
+  context, and gives each bounded context a `generation` and each master
+  key state row an `incarnation`. It also raises a recorded schema level
+  and minimum compatible level to 2 in the same transaction, so 0.4
+  refuses the database even if the upgrade is interrupted. The schema
+  level stays 2.
+- The migration keeps an assignment that is older than its bounded context
+  (`assigned_at` before `created_at`). Such an assignment may have been made
+  for a deleted bounded context with the same name. Every startup logs a
+  warning naming each such bounded context, without key material, and the
+  preflight report lists them (`PreflightReport::key_assignments_to_check`).
+  Check each one against the admin context's `EncryptionKeyAssigned`
+  history. Assigning the bounded context a key again (`assignMasterKey`,
+  its own key or the default) replaces the assignment and is the one way to
+  clear the warning.
+- The migration clears every scheduled deletion of a bounded-context key,
+  since one may have been counted from a deleted context's assignment. The
+  tick schedules each again, a full `retire_after` from then, so a pending
+  key deletion happens at most one grace period later than it would have.
 
 ### Changed
 
+- `skilj_core::db::forget_assignments_of_deleted_contexts` is deprecated and
+  does nothing: the database removes an assignment with its bounded context.
+- Breaking for code that builds command batches itself:
+  `warm_up_event_types_and_encryption_keys` now returns a third value, the
+  bounded context's `ContextGeneration` the keys were read in, and
+  `BatchedCommand` has a new `generation` field to carry it. Pass on what
+  the warm-up answered; `None` is right only when it resolved no keys. A
+  command carrying the generation of a bounded context deleted since is
+  refused alone. `PreflightReport` has a new `key_assignments_to_check`
+  field; the struct is `#[non_exhaustive]`, and the field defaults when an
+  older report is read.
+- `rotate_master_key` refuses a requested rotation of a bounded-context key
+  skilj keeps no state for, with the missing-row error. A recording, or a
+  scheduled rotation, of such a key does nothing.
 - The deadline poll reads due deadlines through `deadlines_claimable`
   instead of scanning the table: 0.05 ms instead of 19.8 ms per tick on
   300,000 resolved deadlines (docs/performance.md, "The deadline poll").
@@ -88,6 +123,22 @@ README.md, "Status and stability").
 
 ### Fixed
 
+- A bounded context created under the name of a deleted one no longer
+  inherits the deleted context's encryption key (#221). The assignment used
+  to be forgotten by the next master-key check; it is now removed in the
+  deleting transaction. A write that read the deleted context before calling
+  the key provider is refused when it ends after the deletion, rather than
+  storing data keys or ciphertext of the deleted context in the new one.
+  This covers events, commands (each command of a batch alone), proposals,
+  secrets, blob uploads, scheduled events and the background rewrap. A
+  data key wrapped under a key version retired, or a key deleted, while
+  the provider answered is wrapped again instead of being stored. A
+  context-scoped `rotateMasterKey` for a context deleted meanwhile is
+  refused instead of rotating the default key. A delayed check no longer
+  records a deleted bounded-context key again.
+- Revoking a role with several grants no longer deadlocks (`40P01`) with
+  startup's access-trail baseline running at the same time: it now locks
+  all of the role's grants before recording the first `AccessRevoked`.
 - Command writes, subject erasure and blind-key rotation work with a
   PostgreSQL publication that includes every table. (#220)
 - `GREATER_THAN`/`LESS_THAN` filters now work on every date and time field

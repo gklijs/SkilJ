@@ -121,6 +121,97 @@ pub(super) async fn require_bounded_context(
         .ok_or_else(crate::error::Error::row_not_found)
 }
 
+/// One lifetime of a bounded context: its `bounded_contexts.generation`,
+/// which the database gives every row it inserts (docs/architecture.md
+/// §230). A bounded context deleted and created again under the same name
+/// has another one. A writer that read the bounded context before calling
+/// a key provider keeps it, and its transaction checks it before storing
+/// what it prepared: a data key wrapped by the deleted context's key, or
+/// a payload encrypted under one of its data keys, must not land in the
+/// new context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextGeneration(String);
+
+impl ContextGeneration {
+    /// As read from `bounded_contexts.generation::TEXT`.
+    pub(super) fn from_column(generation: String) -> Self {
+        Self(generation)
+    }
+}
+
+/// `bounded_context`'s current [`ContextGeneration`]; the missing-row
+/// error when there is no such bounded context.
+pub(super) async fn context_generation<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<ContextGeneration> {
+    let generation: Option<String> =
+        sqlx::query_scalar("SELECT generation::TEXT FROM bounded_contexts WHERE name = $1")
+            .bind(bounded_context)
+            .fetch_optional(executor)
+            .await?;
+    generation
+        .map(ContextGeneration)
+        .ok_or_else(crate::error::Error::row_not_found)
+}
+
+/// At a writing transaction's entry, before it touches any of the bounded
+/// context's own tables: locks `bounded_context`'s row `FOR KEY SHARE`,
+/// which holds off its deletion until the commit, and answers the
+/// generation it has - the missing-row error when it is gone.
+///
+/// Both deletions lock the row first and drop the schema second, so a
+/// writer takes the row before the context's tables too, never after: one
+/// holding the `sequence` lock and then waiting for the row would deadlock
+/// with a deletion waiting to drop the `sequence` table. A writer already
+/// holding one of the context's tables checks with [`generation_is`]
+/// instead, which takes no lock: the schema can't be dropped under it.
+pub(super) async fn lock_context_generation(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+) -> crate::error::Result<ContextGeneration> {
+    let generation: Option<String> = sqlx::query_scalar(
+        "SELECT generation::TEXT FROM bounded_contexts WHERE name = $1 FOR KEY SHARE",
+    )
+    .bind(bounded_context)
+    .fetch_optional(conn)
+    .await?;
+    generation
+        .map(ContextGeneration)
+        .ok_or_else(crate::error::Error::row_not_found)
+}
+
+/// [`lock_context_generation`], refused with the missing-row error unless
+/// it is still `expected`: what the caller prepared belongs to a bounded
+/// context that was deleted since, whatever has its name now.
+pub(super) async fn lock_expected_generation(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+    expected: &ContextGeneration,
+) -> crate::error::Result<()> {
+    if &lock_context_generation(conn, bounded_context).await? != expected {
+        return Err(crate::error::Error::row_not_found());
+    }
+    Ok(())
+}
+
+/// Whether `bounded_context` still has the generation `expected`, read
+/// without a lock - for a transaction that already holds one of the
+/// context's tables, which keeps the schema, and so the row, from being
+/// deleted until it ends (see [`lock_context_generation`]).
+pub(super) async fn generation_is(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+    expected: &ContextGeneration,
+) -> crate::error::Result<bool> {
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT generation::TEXT FROM bounded_contexts WHERE name = $1")
+            .bind(bounded_context)
+            .fetch_optional(conn)
+            .await?;
+    Ok(current.as_deref() == Some(expected.0.as_str()))
+}
+
 /// Like [`require_bounded_context`], for an `EventType` a caller already
 /// has a stored reference to (an `events`/`access_tokens` row's own
 /// `event_type_name`) - the identical `hard_delete_bounded_context` race

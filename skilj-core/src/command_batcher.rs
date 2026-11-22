@@ -384,15 +384,16 @@ impl CommandBatcher {
         )
         .await?;
         self.slow.note_resolved(&item.command_type, &resolved);
-        let (event_types_by_name, keys) = crate::db::warm_up_event_types_and_encryption_keys(
-            pool,
-            &item.command_type.bounded_context.name,
-            &item.command_type,
-            &item.payload,
-            &resolved.decision,
-            key_service,
-        )
-        .await?;
+        let (event_types_by_name, keys, generation) =
+            crate::db::warm_up_event_types_and_encryption_keys(
+                pool,
+                &item.command_type.bounded_context.name,
+                &item.command_type,
+                &item.payload,
+                &resolved.decision,
+                key_service,
+            )
+            .await?;
         Ok(PreparedCommand {
             command: BatchedCommand {
                 command_type: item.command_type,
@@ -416,6 +417,7 @@ impl CommandBatcher {
                 idempotency_key: item.idempotency_key,
                 event_types_by_name,
                 resolved: keys,
+                generation,
             },
         })
     }
@@ -487,15 +489,16 @@ impl CommandBatcher {
         idempotency_key: Option<&str>,
         covered_through: Option<i64>,
     ) -> Result<BatchedCommand> {
-        let (event_types_by_name, resolved) = crate::db::warm_up_event_types_and_encryption_keys(
-            pool,
-            &command_type.bounded_context.name,
-            command_type,
-            payload,
-            &initial_decision,
-            key_service,
-        )
-        .await?;
+        let (event_types_by_name, resolved, generation) =
+            crate::db::warm_up_event_types_and_encryption_keys(
+                pool,
+                &command_type.bounded_context.name,
+                command_type,
+                payload,
+                &initial_decision,
+                key_service,
+            )
+            .await?;
 
         Ok(BatchedCommand {
             command_type: command_type.clone(),
@@ -517,6 +520,7 @@ impl CommandBatcher {
             idempotency_key: idempotency_key.map(str::to_string),
             event_types_by_name,
             resolved,
+            generation,
         })
     }
 

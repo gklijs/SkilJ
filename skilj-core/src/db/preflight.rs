@@ -935,6 +935,13 @@ pub(crate) async fn inspect(
         .iter()
         .find(|r| r.name == ADMIN_BOUNDED_CONTEXT_NAME);
     let admin_context = inspect_admin(conn, admin_report, &mut unknown).await?;
+    // Not changed by an upgrade: told, for an operator to check
+    // (docs/architecture.md §230).
+    let key_assignments_to_check = if relation_exists(conn, "encryption_key_assignments").await? {
+        super::encryption_key_assignments_predating_context(&mut *conn).await?
+    } else {
+        Vec::new()
+    };
 
     tx.rollback().await?;
 
@@ -969,6 +976,7 @@ pub(crate) async fn inspect(
         bounded_contexts,
         registrations: Vec::new(),
         unknown,
+        key_assignments_to_check,
     })
 }
 
