@@ -66,7 +66,10 @@ jobs:
       - run: cargo test -p skilj --test model_unique_value --no-run
       # A test with no database returns early; fail on its skip line, as
       # scripts/ci-test.sh does.
+      # A job container's default shell is `sh` (dash), which has no
+      # pipefail.
       - name: Histories
+        shell: bash
         run: |
           set -o pipefail
           cargo test -p skilj --test model_unique_value histories_match -- --nocapture 2>&1 | tee model.log
