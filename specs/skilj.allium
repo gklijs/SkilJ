@@ -6598,6 +6598,16 @@ rule ArchiveBoundedContext {
 -- context would still carry a creation stamp describing nothing, and a
 -- reused name would inherit it.
 --
+-- Its master_key goes with it the same way: the assignment is the
+-- deleted context's, ended in the same step, so a context that takes the
+-- name back starts on the default key until a superadmin assigns it one
+-- (rule AssignMasterKey). Nothing a write prepared for the deleted
+-- context - a data key wrapped by its key, a payload sealed under one of
+-- its data keys - is ever stored in the new one: a write that began
+-- before the deletion and ends after it is refused (see the guidance on
+-- rule ProvisionEncryptionKey). Archiving ends nothing, the assignment
+-- included.
+--
 -- What does not go away is the fact that any of it happened. Each of the
 -- ten admin operations - adding, archiving and now deleting among them -
 -- is meant in the end to be a Command against the admin bounded
@@ -9084,6 +9094,19 @@ rule ProvisionEncryptionKey {
             status: active,
             created_at: now
         )
+
+    @guidance
+        -- master_key is the key bounded_context uses when the data key is
+        -- stored, and the data key is stored in that same bounded context,
+        -- not a later one of the same name. The provider is asked to wrap
+        -- before anything is stored, so the implementation reads the
+        -- context's lifetime, its key and the key's state first, and
+        -- stores only if all three are unchanged; otherwise it wraps again,
+        -- or refuses when the context is gone. The same holds for every
+        -- write storing what such a key protects - events, commands,
+        -- proposals, secrets, blobs: work prepared for a deleted context
+        -- never lands in one that took its name back
+        -- (docs/architecture.md §230).
 }
 
 rule RegisterMasterKey {
@@ -9126,6 +9149,12 @@ rule AssignMasterKey {
         -- on; existing data keys keep their own master_key/version and stay
         -- readable until that version is retired. A key reserved for one
         -- context cannot be assigned to another.
+        --
+        -- The assignment belongs to this bounded context and ends with it
+        -- (rule DeleteBoundedContext): a context created later under the
+        -- same name does not inherit it. Assigning again replaces it,
+        -- which is also how an operator settles an assignment found older
+        -- than its context after an upgrade (docs/architecture.md §230).
 }
 
 rule RotateMasterKey {

@@ -3490,6 +3490,14 @@ pub async fn ensure_event_read_token_start_from_column(
 pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::error::Result<()> {
     let schema = schema_ident(name);
     let mut tx = pool.begin().await?;
+    // The registry row first, as [`hard_delete_bounded_context_with_trail`]
+    // takes it: a writer holds it `FOR KEY SHARE` before the context's
+    // tables, so both deletions and every writer lock in one order - the
+    // row, then the tables (docs/architecture.md §230).
+    sqlx::query("SELECT name FROM bounded_contexts WHERE name = $1 FOR UPDATE")
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
     super::blobs::queue_blob_deletions(&mut tx, name, Timestamp::now()).await?;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&mut *tx)

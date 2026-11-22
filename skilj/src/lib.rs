@@ -1593,6 +1593,26 @@ async fn check_encryption_keys(
     Ok(())
 }
 
+/// Warns, once per startup, about every bounded context whose encryption
+/// key assignment is older than the bounded context itself
+/// (docs/architecture.md §230): migration 0011 kept it, since it can't tell
+/// one made for a deleted bounded context of the same name from one with a
+/// clock difference behind it. By name only - nothing about the key.
+async fn warn_on_key_assignments_predating_context(pool: &Pool) -> Result<(), skilj_core::Error> {
+    for bounded_context in
+        skilj_core::db::encryption_key_assignments_predating_context(pool).await?
+    {
+        tracing::warn!(
+            bounded_context = %bounded_context,
+            "the bounded context's encryption key assignment is older than the bounded context: \
+             it may have been made for a deleted bounded context of the same name. Check it \
+             against the admin context's EncryptionKeyAssigned history; assigning the bounded \
+             context a key again (its own or the default) replaces it and ends this warning"
+        );
+    }
+    Ok(())
+}
+
 /// Records a key's latest version as the one in use when none is recorded
 /// yet, or a rotation made outside skilj (docs/architecture.md §230).
 async fn record_key_in_use(
@@ -1642,18 +1662,19 @@ async fn master_key_tick(
     rotation: &MasterKeyRotation,
 ) -> Result<(), skilj_core::Error> {
     skilj_core::db::register_known_keys(pool, key_service).await?;
-    let existing: BTreeSet<String> = skilj_core::db::list_bounded_contexts(pool)
-        .await?
-        .into_iter()
-        .map(|bc| bc.name)
-        .collect();
-    skilj_core::db::forget_assignments_of_deleted_contexts(pool, &existing).await?;
-    // Each key's assignment epoch, read before the assignments: a key's
-    // rewrap is marked done only if no assignment came after this read.
+    // Each key's assignment epoch, read before the bounded contexts and
+    // their assignments: a key's rewrap is marked done only if no
+    // assignment came after this read, so a context created and assigned
+    // the key after the listing below can't have its data keys passed by.
     let epochs: BTreeMap<String, i64> = skilj_core::db::master_key_states(pool)
         .await?
         .into_iter()
         .map(|state| (state.provider, state.assignment_epoch))
+        .collect();
+    let existing: BTreeSet<String> = skilj_core::db::list_bounded_contexts(pool)
+        .await?
+        .into_iter()
+        .map(|bc| bc.name)
         .collect();
     let assignments = skilj_core::db::encryption_key_assignments(pool).await?;
     let mut keys: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
@@ -4439,6 +4460,9 @@ impl SkiljBuilder {
         // docs/architecture.md §176: a promotion or restore since the last
         // instance ran is reported, not just survived.
         observe_epoch(&pool).await;
+        // docs/architecture.md §230: at every startup, not only the one
+        // that applied migration 0011, until each is assigned again.
+        warn_on_key_assignments_predating_context(&pool).await?;
 
         // `default BoundedContext admin`'s own `created_at`/`created_by`
         // stamping - unconditional, every startup, and independent of

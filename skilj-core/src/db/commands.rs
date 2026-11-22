@@ -154,7 +154,7 @@ pub async fn submit_command(
     // lookups too. See `warm_up_event_types_and_encryption_keys`'s own
     // doc comment for why this is always safe, never just an
     // optimisation this function's own correctness depends on.
-    let (event_types_by_name, resolved) = warm_up_event_types_and_encryption_keys(
+    let (event_types_by_name, resolved, generation) = warm_up_event_types_and_encryption_keys(
         pool,
         &bounded_context_name,
         command_type,
@@ -165,6 +165,12 @@ pub async fn submit_command(
     .await?;
 
     let mut tx = pool.begin().await?;
+    // Keys warmed up above belong to the bounded context's lifetime they
+    // were read in: refused before the lock if it was deleted, or created
+    // again, since (docs/architecture.md §230).
+    if let Some(generation) = &generation {
+        lock_expected_generation(&mut tx, &bounded_context_name, generation).await?;
+    }
     let (locked_highest, limits) =
         lock_bounded_context_sequence_with_limits(&mut tx, &bounded_context_name).await?;
     let payload_limits = limits.apply(projection_dispatcher.payload_limits());
@@ -198,6 +204,7 @@ pub async fn submit_command(
         &[],
         event_types_by_name,
         resolved,
+        generation.as_ref(),
         covered_through,
         context,
         &payload_limits,
@@ -229,6 +236,13 @@ pub async fn submit_command(
 /// hold span (`submit_command`) or to move that work fully in parallel,
 /// before a request ever joins a shared batch queue at all
 /// (`CommandBatcher::submit`) - not to change what's correct.
+///
+/// The third value is the bounded context's [`ContextGeneration`] the keys
+/// were resolved in, `None` when there was none to resolve: the
+/// transaction that writes the command refuses it unless the bounded
+/// context still has it ([`BatchedCommand::generation`]), so keys of a
+/// bounded context deleted meanwhile never protect a write to one created
+/// again under its name (docs/architecture.md §230).
 pub async fn warm_up_event_types_and_encryption_keys(
     pool: &Pool,
     bounded_context_name: &str,
@@ -239,10 +253,12 @@ pub async fn warm_up_event_types_and_encryption_keys(
 ) -> crate::error::Result<(
     std::collections::HashMap<String, EventType>,
     std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    Option<ContextGeneration>,
 )> {
     let mut event_types_by_name: std::collections::HashMap<String, EventType> =
         std::collections::HashMap::new();
     let mut resolved = std::collections::HashMap::new();
+    let mut generation = None;
     if let crate::shared::CommandDecision::Accepted { events } = initial_decision {
         for spec in events {
             if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -258,9 +274,10 @@ pub async fn warm_up_event_types_and_encryption_keys(
                 }
             }
         }
-        resolve_encryption_keys(
+        resolve_encryption_keys_in(
             pool,
             bounded_context_name,
+            &mut generation,
             &command_type.sensitive_fields,
             payload,
             key_service,
@@ -270,9 +287,10 @@ pub async fn warm_up_event_types_and_encryption_keys(
         for spec in events {
             if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
                 let spec_payload = spec.payload.to_string();
-                resolve_encryption_keys(
+                resolve_encryption_keys_in(
                     pool,
                     bounded_context_name,
+                    &mut generation,
                     &event_type.sensitive_fields,
                     &spec_payload,
                     key_service,
@@ -282,7 +300,7 @@ pub async fn warm_up_event_types_and_encryption_keys(
             }
         }
     }
-    Ok((event_types_by_name, resolved))
+    Ok((event_types_by_name, resolved, generation))
 }
 
 /// The `SELECT ... FOR UPDATE` peek `submit_command`'s own doc comment
@@ -1355,6 +1373,10 @@ pub(super) async fn decide_command_in_tx(
 /// Every distinct `(subject_key, subject_value)` still needed is gathered
 /// up front and deduped (against itself and `resolved`), so no subject is
 /// provisioned twice.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the command, its decided events and the keys warmed up for them, each as its caller holds it"
+)]
 pub(super) async fn provision_missing_encryption_keys(
     conn: &mut sqlx::PgConnection,
     command_type: &CommandType,
@@ -1362,6 +1384,7 @@ pub(super) async fn provision_missing_encryption_keys(
     event_specs: &[crate::shared::EventSpec],
     event_types_by_name: &std::collections::HashMap<String, EventType>,
     resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    generation: Option<&ContextGeneration>,
     key_service: Option<&KeyService>,
 ) -> crate::error::Result<()> {
     let needed_subjects = missing_encryption_subjects(
@@ -1371,7 +1394,15 @@ pub(super) async fn provision_missing_encryption_keys(
         event_types_by_name,
         resolved,
     )?;
-    provision_encryption_subjects(conn, command_type, needed_subjects, resolved, key_service).await
+    provision_encryption_subjects(
+        conn,
+        command_type,
+        needed_subjects,
+        resolved,
+        generation,
+        key_service,
+    )
+    .await
 }
 
 /// The `(subject_key, subject_value)` pairs `command_type`'s payload and
@@ -1400,12 +1431,15 @@ pub(super) fn missing_encryption_subjects(
     Ok(needed_subjects)
 }
 
-/// Provisions a key for each of `needed_subjects` on `conn` into `resolved`.
+/// Provisions a key for each of `needed_subjects` on `conn` into `resolved`,
+/// for the bounded context's lifetime `generation` when the keys already
+/// in `resolved` were read in one.
 pub(super) async fn provision_encryption_subjects(
     conn: &mut sqlx::PgConnection,
     command_type: &CommandType,
     needed_subjects: Vec<(String, String)>,
     resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    generation: Option<&ContextGeneration>,
     key_service: Option<&KeyService>,
 ) -> crate::error::Result<()> {
     if !needed_subjects.is_empty() {
@@ -1414,6 +1448,7 @@ pub(super) async fn provision_encryption_subjects(
             let provisioned = get_or_create_encryption_key_on(
                 &mut *conn,
                 command_type.bounded_context.clone(),
+                generation,
                 &subject.0,
                 &subject.1,
                 key_service,
@@ -1451,6 +1486,7 @@ pub(super) async fn finish_accepted_command_in_tx(
     sequences: Vec<i64>,
     decided: AcceptedDecision,
     mut resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    generation: Option<&ContextGeneration>,
     payload_limits: &crate::payload_limits::PayloadLimits,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
@@ -1472,6 +1508,7 @@ pub(super) async fn finish_accepted_command_in_tx(
         &event_specs,
         &event_types_by_name,
         &mut resolved,
+        generation,
         key_service,
     )
     .await?;
@@ -1611,6 +1648,7 @@ pub(super) async fn submit_one_command_in_tx(
     extra_committed_events: &[Event],
     event_types_by_name: std::collections::HashMap<String, EventType>,
     resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    generation: Option<&ContextGeneration>,
     covered_through: Option<i64>,
     context: &crate::plugin::DecisionContext,
     payload_limits: &crate::payload_limits::PayloadLimits,
@@ -1674,6 +1712,7 @@ pub(super) async fn submit_one_command_in_tx(
         sequences,
         decided,
         resolved,
+        generation,
         payload_limits,
     )
     .await
@@ -1731,6 +1770,12 @@ pub struct BatchedCommand {
     /// always safe and never a correctness dependency.
     pub event_types_by_name: std::collections::HashMap<String, EventType>,
     pub resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    /// The bounded context's lifetime `resolved` was read in, as
+    /// `warm_up_event_types_and_encryption_keys` answers it; `None` when
+    /// nothing was resolved. The batch refuses this command alone, with
+    /// the missing-row error, when the bounded context it holds locked has
+    /// another one (docs/architecture.md §230).
+    pub generation: Option<ContextGeneration>,
 }
 
 /// What one command in a [`submit_command_batch`] call settles on - the
@@ -1751,6 +1796,9 @@ pub struct CommandBatchLeaderTx {
     pub(super) sync_projections: Vec<String>,
     /// Read with the lock (docs/architecture.md §238).
     pub(super) payload_limits: PayloadLimitsOverride,
+    /// The bounded context's lifetime, its row held `FOR KEY SHARE` for
+    /// the batch (docs/architecture.md §230).
+    pub(super) generation: ContextGeneration,
 }
 
 /// The lock-acquiring half of [`submit_command_batch`], pulled out
@@ -1794,6 +1842,10 @@ pub async fn begin_command_batch_leader_tx(
     idle_in_transaction_session_timeout: Option<std::time::Duration>,
 ) -> crate::error::Result<CommandBatchLeaderTx> {
     let mut tx = pool.begin().await?;
+    // The bounded context's row before its `sequence`, as every writer
+    // takes them (docs/architecture.md §230): a deletion waits for the
+    // batch, and each command's keys are checked against this lifetime.
+    let generation = lock_context_generation(&mut tx, bounded_context_name).await?;
     // The timeout rides on the lock statement itself, as `set_config(...,
     // true)` - `SET LOCAL`'s function form - rather than a statement of
     // its own (docs/architecture.md §196). Evaluated as the row is read,
@@ -1832,6 +1884,7 @@ pub async fn begin_command_batch_leader_tx(
         locked_highest,
         sync_projections,
         payload_limits,
+        generation,
     })
 }
 
@@ -2013,6 +2066,7 @@ pub async fn commit_command_batch(
         locked_highest,
         sync_projections,
         payload_limits,
+        generation,
     } = leader_tx;
     let payload_limits = payload_limits.apply(projection_dispatcher.payload_limits());
 
@@ -2051,6 +2105,7 @@ pub async fn commit_command_batch(
         &batch,
         locked_highest,
         &sync_projections,
+        &generation,
         slow,
         &payload_limits,
     )
@@ -2085,6 +2140,7 @@ pub async fn commit_command_batch(
                 &bounded_context_name,
                 locked_highest,
                 &sync_projections,
+                &generation,
                 batch,
                 slow,
                 &payload_limits,
@@ -2174,6 +2230,16 @@ pub(super) struct PlannedCommand {
     pub(super) blob_claims: Vec<BlobClaim>,
 }
 
+/// Whether `item`'s keys were resolved in another lifetime of the bounded
+/// context than `generation`, the one the batch holds locked: a command
+/// prepared before its bounded context was deleted and created again
+/// under the same name (docs/architecture.md §230).
+pub(super) fn stale_generation(item: &BatchedCommand, generation: &ContextGeneration) -> bool {
+    item.generation
+        .as_ref()
+        .is_some_and(|prepared| prepared != generation)
+}
+
 /// `commit_command_batch`'s set path (docs/architecture.md §196): decides
 /// every command in `batch` first, in order, without writing anything
 /// but the encryption keys a redispatch newly needs, then writes every
@@ -2206,6 +2272,7 @@ pub(super) async fn write_command_batch_as_set(
     batch: &[BatchedCommand],
     locked_highest: i64,
     sync_projections: &[String],
+    generation: &ContextGeneration,
     slow: Option<&crate::slow_command::SlowCommandWarnings>,
     payload_limits: &crate::payload_limits::PayloadLimits,
 ) -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> {
@@ -2222,6 +2289,12 @@ pub(super) async fn write_command_batch_as_set(
     let decide_started = std::time::Instant::now();
     let batch_delta = batch_recheck_delta(tx, dispatcher, batch, locked_highest).await?;
     for (index, item) in batch.iter().enumerate() {
+        // Prepared for a bounded context deleted since: refused alone,
+        // before it is decided or takes a sequence number.
+        if stale_generation(item, generation) {
+            results.push(Some(Err(crate::error::Error::row_not_found())));
+            continue;
+        }
         let context = crate::plugin::DecisionContext::at(item.now);
         let decided = decide_command_in_tx(
             tx,
@@ -2289,6 +2362,7 @@ pub(super) async fn write_command_batch_as_set(
                 &item.command_type,
                 needed_subjects,
                 &mut resolved,
+                Some(generation),
                 key_service,
             )
             .await?;
@@ -2955,6 +3029,7 @@ pub(super) async fn commit_command_batch_per_command(
     bounded_context_name: &str,
     locked_highest: i64,
     sync_projections: &[String],
+    generation: &ContextGeneration,
     batch: Vec<BatchedCommand>,
     slow: Option<&crate::slow_command::SlowCommandWarnings>,
     payload_limits: &crate::payload_limits::PayloadLimits,
@@ -2977,6 +3052,11 @@ pub(super) async fn commit_command_batch_per_command(
     let batch_len = batch.len();
 
     for (idx, item) in batch.into_iter().enumerate() {
+        // As in the set path: refused alone, taking no sequence number.
+        if stale_generation(&item, generation) {
+            results.push(Err(crate::error::Error::row_not_found()));
+            continue;
+        }
         // Not inside a `SAVEPOINT`: `decide_command_in_tx` only reads (on
         // `tx`, since it runs under the batch's lock - docs/architecture.md
         // §117), and a failing read means the connection itself is in
@@ -3074,6 +3154,7 @@ pub(super) async fn commit_command_batch_per_command(
             sequences,
             decided,
             item.resolved,
+            Some(generation),
             payload_limits,
         )
         .await;

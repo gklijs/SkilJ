@@ -344,6 +344,15 @@ pub async fn fire_system_event(
     now: Timestamp,
     key_service: Option<&KeyService>,
 ) -> crate::error::Result<Option<Event>> {
+    // The lifetime the event type, its schedule and the keys below are
+    // read in (docs/architecture.md §230). A bounded context deleted since
+    // is gone, and one created again under its name has a schedule of its
+    // own: neither gets this occurrence.
+    let generation = match context_generation(pool, bounded_context).await {
+        Ok(generation) => generation,
+        Err(crate::error::Error::Database(sqlx::Error::RowNotFound)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
     let Some(unlocked_event_type) = get_event_type(pool, bounded_context, event_type_name).await?
     else {
         return Ok(None);
@@ -353,9 +362,10 @@ pub async fn fire_system_event(
     };
 
     let mut resolved = std::collections::HashMap::new();
-    resolve_encryption_keys(
+    resolve_encryption_keys_in(
         pool,
         bounded_context,
+        &mut Some(generation.clone()),
         &unlocked_event_type.sensitive_fields,
         &payload,
         key_service,
@@ -365,6 +375,14 @@ pub async fn fire_system_event(
 
     let schema = schema_ident(bounded_context);
     let mut tx = pool.begin().await?;
+    // Checked at the transaction's entry, before the event type's row and
+    // the sequence are locked or the keys above are used: a stale
+    // occurrence is not fired.
+    match lock_expected_generation(&mut tx, bounded_context, &generation).await {
+        Ok(()) => {}
+        Err(crate::error::Error::Database(sqlx::Error::RowNotFound)) => return Ok(None),
+        Err(err) => return Err(err),
+    }
     let row: Option<EventTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = $1 FOR UPDATE"
     )))

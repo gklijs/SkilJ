@@ -5,8 +5,8 @@
 //! retirement and the deletion of a key no bounded context uses any more.
 
 use super::{
-    get_bounded_context, get_event_type, insert_event, next_sequence,
-    require_admin_bounded_context, schema_ident, upsert_event_type, version_column, Pool,
+    get_event_type, insert_event, next_sequence, require_admin_bounded_context, schema_ident,
+    upsert_event_type, version_column, Pool,
 };
 use crate::encryption::provider::{KeyProvider, WrappedDataKey};
 use crate::encryption::trail::{
@@ -221,6 +221,62 @@ pub async fn rotate_master_key(
     actor_role_id: Option<&str>,
     due: Option<jiff::SignedDuration>,
 ) -> crate::error::Result<Option<u32>> {
+    rotate_master_key_inner(
+        pool,
+        provider,
+        key,
+        rotation,
+        retire_immediately,
+        actor_role_id,
+        due,
+        None,
+    )
+    .await
+}
+
+/// [`rotate_master_key`] for the key `bounded_context` uses, chosen from
+/// what the caller read of it: `key` is the bounded context's own key, or
+/// `None` for the default key it shares. Under the key's lock the
+/// bounded context is read again, and the rotation is refused with the
+/// missing-row error when it is gone or no longer uses that key - a
+/// context deleted between the caller's read and the rotation must not
+/// turn into a rotation of the default key.
+#[tracing::instrument(skip_all, fields(provider = %provider.name()))]
+pub async fn rotate_master_key_for_bounded_context(
+    pool: &Pool,
+    provider: &dyn KeyProvider,
+    bounded_context: &str,
+    key: Option<&str>,
+    retire_immediately: bool,
+    actor_role_id: Option<&str>,
+) -> crate::error::Result<Option<u32>> {
+    rotate_master_key_inner(
+        pool,
+        provider,
+        key,
+        Rotation::Rotate(RotationReason::Requested),
+        retire_immediately,
+        actor_role_id,
+        None,
+        Some(bounded_context),
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the public wrappers pass what each caller knows; a struct would only rename them"
+)]
+async fn rotate_master_key_inner(
+    pool: &Pool,
+    provider: &dyn KeyProvider,
+    key: Option<&str>,
+    rotation: Rotation,
+    retire_immediately: bool,
+    actor_role_id: Option<&str>,
+    due: Option<jiff::SignedDuration>,
+    for_bounded_context: Option<&str>,
+) -> crate::error::Result<Option<u32>> {
     let admin = require_admin_bounded_context(pool).await?;
     // Recording runs at every check, on every instance, for every key: the
     // provider is asked first, with no lock held, and nothing is locked at
@@ -241,6 +297,26 @@ pub async fn rotate_master_key(
     let mut tx = pool.begin().await?;
     lock_key(&mut tx, provider.name()).await?;
     let current = locked_state(&mut tx, provider.name()).await?;
+    // A context-scoped rotation goes on only while the bounded context is
+    // there and still uses the key it was chosen for: a context deleted
+    // since the caller read it never rotates the default key.
+    if let Some(bounded_context) = for_bounded_context {
+        let still = existing_bounded_context_key(&mut *tx, bounded_context).await?;
+        if still.as_deref() != key {
+            return Err(crate::error::Error::row_not_found());
+        }
+    }
+    // A bounded-context key's state row is made by the assignment, and
+    // removed with the key: a check or a scheduled rotation that went on
+    // from what it read before another instance deleted the key must not
+    // make the row again. A rotation someone asked for is refused rather
+    // than answered as if it had been done.
+    if key.is_some() && current.is_none() {
+        return match (rotation, due) {
+            (Rotation::Rotate(_), None) => Err(crate::error::Error::row_not_found()),
+            _ => Ok(None),
+        };
+    }
     let now = Timestamp::now();
     if let (Some(every), Some(state)) = (due, &current) {
         if state.rewrapped_at.is_none() || state.rotated_at + every > now {
@@ -432,18 +508,61 @@ pub async fn bounded_context_key<'e>(
     )
 }
 
-/// Whether skilj keeps state for the key named `provider` - false once it
-/// was deleted.
-pub(super) async fn key_recorded<'e>(
+/// `bounded_context`'s generation and own key (`None` for the default
+/// key), read together; the missing-row error when there is no such
+/// bounded context.
+pub(super) async fn bounded_context_key_and_generation<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<(super::ContextGeneration, Option<String>)> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT c.generation::TEXT, a.key FROM bounded_contexts c \
+         LEFT JOIN encryption_key_assignments a ON a.bounded_context = c.name \
+         WHERE c.name = $1",
+    )
+    .bind(bounded_context)
+    .fetch_optional(executor)
+    .await?;
+    let (generation, key) = row.ok_or_else(crate::error::Error::row_not_found)?;
+    Ok((super::ContextGeneration::from_column(generation), key))
+}
+
+/// The incarnation of the state row of the key named `provider`: a value
+/// the row gets when it is inserted and keeps until the key is deleted, so
+/// a key deleted and recorded again under the same name has another one.
+/// `None` when skilj keeps no state for it - before the default key's
+/// first recording, or once a bounded-context key was deleted.
+pub(super) async fn key_incarnation<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     provider: &str,
-) -> crate::error::Result<bool> {
+) -> crate::error::Result<Option<String>> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM encryption_master_keys WHERE provider = $1)",
+        "SELECT incarnation::TEXT FROM encryption_master_keys WHERE provider = $1",
     )
     .bind(provider)
-    .fetch_one(executor)
+    .fetch_optional(executor)
     .await?)
+}
+
+/// The incarnation and the lowest version not retired of the key named
+/// `provider`, its state row taken `FOR SHARE` until the caller's
+/// transaction ends: a retirement or a deletion of the key, which take the
+/// row `FOR UPDATE` under the key's lock, waits for it, and one that came
+/// first is seen. `None` when skilj keeps no state for the key.
+pub(super) async fn lock_key_state_for_wrap(
+    conn: &mut sqlx::PgConnection,
+    provider: &str,
+) -> crate::error::Result<Option<(String, u32)>> {
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "SELECT incarnation::TEXT, retired_below FROM encryption_master_keys \
+         WHERE provider = $1 FOR SHARE",
+    )
+    .bind(provider)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(|(incarnation, retired_below)| {
+        (incarnation, u32::try_from(retired_below).unwrap_or(0))
+    }))
 }
 
 /// Every bounded context with a key of its own, by its key's name.
@@ -474,9 +593,9 @@ pub async fn assign_encryption_key(
     create: bool,
     actor_role_id: Option<&str>,
 ) -> crate::error::Result<MasterKeyState> {
-    get_bounded_context(pool, bounded_context)
-        .await?
-        .ok_or_else(crate::error::Error::row_not_found)?;
+    // The lifetime this assignment is for, read before the provider is
+    // called: the transaction below refuses another one.
+    let generation = super::context_generation(pool, bounded_context).await?;
     let provider = key_service.provider_for(key)?;
     // A key with the default key's own name - Vault's default key `skilj`,
     // assigned as `skilj` - would be the default key under two lifecycles.
@@ -500,6 +619,21 @@ pub async fn assign_encryption_key(
     let versions = provider.versions().await?;
     let admin = require_admin_bounded_context(pool).await?;
     let mut tx = pool.begin().await?;
+    // The bounded context's row first, `FOR KEY SHARE` - as every writer
+    // takes it, before the key's lock (docs/architecture.md §230): its
+    // deletion waits for this transaction, and one that came first, or a
+    // context created again under the name since, is seen here.
+    let parent_current = match super::lock_context_generation(&mut tx, bounded_context).await {
+        Ok(current) => current == generation,
+        Err(crate::error::Error::Database(sqlx::Error::RowNotFound)) => false,
+        Err(err) => return Err(err),
+    };
+    // A request that lost its bounded context records nothing - unless it
+    // created a key at the provider, which stays recorded as skilj's so
+    // the tick deletes it like any key no bounded context uses.
+    if !parent_current && !created {
+        return Err(crate::error::Error::row_not_found());
+    }
     // The key's first recording and the assignment are one transaction,
     // under the key's lock: a check must never see the key's state without
     // its assignment - an unused key, to be deleted (docs/architecture.md
@@ -510,13 +644,14 @@ pub async fn assign_encryption_key(
         sqlx::query(
             "INSERT INTO encryption_master_keys \
              (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \
-              retired_below) VALUES ($1, $2, $3, $4, false, NULL, $5)",
+              retired_below, created_by_skilj) VALUES ($1, $2, $3, $4, false, NULL, $5, $6)",
         )
         .bind(provider.name())
         .bind(key)
         .bind(version_column(versions.latest)?)
         .bind(Timestamp::now().to_sqlx())
         .bind(version_column(versions.min_decryption)?)
+        .bind(created)
         .execute(&mut *tx)
         .await?;
         record(
@@ -532,6 +667,19 @@ pub async fn assign_encryption_key(
             ),
         )
         .await?;
+    }
+    if !parent_current {
+        // No assignment and no `EncryptionKeyAssigned`: only the key this
+        // call created, recorded as skilj's (above, or on the row another
+        // assignment recorded meanwhile).
+        sqlx::query(
+            "UPDATE encryption_master_keys SET created_by_skilj = true WHERE provider = $1",
+        )
+        .bind(provider.name())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Err(crate::error::Error::row_not_found());
     }
     let previous: Option<String> = sqlx::query_scalar(
         "SELECT provider FROM encryption_key_assignments WHERE bounded_context = $1 FOR UPDATE",
@@ -589,36 +737,85 @@ pub async fn assign_encryption_key(
         .ok_or_else(crate::error::Error::row_not_found)
 }
 
-/// Forgets the assignments of bounded contexts that no longer exist.
+/// Does nothing, and is kept so callers still compile: an assignment is
+/// removed by the database with its bounded context (a foreign key with
+/// `ON DELETE CASCADE`), in the deleting transaction, so there is nothing
+/// left to forget afterwards.
+#[deprecated(note = "assignments are removed with their bounded context by the database")]
+#[allow(
+    clippy::unused_async,
+    reason = "the signature of a public function is kept"
+)]
 pub async fn forget_assignments_of_deleted_contexts(
-    pool: &Pool,
-    existing: &BTreeSet<String>,
+    _pool: &Pool,
+    _existing: &BTreeSet<String>,
 ) -> crate::error::Result<()> {
-    for bounded_context in encryption_key_assignments(pool).await?.into_keys() {
-        if !existing.contains(&bounded_context) {
-            sqlx::query("DELETE FROM encryption_key_assignments WHERE bounded_context = $1")
-                .bind(&bounded_context)
-                .execute(pool)
-                .await?;
-        }
-    }
     Ok(())
 }
 
+/// The key `bounded_context` has of its own, `None` when it uses the
+/// default key, read together with the bounded context: a name that is no
+/// bounded context is the missing-row error, never read as one without a
+/// key of its own.
+pub async fn existing_bounded_context_key<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<Option<String>> {
+    let row: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT a.key FROM bounded_contexts c \
+         LEFT JOIN encryption_key_assignments a ON a.bounded_context = c.name \
+         WHERE c.name = $1",
+    )
+    .bind(bounded_context)
+    .fetch_optional(executor)
+    .await?;
+    row.ok_or_else(crate::error::Error::row_not_found)
+}
+
+/// The bounded contexts whose key assignment is older than the bounded
+/// context itself (`assigned_at` before `created_at`), by name. Migration
+/// 0011 keeps such an assignment rather than guess: it may have been made
+/// for a deleted bounded context of the same name, before assignments were
+/// removed with their context, or the clocks of two instances may simply
+/// disagree. Startup warns about each one and the preflight report lists
+/// them, for an operator to check against the `EncryptionKeyAssigned`
+/// history (docs/architecture.md §230). Assigning the bounded context a
+/// key again - its own or the default - replaces the assignment and ends
+/// the warning.
+pub async fn encryption_key_assignments_predating_context<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+) -> crate::error::Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT a.bounded_context FROM encryption_key_assignments a \
+         JOIN bounded_contexts c ON c.name = a.bounded_context \
+         WHERE a.assigned_at < c.created_at ORDER BY a.bounded_context",
+    )
+    .fetch_all(executor)
+    .await?)
+}
+
 /// Sets when an unused bounded-context key is deleted, if not set yet.
+/// Under the key's lock, which an assignment takes too, and only while no
+/// bounded context is assigned the key: a grace period starts from when
+/// the key stopped being used, never while it is (docs/architecture.md
+/// §230).
 pub async fn schedule_key_deletion(
     pool: &Pool,
     provider: &str,
     at: Timestamp,
 ) -> crate::error::Result<()> {
+    let mut tx = pool.begin().await?;
+    lock_key(&mut tx, provider).await?;
     sqlx::query(
         "UPDATE encryption_master_keys SET delete_after = $2 \
-         WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL",
+         WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM encryption_key_assignments WHERE provider = $1)",
     )
     .bind(provider)
     .bind(at.to_sqlx())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1034,6 +1231,43 @@ async fn key_in_use_on(
     Ok(false)
 }
 
+/// Whether a rewrap of `bounded_context` towards `target` still has a
+/// purpose: the bounded context is there - with the generation `expected`,
+/// when given - and `target` is still the key it uses, its own or the
+/// default. Answers the generation it has, `None` when not. With `lock`,
+/// in the transaction storing a batch, the bounded context's row is taken
+/// `FOR KEY SHARE` (see [`super::lock_context_generation`]): its deletion
+/// waits for the batch. An assignment committed after this check leaves
+/// the batch's data keys behind the new key, which marks its rewrap
+/// pending, and the next check moves them like any other.
+async fn rewrap_still_wanted(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+    key_service: &KeyService,
+    target: &str,
+    expected: Option<&super::ContextGeneration>,
+    lock: bool,
+) -> crate::error::Result<Option<super::ContextGeneration>> {
+    let current = if lock {
+        super::lock_context_generation(&mut *conn, bounded_context).await
+    } else {
+        super::context_generation(&mut *conn, bounded_context).await
+    };
+    let current = match current {
+        Ok(current) => current,
+        Err(crate::error::Error::Database(sqlx::Error::RowNotFound)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if expected.is_some_and(|expected| expected != &current) {
+        return Ok(None);
+    }
+    let key = bounded_context_key(&mut *conn, bounded_context).await?;
+    if key_service.provider_for(key.as_deref())?.name() != target {
+        return Ok(None);
+    }
+    Ok(Some(current))
+}
+
 /// What [`rewrap_data_keys`] did in one bounded context.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RewrapOutcome {
@@ -1045,6 +1279,10 @@ pub struct RewrapOutcome {
     /// the rewrap nor the retirement.
     pub unreadable: u64,
 }
+
+/// How many times in a row a rewrap batch is made again because its wraps
+/// came out under a version retired meanwhile, before the run fails.
+const STALE_VERSION_RETRIES: u32 = 5;
 
 /// How many data keys one rewrap batch covers.
 const REWRAP_BATCH: i64 = 200;
@@ -1213,8 +1451,51 @@ pub async fn rewrap_data_keys(
         )
     };
     let mut outcome = RewrapOutcome::default();
+    // What the run is for, read before any provider call: the bounded
+    // context's lifetime, which must still use `target`, and the target's
+    // state row. A context deleted, created again, or given another key
+    // since the caller chose `target` is left alone: the next check
+    // rewraps it towards the key it has then (docs/architecture.md §230).
+    let Some(generation) = rewrap_still_wanted(
+        &mut *pool.acquire().await?,
+        bounded_context,
+        key_service,
+        &target_name,
+        None,
+        false,
+    )
+    .await?
+    else {
+        return Ok(outcome);
+    };
+    let incarnation = key_incarnation(pool, &target_name).await?;
     let mut after = 0i64;
+    // Batches made again because their wraps came out under a version
+    // retired meanwhile: bounded, so a provider that keeps answering
+    // under a retired version fails the run instead of looping.
+    let mut stale_versions = 0;
     loop {
+        // Again before each batch is read, so no provider is asked to
+        // rewrap a batch nothing would store.
+        if rewrap_still_wanted(
+            &mut *pool.acquire().await?,
+            bounded_context,
+            key_service,
+            &target_name,
+            Some(&generation),
+            false,
+        )
+        .await?
+        .is_none()
+        {
+            if outcome != RewrapOutcome::default() {
+                let mut tx = pool.begin().await?;
+                record(&mut tx, &admin, event(outcome)).await?;
+                tx.commit().await?;
+            }
+            break;
+        }
+        let batch_start = after;
         let rows: Vec<RewrapRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT id, wrapped_key, wrap_nonce, key_provider, master_key_version \
              FROM {schema}.encryption_keys WHERE {behind_filter} AND id > $4 \
@@ -1321,18 +1602,63 @@ pub async fn rewrap_data_keys(
         }
 
         let mut tx = pool.begin().await?;
-        let target_kept: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM encryption_master_keys WHERE provider = $1 FOR SHARE)",
+        // The bounded context's row first, as every writer takes it, then
+        // the target's state row, then the data keys.
+        if rewrap_still_wanted(
+            &mut tx,
+            bounded_context,
+            key_service,
+            &target_name,
+            Some(&generation),
+            true,
         )
-        .bind(&target_name)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !target_kept {
+        .await?
+        .is_none()
+        {
+            tx.rollback().await?;
+            after = batch_start;
+            continue;
+        }
+        // `FOR SHARE`: a deletion or retirement of the key waits for this
+        // batch, and one that came first is seen.
+        let Some((kept_incarnation, retired_below)) =
+            lock_key_state_for_wrap(&mut tx, &target_name).await?
+        else {
             return Err(encryption::Error::ProviderRefused {
                 provider: target_name.clone(),
                 message: "the key was deleted while its data keys were being rewrapped".into(),
             }
             .into());
+        };
+        if incarnation
+            .as_ref()
+            .is_some_and(|read| read != &kept_incarnation)
+        {
+            return Err(encryption::Error::ProviderRefused {
+                provider: target_name.clone(),
+                message: "the key was deleted and created again while its data keys were being \
+                          rewrapped"
+                    .into(),
+            }
+            .into());
+        }
+        // Wrapped under a version retired meanwhile: rewrapped again from
+        // a fresh read rather than stored unreadable.
+        if done.iter().any(|(_, _, w)| w.version < retired_below) {
+            tx.rollback().await?;
+            stale_versions += 1;
+            if stale_versions >= STALE_VERSION_RETRIES {
+                return Err(encryption::Error::ProviderRefused {
+                    provider: target_name.clone(),
+                    message: format!(
+                        "wrapped under a version below {retired_below}, which is retired, \
+                         {STALE_VERSION_RETRIES} times in a row"
+                    ),
+                }
+                .into());
+            }
+            after = batch_start;
+            continue;
         }
         if !done.is_empty() {
             let ids: Vec<i64> = done.iter().map(|(id, _, _)| *id).collect();
@@ -1388,6 +1714,7 @@ pub async fn rewrap_data_keys(
             record(&mut tx, &admin, event(outcome)).await?;
         }
         tx.commit().await?;
+        stale_versions = 0;
         if !more {
             break;
         }

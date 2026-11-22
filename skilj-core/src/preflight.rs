@@ -206,6 +206,13 @@ pub struct PreflightReport {
     pub registrations: Vec<RegistrationOutcome>,
     /// Checks that could not be answered, and why.
     pub unknown: Vec<Unknown>,
+    /// Bounded contexts whose encryption key assignment is older than the
+    /// bounded context itself, which migration 0011 keeps and startup
+    /// warns about until the bounded context is assigned a key again: one
+    /// may have been made for a deleted bounded context of the same name
+    /// (docs/architecture.md §230). Changes nothing about the verdict.
+    #[serde(default)]
+    pub key_assignments_to_check: Vec<String>,
 }
 
 impl PreflightReport {
@@ -719,6 +726,13 @@ impl fmt::Display for PreflightReport {
         }
         for u in &self.unknown {
             writeln!(f, "  not checked: {} - {}", u.check, u.reason)?;
+        }
+        for name in &self.key_assignments_to_check {
+            writeln!(
+                f,
+                "  bounded context {name}: its encryption key assignment is older than it; \
+                 check it against EncryptionKeyAssigned, and assign a key again to clear this"
+            )?;
         }
         Ok(())
     }

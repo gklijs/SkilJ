@@ -323,7 +323,7 @@
       "file": "<registry>/tracing-0.1.44/src/macros.rs",
       "message": "call to associated function `tracing::level_filters::LevelFilter::current` which can panic",
       "source": "&& $lvl <= $crate::level_filters::LevelFilter::current()",
-      "count": 137
+      "count": 141
     },
     {
       "file": "<registry>/tracing-0.1.44/src/macros.rs",
@@ -641,7 +641,7 @@
       "file": "<rust>/library/core/src/macros/mod.rs",
       "message": "call to method `std::fmt::Formatter::<'a>::write_fmt` which can panic",
       "source": "$dst.write_fmt($crate::format_args_nl!($($arg)*))",
-      "count": 24
+      "count": 25
     },
     {
       "file": "<rust>/library/core/src/mem/mod.rs",
@@ -663,7 +663,7 @@
     },
     {
       "file": "<rust>/library/core/src/option.rs",
-      "message": "call to drop of `{closure@skilj-core/src/db/contexts.rs:255:14: 255:24}` which can panic",
+      "message": "call to drop of `{closure@skilj-core/src/db/contexts.rs:346:14: 346:24}` which can panic",
       "source": "}",
       "count": 1
     },
@@ -2141,7 +2141,7 @@
       "file": "skilj-core/src/db/access.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".execute(&mut *tx)",
-      "count": 4
+      "count": 5
     },
     {
       "file": "skilj-core/src/db/access.rs",
@@ -2327,7 +2327,7 @@
       "file": "skilj-core/src/db/access.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 9
+      "count": 10
     },
     {
       "file": "skilj-core/src/db/access.rs",
@@ -2476,6 +2476,12 @@
     {
       "file": "skilj-core/src/db/access.rs",
       "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query( \"SELECT 1 FROM role_access_mappings WHERE role_id = $1 AND status = 'active' \\ ORDER BY bounded_context FOR UPDATE\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/access.rs",
+      "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(\"SELECT pg_advisory_xact_lock(hashtext('skilj_admin_events_origin_kind'))\")",
       "count": 1
     },
@@ -2519,7 +2525,7 @@
       "file": "skilj-core/src/db/access.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": ".execute(&mut *tx)",
-      "count": 4
+      "count": 5
     },
     {
       "file": "skilj-core/src/db/access.rs",
@@ -2705,6 +2711,12 @@
       "file": "skilj-core/src/db/access.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "let done = sqlx::query( \"UPDATE role_access_mappings SET status = 'revoked', revoked_at = $1 \\ WHERE role_id = $2 AND bounded_context = $3 AND status = 'active'\", ) .bind(revoked_at.to_sqlx()) .bind(role_id) .bind(bounded_context)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/access.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"SELECT 1 FROM role_access_mappings WHERE role_id = $1 AND status = 'active' \\ ORDER BY bounded_context FOR UPDATE\", ) .bind(&role.id)",
       "count": 1
     },
     {
@@ -3423,13 +3435,13 @@
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:1419:1: 1419:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:1427:1: 1427:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/approvals.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:698:1: 698:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/approvals.rs:706:1: 706:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -3779,6 +3791,12 @@
       "file": "skilj-core/src/db/approvals.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "check_blob_claims(&mut tx, bounded_context_name, &blob_claims).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/approvals.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "lock_expected_generation(&mut tx, bounded_context_name, generation).await?;",
       "count": 1
     },
     {
@@ -4553,12 +4571,24 @@
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to drop of `error::Error` which can panic",
       "source": "}",
-      "count": 3
+      "count": 4
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to drop of `error::Error` which can panic",
       "source": "})?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to drop of `event_store::BoundedContext` which can panic",
+      "source": ")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to drop of `event_store::BoundedContext` which can panic",
+      "source": "}",
       "count": 1
     },
     {
@@ -4593,7 +4623,7 @@
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
-      "message": "call to drop of `sqlx::Error` which can panic",
+      "message": "call to drop of `sqlx::Transaction<'_, sqlx::Postgres>` which can panic",
       "source": "}",
       "count": 1
     },
@@ -4619,13 +4649,25 @@
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".bind(now.to_sqlx())",
-      "count": 8
+      "count": 7
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": ".bind(now.to_sqlx());",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".execute(&mut **tx)",
       "count": 3
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
+      "source": "insert.execute(&mut *tx).await?;",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
@@ -4809,8 +4851,20 @@
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to drop of `{async fn body of sqlx::Pool<sqlx::Postgres>::begin()}` which can panic",
+      "source": "let mut tx = pool.begin().await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
       "message": "call to drop of `{async fn body of sqlx::RawSql::execute<'_, &sqlx::Pool<sqlx::Postgres>, sqlx::Postgres>()}` which can panic",
       "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::commit()}` which can panic",
+      "source": "tx.commit().await?;",
       "count": 1
     },
     {
@@ -4821,9 +4875,15 @@
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": "insert.execute(&mut *tx).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await;",
-      "count": 2
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
@@ -4836,6 +4896,12 @@
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
       "count": 4
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": "insert.execute(pool).await?;",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
@@ -4954,7 +5020,7 @@
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "let inserted = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" )))",
+      "source": "let insert = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" )))",
       "count": 1
     },
     {
@@ -5021,6 +5087,18 @@
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": ".fetch_one(&mut **tx)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "insert.execute(&mut *tx).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/blobs.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "lock_expected_generation(&mut tx, bounded_context, generation).await?;",
       "count": 1
     },
     {
@@ -5098,49 +5176,49 @@
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(&id)",
+      "source": "let insert = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(id)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(&id) .bind(&stored.sha256)",
+      "source": "let insert = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(id) .bind(&stored.sha256)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(&id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX))",
+      "source": "let insert = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX))",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(&id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type)",
+      "source": "let insert = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(&id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type) .bind(&stored.storage_key)",
+      "source": "let insert = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type) .bind(&stored.storage_key)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(&id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type) .bind(&stored.storage_key) .bind(subject_key)",
+      "source": "let insert = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type) .bind(&stored.storage_key) .bind(subject_key)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(&id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type) .bind(&stored.storage_key) .bind(subject_key) .bind(subject_value)",
+      "source": "let insert = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type) .bind(&stored.storage_key) .bind(subject_key) .bind(subject_value)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/blobs.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(&id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type) .bind(&stored.storage_key) .bind(subject_key) .bind(subject_value) .bind(now.to_sqlx())",
+      "source": "let insert = sqlx::query(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.blobs (id, sha256, size, media_type, storage_key, state, \\ subject_key, subject_value, created_at, grace_from) \\ VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8)\" ))) .bind(id) .bind(&stored.sha256) .bind(i64::try_from(size).unwrap_or(i64::MAX)) .bind(media_type) .bind(&stored.storage_key) .bind(subject_key) .bind(subject_value) .bind(now.to_sqlx());",
       "count": 1
     },
     {
@@ -5607,7 +5685,7 @@
     },
     {
       "file": "skilj-core/src/db/command_records.rs",
-      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::command_types::CommandTypeRow, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, db::command_types::CommandTypeRow, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
       "count": 1
     },
@@ -6490,7 +6568,7 @@
     {
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to drop of `shared::CommandDecision` which can panic",
-      "source": ") -> crate::error::Result<SubmitCommandOutcome> { let bounded_context_name = command_type.bounded_context.name.clone(); // issue #32: a pre-lock warm-up for the common, no-DCB-conflict // path - mirrors `create_and_insert_external_event`/ // `create_and_insert_direct_event`'s own \"resolve encryption keys // before opening the transaction\" shape, extended here to event-type // lookups too. See `warm_up_event_types_and_encryption_keys`'s own // doc comment for why this is always safe, never just an // optimisation this function's own correctness depends on. let (event_types_by_name, resolved) = warm_up_event_types_and_encryption_keys( pool, &bounded_context_name, command_type, payload, &initial_decision, key_service, ) .await?; let mut tx = pool.begin().await?; let (locked_highest, limits) = lock_bounded_context_sequence_with_limits(&mut tx, &bounded_context_name).await?; let payload_limits = limits.apply(projection_dispatcher.payload_limits()); // Fetched once for the whole submission, not once per event ( // issue #32) - and only now, after the lock above is already held, // which is what keeps this read race-free against // `promote_projection_rebuild` (see // `insert_event_and_update_sync_projections_in_tx`'s own doc comment). let sync_projections = sync_projection_names(&mut tx, &bounded_context_name).await?; let outcome = submit_one_command_in_tx( &mut tx, dispatcher, projection_dispatcher, command_type, payload, client_id, correlation_id, causation_id, bounded_context_events, consistency_tags, matching_events, initial_decision, key_service, now, snapshot, snapshot_states, idempotency_key, locked_highest, &sync_projections, &[], event_types_by_name, resolved, covered_through, context, &payload_limits, ) .await?; tx.commit().await?; broadcast_appended_events(pool, broadcaster, event_cache, &outcome).await; Ok(outcome) }",
+      "source": ") -> crate::error::Result<SubmitCommandOutcome> { let bounded_context_name = command_type.bounded_context.name.clone(); // issue #32: a pre-lock warm-up for the common, no-DCB-conflict // path - mirrors `create_and_insert_external_event`/ // `create_and_insert_direct_event`'s own \"resolve encryption keys // before opening the transaction\" shape, extended here to event-type // lookups too. See `warm_up_event_types_and_encryption_keys`'s own // doc comment for why this is always safe, never just an // optimisation this function's own correctness depends on. let (event_types_by_name, resolved, generation) = warm_up_event_types_and_encryption_keys( pool, &bounded_context_name, command_type, payload, &initial_decision, key_service, ) .await?; let mut tx = pool.begin().await?; // Keys warmed up above belong to the bounded context's lifetime they // were read in: refused before the lock if it was deleted, or created // again, since (docs/architecture.md §230). if let Some(generation) = &generation { lock_expected_generation(&mut tx, &bounded_context_name, generation).await?; } let (locked_highest, limits) = lock_bounded_context_sequence_with_limits(&mut tx, &bounded_context_name).await?; let payload_limits = limits.apply(projection_dispatcher.payload_limits()); // Fetched once for the whole submission, not once per event ( // issue #32) - and only now, after the lock above is already held, // which is what keeps this read race-free against // `promote_projection_rebuild` (see // `insert_event_and_update_sync_projections_in_tx`'s own doc comment). let sync_projections = sync_projection_names(&mut tx, &bounded_context_name).await?; let outcome = submit_one_command_in_tx( &mut tx, dispatcher, projection_dispatcher, command_type, payload, client_id, correlation_id, causation_id, bounded_context_events, consistency_tags, matching_events, initial_decision, key_service, now, snapshot, snapshot_states, idempotency_key, locked_highest, &sync_projections, &[], event_types_by_name, resolved, generation.as_ref(), covered_through, context, &payload_limits, ) .await?; tx.commit().await?; broadcast_appended_events(pool, broadcaster, event_cache, &outcome).await; Ok(outcome) }",
       "count": 1
     },
     {
@@ -6509,7 +6587,7 @@
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to drop of `sqlx::Transaction<'_, sqlx::Postgres>` which can panic",
       "source": "}",
-      "count": 2
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/commands.rs",
@@ -6815,7 +6893,7 @@
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 12
+      "count": 13
     },
     {
       "file": "skilj-core/src/db/commands.rs",
@@ -6874,7 +6952,7 @@
     {
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to drop of `std::vec::Vec<(std::string::String, std::string::String)>` which can panic",
-      "source": ") -> crate::error::Result<()> { if !needed_subjects.is_empty() { let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?; for subject in needed_subjects { let provisioned = get_or_create_encryption_key_on( &mut *conn, command_type.bounded_context.clone(), &subject.0, &subject.1, key_service, ) .await?; resolved.insert(subject, provisioned); } } Ok(()) }",
+      "source": ") -> crate::error::Result<()> { if !needed_subjects.is_empty() { let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?; for subject in needed_subjects { let provisioned = get_or_create_encryption_key_on( &mut *conn, command_type.bounded_context.clone(), generation, &subject.0, &subject.1, key_service, ) .await?; resolved.insert(subject, provisioned); } } Ok(()) }",
       "count": 1
     },
     {
@@ -6898,7 +6976,7 @@
     {
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to drop of `std::vec::Vec<db::commands::BatchedCommand>` which can panic",
-      "source": ") -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> { // Per-phase wall-clock accumulators (issue #32, // round four investigation) - the batch-size histogram above already // ruled out \"batches aren't forming large enough to amortise\" as the // explanation for the flat ~27/s ceiling; this is the next // measurement, not more reasoning from round-trip counting alone: // which of decide/sequence-draw/persist actually eats the wall-clock // time inside the held lock. One log line per batch, greppable, same // zero-infra reasoning as the batch-size line above. let mut decide_total = std::time::Duration::ZERO; let mut sequence_total = std::time::Duration::ZERO; let mut persist_total = std::time::Duration::ZERO; let mut results = Vec::with_capacity(batch.len()); let mut extra_committed_events: Vec<Event> = Vec::new(); let mut sequence_pool = SequencePool::new(); let batch_len = batch.len(); for (idx, item) in batch.into_iter().enumerate() { // Not inside a `SAVEPOINT`: `decide_command_in_tx` only reads (on // `tx`, since it runs under the batch's lock - docs/architecture.md // §117), and a failing read means the connection itself is in // trouble, which no savepoint would contain. A decider's own // error is a Rust `Err`, not a statement, and stays per-command. let decide_started = std::time::Instant::now(); let context = crate::plugin::DecisionContext::at(item.now); let decide_result = decide_command_in_tx( tx, dispatcher, &item.command_type, &item.payload, &item.client_id, &item.bounded_context_events, &item.consistency_tags, &item.matching_events, item.initial_decision, item.snapshot.as_ref().map(|s| SnapshotContext { state_json: &s.state_json, as_of_sequence: s.as_of_sequence, }), &item.snapshot_states, item.idempotency_key.as_deref(), locked_highest, &extra_committed_events, item.event_types_by_name, item.covered_through, None, None, slow, &context, ) .await; decide_total += decide_started.elapsed(); let decided = match decide_result { Ok(DecideOutcome::Terminal(outcome)) => { results.push(Ok(outcome)); continue; } Ok(DecideOutcome::Accepted(decided)) => decided, Err(e) => { results.push(Err(e)); continue; } }; // Reserved against `tx` itself, not the `nested` `SAVEPOINT` // opened below - see `SequencePool`'s own doc comment for why // that's what lets a later command's failure recycle these // instead of burning a permanent gap. `refill_hint` is \"how many // commands (including this one) are still left to process\" - an // upper bound on how many single-event commands could still // share whatever this refill provisions. let refill_hint = (batch_len - idx) as i64; let sequence_started = std::time::Instant::now(); let sequence_result = sequence_pool .take( tx, bounded_context_name, decided.event_specs.len() as i64, refill_hint, ) .await; sequence_total += sequence_started.elapsed(); let sequences = match sequence_result { Ok(sequences) => sequences, Err(e) => { // A failure bumping `{schema}.sequence` on `tx` itself - // not a per-command problem any `SAVEPOINT` isolates, // since this call deliberately runs outside one. Same // treatment as a final `tx.commit()` failure below: // nothing in this batch is trustworthy from here, so // every command - this one and everything still // queued - gets the caller's own uniform `BatchFailed` // treatment instead of a partial `results`. return Err(e); } }; let persist_started = std::time::Instant::now(); let mut nested = tx.begin().await?; let outcome = finish_accepted_command_in_tx( &mut nested, projection_dispatcher, &item.command_type, &item.payload, &item.client_id, item.correlation_id.as_deref(), item.causation_id.as_deref(), key_service, item.now, item.idempotency_key.as_deref(), sync_projections, sequences, decided, item.resolved, payload_limits, ) .await; match outcome { Ok(outcome) => { // A failure of this savepoint statement itself (as with // `tx.begin()`/`nested.rollback()` below) means the shared // connection is unusable, not that this one command is bad, // so it deliberately aborts the whole batch: the // transaction can no longer be committed, and the earlier // commands' writes live only in it. Per-command failures // (`finish_accepted_command_in_tx` returning `Err`) are // the ones isolated by the savepoint - see the `Err` arm. // // Releases this command's own savepoint - its writes stay // in `tx`, visible to every subsequent command in this // same batch, but still no more durable than the rest of // `tx` until the one `tx.commit()` below succeeds. nested.commit().await?; persist_total += persist_started.elapsed(); sequence_pool.confirm_last_draw(); if let SubmitCommandOutcome::Accepted { ref events, .. } = outcome { extra_committed_events.extend(events.iter().cloned()); } results.push(Ok(outcome)); } Err(e) => { // `ROLLBACK TO SAVEPOINT`, awaited explicitly rather than // left to `nested`'s own `Drop` - both end up issuing the // same statement, but every subsequent command in this // loop shares `tx`'s one underlying connection, so the // rollback must be known-complete before the next // `tx.begin()` reuses it, not merely queued by a // fire-and-forget `Drop`. nested.rollback().await?; persist_total += persist_started.elapsed(); sequence_pool.return_last_draw(); results.push(Err(e)); } } } sequence_pool.shrink_back(tx, bounded_context_name).await?; Ok(( results, BatchPhaseTiming { as_set: false, decide: decide_total, sequence: sequence_total, persist: persist_total, }, )) }",
+      "source": ") -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> { // Per-phase wall-clock accumulators (issue #32, // round four investigation) - the batch-size histogram above already // ruled out \"batches aren't forming large enough to amortise\" as the // explanation for the flat ~27/s ceiling; this is the next // measurement, not more reasoning from round-trip counting alone: // which of decide/sequence-draw/persist actually eats the wall-clock // time inside the held lock. One log line per batch, greppable, same // zero-infra reasoning as the batch-size line above. let mut decide_total = std::time::Duration::ZERO; let mut sequence_total = std::time::Duration::ZERO; let mut persist_total = std::time::Duration::ZERO; let mut results = Vec::with_capacity(batch.len()); let mut extra_committed_events: Vec<Event> = Vec::new(); let mut sequence_pool = SequencePool::new(); let batch_len = batch.len(); for (idx, item) in batch.into_iter().enumerate() { // As in the set path: refused alone, taking no sequence number. if stale_generation(&item, generation) { results.push(Err(crate::error::Error::row_not_found())); continue; } // Not inside a `SAVEPOINT`: `decide_command_in_tx` only reads (on // `tx`, since it runs under the batch's lock - docs/architecture.md // §117), and a failing read means the connection itself is in // trouble, which no savepoint would contain. A decider's own // error is a Rust `Err`, not a statement, and stays per-command. let decide_started = std::time::Instant::now(); let context = crate::plugin::DecisionContext::at(item.now); let decide_result = decide_command_in_tx( tx, dispatcher, &item.command_type, &item.payload, &item.client_id, &item.bounded_context_events, &item.consistency_tags, &item.matching_events, item.initial_decision, item.snapshot.as_ref().map(|s| SnapshotContext { state_json: &s.state_json, as_of_sequence: s.as_of_sequence, }), &item.snapshot_states, item.idempotency_key.as_deref(), locked_highest, &extra_committed_events, item.event_types_by_name, item.covered_through, None, None, slow, &context, ) .await; decide_total += decide_started.elapsed(); let decided = match decide_result { Ok(DecideOutcome::Terminal(outcome)) => { results.push(Ok(outcome)); continue; } Ok(DecideOutcome::Accepted(decided)) => decided, Err(e) => { results.push(Err(e)); continue; } }; // Reserved against `tx` itself, not the `nested` `SAVEPOINT` // opened below - see `SequencePool`'s own doc comment for why // that's what lets a later command's failure recycle these // instead of burning a permanent gap. `refill_hint` is \"how many // commands (including this one) are still left to process\" - an // upper bound on how many single-event commands could still // share whatever this refill provisions. let refill_hint = (batch_len - idx) as i64; let sequence_started = std::time::Instant::now(); let sequence_result = sequence_pool .take( tx, bounded_context_name, decided.event_specs.len() as i64, refill_hint, ) .await; sequence_total += sequence_started.elapsed(); let sequences = match sequence_result { Ok(sequences) => sequences, Err(e) => { // A failure bumping `{schema}.sequence` on `tx` itself - // not a per-command problem any `SAVEPOINT` isolates, // since this call deliberately runs outside one. Same // treatment as a final `tx.commit()` failure below: // nothing in this batch is trustworthy from here, so // every command - this one and everything still // queued - gets the caller's own uniform `BatchFailed` // treatment instead of a partial `results`. return Err(e); } }; let persist_started = std::time::Instant::now(); let mut nested = tx.begin().await?; let outcome = finish_accepted_command_in_tx( &mut nested, projection_dispatcher, &item.command_type, &item.payload, &item.client_id, item.correlation_id.as_deref(), item.causation_id.as_deref(), key_service, item.now, item.idempotency_key.as_deref(), sync_projections, sequences, decided, item.resolved, Some(generation), payload_limits, ) .await; match outcome { Ok(outcome) => { // A failure of this savepoint statement itself (as with // `tx.begin()`/`nested.rollback()` below) means the shared // connection is unusable, not that this one command is bad, // so it deliberately aborts the whole batch: the // transaction can no longer be committed, and the earlier // commands' writes live only in it. Per-command failures // (`finish_accepted_command_in_tx` returning `Err`) are // the ones isolated by the savepoint - see the `Err` arm. // // Releases this command's own savepoint - its writes stay // in `tx`, visible to every subsequent command in this // same batch, but still no more durable than the rest of // `tx` until the one `tx.commit()` below succeeds. nested.commit().await?; persist_total += persist_started.elapsed(); sequence_pool.confirm_last_draw(); if let SubmitCommandOutcome::Accepted { ref events, .. } = outcome { extra_committed_events.extend(events.iter().cloned()); } results.push(Ok(outcome)); } Err(e) => { // `ROLLBACK TO SAVEPOINT`, awaited explicitly rather than // left to `nested`'s own `Drop` - both end up issuing the // same statement, but every subsequent command in this // loop shares `tx`'s one underlying connection, so the // rollback must be known-complete before the next // `tx.begin()` reuses it, not merely queued by a // fire-and-forget `Drop`. nested.rollback().await?; persist_total += persist_started.elapsed(); sequence_pool.return_last_draw(); results.push(Err(e)); } } } sequence_pool.shrink_back(tx, bounded_context_name).await?; Ok(( results, BatchPhaseTiming { as_set: false, decide: decide_total, sequence: sequence_total, persist: persist_total, }, )) }",
       "count": 1
     },
     {
@@ -7450,6 +7528,12 @@
     {
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "let generation = lock_context_generation(&mut tx, bounded_context_name).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "let sync_projections = sync_projection_names(&mut tx, &bounded_context_name).await?;",
       "count": 1
     },
@@ -7457,6 +7541,12 @@
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "let sync_projections = sync_projection_names(&mut tx, bounded_context_name).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "lock_expected_generation(&mut tx, &bounded_context_name, generation).await?;",
       "count": 1
     },
     {
@@ -8812,6 +8902,12 @@
     {
       "file": "skilj-core/src/db/commands.rs",
       "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "results.push(Err(crate::error::Error::row_not_found()));",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
       "source": "results.push(Err(e));",
       "count": 2
     },
@@ -8826,6 +8922,12 @@
       "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
       "source": "results.push(Ok(outcome));",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/commands.rs",
+      "message": "call to method `std::vec::Vec::<T, A>::push` which can panic",
+      "source": "results.push(Some(Err(crate::error::Error::row_not_found())));",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/commands.rs",
@@ -9609,6 +9711,12 @@
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to drop of `db::contexts::ContextGeneration` which can panic",
+      "source": "if &lock_context_generation(conn, bounded_context).await? != expected {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".bind(bc.created_at.to_sqlx())",
       "count": 1
@@ -9654,6 +9762,12 @@
       "message": "call to drop of `std::option::Option<std::boxed::Box<event_store::BoundedContext>>` which can panic",
       "source": "contexts_by_name.get_mut(&name).unwrap().template = Some(Box::new(template));",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
+      "source": "}",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
@@ -9711,19 +9825,19 @@
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:260:1: 260:55}>` which can panic",
-      "source": "#[tracing::instrument(skip_all, fields(name = %name))]",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/contexts.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:288:1: 288:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:32:1: 32:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:32:1: 32:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:351:1: 351:55}>` which can panic",
+      "source": "#[tracing::instrument(skip_all, fields(name = %name))]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/contexts.rs:379:1: 379:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -9771,6 +9885,18 @@
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
       "message": "call to function `sqlx::query_as` which can panic",
       "source": "let rows: Vec<BoundedContextRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT {BOUNDED_CONTEXT_COLUMNS} FROM bounded_contexts\" )))",
       "count": 1
@@ -9780,6 +9906,18 @@
       "message": "call to function `sqlx::query_as` which can panic",
       "source": "sqlx::query_as(\"SELECT name, dispatch_template FROM bounded_contexts\")",
       "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "let generation: Option<String> = sqlx::query_scalar( \"SELECT generation::TEXT FROM bounded_contexts WHERE name = $1 FOR KEY SHARE\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "sqlx::query_scalar(\"SELECT generation::TEXT FROM bounded_contexts WHERE name = $1\")",
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
@@ -9969,6 +10107,18 @@
     },
     {
       "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let generation: Option<String> = sqlx::query_scalar( \"SELECT generation::TEXT FROM bounded_contexts WHERE name = $1 FOR KEY SHARE\", ) .bind(bounded_context)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query_scalar(\"SELECT generation::TEXT FROM bounded_contexts WHERE name = $1\") .bind(bounded_context)",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
       "message": "call to method `std::collections::HashMap::<K, V, S, A>::get_mut` which can panic",
       "source": "contexts_by_name.get_mut(&name).unwrap().template = Some(Box::new(template));",
       "count": 1
@@ -9989,6 +10139,12 @@
       "file": "skilj-core/src/db/contexts.rs",
       "message": "call to method `std::collections::HashMap::<K, V, S, A>::into_values` which can panic",
       "source": "let mut contexts: Vec<BoundedContext> = contexts_by_name.into_values().collect();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/contexts.rs",
+      "message": "call to method `std::fmt::Formatter::<'a>::debug_tuple_field1_finish` which can panic",
+      "source": "#[derive(Debug, Clone, PartialEq, Eq)]",
       "count": 1
     },
     {
@@ -11344,6 +11500,12 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"INSERT INTO {schema}.encryption_keys \\",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "\"SELECT {ENCRYPTION_KEY_COLUMNS} FROM {schema}.encryption_keys \\",
       "count": 2
     },
@@ -11361,14 +11523,14 @@
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
-      "source": "\"WITH kept AS ({guard}) \\",
+      "message": "call to associated function `jiff::Timestamp::now` which can panic",
+      "source": ".bind(Timestamp::now().to_sqlx())",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to associated function `jiff::Timestamp::now` which can panic",
-      "source": "let now = Timestamp::now();",
+      "message": "call to associated function `std::boxed::Box::<T>::new` which can panic",
+      "source": "Some(row) => Stored::Inserted(Box::new(row)),",
       "count": 1
     },
     {
@@ -11405,19 +11567,19 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `db::encryption_keys::EncryptionKeyRow` which can panic",
       "source": "}",
-      "count": 3
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `db::encryption_keys::Held<'_>` which can panic",
-      "source": "!= key =>",
+      "source": "!= target.key =>",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `db::encryption_keys::Held<'_>` which can panic",
       "source": ".await?;",
-      "count": 2
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -11429,6 +11591,12 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `db::encryption_keys::Held<'_>` which can panic",
       "source": "master_key::register_known_keys(&mut *db.conn().await?, key_service).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to drop of `db::encryption_keys::Stored` which can panic",
+      "source": "}",
       "count": 1
     },
     {
@@ -11452,14 +11620,20 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `event_store::BoundedContext` which can panic",
-      "source": ") -> crate::error::Result<(EncryptionKey, i64, DataKey)> { provision_encryption_key(Db::Conn(conn), bc, subject_key, subject_value, key_service).await }",
+      "source": ")",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to drop of `event_store::BoundedContext` which can panic",
+      "source": ") -> crate::error::Result<(EncryptionKey, i64, DataKey)> { provision_encryption_key( Db::Conn(conn), bc, generation, subject_key, subject_value, key_service, ) .await }",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `event_store::BoundedContext` which can panic",
       "source": "}",
-      "count": 2
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -11482,13 +11656,7 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, db::encryption_keys::EncryptionKeyRow, sqlx::sqlx_postgres::PgArguments>` which can panic",
-      "source": ".bind(now.to_sqlx())",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, db::encryption_keys::EncryptionKeyRow, sqlx::sqlx_postgres::PgArguments>` which can panic",
-      "source": ".bind(provider.name())",
+      "source": ".bind(Timestamp::now().to_sqlx())",
       "count": 1
     },
     {
@@ -11499,8 +11667,8 @@
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, db::encryption_keys::EncryptionKeyRow, sqlx::sqlx_postgres::PgArguments>` which can panic",
-      "source": ".fetch_optional(&mut *db.conn().await?)",
+      "message": "call to drop of `std::boxed::Box<db::encryption_keys::EncryptionKeyRow>` which can panic",
+      "source": "Stored::Inserted(row) => return Ok((row.to_domain(bc), row.id, data_key)),",
       "count": 1
     },
     {
@@ -11512,7 +11680,7 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
-      "source": "};",
+      "source": "if master_key::bounded_context_key(&mut *conn, bounded_context).await? != target.key {",
       "count": 1
     },
     {
@@ -11547,8 +11715,14 @@
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to drop of `std::string::String` which can panic",
+      "source": "};",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `std::sync::Arc<dyn encryption::provider::KeyProvider>` which can panic",
-      "source": "let name = key_service.provider_for(Some(key))?.name().to_string();",
+      "source": "let name = key_service.provider_for(key.as_deref())?.name().to_string();",
       "count": 1
     },
     {
@@ -11559,19 +11733,7 @@
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:362:1: 362:77}>` which can panic",
-      "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:532:1: 532:77}>` which can panic",
-      "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/encryption_keys.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:77:1: 77:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/encryption_keys.rs:699:1: 699:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -11589,9 +11751,15 @@
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to drop of `{async fn body of sqlx::Pool<sqlx::Postgres>::begin()}` which can panic",
+      "source": "let mut tx = pool.begin().await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::commit()}` which can panic",
       "source": "tx.commit().await?;",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -11638,7 +11806,7 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to function `sqlx::query_as` which can panic",
-      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"WITH kept AS ({guard}) \\ INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ SELECT $1, $2, 'active', $3, $4, $5, $6 FROM kept \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" )))",
+      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ VALUES ($1, $2, 'active', $3, $4, $5, $6) \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" )))",
       "count": 1
     },
     {
@@ -11668,7 +11836,13 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `<T as std::string::ToString>::to_string` which can panic",
-      "source": "let name = key_service.provider_for(Some(key))?.name().to_string();",
+      "source": "let name = key_service.provider_for(key.as_deref())?.name().to_string();",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to method `<event_store::BoundedContext as std::clone::Clone>::clone` which can panic",
+      "source": "bc.clone(),",
       "count": 1
     },
     {
@@ -11686,7 +11860,19 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "&mut tx,",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": ".execute(&mut *tx)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "lock_expected_generation(&mut tx, bounded_context, &target.generation).await?;",
       "count": 1
     },
     {
@@ -11716,8 +11902,14 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `db::encryption_keys::EncryptionKeyRow::to_domain` which can panic",
+      "source": "Stored::Inserted(row) => return Ok((row.to_domain(bc), row.id, data_key)),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to method `db::encryption_keys::EncryptionKeyRow::to_domain` which can panic",
       "source": "return Ok((row.to_domain(bc), row.id, data_key));",
-      "count": 2
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
@@ -11728,13 +11920,13 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `encryption::service::KeyService::provider_for` which can panic",
-      "source": "let name = key_service.provider_for(Some(key))?.name().to_string();",
+      "source": "let name = key_service.provider_for(key.as_deref())?.name().to_string();",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `encryption::service::KeyService::provider_for` which can panic",
-      "source": "let provider = key_service.provider_for(key.as_deref())?;",
+      "source": "let provider = key_service.provider_for(target.key.as_deref())?;",
       "count": 1
     },
     {
@@ -11776,37 +11968,37 @@
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"WITH kept AS ({guard}) \\ INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ SELECT $1, $2, 'active', $3, $4, $5, $6 FROM kept \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key)",
+      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ VALUES ($1, $2, 'active', $3, $4, $5, $6) \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"WITH kept AS ({guard}) \\ INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ SELECT $1, $2, 'active', $3, $4, $5, $6 FROM kept \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value)",
+      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ VALUES ($1, $2, 'active', $3, $4, $5, $6) \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"WITH kept AS ({guard}) \\ INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ SELECT $1, $2, 'active', $3, $4, $5, $6 FROM kept \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value) .bind(now.to_sqlx())",
+      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ VALUES ($1, $2, 'active', $3, $4, $5, $6) \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value) .bind(Timestamp::now().to_sqlx())",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"WITH kept AS ({guard}) \\ INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ SELECT $1, $2, 'active', $3, $4, $5, $6 FROM kept \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value) .bind(now.to_sqlx()) .bind(&wrapped.ciphertext)",
+      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ VALUES ($1, $2, 'active', $3, $4, $5, $6) \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value) .bind(Timestamp::now().to_sqlx()) .bind(&wrapped.ciphertext)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"WITH kept AS ({guard}) \\ INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ SELECT $1, $2, 'active', $3, $4, $5, $6 FROM kept \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value) .bind(now.to_sqlx()) .bind(&wrapped.ciphertext) .bind(provider.name())",
+      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ VALUES ($1, $2, 'active', $3, $4, $5, $6) \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value) .bind(Timestamp::now().to_sqlx()) .bind(&wrapped.ciphertext) .bind(provider)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"WITH kept AS ({guard}) \\ INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ SELECT $1, $2, 'active', $3, $4, $5, $6 FROM kept \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value) .bind(now.to_sqlx()) .bind(&wrapped.ciphertext) .bind(provider.name()) .bind(version_column(wrapped.version)?)",
+      "source": "let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"INSERT INTO {schema}.encryption_keys \\ (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \\ master_key_version) \\ VALUES ($1, $2, 'active', $3, $4, $5, $6) \\ ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \\ RETURNING {ENCRYPTION_KEY_COLUMNS}\" ))) .bind(subject_key) .bind(subject_value) .bind(Timestamp::now().to_sqlx()) .bind(&wrapped.ciphertext) .bind(provider) .bind(version_column(wrapped.version)?)",
       "count": 1
     },
     {
@@ -11861,6 +12053,12 @@
       "file": "skilj-core/src/db/encryption_keys.rs",
       "message": "call to method `std::option::Option::<T>::expect` which can panic",
       "source": "let wrapped = row .wrapped_key .as_deref() .expect(\"an active encryption_keys row always still has its wrapped key\");",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/encryption_keys.rs",
+      "message": "call to method `std::option::Option::<T>::insert` which can panic",
+      "source": "None => generation.insert(context_generation(pool, bounded_context).await?),",
       "count": 1
     },
     {
@@ -11967,6 +12165,18 @@
     },
     {
       "file": "skilj-core/src/db/event_types.rs",
+      "message": "call to drop of `error::Error` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/event_types.rs",
+      "message": "call to drop of `error::Error` which can panic",
+      "source": "};",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/event_types.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ")",
       "count": 1
@@ -12000,6 +12210,12 @@
       "message": "call to drop of `sqlx::query::QueryAs<'_, sqlx::Postgres, db::event_types::EventTypeRow, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".fetch_optional(&mut *tx)",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/event_types.rs",
+      "message": "call to drop of `std::option::Option<db::contexts::ContextGeneration>` which can panic",
+      "source": ".await?;",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/event_types.rs",
@@ -12165,6 +12381,12 @@
     },
     {
       "file": "skilj-core/src/db/event_types.rs",
+      "message": "call to method `<db::contexts::ContextGeneration as std::clone::Clone>::clone` which can panic",
+      "source": "&mut Some(generation.clone()),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/event_types.rs",
       "message": "call to method `<event_store::BoundedContext as std::clone::Clone>::clone` which can panic",
       "source": ".map(|row| (row.name.clone(), row.into_domain(bc.clone())))",
       "count": 1
@@ -12209,6 +12431,12 @@
       "file": "skilj-core/src/db/event_types.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "let sync_projections = sync_projection_names(&mut tx, bounded_context).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/event_types.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "match lock_expected_generation(&mut tx, bounded_context, &generation).await {",
       "count": 1
     },
     {
@@ -12898,7 +13126,7 @@
     {
       "file": "skilj-core/src/db/events.rs",
       "message": "call to drop of `std::vec::Vec<db::events::ExternalEventBatchItem>` which can panic",
-      "source": "let created = async { let mut tx = pool.begin().await?; let (_, limits) = lock_bounded_context_sequence_with_limits(&mut tx, &bounded_context_name).await?; let payload_limits = limits.apply(projection_dispatcher.payload_limits()); // docs/architecture.md §209: tags are derived below, under the lock // a rotation holds - of the generation stored now. refresh_blind_generations(&mut tx, &bounded_context_name, blind).await?; // After the lock - see `create_and_insert_external_event`. let sync_projections = sync_projection_names(&mut tx, &bounded_context_name).await?; let mut outcomes = Vec::new(); let mut failed = false; for (item, result) in items.into_iter().zip(&results) { if result.is_some() { continue; } if failed && stop_at_first_failure { outcomes.push(Err(crate::error::Error::NotProcessed)); continue; } // Each item its own time, as if sent alone. let now = Timestamp::now(); let dedupe = item.dedupe.clone(); let mut savepoint = tx.begin().await?; let outcome = insert_external_event_in_tx( &mut savepoint, &schema, projection_dispatcher, adapter, item, dedupe.as_ref().map(ExternalEventBatchDedupe::as_dedupe), now, &resolved, &sync_projections, blind, &payload_limits, ) .await; match &outcome { Ok(CreateExternalEventOutcome::Created(_)) => savepoint.commit().await?, // A redelivery wrote nothing; a failure is undone alone. // Awaited, not left to `Drop`: the next item reuses the // connection. _ => savepoint.rollback().await?, } failed |= outcome.is_err(); outcomes.push(outcome); } tx.commit().await?; Ok::<_, crate::error::Error>(outcomes) }",
+      "source": "let created = async { let mut tx = pool.begin().await?; // Every item's keys were resolved in one lifetime of the bounded // context; a context deleted since fails the batch, before the lock // (docs/architecture.md §230). if let Some(generation) = &generation { lock_expected_generation(&mut tx, &bounded_context_name, generation).await?; } let (_, limits) = lock_bounded_context_sequence_with_limits(&mut tx, &bounded_context_name).await?; let payload_limits = limits.apply(projection_dispatcher.payload_limits()); // docs/architecture.md §209: tags are derived below, under the lock // a rotation holds - of the generation stored now. refresh_blind_generations(&mut tx, &bounded_context_name, blind).await?; // After the lock - see `create_and_insert_external_event`. let sync_projections = sync_projection_names(&mut tx, &bounded_context_name).await?; let mut outcomes = Vec::new(); let mut failed = false; for (item, result) in items.into_iter().zip(&results) { if result.is_some() { continue; } if failed && stop_at_first_failure { outcomes.push(Err(crate::error::Error::NotProcessed)); continue; } // Each item its own time, as if sent alone. let now = Timestamp::now(); let dedupe = item.dedupe.clone(); let mut savepoint = tx.begin().await?; let outcome = insert_external_event_in_tx( &mut savepoint, &schema, projection_dispatcher, adapter, item, dedupe.as_ref().map(ExternalEventBatchDedupe::as_dedupe), now, &resolved, &sync_projections, blind, &payload_limits, ) .await; match &outcome { Ok(CreateExternalEventOutcome::Created(_)) => savepoint.commit().await?, // A redelivery wrote nothing; a failure is undone alone. // Awaited, not left to `Drop`: the next item reuses the // connection. _ => savepoint.rollback().await?, } failed |= outcome.is_err(); outcomes.push(outcome); } tx.commit().await?; Ok::<_, crate::error::Error>(outcomes) }",
       "count": 1
     },
     {
@@ -13578,6 +13806,12 @@
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "let sync_projections = sync_projection_names(&mut tx, &event.bounded_context.name).await?;",
       "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/events.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "lock_expected_generation(&mut tx, &bounded_context_name, generation).await?;",
+      "count": 3
     },
     {
       "file": "skilj-core/src/db/events.rs",
@@ -14704,6 +14938,12 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
+      "source": "\"wrapped under a version below {retired_below}, which is retired, \\",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to associated function `core::fmt::rt::Argument::<'_>::new_display` which can panic",
       "source": "FROM {schema}.encryption_keys WHERE {behind_filter} AND id > $4 \\",
       "count": 1
     },
@@ -14799,6 +15039,18 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `db::contexts::ContextGeneration` which can panic",
+      "source": "Ok(current) => current == generation,",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `db::contexts::ContextGeneration` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `db::master_key::HeldLock` which can panic",
       "source": "lock.release(&name).await;",
       "count": 1
@@ -14841,8 +15093,8 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to drop of `event_store::BoundedContext` which can panic",
-      "source": ".ok_or_else(crate::error::Error::row_not_found)?;",
+      "message": "call to drop of `error::Error` which can panic",
+      "source": "};",
       "count": 1
     },
     {
@@ -14855,7 +15107,19 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `sqlx::Transaction<'_, sqlx::Postgres>` which can panic",
       "source": "}",
-      "count": 4
+      "count": 5
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `sqlx::pool::PoolConnection<sqlx::Postgres>` which can panic",
+      "source": ".is_none()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `sqlx::pool::PoolConnection<sqlx::Postgres>` which can panic",
+      "source": "};",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -14879,7 +15143,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".bind(provider.name())",
-      "count": 7
+      "count": 8
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -14915,7 +15179,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".execute(&mut *tx)",
-      "count": 10
+      "count": 12
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -14957,7 +15221,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `sqlx::query::QueryScalar<'_, sqlx::Postgres, bool, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".fetch_one(&mut *tx)",
-      "count": 3
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -14973,6 +15237,18 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `std::option::Option<db::contexts::ContextGeneration>` which can panic",
+      "source": ".is_none()",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `std::option::Option<db::master_key::MasterKeyState>` which can panic",
+      "source": "}",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `std::option::Option<event_store::EventType>` which can panic",
       "source": "}",
       "count": 1
@@ -14981,6 +15257,12 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `std::option::Option<serde_json::Value>` which can panic",
       "source": "parse(&current.schema).is_some() && parse(&current.schema) == parse(&wanted.schema)",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `std::option::Option<std::string::String>` which can panic",
+      "source": "}",
       "count": 2
     },
     {
@@ -15053,7 +15335,13 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `std::string::String` which can panic",
       "source": "}",
-      "count": 10
+      "count": 13
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `std::sync::Arc<dyn encryption::provider::KeyProvider>` which can panic",
+      "source": "if key_service.provider_for(key.as_deref())?.name() != target {",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -15125,18 +15413,18 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `tracing::Span` which can panic",
       "source": "}",
-      "count": 9
-    },
-    {
-      "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/master_key.rs:1185:1: 1185:77}>` which can panic",
-      "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
-      "count": 1
+      "count": 10
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/master_key.rs:139:1: 139:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/master_key.rs:1423:1: 1423:77}>` which can panic",
+      "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
     {
@@ -15148,6 +15436,12 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async block@sqlx::Pool<sqlx::Postgres>::acquire::{closure#0}}` which can panic",
+      "source": "&mut *pool.acquire().await?,",
+      "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `{async block@sqlx::Pool<sqlx::Postgres>::acquire::{closure#0}}` which can panic",
       "source": "let mut lock = HeldLock(Some(pool.acquire().await?));",
       "count": 1
     },
@@ -15155,19 +15449,19 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::Pool<sqlx::Postgres>::begin()}` which can panic",
       "source": "let mut tx = pool.begin().await?;",
-      "count": 8
+      "count": 10
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::commit()}` which can panic",
       "source": "tx.commit().await?;",
-      "count": 7
+      "count": 10
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::Transaction<'_, sqlx::Postgres>::rollback()}` which can panic",
       "source": "tx.rollback().await?;",
-      "count": 2
+      "count": 4
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -15179,17 +15473,29 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 20
+      "count": 22
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::execute<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
-      "count": 4
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (i64, std::vec::Vec<u8>, std::option::Option<std::vec::Vec<u8>>, std::option::Option<std::string::String>, std::option::Option<i32>), sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String, i32), sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryAs<'_, sqlx::Postgres, (std::string::String, std::option::Option<std::string::String>), sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
       "count": 1
     },
@@ -15244,20 +15550,26 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, bool, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
-      "source": ".await?)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, bool, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 3
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, bool, sqlx::sqlx_postgres::PgArguments>::fetch_one<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::option::Option<std::string::String>, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?)",
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -15269,6 +15581,12 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>::fetch_all<'_, '_, &sqlx::Pool<sqlx::Postgres>>()}` which can panic",
       "source": ".await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to drop of `{async fn body of sqlx::query::QueryScalar<'_, sqlx::Postgres, std::string::String, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
+      "source": ".await?)",
       "count": 1
     },
     {
@@ -15310,6 +15628,18 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let row: Option<(String, Option<String>)> = sqlx::query_as( \"SELECT c.generation::TEXT, a.key FROM bounded_contexts c \\ LEFT JOIN encryption_key_assignments a ON a.bounded_context = c.name \\ WHERE c.name = $1\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
+      "source": "let row: Option<(String, i32)> = sqlx::query_as( \"SELECT incarnation::TEXT, retired_below FROM encryption_master_keys \\ WHERE provider = $1 FOR SHARE\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to function `sqlx::query_as` which can panic",
       "source": "let row: Option<StateRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT {STATE_COLUMNS} FROM encryption_master_keys WHERE provider = $1 FOR UPDATE\" )))",
       "count": 1
     },
@@ -15340,7 +15670,13 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query_scalar` which can panic",
-      "source": "Ok(sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM encryption_master_keys WHERE provider = $1)\", )",
+      "source": "Ok(sqlx::query_scalar( \"SELECT a.bounded_context FROM encryption_key_assignments a \\ JOIN bounded_contexts c ON c.name = a.bounded_context \\ WHERE a.assigned_at < c.created_at ORDER BY a.bounded_context\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to function `sqlx::query_scalar` which can panic",
+      "source": "Ok(sqlx::query_scalar( \"SELECT incarnation::TEXT FROM encryption_master_keys WHERE provider = $1\", )",
       "count": 1
     },
     {
@@ -15400,7 +15736,7 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query_scalar` which can panic",
-      "source": "let target_kept: bool = sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM encryption_master_keys WHERE provider = $1 FOR SHARE)\", )",
+      "source": "let row: Option<Option<String>> = sqlx::query_scalar( \"SELECT a.key FROM bounded_contexts c \\ LEFT JOIN encryption_key_assignments a ON a.bounded_context = c.name \\ WHERE c.name = $1\", )",
       "count": 1
     },
     {
@@ -15460,7 +15796,7 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below) VALUES ($1, $2, $3, $4, false, NULL, $5)\", )",
+      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below, created_by_skilj) VALUES ($1, $2, $3, $4, false, NULL, $5, $6)\", )",
       "count": 1
     },
     {
@@ -15472,7 +15808,13 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query` which can panic",
-      "source": "sqlx::query( \"UPDATE encryption_master_keys SET delete_after = $2 \\ WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL\", )",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET created_by_skilj = true WHERE provider = $1\", )",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to function `sqlx::query` which can panic",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET delete_after = $2 \\ WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL \\ AND NOT EXISTS (SELECT 1 FROM encryption_key_assignments WHERE provider = $1)\", )",
       "count": 1
     },
     {
@@ -15491,7 +15833,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(\"DELETE FROM encryption_key_assignments WHERE bounded_context = $1\")",
-      "count": 2
+      "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -15574,6 +15916,12 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
+      "source": "message: \"the key was deleted and created again while its data keys were being \\ rewrapped\" .into(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `<T as std::convert::Into<U>>::into` which can panic",
       "source": "message: \"the key was deleted while its data keys were being rewrapped\".into(),",
       "count": 1
     },
@@ -15610,6 +15958,12 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "&mut tx,",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": ".execute(&mut **tx)",
       "count": 1
     },
@@ -15617,13 +15971,13 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": ".execute(&mut *tx)",
-      "count": 10
+      "count": 12
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": ".fetch_one(&mut *tx)",
-      "count": 3
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -15664,7 +16018,19 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "let parent_current = match super::lock_context_generation(&mut tx, bounded_context).await {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "let sequence = next_sequence(&mut **tx, &admin.name).await?;",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "let still = existing_bounded_context_key(&mut *tx, bounded_context).await?;",
       "count": 1
     },
     {
@@ -15675,9 +16041,15 @@
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to method `<std::collections::btree_map::IntoKeys<K, V, A> as std::iter::Iterator>::next` which can panic",
-      "source": "for bounded_context in encryption_key_assignments(pool).await?.into_keys() {",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "lock_key_state_for_wrap(&mut tx, &target_name).await?",
       "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `<sqlx::pool::PoolConnection<DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "&mut *pool.acquire().await?,",
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -15695,6 +16067,12 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<std::iter::Zip<A, B> as std::iter::Iterator>::next` which can panic",
       "source": "for ((id, wrapped, ..), result) in moving.into_iter().zip(unwrapped) {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `<std::slice::Iter<'a, T> as std::iter::Iterator>::any` which can panic",
+      "source": "if done.iter().any(|(_, _, w)| w.version < retired_below) {",
       "count": 1
     },
     {
@@ -15725,7 +16103,7 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<std::string::String as std::clone::Clone>::clone` which can panic",
       "source": "provider: target_name.clone(),",
-      "count": 2
+      "count": 4
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
@@ -15737,6 +16115,12 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `<std::string::String as std::clone::Clone>::clone` which can panic",
       "source": "stored: stored.clone(),",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `encryption::service::KeyService::provider_for` which can panic",
+      "source": "if key_service.provider_for(key.as_deref())?.name() != target {",
       "count": 1
     },
     {
@@ -15868,31 +16252,37 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below) VALUES ($1, $2, $3, $4, false, NULL, $5)\", ) .bind(provider.name())",
+      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below, created_by_skilj) VALUES ($1, $2, $3, $4, false, NULL, $5, $6)\", ) .bind(provider.name())",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below) VALUES ($1, $2, $3, $4, false, NULL, $5)\", ) .bind(provider.name()) .bind(key)",
+      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below, created_by_skilj) VALUES ($1, $2, $3, $4, false, NULL, $5, $6)\", ) .bind(provider.name()) .bind(key)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below) VALUES ($1, $2, $3, $4, false, NULL, $5)\", ) .bind(provider.name()) .bind(key) .bind(version_column(versions.latest)?)",
+      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below, created_by_skilj) VALUES ($1, $2, $3, $4, false, NULL, $5, $6)\", ) .bind(provider.name()) .bind(key) .bind(version_column(versions.latest)?)",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below) VALUES ($1, $2, $3, $4, false, NULL, $5)\", ) .bind(provider.name()) .bind(key) .bind(version_column(versions.latest)?) .bind(Timestamp::now().to_sqlx())",
+      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below, created_by_skilj) VALUES ($1, $2, $3, $4, false, NULL, $5, $6)\", ) .bind(provider.name()) .bind(key) .bind(version_column(versions.latest)?) .bind(Timestamp::now().to_sqlx())",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below) VALUES ($1, $2, $3, $4, false, NULL, $5)\", ) .bind(provider.name()) .bind(key) .bind(version_column(versions.latest)?) .bind(Timestamp::now().to_sqlx()) .bind(version_column(versions.min_decryption)?)",
+      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below, created_by_skilj) VALUES ($1, $2, $3, $4, false, NULL, $5, $6)\", ) .bind(provider.name()) .bind(key) .bind(version_column(versions.latest)?) .bind(Timestamp::now().to_sqlx()) .bind(version_column(versions.min_decryption)?)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"INSERT INTO encryption_master_keys \\ (provider, key, version, rotated_at, retire_immediately, rewrapped_at, \\ retired_below, created_by_skilj) VALUES ($1, $2, $3, $4, false, NULL, $5, $6)\", ) .bind(provider.name()) .bind(key) .bind(version_column(versions.latest)?) .bind(Timestamp::now().to_sqlx()) .bind(version_column(versions.min_decryption)?) .bind(created)",
       "count": 1
     },
     {
@@ -15934,13 +16324,19 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"UPDATE encryption_master_keys SET delete_after = $2 \\ WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL\", ) .bind(provider)",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET created_by_skilj = true WHERE provider = $1\", ) .bind(provider.name())",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query( \"UPDATE encryption_master_keys SET delete_after = $2 \\ WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL\", ) .bind(provider) .bind(at.to_sqlx())",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET delete_after = $2 \\ WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL \\ AND NOT EXISTS (SELECT 1 FROM encryption_key_assignments WHERE provider = $1)\", ) .bind(provider)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "sqlx::query( \"UPDATE encryption_master_keys SET delete_after = $2 \\ WHERE provider = $1 AND key IS NOT NULL AND delete_after IS NULL \\ AND NOT EXISTS (SELECT 1 FROM encryption_key_assignments WHERE provider = $1)\", ) .bind(provider) .bind(at.to_sqlx())",
       "count": 1
     },
     {
@@ -15971,12 +16367,6 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "sqlx::query( \"UPDATE encryption_master_keys \\ SET rewrapped_at = NULL, assignment_epoch = assignment_epoch + 1 \\ WHERE provider = $1 \\ AND ($2::TEXT IS DISTINCT FROM provider OR $3::INTEGER IS NULL OR $3 < version)\", ) .bind(provider) .bind(row_provider) .bind(row_version)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "sqlx::query(\"DELETE FROM encryption_key_assignments WHERE bounded_context = $1\") .bind(&bounded_context)",
       "count": 1
     },
     {
@@ -16030,6 +16420,18 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let row: Option<(String, Option<String>)> = sqlx::query_as( \"SELECT c.generation::TEXT, a.key FROM bounded_contexts c \\ LEFT JOIN encryption_key_assignments a ON a.bounded_context = c.name \\ WHERE c.name = $1\", ) .bind(bounded_context)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
+      "source": "let row: Option<(String, i32)> = sqlx::query_as( \"SELECT incarnation::TEXT, retired_below FROM encryption_master_keys \\ WHERE provider = $1 FOR SHARE\", ) .bind(provider)",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/master_key.rs",
+      "message": "call to method `sqlx::query::QueryAs::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "let row: Option<StateRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!( \"SELECT {STATE_COLUMNS} FROM encryption_master_keys WHERE provider = $1 FOR UPDATE\" ))) .bind(provider)",
       "count": 1
     },
@@ -16072,7 +16474,7 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "Ok(sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM encryption_master_keys WHERE provider = $1)\", ) .bind(provider)",
+      "source": "Ok(sqlx::query_scalar( \"SELECT incarnation::TEXT FROM encryption_master_keys WHERE provider = $1\", ) .bind(provider)",
       "count": 1
     },
     {
@@ -16150,7 +16552,7 @@
     {
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
-      "source": "let target_kept: bool = sqlx::query_scalar( \"SELECT EXISTS (SELECT 1 FROM encryption_master_keys WHERE provider = $1 FOR SHARE)\", ) .bind(&target_name)",
+      "source": "let row: Option<Option<String>> = sqlx::query_scalar( \"SELECT a.key FROM bounded_contexts c \\ LEFT JOIN encryption_key_assignments a ON a.bounded_context = c.name \\ WHERE c.name = $1\", ) .bind(bounded_context)",
       "count": 1
     },
     {
@@ -16169,12 +16571,6 @@
       "file": "skilj-core/src/db/master_key.rs",
       "message": "call to method `sqlx::query::QueryScalar::<'q, DB, O, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "sqlx::query_scalar(\"SELECT pg_try_advisory_lock(hashtext($1))\") .bind(&name)",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/master_key.rs",
-      "message": "call to method `std::collections::BTreeSet::<T, A>::contains` which can panic",
-      "source": "if !existing.contains(&bounded_context) {",
       "count": 1
     },
     {
@@ -16461,13 +16857,13 @@
     },
     {
       "file": "skilj-core/src/db/mod.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/mod.rs:311:1: 311:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/mod.rs:316:1: 316:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
     {
       "file": "skilj-core/src/db/mod.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/mod.rs:389:1: 389:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/mod.rs:394:1: 394:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -16737,12 +17133,6 @@
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
-      "message": "call to drop of `preflight::AdminContext` which can panic",
-      "source": "}",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `preflight::BoundedContextReport` which can panic",
       "source": "}",
       "count": 1
@@ -16955,7 +17345,7 @@
       "file": "skilj-core/src/db/preflight.rs",
       "message": "call to drop of `std::vec::Vec<std::string::String>` which can panic",
       "source": "}",
-      "count": 3
+      "count": 4
     },
     {
       "file": "skilj-core/src/db/preflight.rs",
@@ -23777,7 +24167,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>` which can panic",
       "source": ".fetch_optional(&mut *tx)",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -23849,7 +24239,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `std::option::Option<sqlx::sqlx_postgres::PgRow>` which can panic",
       "source": ".await?;",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -24033,7 +24423,7 @@
     },
     {
       "file": "skilj-core/src/db/schema.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3651:1: 3651:33}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/schema.rs:3659:1: 3659:33}>` which can panic",
       "source": "#[tracing::instrument(skip_all)]",
       "count": 1
     },
@@ -24083,7 +24473,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to drop of `{async fn body of sqlx::query::Query<'_, sqlx::Postgres, sqlx::sqlx_postgres::PgArguments>::fetch_optional<'_, '_, &mut sqlx::PgConnection>()}` which can panic",
       "source": ".await?;",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -24353,7 +24743,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to function `sqlx::query` which can panic",
       "source": "sqlx::query(\"SELECT name FROM bounded_contexts WHERE name = $1 FOR UPDATE\")",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -25097,7 +25487,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": ".fetch_optional(&mut *tx)",
-      "count": 3
+      "count": 4
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -25337,7 +25727,7 @@
       "file": "skilj-core/src/db/schema.rs",
       "message": "call to method `sqlx::query::Query::<'_, DB, <DB as sqlx::Database>::Arguments>::bind` which can panic",
       "source": "sqlx::query(\"SELECT name FROM bounded_contexts WHERE name = $1 FOR UPDATE\") .bind(name)",
-      "count": 1
+      "count": 2
     },
     {
       "file": "skilj-core/src/db/schema.rs",
@@ -26043,7 +26433,7 @@
     },
     {
       "file": "skilj-core/src/db/secret_records.rs",
-      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/secret_records.rs:465:1: 465:77}>` which can panic",
+      "message": "call to drop of `tracing::instrument::Instrumented<{async block@skilj-core/src/db/secret_records.rs:472:1: 472:77}>` which can panic",
       "source": "#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]",
       "count": 1
     },
@@ -26357,6 +26747,12 @@
       "file": "skilj-core/src/db/secret_records.rs",
       "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
       "source": "let Some(row) = get_active_secret_row_on(&mut *tx, bounded_context, name, true).await? else {",
+      "count": 1
+    },
+    {
+      "file": "skilj-core/src/db/secret_records.rs",
+      "message": "call to method `<sqlx::Transaction<'_, DB> as std::ops::DerefMut>::deref_mut` which can panic",
+      "source": "lock_expected_generation(&mut tx, bounded_context, &generation).await?;",
       "count": 1
     },
     {
@@ -28443,12 +28839,6 @@
     },
     {
       "file": "skilj-core/src/event_store/mod.rs",
-      "message": "call to closure `db::approvals::write_proposal::{closure#0}::{closure#0}` which can panic",
-      "source": "let (key, data_key) = resolve_key(&sf.subject_key, &subject_value);",
-      "count": 1
-    },
-    {
-      "file": "skilj-core/src/event_store/mod.rs",
       "message": "call to closure `db::commands::write_command_batch_as_set::{closure#0}::{closure#1}` which can panic",
       "source": "let event_type = resolve_event_type(&spec.event_type)",
       "count": 1
@@ -28677,7 +29067,7 @@
     },
     {
       "file": "skilj-core/src/event_store/mod.rs",
-      "message": "call to drop of `{closure@skilj-core/src/db/event_types.rs:390:9: 390:11}` which can panic",
+      "message": "call to drop of `{closure@skilj-core/src/db/event_types.rs:408:9: 408:11}` which can panic",
       "source": "}",
       "count": 1
     },
@@ -29034,6 +29424,12 @@
       "message": "call to method `std::iter::Iterator::zip` which can panic",
       "source": "query_selection(query, events) .into_iter() .zip(events)",
       "count": 2
+    },
+    {
+      "file": "skilj-core/src/event_store/mod.rs",
+      "message": "call to method `std::ops::function::impls::<impl std::ops::Fn<A> for &F>::call` which can panic",
+      "source": "let (key, data_key) = resolve_key(&sf.subject_key, &subject_value);",
+      "count": 1
     },
     {
       "file": "skilj-core/src/event_store/mod.rs",

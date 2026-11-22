@@ -347,9 +347,11 @@ async fn write_proposal(
     let schema = schema_ident(bounded_context_name);
 
     let mut resolved = std::collections::HashMap::new();
-    resolve_encryption_keys(
+    let mut generation = None;
+    resolve_encryption_keys_in(
         pool,
         bounded_context_name,
+        &mut generation,
         &command_type.sensitive_fields,
         &authorised.payload,
         key_service,
@@ -409,6 +411,12 @@ async fn write_proposal(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .execute(&mut *tx)
         .await?;
+    // The proposal's payload is encrypted under keys of the bounded
+    // context's lifetime they were read in: refused, with its pins, if it
+    // was deleted since (docs/architecture.md §230).
+    if let Some(generation) = &generation {
+        lock_expected_generation(&mut tx, bounded_context_name, generation).await?;
+    }
     let deadline_seconds = if recheck_routing {
         let policy: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT deadline_seconds FROM {schema}.command_approval_policies

@@ -2656,9 +2656,11 @@ pub async fn create_and_insert_external_event(
     let schema = schema_ident(&bounded_context_name);
 
     let mut resolved = std::collections::HashMap::new();
-    resolve_encryption_keys(
+    let mut generation = None;
+    resolve_encryption_keys_in(
         pool,
         &bounded_context_name,
+        &mut generation,
         &adapter.event_type.sensitive_fields,
         &payload,
         key_service,
@@ -2667,6 +2669,12 @@ pub async fn create_and_insert_external_event(
     .await?;
 
     let mut tx = pool.begin().await?;
+    // The keys resolved above are of the bounded context's lifetime they
+    // were read in: refused, before the lock, if it was deleted since
+    // (docs/architecture.md §230).
+    if let Some(generation) = &generation {
+        lock_expected_generation(&mut tx, &bounded_context_name, generation).await?;
+    }
     let (next_seq, limits) = next_sequence_with_limits(&mut *tx, &bounded_context_name).await?;
     let payload_limits = limits.apply(projection_dispatcher.payload_limits());
     // docs/architecture.md §209: tags are derived below, under the lock a
@@ -2859,6 +2867,7 @@ pub async fn create_and_insert_external_events(
     let mut results: Vec<Option<crate::error::Result<CreateExternalEventOutcome>>> =
         Vec::with_capacity(items.len());
     let mut resolved = std::collections::HashMap::new();
+    let mut generation = None;
     let mut failed = false;
     for item in &items {
         if failed && stop_at_first_failure {
@@ -2874,9 +2883,10 @@ pub async fn create_and_insert_external_events(
         );
         let checked = match checked {
             Ok(_) => {
-                resolve_encryption_keys(
+                resolve_encryption_keys_in(
                     pool,
                     &bounded_context_name,
+                    &mut generation,
                     &adapter.event_type.sensitive_fields,
                     &item.payload,
                     key_service,
@@ -2895,6 +2905,12 @@ pub async fn create_and_insert_external_events(
 
     let created = async {
         let mut tx = pool.begin().await?;
+        // Every item's keys were resolved in one lifetime of the bounded
+        // context; a context deleted since fails the batch, before the lock
+        // (docs/architecture.md §230).
+        if let Some(generation) = &generation {
+            lock_expected_generation(&mut tx, &bounded_context_name, generation).await?;
+        }
         let (_, limits) =
             lock_bounded_context_sequence_with_limits(&mut tx, &bounded_context_name).await?;
         let payload_limits = limits.apply(projection_dispatcher.payload_limits());
@@ -3112,9 +3128,11 @@ pub async fn create_and_insert_direct_event(
     let bounded_context_name = adapter.event_type.bounded_context.name.clone();
 
     let mut resolved = std::collections::HashMap::new();
-    resolve_encryption_keys(
+    let mut generation = None;
+    resolve_encryption_keys_in(
         pool,
         &bounded_context_name,
+        &mut generation,
         &adapter.event_type.sensitive_fields,
         &payload,
         key_service,
@@ -3123,6 +3141,10 @@ pub async fn create_and_insert_direct_event(
     .await?;
 
     let mut tx = pool.begin().await?;
+    // See `create_and_insert_external_event`.
+    if let Some(generation) = &generation {
+        lock_expected_generation(&mut tx, &bounded_context_name, generation).await?;
+    }
     let (next_seq, limits) = next_sequence_with_limits(&mut *tx, &bounded_context_name).await?;
     // docs/architecture.md §209: tags are derived below, under the lock a
     // rotation holds - of the generation stored now.

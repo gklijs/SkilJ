@@ -755,6 +755,18 @@ pub async fn revoke_role_and_mappings(
     let admin = require_admin_bounded_context(pool).await?;
     let mut tx = pool.begin().await?;
     update_role(&mut *tx, role).await?;
+    // Every one of the role's mapping rows first, before the admin
+    // context's `sequence` is locked by the first event below: every other
+    // writer takes a mapping row and then the sequence, and taking the
+    // second mapping row while holding the sequence deadlocks with one of
+    // them - a baseline holding that row and waiting for the sequence.
+    sqlx::query(
+        "SELECT 1 FROM role_access_mappings WHERE role_id = $1 AND status = 'active' \
+         ORDER BY bounded_context FOR UPDATE",
+    )
+    .bind(&role.id)
+    .execute(&mut *tx)
+    .await?;
     for mapping in mappings {
         let revoked_at = mapping
             .revoked_at

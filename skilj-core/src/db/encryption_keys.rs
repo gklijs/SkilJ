@@ -86,7 +86,15 @@ pub async fn get_or_create_encryption_key(
         return Err(secrets::Error::ReservedSubjectKey.into());
     }
     let bc = require_bounded_context(pool, bounded_context).await?;
-    provision_encryption_key(Db::Pool(pool), bc, subject_key, subject_value, key_service).await
+    provision_encryption_key(
+        Db::Pool(pool),
+        bc,
+        None,
+        subject_key,
+        subject_value,
+        key_service,
+    )
+    .await
 }
 
 /// [`get_or_create_encryption_key`] on a connection the caller holds,
@@ -95,28 +103,74 @@ pub async fn get_or_create_encryption_key(
 /// `sequence` lock, so it never needs a second pooled connection while
 /// holding that lock (docs/architecture.md §117). A key created there
 /// becomes durable with the command that needed it, or not at all.
+///
+/// The caller's transaction must already hold one of the bounded
+/// context's tables (the `sequence` lock, a secret's version row), so the
+/// bounded context can't be deleted under it. `generation`, when given,
+/// is the lifetime the caller's earlier work belongs to: a bounded
+/// context with another one is the missing-row error.
 pub(super) async fn get_or_create_encryption_key_on(
     conn: &mut sqlx::PgConnection,
     bc: BoundedContext,
+    generation: Option<&ContextGeneration>,
     subject_key: &str,
     subject_value: &str,
     key_service: &KeyService,
 ) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
-    provision_encryption_key(Db::Conn(conn), bc, subject_key, subject_value, key_service).await
+    provision_encryption_key(
+        Db::Conn(conn),
+        bc,
+        generation,
+        subject_key,
+        subject_value,
+        key_service,
+    )
+    .await
+}
+
+/// What a data key about to be generated is wrapped by, as read before the
+/// provider is called: the bounded context's lifetime, its own key (`None`
+/// for the default key), and the key's state row's incarnation - `None`
+/// before the default key's first recording.
+struct WrapTarget {
+    generation: ContextGeneration,
+    key: Option<String>,
+    incarnation: Option<String>,
+}
+
+/// How storing a freshly wrapped data key ended.
+enum Stored {
+    Inserted(Box<EncryptionKeyRow>),
+    /// A concurrent provisioner stored one first: read it.
+    LostRace,
+    /// What the wrap was prepared against changed while the provider
+    /// answered - the bounded context's key, or the key's state: wrap
+    /// again from a fresh read.
+    Stale,
 }
 
 /// [`get_or_create_encryption_key_on`] on either a held connection or the
 /// pool (see [`Db`]).
+///
+/// Before the provider is called, the bounded context's generation, its
+/// key and that key's state row are read (docs/architecture.md §230). The
+/// wrapped data key is stored only if, in the storing transaction, the
+/// bounded context still has that generation (the missing-row error
+/// otherwise, `generation` included when given) and that key, and the
+/// key's state row - taken `FOR SHARE`, which a retirement or deletion
+/// takes `FOR UPDATE` under the key's lock - is still the same
+/// incarnation and retires no version the data key is wrapped under.
+/// Otherwise the wrap is dropped and made again from a fresh read.
 pub(super) async fn provision_encryption_key(
     mut db: Db<'_>,
     bc: BoundedContext,
+    generation: Option<&ContextGeneration>,
     subject_key: &str,
     subject_value: &str,
     key_service: &KeyService,
 ) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
     let bounded_context = bc.name.clone();
     let bounded_context = bounded_context.as_str();
-    let schema = schema_ident(bounded_context);
 
     // docs/architecture.md §107: normally one pass. Another pass only when
     // the insert lost to a concurrent provisioner *and* that key was
@@ -141,25 +195,29 @@ pub(super) async fn provision_encryption_key(
 
         // The bounded context's own key, or the default one
         // (docs/architecture.md §230) - read every time, so a key assigned
-        // on another instance is used from then on.
-        let (key, recorded) = {
+        // on another instance is used from then on - with the context's
+        // lifetime and the key's state row, before the provider is called.
+        let target = {
             let mut conn = db.conn().await?;
-            let key = master_key::bounded_context_key(&mut *conn, bounded_context).await?;
-            let recorded = match &key {
-                Some(key) => {
-                    let name = key_service.provider_for(Some(key))?.name().to_string();
-                    master_key::key_recorded(&mut *conn, &name).await?
-                }
-                None => true,
-            };
-            (key, recorded)
+            let (current, key) =
+                master_key::bounded_context_key_and_generation(&mut *conn, bounded_context).await?;
+            if generation.is_some_and(|expected| expected != &current) {
+                return Err(crate::error::Error::row_not_found());
+            }
+            let name = key_service.provider_for(key.as_deref())?.name().to_string();
+            let incarnation = master_key::key_incarnation(&mut *conn, &name).await?;
+            WrapTarget {
+                generation: current,
+                key,
+                incarnation,
+            }
         };
-        let provider = key_service.provider_for(key.as_deref())?;
+        let provider = key_service.provider_for(target.key.as_deref())?;
         // A bounded context's own key that is gone - the context was given
         // another key and this one deleted since the assignment was read -
         // isn't asked to wrap anything (Vault may even create a missing key
         // on encrypt): the next pass reads the assignment again.
-        if !recorded {
+        if target.key.is_some() && target.incarnation.is_none() {
             continue;
         }
         let (data_key, wrapped) = match key_service.generate_with(provider.as_ref()).await {
@@ -167,54 +225,125 @@ pub(super) async fn provision_encryption_key(
             // The same, found by the provider: try again only when the
             // assignment did change meanwhile.
             Err(err)
-                if key.is_some()
+                if target.key.is_some()
                     && master_key::bounded_context_key(&mut *db.conn().await?, bounded_context)
                         .await?
-                        != key =>
+                        != target.key =>
             {
                 tracing::info!(error = %err, "bounded context's key changed while wrapping; again");
                 continue;
             }
             Err(err) => return Err(err.into()),
         };
-        let now = Timestamp::now();
-        // A bounded context's own key is stored only while its state row
-        // is there, taken `FOR SHARE` in the same statement: a deletion of
-        // the key waits for this, and one that came first leaves nothing to
-        // take, so nothing is inserted and the next pass reads the bounded
-        // context's key again (docs/architecture.md §230). The default key
-        // is never deleted.
-        let guard = if key.is_some() {
-            "SELECT 1 FROM encryption_master_keys WHERE provider = $5 FOR SHARE"
-        } else {
-            "SELECT 1"
+        let stored = match &mut db {
+            // On the pool, in a transaction of its own that takes the
+            // bounded context's row first, as the deletions do.
+            Db::Pool(pool) => {
+                let mut tx = pool.begin().await?;
+                lock_expected_generation(&mut tx, bounded_context, &target.generation).await?;
+                let stored = store_wrapped_data_key(
+                    &mut tx,
+                    bounded_context,
+                    &target,
+                    provider.name(),
+                    &wrapped,
+                    subject_key,
+                    subject_value,
+                )
+                .await?;
+                if matches!(stored, Stored::Inserted(_)) {
+                    tx.commit().await?;
+                }
+                stored
+            }
+            // The caller's transaction holds one of the context's tables:
+            // the generation is read without a lock.
+            Db::Conn(conn) => {
+                if !generation_is(conn, bounded_context, &target.generation).await? {
+                    return Err(crate::error::Error::row_not_found());
+                }
+                store_wrapped_data_key(
+                    conn,
+                    bounded_context,
+                    &target,
+                    provider.name(),
+                    &wrapped,
+                    subject_key,
+                    subject_value,
+                )
+                .await?
+            }
         };
-        let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "WITH kept AS ({guard}) \
-             INSERT INTO {schema}.encryption_keys \
-             (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \
-             master_key_version) \
-             SELECT $1, $2, 'active', $3, $4, $5, $6 FROM kept \
-             ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \
-             RETURNING {ENCRYPTION_KEY_COLUMNS}"
-        )))
-        .bind(subject_key)
-        .bind(subject_value)
-        .bind(now.to_sqlx())
-        .bind(&wrapped.ciphertext)
-        .bind(provider.name())
-        .bind(version_column(wrapped.version)?)
-        .fetch_optional(&mut *db.conn().await?)
-        .await?;
-
-        if let Some(row) = inserted {
-            return Ok((row.to_domain(bc), row.id, data_key));
+        match stored {
+            Stored::Inserted(row) => return Ok((row.to_domain(bc), row.id, data_key)),
+            Stored::Stale => {
+                tracing::info!("bounded context's key changed while wrapping; again");
+            }
+            // The next pass reads the row the other provisioner created
+            // (never the key just generated here, which was never persisted
+            // and would silently disagree with it).
+            Stored::LostRace => {}
         }
-        // Lost the race to a concurrent provisioner - the next pass reads
-        // the row it created (never the key just generated here, which
-        // was never persisted and would silently disagree with it).
     }
     Err(crate::error::Error::row_not_found())
+}
+
+/// Stores a data key `provider` wrapped as `wrapped`, on `conn`, if what
+/// `target` read before the wrap still holds: the bounded context's key is
+/// the same, and the key's state row - taken `FOR SHARE`, so a retirement
+/// or deletion of the key waits for this transaction - is the same
+/// incarnation and has retired no version the data key is wrapped under.
+/// The default key before its first recording has no state row to check:
+/// nothing can have been retired or deleted yet.
+async fn store_wrapped_data_key(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+    target: &WrapTarget,
+    provider: &str,
+    wrapped: &crate::encryption::provider::WrappedDataKey,
+    subject_key: &str,
+    subject_value: &str,
+) -> crate::error::Result<Stored> {
+    if master_key::bounded_context_key(&mut *conn, bounded_context).await? != target.key {
+        return Ok(Stored::Stale);
+    }
+    let state = master_key::lock_key_state_for_wrap(&mut *conn, provider).await?;
+    let current = match (&target.incarnation, &state) {
+        (Some(read), Some((incarnation, retired_below))) => {
+            read == incarnation && *retired_below <= wrapped.version
+        }
+        // The default key, recorded since the read.
+        (None, Some((_, retired_below))) => {
+            target.key.is_none() && *retired_below <= wrapped.version
+        }
+        (None, None) => target.key.is_none(),
+        // Deleted since the read.
+        (Some(_), None) => false,
+    };
+    if !current {
+        return Ok(Stored::Stale);
+    }
+    let schema = schema_ident(bounded_context);
+    let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.encryption_keys \
+         (subject_key, subject_value, status, created_at, wrapped_key, key_provider, \
+         master_key_version) \
+         VALUES ($1, $2, 'active', $3, $4, $5, $6) \
+         ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \
+         RETURNING {ENCRYPTION_KEY_COLUMNS}"
+    )))
+    .bind(subject_key)
+    .bind(subject_value)
+    .bind(Timestamp::now().to_sqlx())
+    .bind(&wrapped.ciphertext)
+    .bind(provider)
+    .bind(version_column(wrapped.version)?)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(match inserted {
+        Some(row) => Stored::Inserted(Box::new(row)),
+        None => Stored::LostRace,
+    })
 }
 
 /// Where a provisioning or a read runs its SQL (docs/architecture.md §230):
@@ -368,18 +497,56 @@ pub async fn resolve_encryption_keys(
     key_service: Option<&KeyService>,
     resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
 ) -> crate::error::Result<()> {
+    resolve_encryption_keys_in(
+        pool,
+        bounded_context,
+        &mut None,
+        sensitive_fields,
+        payload,
+        key_service,
+        resolved,
+    )
+    .await
+}
+
+/// [`resolve_encryption_keys`] for one lifetime of the bounded context
+/// (docs/architecture.md §230): `generation` is read before the first key
+/// is looked up or provisioned, when the caller has none yet, and every
+/// key is provisioned against it - a bounded context deleted and created
+/// again since is the missing-row error. The caller checks the same
+/// generation in the transaction that stores what these keys protect
+/// ([`lock_expected_generation`]), so nothing prepared for one lifetime is
+/// stored in the next. Left `None` when there was nothing to resolve.
+pub(super) async fn resolve_encryption_keys_in(
+    pool: &Pool,
+    bounded_context: &str,
+    generation: &mut Option<ContextGeneration>,
+    sensitive_fields: &[SensitiveField],
+    payload: &str,
+    key_service: Option<&KeyService>,
+    resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+) -> crate::error::Result<()> {
     let subjects = crate::event_store::try_sensitive_field_subjects(sensitive_fields, payload)?;
     if subjects.is_empty() {
         return Ok(());
     }
     let key_service = key_service.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+    let generation = match generation {
+        Some(generation) => generation,
+        None => generation.insert(context_generation(pool, bounded_context).await?),
+    };
+    let bc = require_bounded_context(pool, bounded_context).await?;
     for (subject_key, subject_value) in subjects {
         if resolved.contains_key(&(subject_key.clone(), subject_value.clone())) {
             continue;
         }
-        let provisioned = get_or_create_encryption_key(
-            pool,
-            bounded_context,
+        if secrets::is_reserved_subject_key(&subject_key) {
+            return Err(secrets::Error::ReservedSubjectKey.into());
+        }
+        let provisioned = provision_encryption_key(
+            Db::Pool(pool),
+            bc.clone(),
+            Some(generation),
             &subject_key,
             &subject_value,
             key_service,

@@ -673,6 +673,7 @@ fn a_batch_rechecks_each_command_against_its_own_query() {
                 idempotency_key: None,
                 event_types_by_name: std::collections::HashMap::new(),
                 resolved: std::collections::HashMap::new(),
+                generation: None,
             });
         }
         record(&pool, &h.bc, &h.created, "acme", Some("t0")).await;
@@ -820,6 +821,7 @@ fn a_batch_rechecks_a_query_its_tag_query_does_not_cover() {
             idempotency_key: None,
             event_types_by_name: std::collections::HashMap::new(),
             resolved: std::collections::HashMap::new(),
+            generation: None,
         }];
         record(&pool, &h.bc, &h.created, "other", Some("t1")).await;
 
@@ -905,6 +907,7 @@ fn batched(
         idempotency_key: None,
         event_types_by_name: std::collections::HashMap::new(),
         resolved: std::collections::HashMap::new(),
+        generation: None,
     }
 }
 
