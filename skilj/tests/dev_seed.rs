@@ -1,7 +1,8 @@
 //! `skilj::dev` (docs/architecture.md §220): what the template's and
 //! `skilj-demo`'s servers seed a development database with - bounded
-//! contexts, an admin role reconciliation registers types under, and a
-//! command token REST accepts.
+//! contexts, an admin role reconciliation registers types under, a
+//! command token REST accepts, and an event read token that starts where
+//! it was asked to.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -24,6 +25,9 @@ struct Deposited;
 impl EventType for Deposited {
     type Payload = DepositedPayload;
     const NAME: &'static str = "Deposited";
+    fn event_read_allowed() -> bool {
+        true
+    }
 }
 
 enum WalletEvent {
@@ -124,6 +128,106 @@ fn seeded_admin_registers_types_and_mints_a_working_command_token() {
         let unregistered = admin.create_command_token(&bc_name, "Withdraw").await;
         assert!(is_row_not_found(&unregistered.unwrap_err()));
         let not_seeded = admin.create_command_token("elsewhere", "Deposit").await;
+        assert!(is_row_not_found(&not_seeded.unwrap_err()));
+
+        admin.close().await;
+        skilj.shutdown(std::time::Duration::from_secs(5)).await;
+    });
+}
+
+async fn deposit(router: &axum::Router, token: &str, amount: i64) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/commands/trigger")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "payload": { "amount": amount } }).to_string(),
+        ))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// The amounts of the events the token's first consume serves.
+async fn first_consume(router: &axum::Router, token: &str) -> Vec<i64> {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/events/consume?mode=auto")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["payload"]["amount"].as_i64().unwrap())
+        .collect()
+}
+
+#[test]
+fn event_read_tokens_start_at_the_beginning_or_where_they_were_minted() {
+    runtime().block_on(async {
+        // Its own database: `database_url` drops and recreates the one it
+        // names, so sharing a name with the test above races it.
+        let Some(database_url) =
+            skilj_test_support::database_url("skilj_dev_seed_read_tokens_test").await
+        else {
+            return;
+        };
+        let bc_name = format!("wallet_{}", generate_token_id());
+        let admin = skilj::dev::seed_admin(&database_url, "reader", &[&bc_name])
+            .await
+            .unwrap();
+        let (skilj, _report) = Skilj::builder(database_url)
+            .pool_options(skilj::PgPoolOptions::new().max_connections(4))
+            .bounded_context(bc_name.clone())
+            .event_type::<Deposited>()
+            .command_type::<Deposit>()
+            .reconciliation_role(admin.external_subject())
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.rest_router();
+        let command = admin
+            .create_command_token(&bc_name, "Deposit")
+            .await
+            .unwrap();
+
+        // Minted before anything was committed, Now starts at the start.
+        let now_on_empty = admin
+            .create_event_read_token(&bc_name, "Deposited", skilj::dev::ReadFrom::Now)
+            .await
+            .unwrap();
+        deposit(&router, &command, 1).await;
+        let beginning = admin
+            .create_event_read_token(&bc_name, "Deposited", skilj::dev::ReadFrom::Beginning)
+            .await
+            .unwrap();
+        // Pinned here, after event 1 - not at its first read, which comes
+        // only after event 2 is committed.
+        let now = admin
+            .create_event_read_token(&bc_name, "Deposited", skilj::dev::ReadFrom::Now)
+            .await
+            .unwrap();
+        deposit(&router, &command, 2).await;
+
+        assert_eq!(first_consume(&router, &now).await, vec![2]);
+        assert_eq!(first_consume(&router, &beginning).await, vec![1, 2]);
+        assert_eq!(first_consume(&router, &now_on_empty).await, vec![1, 2]);
+
+        let unregistered = admin
+            .create_event_read_token(&bc_name, "Withdrawn", skilj::dev::ReadFrom::Now)
+            .await;
+        assert!(is_row_not_found(&unregistered.unwrap_err()));
+        let not_seeded = admin
+            .create_event_read_token("elsewhere", "Deposited", skilj::dev::ReadFrom::Beginning)
+            .await;
         assert!(is_row_not_found(&not_seeded.unwrap_err()));
 
         admin.close().await;

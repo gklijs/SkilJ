@@ -1,0 +1,355 @@
+diff -ruN a/src/bin/server.rs b/src/bin/server.rs
+--- a/src/bin/server.rs
++++ b/src/bin/server.rs
+@@ -24,7 +24,7 @@
+ 
+ use skilj::Skilj;
+ 
+-const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw"];
++const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw", "RegisterOwner"];
+ 
+ // A `main` returning `Result` prints its error with `Debug`; this prints
+ // the message instead, which for local mode says what to install or set.
+@@ -67,11 +67,43 @@
+         .and_then(|p| p.parse().ok())
+         .unwrap_or(8080);
+ 
++    // An owner's email address is a sensitive field, encrypted under a
++    // master key, and a blind tag, hashed under a blind index key: here
++    // both in files next to the embedded Postgres's data, or where
++    // KEY_FILE and BLIND_INDEX_KEY_FILE say. Losing the key file loses
++    // every address; changing the blind index key makes every stored hash
++    // stop matching. A deployment keeps both in a secret store instead.
++    #[cfg(feature = "local")]
++    let (local_key_file, local_blind_key_file) = match &local_postgres {
++        Some(postgres) => (
++            Some(skilj::local::key_file(postgres.data_dir())),
++            Some(postgres.data_dir().join("skilj.blind-index.key")),
++        ),
++        None => (None, None),
++    };
++    #[cfg(not(feature = "local"))]
++    let (local_key_file, local_blind_key_file): (
++        Option<std::path::PathBuf>,
++        Option<std::path::PathBuf>,
++    ) = (None, None);
++    let key_file = match std::env::var("KEY_FILE") {
++        Ok(path) => path.into(),
++        Err(_) => local_key_file.unwrap_or_else(|| "skilj.keys.json".into()),
++    };
++    let keys = skilj::KeyFileProvider::open(&key_file)?;
++    let blind_key_file = match std::env::var("BLIND_INDEX_KEY_FILE") {
++        Ok(path) => path.into(),
++        Err(_) => local_blind_key_file.unwrap_or_else(|| "skilj.blind-index.key".into()),
++    };
++    let blind_index_key = load_or_create_blind_index_key(&blind_key_file)?;
++
+     let bounded_context = template_check::wallet::BOUNDED_CONTEXT;
+     let admin =
+         skilj::dev::seed_admin(&database_url, "template_check admin", &[bounded_context]).await?;
+ 
+     let (skilj, report) = template_check::register(Skilj::builder(database_url))
++        .key_provider(keys)
++        .blind_index_key(blind_index_key)
+         .reconciliation_role(admin.external_subject())
+         .build()
+         .await?;
+@@ -125,6 +157,26 @@
+     Ok(())
+ }
+ 
++/// The blind index key: 32 random bytes, hex in `path`, made on first use.
++fn load_or_create_blind_index_key(
++    path: &std::path::Path,
++) -> Result<skilj::BlindIndexKey, Box<dyn std::error::Error>> {
++    if !path.exists() {
++        // A token secret is 32 of the OS's random bytes, as hex.
++        std::fs::write(path, skilj_core::shared::try_generate_token_secret()?)?;
++    }
++    let hex = std::fs::read_to_string(path)?;
++    let hex = hex.trim();
++    if hex.len() != 64 {
++        return Err(format!("{}: expected 64 hex digits", path.display()).into());
++    }
++    let mut bytes = [0u8; 32];
++    for (i, byte) in bytes.iter_mut().enumerate() {
++        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)?;
++    }
++    Ok(skilj::BlindIndexKey::from_bytes(bytes))
++}
++
+ async fn shutdown_signal() {
+     let ctrl_c = async {
+         tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl-C");
+diff -ruN a/src/wallet.rs b/src/wallet.rs
+--- a/src/wallet.rs
++++ b/src/wallet.rs
+@@ -14,10 +14,12 @@
+ 
+ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+-use skilj::{auto_register, CommandType, EventType, Projection};
++use skilj::{auto_register, normalize, BlindErasure, BlindTag, CommandType, EventType, Projection};
+ use skilj_core::event_store::Event;
+ use skilj_core::plugin::BoundedContextEvent;
+-use skilj_core::shared::{CommandDecision, EventSpec, TagMapping};
++use skilj_core::shared::{
++    CommandDecision, EventSpec, QueryItemMapping, SensitiveField, TagMapping,
++};
+ 
+ pub const BOUNDED_CONTEXT: &str = "wallet";
+ 
+@@ -25,6 +27,38 @@
+     vec![TagMapping::new("wallet", "wallet_id")]
+ }
+ 
++/// An owner's email address is unique across all wallets: a blind tag, the
++/// keyed hash of the normalized address, so the address itself is never
++/// stored in the clear. Forgetting the owner (subject `owner`) removes the
++/// tag, which frees the address.
++pub struct OwnerEmail;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl BlindTag for OwnerEmail {
++    const TAG_KEY: &'static str = "email";
++    const NORMALIZER_VERSION: u32 = 1;
++    const ERASURE: BlindErasure = BlindErasure::with_subject("owner");
++    fn normalize(value: &str) -> String {
++        normalize::email(value)
++    }
++}
++
++/// The wallet, the owner as the plain tag erasure finds them by, and the
++/// address as a blind tag.
++fn owner_tags() -> Vec<TagMapping> {
++    vec![
++        TagMapping::new("wallet", "wallet_id"),
++        TagMapping::new("owner", "owner_id"),
++        TagMapping::blind::<OwnerEmail>("email"),
++    ]
++}
++
++/// The address is encrypted under the owner's key, on the command as well
++/// as on the event, since both are stored.
++fn owner_email() -> Vec<SensitiveField> {
++    vec![SensitiveField::new("email", "owner", "owner_id")]
++}
++
+ // --- events ---
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+@@ -61,12 +95,34 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct OwnerRegisteredPayload {
++    pub wallet_id: String,
++    pub owner_id: String,
++    pub email: String,
++}
++
++pub struct OwnerRegistered;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl EventType for OwnerRegistered {
++    type Payload = OwnerRegisteredPayload;
++    const NAME: &'static str = "OwnerRegistered";
++    fn tag_mappings() -> Vec<TagMapping> {
++        owner_tags()
++    }
++    fn sensitive_fields() -> Vec<SensitiveField> {
++        owner_email()
++    }
++}
++
+ /// This bounded context's own hand-written event enum - every `decide()`
+ /// below only ever sees the events its own tags matched, so folding
+ /// this never has to check which wallet an event belongs to.
+ pub enum WalletEvent {
+     Deposited(DepositedPayload),
+     Withdrawn(WithdrawnPayload),
++    OwnerRegistered(OwnerRegisteredPayload),
+ }
+ 
+ impl BoundedContextEvent for WalletEvent {
+@@ -74,6 +130,9 @@
+         match event.event_type.name.as_str() {
+             "Deposited" => Some(serde_json::from_str(&event.payload).map(WalletEvent::Deposited)),
+             "Withdrawn" => Some(serde_json::from_str(&event.payload).map(WalletEvent::Withdrawn)),
++            "OwnerRegistered" => {
++                Some(serde_json::from_str(&event.payload).map(WalletEvent::OwnerRegistered))
++            }
+             _ => None,
+         }
+     }
+@@ -83,6 +142,7 @@
+     matching_events.iter().fold(0i64, |balance, event| match event {
+         WalletEvent::Deposited(p) => balance + p.amount,
+         WalletEvent::Withdrawn(p) => balance - p.amount,
++        WalletEvent::OwnerRegistered(_) => balance,
+     })
+ }
+ 
+@@ -178,6 +238,59 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct RegisterOwnerPayload {
++    pub wallet_id: String,
++    pub owner_id: String,
++    pub email: String,
++}
++
++pub struct RegisterOwner;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl CommandType for RegisterOwner {
++    type Payload = RegisterOwnerPayload;
++    type Event = WalletEvent;
++    const NAME: &'static str = "RegisterOwner";
++    fn tag_mappings() -> Vec<TagMapping> {
++        owner_tags()
++    }
++    fn sensitive_fields() -> Vec<SensitiveField> {
++        owner_email()
++    }
++    /// Every registration with the same normalized address, in any wallet:
++    /// the blind tag selects them, and conflicts with a racing one.
++    fn consistency_query() -> Vec<QueryItemMapping> {
++        vec![QueryItemMapping::types(&["OwnerRegistered"])
++            .tagged(vec![TagMapping::blind::<OwnerEmail>("email")])]
++    }
++    fn rest_trigger_allowed() -> bool {
++        true
++    }
++    /// Decides on which events matched, never on the address itself.
++    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
++        let taken = matching_events
++            .iter()
++            .any(|event| matches!(event, WalletEvent::OwnerRegistered(_)));
++        if taken {
++            return CommandDecision::Rejected {
++                reason: "this email address belongs to another owner".into(),
++                kind: "email_taken".into(),
++            };
++        }
++        CommandDecision::Accepted {
++            events: vec![EventSpec {
++                event_type: "OwnerRegistered".into(),
++                payload: serde_json::json!({
++                    "wallet_id": payload.wallet_id,
++                    "owner_id": payload.owner_id,
++                    "email": payload.email,
++                }),
++            }],
++        }
++    }
++}
++
+ // --- projection ---
+ 
+ #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+@@ -205,12 +318,14 @@
+         match event {
+             WalletEvent::Deposited(p) => vec![p.wallet_id.clone()],
+             WalletEvent::Withdrawn(p) => vec![p.wallet_id.clone()],
++            WalletEvent::OwnerRegistered(_) => Vec::new(),
+         }
+     }
+     fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+         match event {
+             WalletEvent::Deposited(p) => state.balance += p.amount,
+             WalletEvent::Withdrawn(p) => state.balance -= p.amount,
++            WalletEvent::OwnerRegistered(_) => {}
+         }
+     }
+ }
+diff -ruN a/tests/wallet_fixture.rs b/tests/wallet_fixture.rs
+--- a/tests/wallet_fixture.rs
++++ b/tests/wallet_fixture.rs
+@@ -2,14 +2,82 @@
+ //! Tag selection, projection keys, persistence, authorization and concurrency
+ //! need integration tests against a running application.
+ 
++use skilj::BlindTag;
+ use skilj_core::shared::EventSpec;
+ use skilj_test_fixture::command::GivenEvents as GivenCommandEvents;
+ use skilj_test_fixture::projection::GivenEvents as GivenProjectionEvents;
+ use template_check::wallet::{
+-    Balance, BalanceState, Deposit, DepositPayload, DepositedPayload, WalletEvent, Withdraw,
++    Balance, BalanceState, Deposit, DepositPayload, DepositedPayload, OwnerEmail,
++    OwnerRegisteredPayload, RegisterOwner, RegisterOwnerPayload, WalletEvent, Withdraw,
+     WithdrawPayload, WithdrawnPayload,
+ };
+ 
++fn register_owner(wallet_id: &str, email: &str) -> RegisterOwnerPayload {
++    RegisterOwnerPayload {
++        wallet_id: wallet_id.into(),
++        owner_id: "o-1".into(),
++        email: email.into(),
++    }
++}
++
++#[test]
++fn a_free_address_is_registered() {
++    GivenCommandEvents::<RegisterOwner>::new()
++        .when(register_owner("a", "ada@example.com"))
++        .then_accepted(vec![EventSpec {
++            event_type: "OwnerRegistered".into(),
++            payload: serde_json::json!({
++                "wallet_id": "a",
++                "owner_id": "o-1",
++                "email": "ada@example.com",
++            }),
++        }]);
++}
++
++/// The consistency query hands decide() the registrations of the same
++/// address only, from any wallet.
++#[test]
++fn a_taken_address_is_rejected_whatever_the_wallet() {
++    GivenCommandEvents::<RegisterOwner>::new()
++        .event(WalletEvent::OwnerRegistered(OwnerRegisteredPayload {
++            wallet_id: "b".into(),
++            owner_id: "o-2".into(),
++            email: "Ada@Example.com".into(),
++        }))
++        .when(register_owner("a", "ada@example.com"))
++        .then_rejected("email_taken");
++}
++
++#[test]
++fn addresses_differing_in_case_are_the_same() {
++    assert_eq!(
++        OwnerEmail::normalize("Ada@Example.COM"),
++        OwnerEmail::normalize("ada@example.com")
++    );
++}
++
++#[test]
++fn an_owner_leaves_the_balance_alone() {
++    GivenCommandEvents::<Withdraw>::new()
++        .event(WalletEvent::Deposited(DepositedPayload {
++            wallet_id: "a".into(),
++            amount: 10,
++        }))
++        .event(WalletEvent::OwnerRegistered(OwnerRegisteredPayload {
++            wallet_id: "a".into(),
++            owner_id: "o-1".into(),
++            email: "ada@example.com".into(),
++        }))
++        .when(WithdrawPayload {
++            wallet_id: "a".into(),
++            amount: 10,
++        })
++        .then_accepted(vec![EventSpec {
++            event_type: "Withdrawn".into(),
++            payload: serde_json::json!({ "wallet_id": "a", "amount": 10 }),
++        }]);
++}
++
+ #[test]
+ fn deposit_of_a_positive_amount_is_accepted() {
+     GivenCommandEvents::<Deposit>::new()

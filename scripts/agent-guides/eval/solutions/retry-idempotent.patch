@@ -1,0 +1,359 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -19,6 +19,8 @@
+ serde_json = "1"
+ schemars = { version = "1", features = ["jiff02"] }
+ jiff = { version = "0.2.46", features = ["serde"] }
++# The payment provider's client (src/client.rs).
++reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "json"] }
+ 
+ [dev-dependencies]
+ skilj-test-fixture = "0.5.0"
+diff -ruN a/src/bin/deposit.rs b/src/bin/deposit.rs
+--- a/src/bin/deposit.rs
++++ b/src/bin/deposit.rs
+@@ -0,0 +1,27 @@
++//! `deposit <base_url> <token> <wallet_id> <amount> <deposit_id>`: one
++//! deposit through the client, retried as it retries; prints the answer.
++
++use std::process::ExitCode;
++
++#[tokio::main]
++async fn main() -> ExitCode {
++    let args: Vec<String> = std::env::args().skip(1).collect();
++    let [base_url, token, wallet_id, amount, deposit_id] = args.as_slice() else {
++        eprintln!("usage: deposit <base_url> <token> <wallet_id> <amount> <deposit_id>");
++        return ExitCode::from(2);
++    };
++    let Ok(amount) = amount.parse::<i64>() else {
++        eprintln!("deposit: the amount must be a whole number, not {amount}");
++        return ExitCode::from(2);
++    };
++    match template_check::client::deposit(base_url, token, wallet_id, amount, deposit_id).await {
++        Ok(answer) => {
++            println!("{answer}");
++            ExitCode::SUCCESS
++        }
++        Err(error) => {
++            eprintln!("deposit: {error}");
++            ExitCode::FAILURE
++        }
++    }
++}
+diff -ruN a/src/client.rs b/src/client.rs
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -0,0 +1,96 @@
++//! The payment provider's client: deposits into a wallet over REST, and
++//! retries a request that failed on the way.
++//!
++//! Every attempt for one deposit carries the same `Idempotency-Key`,
++//! derived from the deposit's own id, so the server books it once however
++//! often it arrives. The server remembers a key for its idempotency-key
++//! retention, 48 hours by default (`SkiljBuilder::idempotency_key_retention`):
++//! retrying the same deposit later than that books it again, so keep every
++//! retry of one deposit, this client's and the caller's, within it.
++
++use std::time::Duration;
++
++/// How often a request is sent at most, the first time included.
++const ATTEMPTS: u32 = 5;
++/// The wait before the first retry; it doubles for each next one.
++const FIRST_BACKOFF: Duration = Duration::from_millis(100);
++
++/// Why a deposit was not answered.
++#[derive(Debug)]
++pub enum DepositError {
++    /// The server refused the request (4xx): sending it again won't help.
++    Refused { status: u16, body: String },
++    /// Every attempt failed on the way: a transport error or a 5xx.
++    GaveUp { attempts: u32, last: String },
++}
++
++impl std::fmt::Display for DepositError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            DepositError::Refused { status, body } => write!(f, "refused with {status}: {body}"),
++            DepositError::GaveUp { attempts, last } => {
++                write!(f, "gave up after {attempts} attempts: {last}")
++            }
++        }
++    }
++}
++
++impl std::error::Error for DepositError {}
++
++/// The key one deposit is known by, on every attempt.
++pub fn idempotency_key(deposit_id: &str) -> String {
++    format!("deposit:{deposit_id}")
++}
++
++/// Deposits `amount` into `wallet_id` with a `Deposit` trigger, and
++/// returns the server's answer (the response body). A transport error or
++/// a 5xx is retried, with the same `Idempotency-Key`; a 4xx is not.
++pub async fn deposit(
++    base_url: &str,
++    token: &str,
++    wallet_id: &str,
++    amount: i64,
++    deposit_id: &str,
++) -> Result<String, DepositError> {
++    let client = reqwest::Client::new();
++    let url = format!("{}/v1/commands/trigger", base_url.trim_end_matches('/'));
++    let body = serde_json::json!({ "payload": { "wallet_id": wallet_id, "amount": amount } });
++    let key = idempotency_key(deposit_id);
++    let mut backoff = FIRST_BACKOFF;
++    let mut last = String::new();
++    for attempt in 1..=ATTEMPTS {
++        let sent = client
++            .post(&url)
++            .bearer_auth(token)
++            .header("Idempotency-Key", &key)
++            .json(&body)
++            .send()
++            .await;
++        match sent {
++            Ok(response) => {
++                let status = response.status();
++                let text = response.text().await;
++                match text {
++                    Ok(text) if status.is_success() => return Ok(text),
++                    Ok(text) if status.is_client_error() => {
++                        return Err(DepositError::Refused {
++                            status: status.as_u16(),
++                            body: text,
++                        })
++                    }
++                    Ok(text) => last = format!("{status}: {text}"),
++                    Err(error) => last = format!("{status}, reading the answer failed: {error}"),
++                }
++            }
++            Err(error) => last = error.to_string(),
++        }
++        if attempt < ATTEMPTS {
++            tokio::time::sleep(backoff).await;
++            backoff *= 2;
++        }
++    }
++    Err(DepositError::GaveUp {
++        attempts: ATTEMPTS,
++        last,
++    })
++}
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,6 +10,7 @@
+ //! pattern; `register()` picks all of them up automatically, the same
+ //! way it already picks up `wallet`.
+ 
++pub mod client;
+ pub mod wallet;
+ 
+ /// Registers every `#[auto_register]`-tagged type in this crate onto
+diff -ruN a/tests/client.rs b/tests/client.rs
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -0,0 +1,202 @@
++//! The client against a mock server is a mock on a local socket that answers each request as
++//! the test scripts it: a lost response (the request arrives, the
++//! connection is closed without an answer), a status, or a body.
++
++use std::sync::{Arc, Mutex};
++
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::TcpListener;
++
++#[derive(Clone, Copy)]
++enum Answer {
++    /// The request is read and recorded; the connection closes unanswered.
++    Lost,
++    Status(u16),
++}
++
++#[derive(Debug, Clone)]
++struct Request {
++    line: String,
++    headers: Vec<(String, String)>,
++    body: serde_json::Value,
++}
++
++impl Request {
++    fn header(&self, name: &str) -> Option<&str> {
++        self.headers
++            .iter()
++            .find(|(key, _)| key.eq_ignore_ascii_case(name))
++            .map(|(_, value)| value.as_str())
++    }
++}
++
++const ACCEPTED: &str = r#"{"accepted":true,"triggeredEventSequences":[1],"deduplicated":false}"#;
++
++/// Starts the mock; answers `script` in order, then 200 with ACCEPTED.
++async fn mock(script: Vec<Answer>) -> (String, Arc<Mutex<Vec<Request>>>) {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let base_url = format!("http://{}", listener.local_addr().unwrap());
++    let seen = Arc::new(Mutex::new(Vec::new()));
++    let recorded = seen.clone();
++    tokio::spawn(async move {
++        let mut script = script.into_iter();
++        loop {
++            let (mut socket, _) = listener.accept().await.unwrap();
++            let Some(request) = read_request(&mut socket).await else {
++                continue;
++            };
++            recorded.lock().unwrap().push(request);
++            let (status, body) = match script.next() {
++                Some(Answer::Lost) => {
++                    drop(socket);
++                    continue;
++                }
++                Some(Answer::Status(status)) => (status, r#"{"error":"scripted"}"#),
++                None => (200, ACCEPTED),
++            };
++            let response = format!(
++                "HTTP/1.1 {status} Scripted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
++                body.len()
++            );
++            let _ = socket.write_all(response.as_bytes()).await;
++            let _ = socket.shutdown().await;
++        }
++    });
++    (base_url, seen)
++}
++
++async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Request> {
++    let mut buffer = Vec::new();
++    let mut chunk = [0u8; 4096];
++    let header_end = loop {
++        let n = socket.read(&mut chunk).await.ok()?;
++        if n == 0 {
++            return None;
++        }
++        buffer.extend_from_slice(&chunk[..n]);
++        if let Some(at) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
++            break at + 4;
++        }
++    };
++    let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
++    let mut lines = head.split("\r\n");
++    let line = lines.next()?.to_string();
++    let headers: Vec<(String, String)> = lines
++        .filter_map(|l| l.split_once(':'))
++        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
++        .collect();
++    let length: usize = headers
++        .iter()
++        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
++        .and_then(|(_, v)| v.parse().ok())
++        .unwrap_or(0);
++    while buffer.len() < header_end + length {
++        let n = socket.read(&mut chunk).await.ok()?;
++        if n == 0 {
++            break;
++        }
++        buffer.extend_from_slice(&chunk[..n]);
++    }
++    let body = serde_json::from_slice(&buffer[header_end..]).unwrap_or(serde_json::Value::Null);
++    Some(Request {
++        line,
++        headers,
++        body,
++    })
++}
++
++fn requests(seen: &Arc<Mutex<Vec<Request>>>) -> Vec<Request> {
++    seen.lock().unwrap().clone()
++}
++
++/// A single Deposit trigger, with the token, and an Idempotency-Key.
++fn assert_is_the_deposit(request: &Request) -> String {
++    assert!(
++        request.line.starts_with("POST /v1/commands/trigger "),
++        "{}",
++        request.line
++    );
++    assert_eq!(
++        request.header("authorization"),
++        Some("Bearer tok"),
++        "{request:?}"
++    );
++    assert_eq!(
++        request.body["payload"],
++        serde_json::json!({ "wallet_id": "w1", "amount": 100 }),
++        "{request:?}"
++    );
++    let key = request.header("idempotency-key").unwrap_or_default();
++    assert!(!key.is_empty(), "no Idempotency-Key: {request:?}");
++    key.to_string()
++}
++
++async fn deposit(base_url: &str, deposit_id: &str) -> Option<String> {
++    template_check::client::deposit(base_url, "tok", "w1", 100, deposit_id)
++        .await
++        .ok()
++}
++
++#[tokio::test]
++async fn a_lost_answer_is_retried_with_the_same_key() {
++    let (base_url, seen) = mock(vec![Answer::Lost]).await;
++    let answer = deposit(&base_url, "dep-1")
++        .await
++        .expect("the retry is answered");
++    assert!(answer.contains(r#""accepted":true"#), "{answer}");
++    let requests = requests(&seen);
++    assert_eq!(requests.len(), 2, "{requests:?}");
++    assert_eq!(
++        assert_is_the_deposit(&requests[0]),
++        assert_is_the_deposit(&requests[1])
++    );
++}
++
++#[tokio::test]
++async fn a_server_error_is_retried_with_the_same_key() {
++    let (base_url, seen) = mock(vec![Answer::Status(503), Answer::Status(500)]).await;
++    let answer = deposit(&base_url, "dep-1")
++        .await
++        .expect("the retry is answered");
++    assert!(answer.contains(r#""accepted":true"#), "{answer}");
++    let requests = requests(&seen);
++    assert_eq!(requests.len(), 3, "{requests:?}");
++    let key = assert_is_the_deposit(&requests[0]);
++    assert_eq!(assert_is_the_deposit(&requests[1]), key);
++    assert_eq!(assert_is_the_deposit(&requests[2]), key);
++}
++
++/// Running the binary again with a deposit's id is the same deposit.
++#[test]
++fn the_key_is_derived_from_the_deposit() {
++    assert_eq!(
++        template_check::client::idempotency_key("dep-1"),
++        template_check::client::idempotency_key("dep-1")
++    );
++    assert_ne!(
++        template_check::client::idempotency_key("dep-1"),
++        template_check::client::idempotency_key("dep-2")
++    );
++}
++
++#[tokio::test]
++async fn one_deposit_has_one_key() {
++    let (base_url, seen) = mock(vec![]).await;
++    deposit(&base_url, "dep-1").await.expect("answered");
++    deposit(&base_url, "dep-1").await.expect("answered");
++    deposit(&base_url, "dep-2").await.expect("answered");
++    let keys: Vec<String> = requests(&seen).iter().map(assert_is_the_deposit).collect();
++    assert_eq!(keys.len(), 3);
++    assert_eq!(keys[0], keys[1], "the same deposit_id, the same key");
++    assert_ne!(keys[0], keys[2], "another deposit_id, another key");
++}
++
++#[tokio::test]
++async fn a_refusal_is_not_retried() {
++    let (base_url, seen) = mock(vec![Answer::Status(400), Answer::Status(400)]).await;
++    assert!(
++        deposit(&base_url, "dep-1").await.is_none(),
++        "a refusal is an error"
++    );
++    assert_eq!(requests(&seen).len(), 1);
++}

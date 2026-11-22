@@ -1,0 +1,359 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -20,6 +20,10 @@
+ schemars = { version = "1", features = ["jiff02"] }
+ jiff = { version = "0.2.46", features = ["serde"] }
+ 
++[build-dependencies]
++# build.rs generates src/savings.skilj.toml's events and commands.
++skilj-codegen = "0.5.0"
++
+ [dev-dependencies]
+ skilj-test-fixture = "0.5.0"
+ 
+--- a/build.rs
++++ b/build.rs
+@@ -0,0 +1,19 @@
++//! Generates the `savings` bounded context's events and commands from
++//! `src/savings.skilj.toml` (imported from `models/savings.em.json` with
++//! `skilj-codegen import --from em-json`) into `$OUT_DIR`, where
++//! `src/savings.rs` includes them. Runs on every build that changes the
++//! file, so the Rust can't drift from the model.
++
++use std::path::PathBuf;
++
++fn main() {
++    let toml_path = "src/savings.skilj.toml";
++    println!("cargo:rerun-if-changed={toml_path}");
++    let toml_source = std::fs::read_to_string(toml_path)
++        .unwrap_or_else(|e| panic!("failed to read {toml_path}: {e}"));
++    let generated = skilj_codegen::generate(&toml_source)
++        .unwrap_or_else(|e| panic!("skilj-codegen failed on {toml_path}: {e}"));
++    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo always sets OUT_DIR"));
++    std::fs::write(out_dir.join("savings_generated.rs"), generated)
++        .unwrap_or_else(|e| panic!("failed to write savings_generated.rs: {e}"));
++}
+diff -ruN a/src/bin/server.rs b/src/bin/server.rs
+--- a/src/bin/server.rs
++++ b/src/bin/server.rs
+@@ -24,7 +24,14 @@
+ 
+ use skilj::Skilj;
+ 
+-const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw"];
++/// The command types a token is printed for, per bounded context.
++const COMMAND_TYPES: &[(&str, &[&str])] = &[
++    (template_check::wallet::BOUNDED_CONTEXT, &["Deposit", "Withdraw"]),
++    (
++        template_check::savings::BOUNDED_CONTEXT,
++        &["OpenGoal", "SaveTowardsGoal", "CloseGoal"],
++    ),
++];
+ 
+ // A `main` returning `Result` prints its error with `Debug`; this prints
+ // the message instead, which for local mode says what to install or set.
+@@ -67,9 +74,9 @@
+         .and_then(|p| p.parse().ok())
+         .unwrap_or(8080);
+ 
+-    let bounded_context = template_check::wallet::BOUNDED_CONTEXT;
++    let bounded_contexts: Vec<&str> = COMMAND_TYPES.iter().map(|(context, _)| *context).collect();
+     let admin =
+-        skilj::dev::seed_admin(&database_url, "template_check admin", &[bounded_context]).await?;
++        skilj::dev::seed_admin(&database_url, "template_check admin", &bounded_contexts).await?;
+ 
+     let (skilj, report) = template_check::register(Skilj::builder(database_url))
+         .reconciliation_role(admin.external_subject())
+@@ -82,12 +89,14 @@
+ 
+     println!("\ncommand tokens (send as `authorization: Bearer <id>.<secret>`):");
+     let mut tokens = Vec::new();
+-    for command_type_name in COMMAND_TYPES {
+-        let token = admin
+-            .create_command_token(bounded_context, command_type_name)
+-            .await?;
+-        println!("  {bounded_context}/{command_type_name}: {token}");
+-        tokens.push(token);
++    for (bounded_context, command_types) in COMMAND_TYPES {
++        for command_type_name in *command_types {
++            let token = admin
++                .create_command_token(bounded_context, command_type_name)
++                .await?;
++            println!("  {bounded_context}/{command_type_name}: {token}");
++            tokens.push(token);
++        }
+     }
+     admin.close().await;
+ 
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,6 +10,7 @@
+ //! pattern; `register()` picks all of them up automatically, the same
+ //! way it already picks up `wallet`.
+ 
++pub mod savings;
+ pub mod wallet;
+ 
+ /// Registers every `#[auto_register]`-tagged type in this crate onto
+diff -ruN a/src/savings.rs b/src/savings.rs
+--- a/src/savings.rs
++++ b/src/savings.rs
+@@ -0,0 +1,88 @@
++//! Savings goals, as the team modeled them (`models/savings.em.json`):
++//! a goal is opened, saved towards, and closed. The events and commands
++//! are generated from `src/savings.skilj.toml` by `build.rs`; what each
++//! command decides is written here, one `decide_<name>` per command, after
++//! the model's specifications.
++
++use skilj_core::shared::{CommandDecision, EventSpec};
++
++include!(concat!(env!("OUT_DIR"), "/savings_generated.rs"));
++
++/// Whether the goal was opened, and whether it is closed, from the goal's
++/// own events (its tag selected them).
++fn goal_state(matching_events: &[SavingsEvent]) -> (bool, bool) {
++    matching_events
++        .iter()
++        .fold((false, false), |(opened, closed), event| match event {
++            SavingsEvent::GoalOpened(_) => (true, closed),
++            SavingsEvent::SavedTowardsGoal(_) => (opened, closed),
++            SavingsEvent::GoalClosed(_) => (opened, true),
++        })
++}
++
++/// The model's rejections: `goal_not_found`, `goal_closed`.
++fn open_goal_or_rejection(
++    goal_id: &str,
++    matching_events: &[SavingsEvent],
++) -> Option<CommandDecision> {
++    match goal_state(matching_events) {
++        (false, _) => Some(CommandDecision::Rejected {
++            reason: format!("there is no goal {goal_id}"),
++            kind: "goal_not_found".into(),
++        }),
++        (true, true) => Some(CommandDecision::Rejected {
++            reason: format!("goal {goal_id} is closed"),
++            kind: "goal_closed".into(),
++        }),
++        (true, false) => None,
++    }
++}
++
++fn decide_open_goal(
++    payload: &OpenGoalPayload,
++    _matching_events: &[SavingsEvent],
++) -> CommandDecision {
++    CommandDecision::Accepted {
++        events: vec![EventSpec {
++            event_type: "GoalOpened".into(),
++            payload: serde_json::json!({
++                "goal_id": payload.goal_id,
++                "name": payload.name,
++                "target_amount": payload.target_amount,
++            }),
++        }],
++    }
++}
++
++fn decide_save_towards_goal(
++    payload: &SaveTowardsGoalPayload,
++    matching_events: &[SavingsEvent],
++) -> CommandDecision {
++    if let Some(rejection) = open_goal_or_rejection(&payload.goal_id, matching_events) {
++        return rejection;
++    }
++    CommandDecision::Accepted {
++        events: vec![EventSpec {
++            event_type: "SavedTowardsGoal".into(),
++            payload: serde_json::json!({
++                "goal_id": payload.goal_id,
++                "amount": payload.amount,
++            }),
++        }],
++    }
++}
++
++fn decide_close_goal(
++    payload: &CloseGoalPayload,
++    matching_events: &[SavingsEvent],
++) -> CommandDecision {
++    if let Some(rejection) = open_goal_or_rejection(&payload.goal_id, matching_events) {
++        return rejection;
++    }
++    CommandDecision::Accepted {
++        events: vec![EventSpec {
++            event_type: "GoalClosed".into(),
++            payload: serde_json::json!({ "goal_id": payload.goal_id }),
++        }],
++    }
++}
+diff -ruN a/src/savings.skilj.toml b/src/savings.skilj.toml
+--- a/src/savings.skilj.toml
++++ b/src/savings.skilj.toml
+@@ -0,0 +1,63 @@
++# Imported from Event Modeling JSON by skilj-codegen import --from em-json.
++# Command decisions stay hand-written: one decide_<name> function per command.
++
++bounded_context = "savings"
++
++[[event_type]]
++# From Goal Opened (5100000000000000012)
++name = "GoalOpened"
++fields = [
++    { name = "goal_id", type = "string" },
++    { name = "name", type = "string" },
++    { name = "target_amount", type = "i64" },
++]
++tags = { goal_id = "goal_id" }
++
++[[event_type]]
++# From Saved Towards Goal (5100000000000000022)
++name = "SavedTowardsGoal"
++fields = [
++    { name = "goal_id", type = "string" },
++    { name = "amount", type = "i64" },
++]
++tags = { goal_id = "goal_id" }
++
++[[event_type]]
++# From Goal Closed (5100000000000000032)
++name = "GoalClosed"
++fields = [
++    { name = "goal_id", type = "string" },
++]
++tags = { goal_id = "goal_id" }
++
++[[command_type]]
++# From Open Goal (5100000000000000011)
++name = "OpenGoal"
++rest_trigger_allowed = true
++fields = [
++    { name = "goal_id", type = "string" },
++    { name = "name", type = "string" },
++    { name = "target_amount", type = "i64" },
++]
++tags = { goal_id = "goal_id" }
++
++# Rejected as: goal_closed, goal_not_found
++[[command_type]]
++# From Save Towards Goal (5100000000000000021)
++name = "SaveTowardsGoal"
++rest_trigger_allowed = true
++fields = [
++    { name = "goal_id", type = "string" },
++    { name = "amount", type = "i64" },
++]
++tags = { goal_id = "goal_id" }
++
++# Rejected as: goal_closed, goal_not_found
++[[command_type]]
++# From Close Goal (5100000000000000031)
++name = "CloseGoal"
++rest_trigger_allowed = true
++fields = [
++    { name = "goal_id", type = "string" },
++]
++tags = { goal_id = "goal_id" }
+diff -ruN a/tests/savings_fixture.rs b/tests/savings_fixture.rs
+--- a/tests/savings_fixture.rs
++++ b/tests/savings_fixture.rs
+@@ -0,0 +1,98 @@
++//! The `savings` bounded context's decisions, after the model's
++//! specifications (models/savings.em.json).
++
++use skilj_core::shared::EventSpec;
++use skilj_test_fixture::command::GivenEvents;
++use template_check::savings::{
++    CloseGoal, CloseGoalPayload, GoalClosedPayload, GoalOpenedPayload, OpenGoal, OpenGoalPayload,
++    SaveTowardsGoal, SaveTowardsGoalPayload, SavingsEvent,
++};
++
++fn opened() -> SavingsEvent {
++    SavingsEvent::GoalOpened(GoalOpenedPayload {
++        goal_id: "g".into(),
++        name: "Holiday".into(),
++        target_amount: 500,
++    })
++}
++
++fn closed() -> SavingsEvent {
++    SavingsEvent::GoalClosed(GoalClosedPayload {
++        goal_id: "g".into(),
++    })
++}
++
++fn save(amount: i64) -> SaveTowardsGoalPayload {
++    SaveTowardsGoalPayload {
++        goal_id: "g".into(),
++        amount,
++    }
++}
++
++#[test]
++fn goal_opened() {
++    GivenEvents::<OpenGoal>::new()
++        .when(OpenGoalPayload {
++            goal_id: "g".into(),
++            name: "Holiday".into(),
++            target_amount: 500,
++        })
++        .then_accepted(vec![EventSpec {
++            event_type: "GoalOpened".into(),
++            payload: serde_json::json!({ "goal_id": "g", "name": "Holiday", "target_amount": 500 }),
++        }]);
++}
++
++#[test]
++fn saved_towards_an_open_goal() {
++    GivenEvents::<SaveTowardsGoal>::new()
++        .event(opened())
++        .when(save(50))
++        .then_accepted(vec![EventSpec {
++            event_type: "SavedTowardsGoal".into(),
++            payload: serde_json::json!({ "goal_id": "g", "amount": 50 }),
++        }]);
++}
++
++#[test]
++fn saving_towards_no_such_goal_is_rejected() {
++    GivenEvents::<SaveTowardsGoal>::new()
++        .when(save(50))
++        .then_rejected("goal_not_found");
++}
++
++#[test]
++fn saving_towards_a_closed_goal_is_rejected() {
++    GivenEvents::<SaveTowardsGoal>::new()
++        .events([opened(), closed()])
++        .when(save(50))
++        .then_rejected("goal_closed");
++}
++
++#[test]
++fn an_open_goal_is_closed() {
++    GivenEvents::<CloseGoal>::new()
++        .event(opened())
++        .when(CloseGoalPayload {
++            goal_id: "g".into(),
++        })
++        .then_accepted(vec![EventSpec {
++            event_type: "GoalClosed".into(),
++            payload: serde_json::json!({ "goal_id": "g" }),
++        }]);
++}
++
++#[test]
++fn closing_a_closed_goal_or_none_is_rejected() {
++    GivenEvents::<CloseGoal>::new()
++        .events([opened(), closed()])
++        .when(CloseGoalPayload {
++            goal_id: "g".into(),
++        })
++        .then_rejected("goal_closed");
++    GivenEvents::<CloseGoal>::new()
++        .when(CloseGoalPayload {
++            goal_id: "g".into(),
++        })
++        .then_rejected("goal_not_found");
++}

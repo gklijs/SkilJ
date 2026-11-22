@@ -1,0 +1,328 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -19,6 +19,9 @@
+ serde_json = "1"
+ schemars = { version = "1", features = ["jiff02"] }
+ jiff = { version = "0.2.46", features = ["serde"] }
++# Onboarding: the bridge from WalletOpened to a Temporal workflow (src/onboarding.rs).
++skilj-temporal = "0.5.0"
++temporalio-client = "1.0.0"
+ 
+ [dev-dependencies]
+ skilj-test-fixture = "0.5.0"
+diff -ruN a/src/bin/server.rs b/src/bin/server.rs
+--- a/src/bin/server.rs
++++ b/src/bin/server.rs
+@@ -24,7 +24,7 @@
+ 
+ use skilj::Skilj;
+ 
+-const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw"];
++const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw", "OpenWallet"];
+ 
+ // A `main` returning `Result` prints its error with `Debug`; this prints
+ // the message instead, which for local mode says what to install or set.
+@@ -89,6 +89,23 @@
+         println!("  {bounded_context}/{command_type_name}: {token}");
+         tokens.push(token);
+     }
++
++    // With TEMPORAL_ADDRESS, every wallet opened from now on starts its
++    // onboarding workflow. The read token is minted here, before the
++    // server takes requests, and starts at this moment (ReadFrom::Now):
++    // a wallet opened before the bridge's first read is still onboarded,
++    // one opened while the server ran without Temporal never is.
++    let onboarding = match std::env::var("TEMPORAL_ADDRESS") {
++        Ok(address) => {
++            let credential = admin
++                .create_event_read_token(bounded_context, "WalletOpened", skilj::dev::ReadFrom::Now)
++                .await?;
++            let temporal = connect_temporal(&address).await?;
++            println!("onboarding: starting WalletOnboarding workflows on Temporal at {address}");
++            Some((credential, temporal))
++        }
++        Err(_) => None,
++    };
+     admin.close().await;
+ 
+     let rest = skilj.rest_router();
+@@ -108,12 +125,37 @@
+         );
+     }
+ 
++    // The bridge reads WalletOpened from this server's own REST surface.
++    let (stop_bridge, bridge_stopped) = tokio::sync::oneshot::channel::<()>();
++    let bridge = onboarding.map(|(credential, temporal)| {
++        let base_url = format!("http://127.0.0.1:{port}");
++        tokio::spawn(async move {
++            let mappings = [template_check::onboarding::onboarding_mapping(credential)];
++            skilj_temporal::run_until(
++                &base_url,
++                &temporal,
++                bounded_context,
++                &mappings,
++                std::time::Duration::from_secs(1),
++                async {
++                    let _ = bridge_stopped.await;
++                },
++            )
++            .await;
++        })
++    });
++
+     // On Ctrl-C or SIGTERM (what `docker stop` sends): stop taking
+     // requests and finish the ones in flight, then let skilj's background
+     // work finish what it's doing and close its connections.
+     axum::serve(listener, app)
+         .with_graceful_shutdown(shutdown_signal())
+         .await?;
++    // The bridge finishes the event it is starting a workflow for.
++    let _ = stop_bridge.send(());
++    if let Some(bridge) = bridge {
++        bridge.await?;
++    }
+     let report = skilj.shutdown(std::time::Duration::from_secs(10)).await;
+     if !report.aborted.is_empty() {
+         println!("shutdown: aborted after the timeout: {:?}", report.aborted);
+@@ -125,6 +167,17 @@
+     Ok(())
+ }
+ 
++/// A client of the Temporal frontend at `address` (`host:port`), in the
++/// `default` namespace.
++async fn connect_temporal(
++    address: &str,
++) -> Result<temporalio_client::Client, Box<dyn std::error::Error>> {
++    use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
++    let url: temporalio_client::Url = format!("http://{address}").parse()?;
++    let connection = Connection::connect(ConnectionOptions::new(url).build()).await?;
++    Ok(Client::new(connection, ClientOptions::new("default").build())?)
++}
++
+ async fn shutdown_signal() {
+     let ctrl_c = async {
+         tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl-C");
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,6 +10,7 @@
+ //! pattern; `register()` picks all of them up automatically, the same
+ //! way it already picks up `wallet`.
+ 
++pub mod onboarding;
+ pub mod wallet;
+ 
+ /// Registers every `#[auto_register]`-tagged type in this crate onto
+diff -ruN a/src/onboarding.rs b/src/onboarding.rs
+--- a/src/onboarding.rs
++++ b/src/onboarding.rs
+@@ -0,0 +1,27 @@
++//! Every opened wallet is onboarded by a Temporal workflow: the
++//! `skilj-temporal` bridge reads `WalletOpened` over REST and starts a
++//! `WalletOnboarding` execution for it, correlated by the wallet's tag
++//! (workflow id `wallet:wallet:<wallet_id>`). The workflow itself runs on
++//! another team's workers.
++
++use skilj_temporal::{EventTypeMapping, MappingAction};
++
++/// The workflow type each opened wallet starts.
++pub const WORKFLOW_TYPE: &str = "WalletOnboarding";
++/// The task queue its workers poll.
++pub const TASK_QUEUE: &str = "wallet-onboarding";
++
++/// `WalletOpened` starts `WalletOnboarding` on `wallet-onboarding`, one
++/// execution per wallet. `credential` is an event read token for
++/// `WalletOpened` (`<id>.<secret>`).
++pub fn onboarding_mapping(credential: String) -> EventTypeMapping {
++    EventTypeMapping {
++        event_type: "WalletOpened".to_string(),
++        credential,
++        correlation_tag_key: "wallet".to_string(),
++        action: MappingAction::Start {
++            workflow_type: WORKFLOW_TYPE.to_string(),
++            task_queue: TASK_QUEUE.to_string(),
++        },
++    }
++}
+diff -ruN a/src/wallet.rs b/src/wallet.rs
+--- a/src/wallet.rs
++++ b/src/wallet.rs
+@@ -61,12 +61,34 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct WalletOpenedPayload {
++    pub wallet_id: String,
++    pub owner_id: String,
++}
++
++pub struct WalletOpened;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl EventType for WalletOpened {
++    type Payload = WalletOpenedPayload;
++    const NAME: &'static str = "WalletOpened";
++    fn tag_mappings() -> Vec<TagMapping> {
++        wallet_tag()
++    }
++    /// Read over REST by the onboarding bridge (src/onboarding.rs).
++    fn event_read_allowed() -> bool {
++        true
++    }
++}
++
+ /// This bounded context's own hand-written event enum - every `decide()`
+ /// below only ever sees the events its own tags matched, so folding
+ /// this never has to check which wallet an event belongs to.
+ pub enum WalletEvent {
+     Deposited(DepositedPayload),
+     Withdrawn(WithdrawnPayload),
++    WalletOpened(WalletOpenedPayload),
+ }
+ 
+ impl BoundedContextEvent for WalletEvent {
+@@ -74,6 +96,7 @@
+         match event.event_type.name.as_str() {
+             "Deposited" => Some(serde_json::from_str(&event.payload).map(WalletEvent::Deposited)),
+             "Withdrawn" => Some(serde_json::from_str(&event.payload).map(WalletEvent::Withdrawn)),
++            "WalletOpened" => Some(serde_json::from_str(&event.payload).map(WalletEvent::WalletOpened)),
+             _ => None,
+         }
+     }
+@@ -83,6 +106,7 @@
+     matching_events.iter().fold(0i64, |balance, event| match event {
+         WalletEvent::Deposited(p) => balance + p.amount,
+         WalletEvent::Withdrawn(p) => balance - p.amount,
++        WalletEvent::WalletOpened(_) => balance,
+     })
+ }
+ 
+@@ -178,6 +202,48 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct OpenWalletPayload {
++    pub wallet_id: String,
++    pub owner_id: String,
++}
++
++pub struct OpenWallet;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl CommandType for OpenWallet {
++    type Payload = OpenWalletPayload;
++    type Event = WalletEvent;
++    const NAME: &'static str = "OpenWallet";
++    fn tag_mappings() -> Vec<TagMapping> {
++        wallet_tag()
++    }
++    fn rest_trigger_allowed() -> bool {
++        true
++    }
++    /// A wallet is opened once, so it starts one onboarding workflow.
++    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
++        let open = matching_events
++            .iter()
++            .any(|event| matches!(event, WalletEvent::WalletOpened(_)));
++        if open {
++            return CommandDecision::Rejected {
++                reason: format!("wallet {} is open already", payload.wallet_id),
++                kind: "wallet_already_open".into(),
++            };
++        }
++        CommandDecision::Accepted {
++            events: vec![EventSpec {
++                event_type: "WalletOpened".into(),
++                payload: serde_json::json!({
++                    "wallet_id": payload.wallet_id,
++                    "owner_id": payload.owner_id,
++                }),
++            }],
++        }
++    }
++}
++
+ // --- projection ---
+ 
+ #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+@@ -205,12 +271,14 @@
+         match event {
+             WalletEvent::Deposited(p) => vec![p.wallet_id.clone()],
+             WalletEvent::Withdrawn(p) => vec![p.wallet_id.clone()],
++            WalletEvent::WalletOpened(_) => Vec::new(),
+         }
+     }
+     fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+         match event {
+             WalletEvent::Deposited(p) => state.balance += p.amount,
+             WalletEvent::Withdrawn(p) => state.balance -= p.amount,
++            WalletEvent::WalletOpened(_) => {}
+         }
+     }
+ }
+diff -ruN a/tests/onboarding.rs b/tests/onboarding.rs
+--- a/tests/onboarding.rs
++++ b/tests/onboarding.rs
+@@ -0,0 +1,60 @@
++//! Opening a wallet, and the mapping that onboards it.
++
++use skilj::EventType;
++use skilj_core::shared::EventSpec;
++use skilj_temporal::MappingAction;
++use skilj_test_fixture::command::GivenEvents;
++use template_check::onboarding::onboarding_mapping;
++use template_check::wallet::{
++    OpenWallet, OpenWalletPayload, WalletEvent, WalletOpened, WalletOpenedPayload,
++};
++
++fn open() -> OpenWalletPayload {
++    OpenWalletPayload {
++        wallet_id: "a".into(),
++        owner_id: "o-1".into(),
++    }
++}
++
++#[test]
++fn a_new_wallet_is_opened() {
++    GivenEvents::<OpenWallet>::new()
++        .when(open())
++        .then_accepted(vec![EventSpec {
++            event_type: "WalletOpened".into(),
++            payload: serde_json::json!({ "wallet_id": "a", "owner_id": "o-1" }),
++        }]);
++}
++
++#[test]
++fn an_open_wallet_is_not_opened_again() {
++    GivenEvents::<OpenWallet>::new()
++        .event(WalletEvent::WalletOpened(WalletOpenedPayload {
++            wallet_id: "a".into(),
++            owner_id: "o-1".into(),
++        }))
++        .when(open())
++        .then_rejected("wallet_already_open");
++}
++
++#[test]
++fn an_opened_wallet_starts_its_onboarding_workflow() {
++    let mapping = onboarding_mapping("id.secret".into());
++    assert_eq!(mapping.event_type, "WalletOpened");
++    assert_eq!(mapping.credential, "id.secret");
++    assert_eq!(mapping.correlation_tag_key, "wallet");
++    let MappingAction::Start {
++        workflow_type,
++        task_queue,
++    } = mapping.action
++    else {
++        panic!("WalletOpened starts a workflow");
++    };
++    assert_eq!(workflow_type, "WalletOnboarding");
++    assert_eq!(task_queue, "wallet-onboarding");
++}
++
++#[test]
++fn the_bridge_may_read_wallet_opened() {
++    assert!(WalletOpened::event_read_allowed());
++}

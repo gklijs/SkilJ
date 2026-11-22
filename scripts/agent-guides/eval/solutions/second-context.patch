@@ -1,0 +1,313 @@
+diff -ruN a/src/bin/server.rs b/src/bin/server.rs
+--- a/src/bin/server.rs
++++ b/src/bin/server.rs
+@@ -24,7 +24,17 @@
+ 
+ use skilj::Skilj;
+ 
+-const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw"];
++/// The command types a token is printed for, per bounded context.
++const COMMAND_TYPES: &[(&str, &[&str])] = &[
++    (
++        template_check::wallet::BOUNDED_CONTEXT,
++        &["Deposit", "Withdraw"],
++    ),
++    (
++        template_check::rewards::BOUNDED_CONTEXT,
++        &["EarnPoints", "RedeemPoints"],
++    ),
++];
+ 
+ // A `main` returning `Result` prints its error with `Debug`; this prints
+ // the message instead, which for local mode says what to install or set.
+@@ -67,9 +77,11 @@
+         .and_then(|p| p.parse().ok())
+         .unwrap_or(8080);
+ 
+-    let bounded_context = template_check::wallet::BOUNDED_CONTEXT;
++    // Every bounded context goes in the list: one left out has no grant,
++    // and its types are skipped (report.skipped_no_access).
++    let bounded_contexts: Vec<&str> = COMMAND_TYPES.iter().map(|(context, _)| *context).collect();
+     let admin =
+-        skilj::dev::seed_admin(&database_url, "template_check admin", &[bounded_context]).await?;
++        skilj::dev::seed_admin(&database_url, "template_check admin", &bounded_contexts).await?;
+ 
+     let (skilj, report) = template_check::register(Skilj::builder(database_url))
+         .reconciliation_role(admin.external_subject())
+@@ -82,12 +94,14 @@
+ 
+     println!("\ncommand tokens (send as `authorization: Bearer <id>.<secret>`):");
+     let mut tokens = Vec::new();
+-    for command_type_name in COMMAND_TYPES {
+-        let token = admin
+-            .create_command_token(bounded_context, command_type_name)
+-            .await?;
+-        println!("  {bounded_context}/{command_type_name}: {token}");
+-        tokens.push(token);
++    for (bounded_context, command_types) in COMMAND_TYPES {
++        for command_type_name in *command_types {
++            let token = admin
++                .create_command_token(bounded_context, command_type_name)
++                .await?;
++            println!("  {bounded_context}/{command_type_name}: {token}");
++            tokens.push(token);
++        }
+     }
+     admin.close().await;
+ 
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,6 +10,7 @@
+ //! pattern; `register()` picks all of them up automatically, the same
+ //! way it already picks up `wallet`.
+ 
++pub mod rewards;
+ pub mod wallet;
+ 
+ /// Registers every `#[auto_register]`-tagged type in this crate onto
+diff -ruN a/src/rewards.rs b/src/rewards.rs
+--- a/src/rewards.rs
++++ b/src/rewards.rs
+@@ -0,0 +1,170 @@
++//! A second bounded context, next to `wallet`: members earn reward points
++//! and redeem them. Tagged on `member` alone, keyed by the payload's
++//! `member_id`, so `decide()` for one member sees only that member's
++//! points.
++
++use schemars::JsonSchema;
++use serde::{Deserialize, Serialize};
++use skilj::{auto_register, CommandType, EventType};
++use skilj_core::event_store::Event;
++use skilj_core::plugin::BoundedContextEvent;
++use skilj_core::shared::{CommandDecision, EventSpec, TagMapping};
++
++pub const BOUNDED_CONTEXT: &str = "rewards";
++
++fn member_tag() -> Vec<TagMapping> {
++    vec![TagMapping::new("member", "member_id")]
++}
++
++// --- events ---
++
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct PointsEarnedPayload {
++    pub member_id: String,
++    pub points: i64,
++}
++
++pub struct PointsEarned;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl EventType for PointsEarned {
++    type Payload = PointsEarnedPayload;
++    const NAME: &'static str = "PointsEarned";
++    fn tag_mappings() -> Vec<TagMapping> {
++        member_tag()
++    }
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct PointsRedeemedPayload {
++    pub member_id: String,
++    pub points: i64,
++}
++
++pub struct PointsRedeemed;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl EventType for PointsRedeemed {
++    type Payload = PointsRedeemedPayload;
++    const NAME: &'static str = "PointsRedeemed";
++    fn tag_mappings() -> Vec<TagMapping> {
++        member_tag()
++    }
++}
++
++pub enum RewardsEvent {
++    PointsEarned(PointsEarnedPayload),
++    PointsRedeemed(PointsRedeemedPayload),
++}
++
++impl BoundedContextEvent for RewardsEvent {
++    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
++        match event.event_type.name.as_str() {
++            "PointsEarned" => {
++                Some(serde_json::from_str(&event.payload).map(RewardsEvent::PointsEarned))
++            }
++            "PointsRedeemed" => {
++                Some(serde_json::from_str(&event.payload).map(RewardsEvent::PointsRedeemed))
++            }
++            _ => None,
++        }
++    }
++}
++
++fn points_of(matching_events: &[RewardsEvent]) -> i64 {
++    matching_events
++        .iter()
++        .fold(0i64, |points, event| match event {
++            RewardsEvent::PointsEarned(p) => points + p.points,
++            RewardsEvent::PointsRedeemed(p) => points - p.points,
++        })
++}
++
++fn positive(points: i64) -> Option<CommandDecision> {
++    (points <= 0).then(|| CommandDecision::Rejected {
++        reason: "points must be positive".into(),
++        kind: "invalid_points".into(),
++    })
++}
++
++// --- commands ---
++
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct EarnPointsPayload {
++    pub member_id: String,
++    pub points: i64,
++}
++
++pub struct EarnPoints;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl CommandType for EarnPoints {
++    type Payload = EarnPointsPayload;
++    type Event = RewardsEvent;
++    const NAME: &'static str = "EarnPoints";
++    fn tag_mappings() -> Vec<TagMapping> {
++        member_tag()
++    }
++    fn rest_trigger_allowed() -> bool {
++        true
++    }
++    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
++        if let Some(rejected) = positive(payload.points) {
++            return rejected;
++        }
++        CommandDecision::Accepted {
++            events: vec![EventSpec {
++                event_type: "PointsEarned".into(),
++                payload: serde_json::json!({
++                    "member_id": payload.member_id,
++                    "points": payload.points,
++                }),
++            }],
++        }
++    }
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct RedeemPointsPayload {
++    pub member_id: String,
++    pub points: i64,
++}
++
++pub struct RedeemPoints;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl CommandType for RedeemPoints {
++    type Payload = RedeemPointsPayload;
++    type Event = RewardsEvent;
++    const NAME: &'static str = "RedeemPoints";
++    fn tag_mappings() -> Vec<TagMapping> {
++        member_tag()
++    }
++    fn rest_trigger_allowed() -> bool {
++        true
++    }
++    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
++        if let Some(rejected) = positive(payload.points) {
++            return rejected;
++        }
++        let points = points_of(matching_events);
++        if payload.points > points {
++            return CommandDecision::Rejected {
++                reason: format!(
++                    "member {} has {points} points, cannot redeem {}",
++                    payload.member_id, payload.points
++                ),
++                kind: "insufficient_points".into(),
++            };
++        }
++        CommandDecision::Accepted {
++            events: vec![EventSpec {
++                event_type: "PointsRedeemed".into(),
++                payload: serde_json::json!({
++                    "member_id": payload.member_id,
++                    "points": payload.points,
++                }),
++            }],
++        }
++    }
++}
+diff -ruN a/tests/rewards_fixture.rs b/tests/rewards_fixture.rs
+--- a/tests/rewards_fixture.rs
++++ b/tests/rewards_fixture.rs
+@@ -0,0 +1,67 @@
++//! Pure decision tests of the `rewards` bounded context.
++
++use skilj_core::shared::EventSpec;
++use skilj_test_fixture::command::GivenEvents;
++use template_check::rewards::{
++    EarnPoints, EarnPointsPayload, PointsEarnedPayload, PointsRedeemedPayload, RedeemPoints,
++    RedeemPointsPayload, RewardsEvent,
++};
++
++fn earned(points: i64) -> RewardsEvent {
++    RewardsEvent::PointsEarned(PointsEarnedPayload {
++        member_id: "m".into(),
++        points,
++    })
++}
++
++fn redeem(points: i64) -> RedeemPointsPayload {
++    RedeemPointsPayload {
++        member_id: "m".into(),
++        points,
++    }
++}
++
++#[test]
++fn points_are_earned() {
++    GivenEvents::<EarnPoints>::new()
++        .when(EarnPointsPayload {
++            member_id: "m".into(),
++            points: 10,
++        })
++        .then_accepted(vec![EventSpec {
++            event_type: "PointsEarned".into(),
++            payload: serde_json::json!({ "member_id": "m", "points": 10 }),
++        }]);
++}
++
++#[test]
++fn earned_points_can_be_redeemed() {
++    GivenEvents::<RedeemPoints>::new()
++        .event(earned(10))
++        .when(redeem(10))
++        .then_accepted(vec![EventSpec {
++            event_type: "PointsRedeemed".into(),
++            payload: serde_json::json!({ "member_id": "m", "points": 10 }),
++        }]);
++}
++
++#[test]
++fn redeeming_more_than_the_balance_is_rejected() {
++    GivenEvents::<RedeemPoints>::new()
++        .events([
++            earned(10),
++            RewardsEvent::PointsRedeemed(PointsRedeemedPayload {
++                member_id: "m".into(),
++                points: 4,
++            }),
++        ])
++        .when(redeem(7))
++        .then_rejected("insufficient_points");
++}
++
++#[test]
++fn a_member_without_points_cannot_redeem() {
++    GivenEvents::<RedeemPoints>::new()
++        .when(redeem(1))
++        .then_rejected("insufficient_points");
++}

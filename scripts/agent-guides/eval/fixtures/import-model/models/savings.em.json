@@ -1,0 +1,554 @@
+{
+  "slices": [
+    {
+      "id": "5100000000000000001",
+      "status": "Planned",
+      "index": 0,
+      "title": "Open a savings goal",
+      "context": "Savings",
+      "sliceType": "STATE_CHANGE",
+      "commands": [
+        {
+          "id": "5100000000000000011",
+          "title": "Open Goal",
+          "type": "COMMAND",
+          "modelContext": "Savings",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "goalId",
+              "type": "String",
+              "example": "g-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            },
+            {
+              "name": "name",
+              "type": "String",
+              "example": "Holiday",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            },
+            {
+              "name": "targetAmount",
+              "type": "Int",
+              "example": "500",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "5100000000000000010",
+              "type": "INBOUND",
+              "title": "Open Goal Request",
+              "elementType": "SCREEN"
+            },
+            {
+              "id": "5100000000000000012",
+              "type": "OUTBOUND",
+              "title": "Goal Opened",
+              "elementType": "EVENT"
+            }
+          ],
+          "aggregate": "Goal"
+        }
+      ],
+      "events": [
+        {
+          "id": "5100000000000000012",
+          "title": "Goal Opened",
+          "type": "EVENT",
+          "modelContext": "Savings",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "goalId",
+              "type": "String",
+              "example": "g-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            },
+            {
+              "name": "name",
+              "type": "String",
+              "example": "Holiday",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            },
+            {
+              "name": "targetAmount",
+              "type": "Int",
+              "example": "500",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "5100000000000000011",
+              "type": "INBOUND",
+              "title": "Open Goal",
+              "elementType": "COMMAND"
+            }
+          ],
+          "aggregate": "Goal"
+        }
+      ],
+      "screens": [
+        {
+          "id": "5100000000000000010",
+          "title": "Open Goal Request",
+          "type": "SCREEN",
+          "fields": [],
+          "apiEndpoint": "POST /v1/commands/trigger",
+          "dependencies": [
+            {
+              "id": "5100000000000000011",
+              "type": "OUTBOUND",
+              "title": "Open Goal",
+              "elementType": "COMMAND"
+            }
+          ]
+        }
+      ],
+      "specifications": [
+        {
+          "id": "5100000000000000013",
+          "title": "goal opened",
+          "linkedId": "5100000000000000011",
+          "given": [],
+          "when": [
+            {
+              "id": "5100000000000000013-w",
+              "title": "Open Goal",
+              "type": "SPEC_COMMAND",
+              "linkedId": "5100000000000000011"
+            }
+          ],
+          "then": [
+            {
+              "id": "5100000000000000013-t",
+              "title": "Goal Opened",
+              "type": "SPEC_EVENT",
+              "linkedId": "5100000000000000012"
+            }
+          ]
+        }
+      ],
+      "actors": [
+        {
+          "name": "Saver",
+          "authRequired": true
+        }
+      ],
+      "aggregates": [
+        "Goal"
+      ],
+      "readmodels": [],
+      "processors": [],
+      "tables": [],
+      "screenImages": []
+    },
+    {
+      "id": "5100000000000000002",
+      "status": "Planned",
+      "index": 1,
+      "title": "Save towards a goal",
+      "context": "Savings",
+      "sliceType": "STATE_CHANGE",
+      "commands": [
+        {
+          "id": "5100000000000000021",
+          "title": "Save Towards Goal",
+          "type": "COMMAND",
+          "modelContext": "Savings",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "goalId",
+              "type": "String",
+              "example": "g-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "50",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "5100000000000000020",
+              "type": "INBOUND",
+              "title": "Save Towards Goal Request",
+              "elementType": "SCREEN"
+            },
+            {
+              "id": "5100000000000000022",
+              "type": "OUTBOUND",
+              "title": "Saved Towards Goal",
+              "elementType": "EVENT"
+            }
+          ],
+          "aggregate": "Goal"
+        }
+      ],
+      "events": [
+        {
+          "id": "5100000000000000022",
+          "title": "Saved Towards Goal",
+          "type": "EVENT",
+          "modelContext": "Savings",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "goalId",
+              "type": "String",
+              "example": "g-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            },
+            {
+              "name": "amount",
+              "type": "Int",
+              "example": "50",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single"
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "5100000000000000021",
+              "type": "INBOUND",
+              "title": "Save Towards Goal",
+              "elementType": "COMMAND"
+            }
+          ],
+          "aggregate": "Goal"
+        }
+      ],
+      "screens": [
+        {
+          "id": "5100000000000000020",
+          "title": "Save Towards Goal Request",
+          "type": "SCREEN",
+          "fields": [],
+          "apiEndpoint": "POST /v1/commands/trigger",
+          "dependencies": [
+            {
+              "id": "5100000000000000021",
+              "type": "OUTBOUND",
+              "title": "Save Towards Goal",
+              "elementType": "COMMAND"
+            }
+          ]
+        }
+      ],
+      "specifications": [
+        {
+          "id": "5100000000000000023",
+          "title": "saved towards an open goal",
+          "linkedId": "5100000000000000021",
+          "given": [
+            {
+              "id": "5100000000000000023-g0",
+              "title": "Goal Opened",
+              "type": "SPEC_EVENT",
+              "linkedId": "5100000000000000012"
+            }
+          ],
+          "when": [
+            {
+              "id": "5100000000000000023-w",
+              "title": "Save Towards Goal",
+              "type": "SPEC_COMMAND",
+              "linkedId": "5100000000000000021"
+            }
+          ],
+          "then": [
+            {
+              "id": "5100000000000000023-t",
+              "title": "Saved Towards Goal",
+              "type": "SPEC_EVENT",
+              "linkedId": "5100000000000000022"
+            }
+          ]
+        },
+        {
+          "id": "5100000000000000024",
+          "title": "no such goal",
+          "linkedId": "5100000000000000021",
+          "given": [],
+          "when": [
+            {
+              "id": "5100000000000000024-w",
+              "title": "Save Towards Goal",
+              "type": "SPEC_COMMAND",
+              "linkedId": "5100000000000000021"
+            }
+          ],
+          "then": [
+            {
+              "id": "5100000000000000024-t",
+              "title": "goal_not_found: there is no goal with this id",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        },
+        {
+          "id": "5100000000000000025",
+          "title": "goal is closed",
+          "linkedId": "5100000000000000021",
+          "given": [
+            {
+              "id": "5100000000000000025-g0",
+              "title": "Goal Opened",
+              "type": "SPEC_EVENT",
+              "linkedId": "5100000000000000012"
+            },
+            {
+              "id": "5100000000000000025-g1",
+              "title": "Goal Closed",
+              "type": "SPEC_EVENT",
+              "linkedId": "5100000000000000032"
+            }
+          ],
+          "when": [
+            {
+              "id": "5100000000000000025-w",
+              "title": "Save Towards Goal",
+              "type": "SPEC_COMMAND",
+              "linkedId": "5100000000000000021"
+            }
+          ],
+          "then": [
+            {
+              "id": "5100000000000000025-t",
+              "title": "goal_closed: the goal is closed",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        }
+      ],
+      "actors": [
+        {
+          "name": "Saver",
+          "authRequired": true
+        }
+      ],
+      "aggregates": [
+        "Goal"
+      ],
+      "readmodels": [],
+      "processors": [],
+      "tables": [],
+      "screenImages": []
+    },
+    {
+      "id": "5100000000000000003",
+      "status": "Planned",
+      "index": 2,
+      "title": "Close a goal",
+      "context": "Savings",
+      "sliceType": "STATE_CHANGE",
+      "commands": [
+        {
+          "id": "5100000000000000031",
+          "title": "Close Goal",
+          "type": "COMMAND",
+          "modelContext": "Savings",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "goalId",
+              "type": "String",
+              "example": "g-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "5100000000000000030",
+              "type": "INBOUND",
+              "title": "Close Goal Request",
+              "elementType": "SCREEN"
+            },
+            {
+              "id": "5100000000000000032",
+              "type": "OUTBOUND",
+              "title": "Goal Closed",
+              "elementType": "EVENT"
+            }
+          ],
+          "aggregate": "Goal"
+        }
+      ],
+      "events": [
+        {
+          "id": "5100000000000000032",
+          "title": "Goal Closed",
+          "type": "EVENT",
+          "modelContext": "Savings",
+          "context": "INTERNAL",
+          "fields": [
+            {
+              "name": "goalId",
+              "type": "String",
+              "example": "g-1",
+              "optional": false,
+              "generated": false,
+              "cardinality": "Single",
+              "idAttribute": true
+            }
+          ],
+          "dependencies": [
+            {
+              "id": "5100000000000000031",
+              "type": "INBOUND",
+              "title": "Close Goal",
+              "elementType": "COMMAND"
+            }
+          ],
+          "aggregate": "Goal"
+        }
+      ],
+      "screens": [
+        {
+          "id": "5100000000000000030",
+          "title": "Close Goal Request",
+          "type": "SCREEN",
+          "fields": [],
+          "apiEndpoint": "POST /v1/commands/trigger",
+          "dependencies": [
+            {
+              "id": "5100000000000000031",
+              "type": "OUTBOUND",
+              "title": "Close Goal",
+              "elementType": "COMMAND"
+            }
+          ]
+        }
+      ],
+      "specifications": [
+        {
+          "id": "5100000000000000033",
+          "title": "open goal closed",
+          "linkedId": "5100000000000000031",
+          "given": [
+            {
+              "id": "5100000000000000033-g0",
+              "title": "Goal Opened",
+              "type": "SPEC_EVENT",
+              "linkedId": "5100000000000000012"
+            }
+          ],
+          "when": [
+            {
+              "id": "5100000000000000033-w",
+              "title": "Close Goal",
+              "type": "SPEC_COMMAND",
+              "linkedId": "5100000000000000031"
+            }
+          ],
+          "then": [
+            {
+              "id": "5100000000000000033-t",
+              "title": "Goal Closed",
+              "type": "SPEC_EVENT",
+              "linkedId": "5100000000000000032"
+            }
+          ]
+        },
+        {
+          "id": "5100000000000000034",
+          "title": "no such goal",
+          "linkedId": "5100000000000000031",
+          "given": [],
+          "when": [
+            {
+              "id": "5100000000000000034-w",
+              "title": "Close Goal",
+              "type": "SPEC_COMMAND",
+              "linkedId": "5100000000000000031"
+            }
+          ],
+          "then": [
+            {
+              "id": "5100000000000000034-t",
+              "title": "goal_not_found: there is no goal with this id",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        },
+        {
+          "id": "5100000000000000035",
+          "title": "goal already closed",
+          "linkedId": "5100000000000000031",
+          "given": [
+            {
+              "id": "5100000000000000035-g0",
+              "title": "Goal Opened",
+              "type": "SPEC_EVENT",
+              "linkedId": "5100000000000000012"
+            },
+            {
+              "id": "5100000000000000035-g1",
+              "title": "Goal Closed",
+              "type": "SPEC_EVENT",
+              "linkedId": "5100000000000000032"
+            }
+          ],
+          "when": [
+            {
+              "id": "5100000000000000035-w",
+              "title": "Close Goal",
+              "type": "SPEC_COMMAND",
+              "linkedId": "5100000000000000031"
+            }
+          ],
+          "then": [
+            {
+              "id": "5100000000000000035-t",
+              "title": "goal_closed: the goal is closed",
+              "type": "SPEC_ERROR"
+            }
+          ]
+        }
+      ],
+      "actors": [
+        {
+          "name": "Saver",
+          "authRequired": true
+        }
+      ],
+      "aggregates": [
+        "Goal"
+      ],
+      "readmodels": [],
+      "processors": [],
+      "tables": [],
+      "screenImages": []
+    }
+  ]
+}

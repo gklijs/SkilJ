@@ -46,3 +46,6 @@ scripts/federation/node_modules/
 
 # CGA compiler driver has a dedicated Actions cache, outside rust-cache cleanup.
 .ci-cga-tool/
+
+# python3 -m unittest scripts/agent-guides/eval/test_compare_import.py
+__pycache__/

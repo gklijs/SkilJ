@@ -80,6 +80,12 @@ if ! $prepared; then
 skilj = { path = "$root/skilj" }
 skilj-core = { path = "$root/skilj-core" }
 skilj-test-fixture = { path = "$root/skilj-test-fixture" }
+# What the agent guides' evaluation tasks add (scripts/agent-guides/eval/):
+# patched too, so they build against this workspace. Unused, they only warn.
+skilj-codegen = { path = "$root/skilj-codegen" }
+skilj-temporal = { path = "$root/skilj-temporal" }
+skilj-bridge = { path = "$root/skilj-bridge" }
+skilj-retry = { path = "$root/skilj-retry" }
 EOF
     fi
 else

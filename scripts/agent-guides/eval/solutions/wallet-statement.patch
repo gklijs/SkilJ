@@ -1,0 +1,132 @@
+diff -ruN a/src/wallet.rs b/src/wallet.rs
+--- a/src/wallet.rs
++++ b/src/wallet.rs
+@@ -214,3 +214,59 @@
+         }
+     }
+ }
++
++/// One line of a wallet's statement: a deposit or a withdrawal, and the
++/// balance after it.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
++pub struct StatementEntry {
++    /// `"deposit"` or `"withdrawal"`.
++    pub kind: String,
++    /// Positive for both kinds.
++    pub amount: i64,
++    pub balance: i64,
++}
++
++#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
++pub struct WalletStatementState {
++    /// In the order they happened.
++    pub entries: Vec<StatementEntry>,
++}
++
++/// Keyed by `wallet_id`, like `Balance`, and `sync: true` for the same
++/// reason: it is up to date as soon as a command is accepted.
++pub struct WalletStatement;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl Projection for WalletStatement {
++    type State = WalletStatementState;
++    type Event = WalletEvent;
++    const NAME: &'static str = "WalletStatement";
++    fn consumed_event_types() -> Vec<&'static str> {
++        vec!["Deposited", "Withdrawn"]
++    }
++    fn sync() -> bool {
++        true
++    }
++    fn keys(event: &Self::Event) -> Vec<String> {
++        match event {
++            WalletEvent::Deposited(p) => vec![p.wallet_id.clone()],
++            WalletEvent::Withdrawn(p) => vec![p.wallet_id.clone()],
++        }
++    }
++    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
++        let before = state.entries.last().map_or(0, |entry| entry.balance);
++        let entry = match event {
++            WalletEvent::Deposited(p) => StatementEntry {
++                kind: "deposit".into(),
++                amount: p.amount,
++                balance: before + p.amount,
++            },
++            WalletEvent::Withdrawn(p) => StatementEntry {
++                kind: "withdrawal".into(),
++                amount: p.amount,
++                balance: before - p.amount,
++            },
++        };
++        state.entries.push(entry);
++    }
++}
+diff -ruN a/tests/wallet_fixture.rs b/tests/wallet_fixture.rs
+--- a/tests/wallet_fixture.rs
++++ b/tests/wallet_fixture.rs
+@@ -6,10 +6,63 @@
+ use skilj_test_fixture::command::GivenEvents as GivenCommandEvents;
+ use skilj_test_fixture::projection::GivenEvents as GivenProjectionEvents;
+ use template_check::wallet::{
+-    Balance, BalanceState, Deposit, DepositPayload, DepositedPayload, WalletEvent, Withdraw,
+-    WithdrawPayload, WithdrawnPayload,
++    Balance, BalanceState, Deposit, DepositPayload, DepositedPayload, StatementEntry, WalletEvent,
++    WalletStatement, WalletStatementState, Withdraw, WithdrawPayload, WithdrawnPayload,
+ };
+ 
++fn entry(kind: &str, amount: i64, balance: i64) -> StatementEntry {
++    StatementEntry {
++        kind: kind.into(),
++        amount,
++        balance,
++    }
++}
++
++#[test]
++fn the_statement_lists_each_deposit_and_withdrawal_with_the_balance_after_it() {
++    GivenProjectionEvents::<WalletStatement>::new()
++        .events([
++            WalletEvent::Deposited(DepositedPayload {
++                wallet_id: "a".into(),
++                amount: 100,
++            }),
++            WalletEvent::Withdrawn(WithdrawnPayload {
++                wallet_id: "a".into(),
++                amount: 30,
++            }),
++            WalletEvent::Deposited(DepositedPayload {
++                wallet_id: "a".into(),
++                amount: 5,
++            }),
++        ])
++        .then(|state| {
++            assert_eq!(
++                state.entries,
++                vec![
++                    entry("deposit", 100, 100),
++                    entry("withdrawal", 30, 70),
++                    entry("deposit", 5, 75),
++                ]
++            );
++        });
++}
++
++#[test]
++fn a_wallet_without_transactions_has_an_empty_statement() {
++    let state = WalletStatementState::default();
++    assert!(state.entries.is_empty());
++}
++
++#[test]
++fn each_transaction_belongs_to_its_own_wallets_statement() {
++    use skilj::Projection;
++    let deposit = WalletEvent::Deposited(DepositedPayload {
++        wallet_id: "b".into(),
++        amount: 1,
++    });
++    assert_eq!(WalletStatement::keys(&deposit), vec!["b".to_string()]);
++}
++
+ #[test]
+ fn deposit_of_a_positive_amount_is_accepted() {
+     GivenCommandEvents::<Deposit>::new()

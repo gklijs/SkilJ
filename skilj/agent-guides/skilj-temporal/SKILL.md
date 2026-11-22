@@ -76,6 +76,31 @@ naming the same `tag_key` route events carrying the same tag value to
 the *same* workflow execution - that's what lets `OrderPlaced` start it
 and `PaymentConfirmed` signal that exact run later.
 
+### Getting the `EventReadToken`
+
+The mapped event type must declare `fn event_read_allowed() -> bool { true }`,
+or the bridge's reads are refused. In production an admin mints the token
+over GraphQL (`createEventReadToken`). In local development, next to the
+command tokens the template's server prints, `skilj::dev` mints it:
+
+```rust
+use skilj::dev::ReadFrom;
+
+// After build(), before the server takes requests.
+let credential = admin
+    .create_event_read_token("orders", "OrderPlaced", ReadFrom::Now)
+    .await?;
+```
+
+`ReadFrom::Now` starts at the moment it is minted: every event committed
+after the call is bridged, however late the bridge's first poll comes,
+and none before it. (GraphQL's `LATEST` anchors at the token's first read
+instead, so an event committed between minting and that read would be
+skipped.) So events committed while the bridge is off - the server ran
+without Temporal configured - are not bridged later. `ReadFrom::Beginning`
+replays every event of the type, which starts a workflow for each one ever
+committed.
+
 ## Real gotchas worth knowing before you use this
 
 - **One `EventReadToken` per mapped `EventType`, not one per bounded

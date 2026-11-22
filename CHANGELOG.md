@@ -120,6 +120,15 @@ README.md, "Status and stability").
 - The `skilj-event-modeling` guide finds a model in the project and imports it, reads a prooph
   board over its MCP server, and shows how to keep an application's rules in an optional Allium
   file beside the model.
+- `skilj::dev::DevAdmin::create_event_read_token(bounded_context, event_type, from)` and
+  `skilj::dev::ReadFrom` mint a REST event read token in development, the credential a bridge
+  such as `skilj-temporal` reads with. `ReadFrom::Now` is pinned when the token is minted (the
+  GraphQL `LATEST` anchors at the first read instead); the `skilj-temporal` guide shows it
+  (docs/architecture.md §257).
+- Seven more evaluation tasks for the agent guides, ten in all, so every guide is exercised by
+  one; `scripts/agent-guides/eval/check.sh` reports pass, fail or skipped per step; `run.sh`
+  writes a result record per run, `suite.sh` runs every task for one agent, and `summarize.mjs`
+  turns the records into the scoreboard in `docs/agent-guidance.md` (docs/architecture.md §257).
 
 ### Fixed
 
