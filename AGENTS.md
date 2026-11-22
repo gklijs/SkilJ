@@ -69,7 +69,17 @@ node scripts/agent-guides/check.mjs
 node --test scripts/agent-guides/check.test.mjs
 ```
 
-The check fails when a guide shows a trait other than as it is, names something the workspace's code doesn't contain, or links to a file that is gone. A change to `EventType`, `CommandType`, `Projection` or another trait a guide lists therefore needs the guide updated in the same diff. A name that only a guide's own example uses goes in `scripts/agent-guides/illustrative-names.txt`. `scripts/agent-guides/eval/check-solutions.sh` applies the reference solutions of the three evaluation tasks in `scripts/agent-guides/eval/` to a generated project (`--no-run` skips starting its server); when one stops applying or passing, fix the guide or the solution, and record the solution again as docs/agent-guidance.md describes.
+The check fails when a guide shows a trait other than as it is, names something the workspace's code doesn't contain, or links to a file that is gone. A change to `EventType`, `CommandType`, `Projection` or another trait a guide lists therefore needs the guide updated in the same diff. A name that only a guide's own example uses goes in `scripts/agent-guides/illustrative-names.txt`.
+
+`scripts/agent-guides/eval/check-solutions.sh` applies the reference solution of every evaluation task in `scripts/agent-guides/eval/tasks/` to a generated project and runs `check.sh` on it (`--no-run` skips starting its server; `temporal-activity` runs Temporal in Docker, `temporalio/temporal:1.5.0`). When one stops applying or passing, fix the guide or the solution, and record it again with `scripts/agent-guides/eval/record-solution.sh <task> <project>` (docs/agent-guidance.md, docs/architecture.md §257). The scripts take a lock with `flock`, so they need Linux. After changing the evaluation scripts:
+
+```sh
+node --test scripts/agent-guides/eval/summarize.test.mjs
+python3 -m unittest scripts/agent-guides/eval/test_compare_import.py
+node scripts/agent-guides/eval/summarize.mjs --check
+```
+
+`run.sh` and `suite.sh` with `claude` or `codex` cost an agent session per task and are run by hand; the free harness agents `none` and `reference` test the pipeline. Their result records go in `scripts/agent-guides/eval/results/` and docs/agent-guidance.md's scoreboard (`summarize.mjs --write`), committed together; point `SKILJ_EVAL_RESULTS` elsewhere for a run that isn't to be committed.
 
 ## Panic analysis (CGA)
 
@@ -88,8 +98,8 @@ Coverage is partial: unresolved generic vtable calls are skipped with their name
 
 The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs. Steps 8-9 run per whole-binary test shard (`business`, `app`, `libraries`), aggregated by the required `test` check; 10-11 stay together. Coverage (15) runs on `main` and manual dispatch in its own workflow (`.github/workflows/coverage.yml`); 16 and 19 are weekly workflows:
 1. actionlint — checks the workflow file itself, including shellcheck on its `run:` blocks
-2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`; the same job runs `node scripts/agent-guides/check.mjs`, which holds `skilj/agent-guides` to the workspace's traits, names and paths
-3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace, then runs its quickstart (embedded Postgres, a deposit accepted, an overdraft rejected, `scripts/template-quickstart.sh`); `--no-run` skips the run. The same job runs `scripts/check-new-project-skill.sh` (what the `skilj` plugin's `skilj-new-project` skill tells an agent to run, run as written on that project, and the plugin's manifests in step with the workspace version, docs/architecture.md §252), then `scripts/check-upgrade-pair.sh` (the previous release's template on an empty database, this workspace upgrading it with its data intact, the previous release then refusing the upgraded database; it fetches the previous release's tag, docs/architecture.md §249), then `scripts/agent-guides/eval/check-solutions.sh`: the generated project finds the agent guides, and the reference solution of each evaluation task applies, passes and answers over REST
+2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`; the same job runs `node scripts/agent-guides/check.mjs`, which holds `skilj/agent-guides` to the workspace's traits, names and paths, `node scripts/agent-guides/eval/summarize.mjs --check` (docs/agent-guidance.md's scoreboard matches the committed result records), and the evaluation scripts' tests
+3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace, then runs its quickstart (embedded Postgres, a deposit accepted, an overdraft rejected, `scripts/template-quickstart.sh`); `--no-run` skips the run. The same job runs `scripts/check-new-project-skill.sh` (what the `skilj` plugin's `skilj-new-project` skill tells an agent to run, run as written on that project, and the plugin's manifests in step with the workspace version, docs/architecture.md §252), then `scripts/check-upgrade-pair.sh` (the previous release's template on an empty database, this workspace upgrading it with its data intact, the previous release then refusing the upgraded database; it fetches the previous release's tag, docs/architecture.md §249), then (`agent-guide-solutions`, its own job, with Docker for Temporal) `scripts/agent-guides/eval/check-solutions.sh`: the generated project finds the agent guides, and the reference solution of each evaluation task applies, passes and answers over REST
 4. `scripts/check-federation-composition.sh` — composes the recorded federation descriptions with Apollo's and Hive's composition
 5. `cargo fmt --all -- --check`
 6. `cargo deny check` — RustSec advisories, licenses, banned crates and sources, per `deny.toml`
@@ -107,7 +117,7 @@ The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/archi
 18. `node scripts/cga/check.mjs` — pinned partial `skilj-core` panic analysis; fails on new findings, new analysis gaps, or analyzer failures. Its Node.js regression tests run in the same job.
 19. `node scripts/bench/compare.mjs` — weekly and on manual dispatch (`.github/workflows/benchmarks.yml`), a representative set of the `#[ignore]`d benchmarks on a baseline and a candidate commit, against a durable Postgres with fixed settings. Fails when a run skips, crashes, loses a workload or a sample, or runs non-durable; throughput deltas are informational. See docs/performance.md, "Comparing two commits"
 
-Run `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs scripts/agent-guides/check.test.mjs scripts/bench/compare.test.mjs` after changing CI scripts.
+Run `node --test scripts/ci.test.mjs scripts/cga/check.test.mjs scripts/agent-guides/check.test.mjs scripts/bench/compare.test.mjs scripts/agent-guides/eval/summarize.test.mjs` after changing CI scripts.
 The CI regression suite checks that sharding covers every integration target exactly once,
 preserves doctests and `skilj/local`, and still fails when a service-dependent test skips.
 The required `test` check also includes focused PostgreSQL 15/18 compatibility jobs;

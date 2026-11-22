@@ -105,64 +105,148 @@ template's `AGENTS.md` with the workspace:
   guides' `README.md` and in the template's `AGENTS.md`.
 
 That catches a guide that names something gone. It doesn't catch one that
-describes behavior wrongly. For that there are three tasks.
+describes behavior wrongly. For that there are ten tasks.
 
 ## The evaluation tasks
 
 Each is a request as a user would write it, in
 `scripts/agent-guides/eval/tasks/`, for a project generated from the
-template:
+template, with the files it needs (`fixtures/<task>/`) put in the project
+before the agent starts:
 
-| Task | Asks for | What it takes |
-|---|---|---|
-| `add-command` | Closing a wallet, with tests | A command, its event, the enum variant and its decoding, the tag, and two existing commands that now read the new event |
-| `evolve-event` | An optional reference on a deposit, in production | An additive schema change on the event and the command, and old events and old clients that keep working |
-| `sensitive-field` | An owner with an email address that can be forgotten | A sensitive field on the event and on the command, a subject, no tag on the value, and a key provider in the server |
+| Task | Asks for | What it takes | Guides |
+|---|---|---|---|
+| `add-command` | Closing a wallet, with tests | A command, its event, the enum variant and its decoding, the tag, and two existing commands that now read the new event | `skilj` |
+| `evolve-event` | An optional reference on a deposit, in production | An additive schema change on the event and the command, and old events and old clients that keep working | `skilj` |
+| `sensitive-field` | An owner with an email address that can be forgotten | A sensitive field on the event and on the command, a subject, no tag on the value, and a key provider in the server | `skilj` |
+| `unique-email` | An email address that belongs to one owner across wallets | A blind tag erased with the owner, a consistency query on it, normalization as an email address, a blind index key and a key provider in the server | `skilj-uniqueness` |
+| `attach-document` | A monthly statement PDF on a wallet, erased with its owner | A blob field with a subject on the event and the command, upload first and append second, a key provider | `skilj-large-payloads` |
+| `wallet-statement` | Each wallet's transactions in order, with a running balance | A synchronous projection with keys per wallet | `skilj` (projection.md) |
+| `import-model` | The bounded context an Event Modeling export describes | `skilj-codegen import --from em-json`, a `.skilj.toml` that keeps what the model says, the decisions after its specifications, a second bounded context registered | `skilj-event-modeling` (its import half) |
+| `retry-idempotent` | A client that retries a deposit without booking it twice | An `Idempotency-Key` per deposit, retries on transport errors and 5xx only, the retention window | `skilj-temporal` (its first half: a command submitted idempotently) |
+| `second-context` | A rewards bounded context next to wallet | A bounded context created and registered at startup in local development, with tokens per context | `skilj-bootstrap` |
+| `temporal-activity` | A Temporal workflow started for every opened wallet | The `skilj-temporal` bridge, an event read token that starts when the bridge is enabled (`DevAdmin::create_event_read_token` with `ReadFrom::Now`), `event_read_allowed` | `skilj-temporal` (its second half: the bridge) |
+
+So every guide is exercised by a task: `skilj` by four,
+`skilj-uniqueness` by `unique-email`, `skilj-large-payloads` by
+`attach-document`, `skilj-event-modeling` by `import-model`,
+`skilj-temporal` by `retry-idempotent` and `temporal-activity`, and
+`skilj-bootstrap` by `second-context` (architecture.md §257).
+
+Some of it isn't checked over the wire, because a project from the
+template can't: skilj has no REST route that reads a projection, and a
+GraphQL read, a download of a blob with a subject and `forgetSubject` need
+a Role authenticated by an identity provider, which the template doesn't
+configure. `wallet-statement` is checked by folding a history through the
+projection as skilj's writer does, `attach-document` by an upload, an
+append and the refusals, and the erasure in `unique-email` and
+`attach-document` by what the types declare.
 
 `scripts/agent-guides/eval/check.sh <task> <project> [--run]` decides
-whether a project has done one:
+whether a project has done one. Each step passes, fails or is skipped, every
+step that can runs, and it ends with a summary and exits 1 when any failed:
 
-1. The project's own tests pass, and there are more than the template has.
-2. `acceptance/<task>.rs` passes: decisions for given histories, the tags
-   and sensitive fields the types declare, and for `evolve-event` that the
-   new schemas are revisions of the stored ones by the rule startup
-   applies (`schema_is_backwards_compatible`).
-3. It builds with and without local mode.
-4. With `--run`, the server starts on an embedded Postgres and answers the
-   task's requests over REST. A command that is rejected for an event
-   written by an earlier request shows that the event is stored, tagged,
-   decoded and, for the email address, decrypted.
+1. `own-tests`: the project's own tests pass.
+2. `tests-added`: more of them passed than the template has tests. A test
+   gated on local mode or ignored doesn't count.
+3. `build-local` and 4. `build-no-local`: it builds with and without local
+   mode.
+5. `static`: the task's checks of the source, where it has any: a key
+   provider and a blind index key are configured, and for `import-model`
+   that `src/savings.skilj.toml` passes `skilj-codegen check` and keeps
+   every type, field, tag, REST trigger and rejection the import of the
+   original model has (`compare_import.py`).
+6. `acceptance`: `acceptance/<task>.rs`, copied into the project as
+   `tests/skilj_eval_acceptance.rs` (a project file of that name fails the
+   step and is left alone), passes: decisions for given histories, the tags,
+   sensitive fields and blob fields the types declare, and for
+   `evolve-event` that the new schemas are revisions of the stored ones by
+   the rule startup applies (`schema_is_backwards_compatible`).
+7. `run`, with `--run`: the server starts on an embedded Postgres and
+   answers the task's requests over REST. A command that is rejected for an
+   event written by an earlier request shows that the event is stored,
+   tagged, decoded and, for the email address, decrypted.
+   `temporal-activity` runs Temporal's development server in Docker
+   (`temporalio/temporal:1.5.0`, so it needs Docker, and fails without it):
+   a wallet opened while the server ran without `TEMPORAL_ADDRESS`, then on
+   the same data with it a wallet that starts its `WalletOnboarding`
+   workflow, while the first one doesn't.
+
+A step that needs a build is skipped when that build failed.
 
 **Reference solutions.** `solutions/<task>.patch` is a solution of each
-task. `scripts/agent-guides/eval/check-solutions.sh`, in CI after the
-template check, applies each to the generated project and runs the check
-on it, with `--run` unless it was given `--no-run`. So what the guides teach is compiled and run against every
-change to the crates and to the template. When the template changes, a
-patch may stop applying: apply it by hand in a generated project, fix it,
-and record it again with
+task. `scripts/agent-guides/eval/check-solutions.sh`, in CI in a job of its
+own (`agent-guide-solutions`, with Docker for Temporal), applies each to the
+generated project and runs the check on it, with `--run` unless it was given
+`--no-run`, and puts the project back exactly as it was. So what the guides
+teach is compiled and run against every change to the crates and to the
+template. When the template changes, a patch may stop applying: apply it by
+hand in a generated project, fix it, and record it again with
 
 ```sh
-(diff -ruN pristine/src src; diff -ruN pristine/tests tests) |
-    sed -E 's#^(---|\+\+\+) pristine/#\1 a/#; s#^\+\+\+ (src|tests)/#+++ b/\1/#'
+scripts/agent-guides/eval/record-solution.sh <task> <project>
 ```
 
-where `pristine` is a copy of the generated project's `src` and `tests`
-from before the change.
+which diffs the project's `src/`, `tests/`, `build.rs` and `Cargo.toml`
+against a freshly generated project with the task's fixtures, and leaves out
+key files, the guides' links and `Cargo.lock`.
 
-**With an agent.** `scripts/agent-guides/eval/run.sh <claude|codex> <task>
-[--link]` generates a project outside the repository, hands the agent the
-task's text and nothing else, and runs the check with `--run` on the
-result. Without `--link` the agent has `AGENTS.md`; with it, the guides
-are skills as well. It needs the agent's CLI signed in and costs a
-session, so it is run by hand: after a change to a guide or to `AGENTS.md`,
+**With an agent.** `scripts/agent-guides/eval/run.sh <agent> <task>
+[--link] [--model <model>]` generates a project outside the repository,
+hands the agent the task's text and nothing else, runs the check with
+`--run` on the result, and writes a result record. Without `--link` the
+agent has `AGENTS.md`; with it, the guides are skills as well. This
+workspace's `skilj-codegen` is first on the agent's `PATH`, so
+`import-model` exercises this workspace's importer. The agents:
+
+- `claude` and `codex`: the CLI, signed in, with `--model` (required, and
+  recorded). `SKILJ_EVAL_CLAUDE` and `SKILJ_EVAL_CODEX` name another binary.
+- `none`: does nothing. Its run fails, and shows which steps a task's
+  checks fail on an untouched project.
+- `reference`: applies the task's reference solution. Its run passes, and
+  tests the whole pipeline without a paid session.
+
+`scripts/agent-guides/eval/suite.sh <agent> [--link] [--model <model>]
+[--only <task>,...]` runs every task for one agent, goes on past a failed
+one, and lists the records written.
+
+Each run has a directory of its own under `SKILJ_EVAL_DIR`
+(`~/.cache/skilj-agent-eval`) with the project, the agent's log and the
+check's logs. The build directory is shared and used by one run at a time:
+a run holds its lock from before the agent starts until its check is done,
+and another run on the same build directory waits, saying so (a hung agent
+holds it until it is stopped). `SKILJ_EVAL_BUILD_DIR` gives a run a build
+directory of its own. The lock is taken with `flock`, so the scripts need
+Linux; `check.sh` on its own, and so `check-solutions.sh`, takes the same
+lock.
+
+**Result records.** Every run writes
+`scripts/agent-guides/eval/results/<run id>.json` (or
+`SKILJ_EVAL_RESULTS`), a failed run too:
+
+| Field | Holds |
+|---|---|
+| `format` | 1 |
+| `runId`, `agent`, `agentVersion`, `model`, `task`, `linked` | What ran |
+| `skiljCommit`, `dirty`, `guidesHash` | What it ran against: the commit, whether the checkout had changes, and a hash of the guides, the template and the tasks, so a record made before a commit still says what it measured |
+| `startedAt`, `durationSeconds`, `lockWaitSeconds` | When, and how long, not counting the wait for the build directory |
+| `steps`, `passed`, `failure` | Each check step's `pass`, `fail`, `skipped` or `unrun`, and the phase and message of the first failure |
+| `costUsd`, `tokens` | What the agent's CLI reported, or `null` |
+
+A third agent is a case in `run.sh` and, if its CLI reports usage, a parser
+in `record.mjs`; the format stays the same. The records are committed with
+the scoreboard they make.
+
+The runs with `claude` and `codex` are manual and cost money: an agent
+session per task. Run the suite after a change to a guide or to `AGENTS.md`,
 and before a release.
 
 **Review by hand.** The check can't see everything. After a run, read
-`git diff` in the project for:
+`git diff --cached` in the project for:
 
 - `decide()` and `project()` stay pure: no clock, no I/O, no state outside
   the arguments.
-- The new event has its variant in `WalletEvent` and its arm in
+- A new event has its variant in the event enum and its arm in
   `try_from_event`, and every `match` on the enum handles it on purpose
   rather than through a `_` arm.
 - Rejections have a `kind` in `snake_case` and a `reason` a person can read.
@@ -174,9 +258,33 @@ and before a release.
 - `sensitive-field`: the email address is in `sensitive_fields()` of both
   types, is not a tag and is not compared in `decide()`; the key provider's
   file is somewhere that survives a restart, and nothing logs the address.
+- `unique-email`: `decide()` decides on which events the blind tag
+  matched, not on the address; the blind index key survives a restart.
+- `attach-document`: the PDF is uploaded, not put in the payload as text.
+- `import-model`: the decisions are hand-written after the model's
+  specifications, and the `.skilj.toml` is the import's, not retyped.
+- `retry-idempotent`: the key comes from the deposit, not from the
+  attempt, and the documentation names the retention window.
+- `temporal-activity`: the read token is minted before the server takes
+  requests.
 - Nothing outside the task was changed, and the project's `AGENTS.md` is
   as it was unless the task gave a reason.
 
-## Results
+## Scoreboard
 
-RESULTS_PLACEHOLDER
+The records in `scripts/agent-guides/eval/results/`, per task, agent, model
+and whether the guides were linked as skills: how many runs passed, and the
+latest run's date, outcome, skilj commit and guides hash.
+`node scripts/agent-guides/eval/summarize.mjs --write` regenerates it from
+the records, and CI fails when it differs from them (`--check`). The harness
+agents `none` and `reference` are left out (`--baselines` shows them).
+
+<!-- scoreboard:start -->
+No runs recorded yet. Run the suite for an agent and model, then regenerate this
+section:
+
+```sh
+scripts/agent-guides/eval/suite.sh claude --model <model> [--link]
+node scripts/agent-guides/eval/summarize.mjs --write
+```
+<!-- scoreboard:end -->

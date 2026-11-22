@@ -26,7 +26,9 @@
 //! ```
 
 use jiff::Timestamp;
-use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
+use skilj_core::access_control::{
+    self, AccessLevel, EventReadStartPosition, Role, RoleAccessMapping, RoleStatus,
+};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
@@ -163,9 +165,84 @@ impl DevAdmin {
         Ok(format!("{}.{}", token.id, token.secret))
     }
 
+    /// Mints a REST event read token for `event_type` in
+    /// `bounded_context`, returned as the `<id>.<secret>` an
+    /// `authorization: Bearer` header carries: the credential
+    /// `GET /v1/events/consume` and a bridge such as `skilj-temporal`'s
+    /// `EventTypeMapping` take.
+    ///
+    /// `from` says where the token's first read starts.
+    /// [`ReadFrom::Now`] is pinned when this is called: the token reads
+    /// the events committed after this call, however late its first read
+    /// comes. (A token minted over GraphQL with `LATEST` anchors at its
+    /// first read instead, so it skips whatever was committed between
+    /// minting and that read.) Mint it before the server takes requests,
+    /// so no write is in flight while the position is taken.
+    ///
+    /// Development only, like the rest of this module. The event type
+    /// must be registered - call this after
+    /// [`SkiljBuilder::build`](crate::SkiljBuilder::build) - and must
+    /// declare `event_read_allowed()`, which the read itself enforces. An
+    /// unregistered event type, or a bounded context [`seed_admin`]
+    /// wasn't given, is `Error::Database(sqlx::Error::RowNotFound)`.
+    pub async fn create_event_read_token(
+        &self,
+        bounded_context: &str,
+        event_type: &str,
+        from: ReadFrom,
+    ) -> Result<String, Error> {
+        let mapping = self
+            .mappings
+            .iter()
+            .find(|m| m.bounded_context.name == bounded_context)
+            .ok_or_else(Error::row_not_found)?;
+        let event_type = db::get_event_type(&self.pool, bounded_context, event_type)
+            .await?
+            .ok_or_else(Error::row_not_found)?;
+        let (start_from, start_at_sequence) = match from {
+            ReadFrom::Beginning => (EventReadStartPosition::Beginning, None),
+            // Reads start strictly after the given sequence; -1 when the
+            // bounded context has no events yet.
+            ReadFrom::Now => (
+                EventReadStartPosition::AtSequence,
+                Some(
+                    db::latest_sequence(&self.pool, bounded_context)
+                        .await?
+                        .unwrap_or(-1),
+                ),
+            ),
+        };
+        let token = access_control::create_event_read_token(
+            mapping,
+            &event_type,
+            try_generate_token_id()?,
+            try_generate_token_secret()?,
+            None,
+            Some(start_from),
+            start_at_sequence,
+            None,
+            Timestamp::now(),
+        )?;
+        db::insert_event_read_token(&self.pool, &token).await?;
+        Ok(format!("{}.{}", token.id, token.secret))
+    }
+
     /// Closes the database connections it holds. Dropping it closes them
     /// too, without waiting.
     pub async fn close(self) {
         self.pool.close().await;
     }
+}
+
+/// Where an event read token from [`DevAdmin::create_event_read_token`]
+/// starts reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReadFrom {
+    /// From the first event of its type.
+    Beginning,
+    /// From the events committed after the token was minted, pinned at
+    /// minting time: what was committed before is skipped, what comes
+    /// after is read, however late the first read is.
+    Now,
 }

@@ -41,13 +41,21 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - run: node --test scripts/ci.test.mjs scripts/agent-guides/check.test.mjs scripts/bench/compare.test.mjs
+      - run: >-
+          node --test scripts/ci.test.mjs scripts/agent-guides/check.test.mjs scripts/bench/compare.test.mjs
+          scripts/agent-guides/eval/summarize.test.mjs
+      # The import-model task's comparison of a .skilj.toml with the import.
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python3 -m unittest scripts/agent-guides/eval/test_compare_import.py
       # Validates every "§N" citation of docs/architecture.md's own section
       # headings (a past renumbering silently broke ~600 of them).
       - run: scripts/check-section-refs.sh
       # skilj/agent-guides still describes the traits, names and paths this
       # workspace has (docs/architecture.md §248).
       - run: node scripts/agent-guides/check.mjs
+      # docs/agent-guidance.md's scoreboard is what the committed records
+      # in scripts/agent-guides/eval/results/ give.
+      - run: node scripts/agent-guides/eval/summarize.mjs --check
 
   check-cga:
     runs-on: ubuntu-24.04
@@ -166,9 +174,39 @@ jobs:
       - run: >-
           scripts/check-upgrade-pair.sh --prepared --cache-dir target/upgrade-pair
           --new-cache target/template-check
-      # What the template gives a coding agent: the guides are found, and
-      # the reference solutions of their three evaluation tasks still pass
-      # against this workspace (docs/architecture.md §248).
+
+  agent-guide-solutions:
+    # What the template gives a coding agent: the guides are found, and the
+    # reference solution of every evaluation task applies, builds, passes
+    # and answers over REST against this workspace (docs/architecture.md
+    # §248, §257). On the bare runner, like check-template: local mode's
+    # embedded Postgres as a reader gets it, and Docker for
+    # temporal-activity's Temporal.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      # See check-template: the embedded Postgres's release lookup.
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: ~/.theseus/postgresql
+          key: postgres-embedded-${{ runner.os }}-${{ hashFiles('skilj/src/local.rs', 'scripts/check-upgrade-pair.sh') }}
+          restore-keys: postgres-embedded-${{ runner.os }}-
+      - name: Prepare template at a stable path
+        run: scripts/check-template.sh --prepare-only --cache-dir target/template-check
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            target/template-check/app -> ../build
+            . -> target/agent-eval-tools
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # temporal-activity runs Temporal's development server in Docker.
+      - run: docker pull temporalio/temporal:1.5.0
       - run: scripts/agent-guides/eval/check-solutions.sh --cache-dir target/template-check
 
   check-template-docker:

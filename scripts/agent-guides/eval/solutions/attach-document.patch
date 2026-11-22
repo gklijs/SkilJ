@@ -1,0 +1,287 @@
+diff -ruN a/src/bin/server.rs b/src/bin/server.rs
+--- a/src/bin/server.rs
++++ b/src/bin/server.rs
+@@ -24,7 +24,7 @@
+ 
+ use skilj::Skilj;
+ 
+-const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw"];
++const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw", "AttachStatement"];
+ 
+ // A `main` returning `Result` prints its error with `Debug`; this prints
+ // the message instead, which for local mode says what to install or set.
+@@ -67,11 +67,29 @@
+         .and_then(|p| p.parse().ok())
+         .unwrap_or(8080);
+ 
++    // A statement is encrypted under its owner's key, which a master key
++    // protects: here one in a file, next to the embedded Postgres's data or
++    // where KEY_FILE says. Losing the file loses every statement. A
++    // deployment keeps the key in Vault or OpenBao instead
++    // (`skilj::VaultTransitProvider`).
++    #[cfg(feature = "local")]
++    let local_key_file = local_postgres
++        .as_ref()
++        .map(|postgres| skilj::local::key_file(postgres.data_dir()));
++    #[cfg(not(feature = "local"))]
++    let local_key_file: Option<std::path::PathBuf> = None;
++    let key_file = match std::env::var("KEY_FILE") {
++        Ok(path) => path.into(),
++        Err(_) => local_key_file.unwrap_or_else(|| "skilj.keys.json".into()),
++    };
++    let keys = skilj::KeyFileProvider::open(&key_file)?;
++
+     let bounded_context = template_check::wallet::BOUNDED_CONTEXT;
+     let admin =
+         skilj::dev::seed_admin(&database_url, "template_check admin", &[bounded_context]).await?;
+ 
+     let (skilj, report) = template_check::register(Skilj::builder(database_url))
++        .key_provider(keys)
+         .reconciliation_role(admin.external_subject())
+         .build()
+         .await?;
+diff -ruN a/src/wallet.rs b/src/wallet.rs
+--- a/src/wallet.rs
++++ b/src/wallet.rs
+@@ -15,6 +15,7 @@
+ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+ use skilj::{auto_register, CommandType, EventType, Projection};
++use skilj_core::blob::{BlobField, BlobRef};
+ use skilj_core::event_store::Event;
+ use skilj_core::plugin::BoundedContextEvent;
+ use skilj_core::shared::{CommandDecision, EventSpec, TagMapping};
+@@ -25,6 +26,14 @@
+     vec![TagMapping::new("wallet", "wallet_id")]
+ }
+ 
++/// A statement is the owner's personal data: its bytes are encrypted
++/// under the owner's key (subject `owner`), so forgetting the owner makes
++/// them unreadable. Declared on the command as well as on the event, since
++/// both are stored.
++fn statement_document() -> Vec<BlobField> {
++    vec![BlobField::with_subject("document", "owner", "owner_id")]
++}
++
+ // --- events ---
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+@@ -61,12 +70,37 @@
+     }
+ }
+ 
++/// The PDF itself is uploaded first (`POST /v1/blobs/wallet`); the event
++/// holds the reference the upload answered.
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct StatementAttachedPayload {
++    pub wallet_id: String,
++    pub owner_id: String,
++    pub month: String,
++    pub document: BlobRef,
++}
++
++pub struct StatementAttached;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl EventType for StatementAttached {
++    type Payload = StatementAttachedPayload;
++    const NAME: &'static str = "StatementAttached";
++    fn tag_mappings() -> Vec<TagMapping> {
++        wallet_tag()
++    }
++    fn blob_fields() -> Vec<BlobField> {
++        statement_document()
++    }
++}
++
+ /// This bounded context's own hand-written event enum - every `decide()`
+ /// below only ever sees the events its own tags matched, so folding
+ /// this never has to check which wallet an event belongs to.
+ pub enum WalletEvent {
+     Deposited(DepositedPayload),
+     Withdrawn(WithdrawnPayload),
++    StatementAttached(StatementAttachedPayload),
+ }
+ 
+ impl BoundedContextEvent for WalletEvent {
+@@ -74,6 +108,9 @@
+         match event.event_type.name.as_str() {
+             "Deposited" => Some(serde_json::from_str(&event.payload).map(WalletEvent::Deposited)),
+             "Withdrawn" => Some(serde_json::from_str(&event.payload).map(WalletEvent::Withdrawn)),
++            "StatementAttached" => {
++                Some(serde_json::from_str(&event.payload).map(WalletEvent::StatementAttached))
++            }
+             _ => None,
+         }
+     }
+@@ -83,6 +120,7 @@
+     matching_events.iter().fold(0i64, |balance, event| match event {
+         WalletEvent::Deposited(p) => balance + p.amount,
+         WalletEvent::Withdrawn(p) => balance - p.amount,
++        WalletEvent::StatementAttached(_) => balance,
+     })
+ }
+ 
+@@ -178,6 +216,59 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct AttachStatementPayload {
++    pub wallet_id: String,
++    pub owner_id: String,
++    pub month: String,
++    pub document: BlobRef,
++}
++
++pub struct AttachStatement;
++
++#[auto_register(BOUNDED_CONTEXT)]
++impl CommandType for AttachStatement {
++    type Payload = AttachStatementPayload;
++    type Event = WalletEvent;
++    const NAME: &'static str = "AttachStatement";
++    fn tag_mappings() -> Vec<TagMapping> {
++        wallet_tag()
++    }
++    fn blob_fields() -> Vec<BlobField> {
++        statement_document()
++    }
++    fn rest_trigger_allowed() -> bool {
++        true
++    }
++    /// One statement per wallet and month; the wallet's tag already
++    /// selected this wallet's events.
++    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
++        let attached = matching_events.iter().any(
++            |event| matches!(event, WalletEvent::StatementAttached(p) if p.month == payload.month),
++        );
++        if attached {
++            return CommandDecision::Rejected {
++                reason: format!(
++                    "wallet {} has a statement for {} already",
++                    payload.wallet_id, payload.month
++                ),
++                kind: "statement_already_attached".into(),
++            };
++        }
++        CommandDecision::Accepted {
++            events: vec![EventSpec {
++                event_type: "StatementAttached".into(),
++                payload: serde_json::json!({
++                    "wallet_id": payload.wallet_id,
++                    "owner_id": payload.owner_id,
++                    "month": payload.month,
++                    "document": payload.document,
++                }),
++            }],
++        }
++    }
++}
++
+ // --- projection ---
+ 
+ #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+@@ -205,12 +296,14 @@
+         match event {
+             WalletEvent::Deposited(p) => vec![p.wallet_id.clone()],
+             WalletEvent::Withdrawn(p) => vec![p.wallet_id.clone()],
++            WalletEvent::StatementAttached(_) => Vec::new(),
+         }
+     }
+     fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+         match event {
+             WalletEvent::Deposited(p) => state.balance += p.amount,
+             WalletEvent::Withdrawn(p) => state.balance -= p.amount,
++            WalletEvent::StatementAttached(_) => {}
+         }
+     }
+ }
+diff -ruN a/tests/wallet_fixture.rs b/tests/wallet_fixture.rs
+--- a/tests/wallet_fixture.rs
++++ b/tests/wallet_fixture.rs
+@@ -2,14 +2,82 @@
+ //! Tag selection, projection keys, persistence, authorization and concurrency
+ //! need integration tests against a running application.
+ 
++use skilj_core::blob::BlobRef;
+ use skilj_core::shared::EventSpec;
+ use skilj_test_fixture::command::GivenEvents as GivenCommandEvents;
+ use skilj_test_fixture::projection::GivenEvents as GivenProjectionEvents;
+ use template_check::wallet::{
+-    Balance, BalanceState, Deposit, DepositPayload, DepositedPayload, WalletEvent, Withdraw,
+-    WithdrawPayload, WithdrawnPayload,
++    AttachStatement, AttachStatementPayload, Balance, BalanceState, Deposit, DepositPayload,
++    DepositedPayload, StatementAttachedPayload, WalletEvent, Withdraw, WithdrawPayload,
++    WithdrawnPayload,
+ };
+ 
++fn statement_pdf() -> BlobRef {
++    BlobRef {
++        id: "blob-1".into(),
++        sha256: "ab".repeat(32),
++        size: 1234,
++        media_type: "application/pdf".into(),
++    }
++}
++
++fn attach(month: &str) -> AttachStatementPayload {
++    AttachStatementPayload {
++        wallet_id: "a".into(),
++        owner_id: "o-1".into(),
++        month: month.into(),
++        document: statement_pdf(),
++    }
++}
++
++fn attached(month: &str) -> WalletEvent {
++    WalletEvent::StatementAttached(StatementAttachedPayload {
++        wallet_id: "a".into(),
++        owner_id: "o-1".into(),
++        month: month.into(),
++        document: statement_pdf(),
++    })
++}
++
++#[test]
++fn a_months_first_statement_is_attached() {
++    GivenCommandEvents::<AttachStatement>::new()
++        .when(attach("2026-10"))
++        .then_accepted(vec![EventSpec {
++            event_type: "StatementAttached".into(),
++            payload: serde_json::json!({
++                "wallet_id": "a",
++                "owner_id": "o-1",
++                "month": "2026-10",
++                "document": statement_pdf(),
++            }),
++        }]);
++}
++
++#[test]
++fn a_second_statement_for_the_month_is_rejected() {
++    GivenCommandEvents::<AttachStatement>::new()
++        .event(attached("2026-10"))
++        .when(attach("2026-10"))
++        .then_rejected("statement_already_attached");
++}
++
++#[test]
++fn another_months_statement_is_attached() {
++    GivenCommandEvents::<AttachStatement>::new()
++        .event(attached("2026-09"))
++        .when(attach("2026-10"))
++        .then_accepted(vec![EventSpec {
++            event_type: "StatementAttached".into(),
++            payload: serde_json::json!({
++                "wallet_id": "a",
++                "owner_id": "o-1",
++                "month": "2026-10",
++                "document": statement_pdf(),
++            }),
++        }]);
++}
++
+ #[test]
+ fn deposit_of_a_positive_amount_is_accepted() {
+     GivenCommandEvents::<Deposit>::new()
