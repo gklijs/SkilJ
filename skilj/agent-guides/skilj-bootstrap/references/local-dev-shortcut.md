@@ -29,8 +29,9 @@ admin.close().await;
 ```
 
 A bounded context added later goes in the list `seed_admin` is given:
-one it wasn't given has no grant, and shows up in
-`report.skipped_no_access`.
+one it wasn't given has no grant, shows up in
+`report.skipped_no_access`, and skilj logs a warning per skipped
+registration (`code=skipped_no_access`, with a hint and a guide).
 
 `create_command_token` answers `Error::Database(sqlx::Error::RowNotFound)`
 for a command type that isn't registered, or a bounded context that

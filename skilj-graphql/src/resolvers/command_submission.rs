@@ -35,21 +35,22 @@ use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::futures_util::StreamExt;
-use async_graphql::ErrorExtensions;
 use jiff::Timestamp;
 use skilj_core::access_control::{Role, RoleAccessMapping};
 use skilj_core::command_batcher::CommandBatchItem;
 
 fn insufficient_role_error(required: &str) -> async_graphql::Error {
-    async_graphql::Error::new(format!(
-        "this command type requires the caller's Role.name to be {required:?}"
-    ))
-    .extend_with(|_, ext| ext.set("code", "insufficient_role"))
+    crate::error::coded(
+        "insufficient_role",
+        format!("this command type requires the caller's Role.name to be {required:?}"),
+    )
 }
 
 fn no_decider_registered_error() -> async_graphql::Error {
-    async_graphql::Error::new("this CommandType has no decide() registered in the running process")
-        .extend_with(|_, ext| ext.set("code", "no_decider_registered"))
+    crate::error::coded(
+        "no_decider_registered",
+        "this CommandType has no decide() registered in the running process",
+    )
 }
 
 /// `submitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String, correlationId: String, causationId: String): SubmitCommandPayload!`
@@ -451,11 +452,13 @@ pub fn submit_commands_field(n: &Naming) -> Field {
                 let inputs = ctx.args.try_get("commands")?.list()?;
                 let max = state.command_batcher.max_items_per_batch();
                 if inputs.len() > max {
-                    return Err(async_graphql::Error::new(format!(
-                        "a batch carries at most {max} items, this one {}",
-                        inputs.len()
-                    ))
-                    .extend_with(|_, ext| ext.set("code", "batch_too_large")));
+                    return Err(crate::error::coded(
+                        "batch_too_large",
+                        format!(
+                            "a batch carries at most {max} items, this one {}",
+                            inputs.len()
+                        ),
+                    ));
                 }
                 let mut commands = Vec::with_capacity(inputs.len());
                 for input in inputs.iter() {
@@ -557,21 +560,26 @@ pub fn submit_commands_field(n: &Naming) -> Field {
     ))
 }
 
-/// A command's error as an item of `submitCommands`: the code and message
-/// `submitCommand` would have put in `errors`.
+/// A command's error as an item of `submitCommands`: the code, message, hint
+/// and guide `submitCommand` would have put in `errors`.
 fn batch_item_error(e: async_graphql::Error) -> BatchItemError {
-    let code = e
-        .extensions
-        .as_ref()
-        .and_then(|ext| ext.get("code"))
-        .map(|code| match code {
-            async_graphql::Value::String(code) => code.clone(),
-            other => other.to_string(),
-        })
-        .unwrap_or_else(|| "error".to_string());
+    let extension = |name: &str| {
+        e.extensions
+            .as_ref()
+            .and_then(|ext| ext.get(name))
+            .map(|value| match value {
+                async_graphql::Value::String(value) => value.clone(),
+                other => other.to_string(),
+            })
+    };
+    let code = extension("code").unwrap_or_else(|| "error".to_string());
+    let hint = extension("hint");
+    let guide = extension("guide");
     BatchItemError {
         code,
         message: e.message,
+        hint,
+        guide,
     }
 }
 
@@ -767,4 +775,26 @@ pub fn dry_run_command_field(n: &Naming) -> Field {
         "payload",
         TypeRef::named_nn(TypeRef::STRING),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// A batch item reads as the same command's error would alone: its code,
+    /// and its hint and guide when it has them.
+    #[test]
+    fn a_batch_item_error_carries_the_error_s_hint_and_guide() {
+        let item = super::batch_item_error(super::no_decider_registered_error());
+        assert_eq!(item.code, "no_decider_registered");
+        let guidance = skilj_core::error::guidance("no_decider_registered").unwrap();
+        assert_eq!(item.hint.as_deref(), Some(guidance.hint));
+        assert_eq!(item.guide.as_deref(), Some(guidance.guide));
+
+        let item = super::batch_item_error(crate::error::coded("batch_too_large", "too many"));
+        assert_eq!(item.code, "batch_too_large");
+        assert_eq!((item.hint, item.guide), (None, None));
+
+        let item = super::batch_item_error(async_graphql::Error::new("no code"));
+        assert_eq!(item.code, "error");
+        assert_eq!((item.hint, item.guide), (None, None));
+    }
 }

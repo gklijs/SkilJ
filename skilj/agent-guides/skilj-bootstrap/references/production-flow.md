@@ -87,9 +87,10 @@ mutation {
 
 `level: ADMIN` specifically - `RegisterEventType`/`RegisterCommandType`/
 `RegisterProjection` all require it; `READ`/`WRITE` are not enough,
-and reconciliation will silently skip this bounded context
-(`ReconciliationReport.skipped_no_access`) rather than error if this
-step is missed or the wrong level was granted.
+and reconciliation will skip this bounded context
+(`ReconciliationReport.skipped_no_access`, and a warning skilj logs per
+skipped registration, `code=skipped_no_access`) rather than error if
+this step is missed or the wrong level was granted.
 
 ## 5. Point your process at that Role
 

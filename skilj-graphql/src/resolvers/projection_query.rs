@@ -14,7 +14,6 @@ use crate::naming::Naming;
 use crate::projection_types::graphql_type_name;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
-use async_graphql::ErrorExtensions;
 use skilj_core::access_control::RoleAccessMapping;
 use skilj_core::db::Pool;
 
@@ -145,12 +144,14 @@ pub(crate) async fn fetch_projection_result(
             .map_err(to_graphql_error)?
             .unwrap_or(-1);
         if seq > latest {
-            return Err(async_graphql::Error::new(format!(
-                "waitForSequence {seq} is past the latest committed sequence {latest} of \
+            return Err(crate::error::coded(
+                "wait_for_sequence_not_committed",
+                format!(
+                    "waitForSequence {seq} is past the latest committed sequence {latest} of \
                  {bounded_context_name:?} - pass a sequence already committed, such as one \
                  a submitted command triggered"
-            ))
-            .extend_with(|_, ext| ext.set("code", "wait_for_sequence_not_committed")));
+                ),
+            ));
         }
     }
     let caught_up = match wait_for_sequence {

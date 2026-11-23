@@ -7,7 +7,6 @@ use crate::error::to_graphql_error;
 use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
-use async_graphql::ErrorExtensions;
 use skilj_core::shared::try_generate_token_id;
 
 /// `createSuperadmin(bootstrapSecret: String!, name: String!, externalSubject: String!): CreatedSuperadmin!`,
@@ -28,12 +27,12 @@ pub fn field(n: &Naming) -> Field {
                 // the secret consumed once it succeeds.
                 let mut gate = state.bootstrap.lock().await;
                 let Some(bootstrap_secret) = gate.as_ref() else {
-                    return Err(async_graphql::Error::new(
+                    return Err(crate::error::coded(
+                        "bootstrap_secret_unavailable",
                         "this process holds no bootstrap secret: it was already used, or an \
                          active superadmin existed when the process started. If every superadmin \
                          has since been revoked, restart to generate a new one.",
-                    )
-                    .extend_with(|_, ext| ext.set("code", "bootstrap_secret_unavailable")));
+                    ));
                 };
                 let existing_roles = skilj_core::db::list_roles(&state.pool)
                     .await

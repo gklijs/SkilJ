@@ -66,6 +66,36 @@ README.md, "Status and stability").
   since one may have been counted from a deleted context's assignment. The
   tick schedules each again, a full `retire_after` from then, so a pending
   key deletion happens at most one grace period later than it would have.
+- `skilj-codegen --diagnostic-format json` writes `{"version":2,...}`: each
+  diagnostic's `code` is now specific and stable, one per rule
+  (`tag_on_sensitive_field`, `duplicate_field`, `unknown_field_type`, ...),
+  and the former code (`parse`, `semantic`, `io`, `generation`, `drift`,
+  `usage`) is in the new `category`. Read `category` where you read `code`.
+  Each diagnostic also has `hint` and `guide`, `null` when absent. Exit
+  statuses are unchanged; import's notes document stays version 1. A field
+  type the format doesn't have (`type = "uuid"`) is now `unknown_field_type`
+  with its position rather than a TOML error, and text-mode argument errors
+  print `usage: ...`. (#224, docs/codegen-cli.md)
+- `skilj_codegen::ValidationProblem` is `#[non_exhaustive]` (only
+  skilj-codegen builds one) and gains `code`, `hint`, `guide`, `span` and
+  `category()`, and `skilj_codegen::Error::Invalid` carries
+  `Vec<ValidationProblem>` instead of `Vec<String>`; its `Display` is
+  unchanged. `generate` and `validate` report an unknown field type as
+  `Error::Invalid`/a problem instead of `Error::Toml`. (#224)
+- `skilj_core::Error::BatchFailed` gains `rejected`, true when the error it
+  copies was a `decide()`'s rejection, which then gives no hint or guide.
+- `skilj_rest::error::ErrorBody` and `ItemErrorBody` are `#[non_exhaustive]`
+  and gain `hint` and `guide`; `skilj_graphql::gql_types::BatchItemError` is
+  `#[non_exhaustive]` and gains `hint` and `guide`, and GraphQL's
+  `BatchItemError` type the nullable fields of the same names. (#224)
+- `Skilj::builder().build()` logs each registration it skips
+  (`skipped_no_access`) as a warning, and a failed reconciliation as an
+  error, itself.
+  skilj-demo and the template no longer log the skipped list, and the
+  template's server installs a `tracing_subscriber::fmt()` subscriber
+  (`RUST_LOG`, `info` by default) to show them; a project generated from an
+  older template that printed `report.skipped_no_access` can drop that.
+  (#224)
 
 ### Changed
 
@@ -101,6 +131,24 @@ README.md, "Status and stability").
 
 ### Added
 
+- Hints and guide pointers on codes (#224, docs/architecture.md §258). A
+  GraphQL error's `extensions` and a REST error body carry `hint` (what to
+  change, one line) and `guide` (`<skill>` or `<skill>#<anchor>`, a section
+  of a guide in `skilj/agent-guides/`) next to `code` where a guide section
+  explains the code, from one table (`skilj_core::error::GUIDANCE`,
+  `guidance(code)`, `SkiljRejection::hint`/`guide`), and so do batch items:
+  REST's `ItemErrorBody` and GraphQL's `BatchItemError`. A `decide()`'s
+  business rejection never has them. `skilj-codegen` diagnostics carry
+  specific codes with the same two fields, and `build()` logs
+  `skipped_no_access` and a failed reconciliation with `code`, `hint` and
+  `guide`.
+- `skilj::error_codes` (`skilj/src/error_codes.md`): the one table of every
+  codegen, GraphQL, REST and startup code, with its hint and guide, and of the
+  rejection kinds skilj's own checks give (retractions, doubts, the default
+  `decide()`).
+  `node scripts/agent-guides/check.mjs` holds it to the codes the sources
+  produce, to the two Rust tables and to the guides (`codes` rule,
+  `scripts/agent-guides/non-code-names.txt`).
 - `skilj_core::db::build_concurrent_indexes`, `build_concurrent_indexes_until`,
   `pending_concurrent_index_work`, `ConcurrentIndexOutcome` and
   `CONCURRENT_INDEX_APPLICATION_NAME`, and

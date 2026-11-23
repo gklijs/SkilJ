@@ -22,7 +22,6 @@ use crate::gql_types::{CommandProposalData, CommandProposalDecisionResult};
 use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
-use async_graphql::ErrorExtensions;
 use jiff::Timestamp;
 use skilj_core::access_control::RoleAccessMapping;
 use skilj_core::approvals::CommandProposalStatus;
@@ -137,10 +136,10 @@ pub fn command_proposals_field(n: &Naming) -> Field {
                         Some(
                             skilj_core::db::CommandProposalCursor::decode(raw).ok_or_else(
                                 || {
-                                    async_graphql::Error::new(format!(
-                                        "{raw:?} is not a commandProposals cursor"
-                                    ))
-                                    .extend_with(|_, ext| ext.set("code", "invalid_cursor"))
+                                    crate::error::coded(
+                                        "invalid_cursor",
+                                        format!("{raw:?} is not a commandProposals cursor"),
+                                    )
                                 },
                             )?,
                         )

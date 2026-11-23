@@ -14,6 +14,8 @@ enum LedgerAccessTokenStatus {
 type LedgerBatchItemError {
 	code: String!
 	message: String!
+	hint: String
+	guide: String
 }
 
 type LedgerBlobField {

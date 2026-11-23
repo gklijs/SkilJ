@@ -103,6 +103,20 @@ template's `AGENTS.md` with the workspace:
   `§N` names a section (`scripts/check-section-refs.sh`).
 - Every guide is linked from both skill directories and listed in the
   guides' `README.md` and in the template's `AGENTS.md`.
+- Codes (`codes`, docs/architecture.md §258): `skilj/src/error_codes.md`
+  lists exactly the codes the non-test sources produce, read from a fixed
+  list of producer forms (the script's header comment has them), with the
+  hint and guide `skilj-codegen`'s `CODES` and `skilj_core::error::GUIDANCE`
+  give them. Every guide pointer names a skill and an anchor of its
+  `SKILL.md`. A code-shaped name (`word_word`, any casing) in backticks, or
+  in double quotes in a `SKILL.md`'s frontmatter, is a live code, an
+  instance of `<entity>_not_found`, or listed: in
+  `scripts/agent-guides/non-code-names.txt` when it is in the code but no
+  code (a field, a function, an application's rejection kind), in `illustrative-names.txt`
+  when it isn't in the code at all. A code in the table's "Retired codes"
+  fails anywhere in a guide (a one-word one only in backticks or quotes).
+  A producer in a form the check doesn't accept fails as unclassified, so
+  a new kind of producer needs the check taught first.
 
 That catches a guide that names something gone. It doesn't catch one that
 describes behavior wrongly. For that there are ten tasks.

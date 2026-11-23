@@ -1408,14 +1408,20 @@ pub fn submit_command_input(n: &Naming) -> InputObject {
         ))
 }
 
-/// A command of a batch that failed on its own: the code and message
-/// `submitCommand` would have answered it with in `errors`.
+/// A command of a batch that failed on its own: the code, message, hint and
+/// guide `submitCommand` would have answered it with in `errors`.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct BatchItemError {
     /// The error's stable code, as `extensions.code` would carry it.
     pub code: String,
     /// The error's message.
     pub message: String,
+    /// What to change, as `extensions.hint` would carry it, where an agent
+    /// guide section explains the code (docs/architecture.md §258).
+    pub hint: Option<String>,
+    /// That guide section, as `extensions.guide` would carry it.
+    pub guide: Option<String>,
 }
 
 /// `type BatchItemError`.
@@ -1423,6 +1429,8 @@ pub fn batch_item_error_object(n: &Naming) -> Object {
     gql_object!(BatchItemError => n.ty("BatchItemError") {
         scalar "code": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.code.clone()),
         scalar "message": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.message.clone()),
+        scalar "hint": TypeRef::named(TypeRef::STRING) => |e| optional_string(e.hint.clone()),
+        scalar "guide": TypeRef::named(TypeRef::STRING) => |e| optional_string(e.guide.clone()),
     })
 }
 

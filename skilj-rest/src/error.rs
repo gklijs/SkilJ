@@ -18,11 +18,21 @@ use skilj_core::Error as CoreError;
 
 /// The JSON body of every REST error response.
 #[derive(Debug, Serialize)]
+#[non_exhaustive]
 pub struct ErrorBody {
     /// Machine-readable, stable error code (`SkiljRejection::code`).
     pub code: String,
     /// Human-readable description; not stable, not for matching on.
     pub message: String,
+    /// What to change, in one line, where an agent guide section explains
+    /// the code (docs/architecture.md §258); absent otherwise, and never on
+    /// a business rejection. Not stable wording either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// The agent guide section that explains the code, `<skill>` or
+    /// `<skill>#<anchor>`; present exactly when `hint` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guide: Option<String>,
     /// The current request's OTel trace id, hex-encoded, for a caller to
     /// quote back when escalating - `None` when no real
     /// `tracing-opentelemetry` layer is installed (this crate used
@@ -268,17 +278,28 @@ fn status_for(err: &CoreError) -> StatusCode {
 
 impl IntoResponse for RestError {
     fn into_response(self) -> Response {
-        let (status, code, message) = self.parts();
+        let parts = self.guided_parts();
         (
-            status,
+            parts.status,
             Json(ErrorBody {
-                code,
-                message,
+                code: parts.code,
+                message: parts.message,
+                hint: parts.hint.map(str::to_string),
+                guide: parts.guide.map(str::to_string),
                 trace_id: current_trace_id(),
             }),
         )
             .into_response()
     }
+}
+
+/// What a response, or a batch item, says about one error.
+struct Parts {
+    status: StatusCode,
+    code: String,
+    message: String,
+    hint: Option<&'static str>,
+    guide: Option<&'static str>,
 }
 
 /// One item of a batch that failed on its own: the status, code and
@@ -287,6 +308,7 @@ impl IntoResponse for RestError {
 /// about it, as it would for a single request: a 4xx won't succeed
 /// unchanged, a 5xx may on a retry.
 #[derive(Debug, Serialize)]
+#[non_exhaustive]
 pub struct ItemErrorBody {
     /// The HTTP status a single request would have been answered with.
     pub status: u16,
@@ -294,16 +316,49 @@ pub struct ItemErrorBody {
     pub code: String,
     /// The human-readable message.
     pub message: String,
+    /// The hint the same request's [`ErrorBody`] would carry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// The guide the same request's [`ErrorBody`] would carry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guide: Option<String>,
 }
 
 impl RestError {
     /// This error as one failed item of a batch.
     pub fn into_item_error(self) -> ItemErrorBody {
-        let (status, code, message) = self.parts();
+        let parts = self.guided_parts();
         ItemErrorBody {
-            status: status.as_u16(),
+            status: parts.status.as_u16(),
+            code: parts.code,
+            message: parts.message,
+            hint: parts.hint.map(str::to_string),
+            guide: parts.guide.map(str::to_string),
+        }
+    }
+
+    /// The status, code, message, hint and guide: a core error's own hint
+    /// and guide (none for a business rejection), and for this crate's own
+    /// codes what `skilj_core::error::GUIDANCE` has.
+    fn guided_parts(self) -> Parts {
+        let core_advice = match &self {
+            RestError::Core(e) => Some((e.hint(), e.guide())),
+            _ => None,
+        };
+        let (status, code, message) = self.parts();
+        let (hint, guide) = core_advice.unwrap_or_else(|| {
+            let guidance = skilj_core::error::guidance(&code);
+            (
+                guidance.map(|guidance| guidance.hint),
+                guidance.map(|guidance| guidance.guide),
+            )
+        });
+        Parts {
+            status,
             code,
             message,
+            hint,
+            guide,
         }
     }
 
@@ -391,6 +446,79 @@ mod tests {
         assert_eq!(body["code"], "database_error");
         assert_eq!(body["message"], "an internal database error occurred");
         assert!(!body.to_string().contains("acme_corp"), "{body}");
+        // No guide section explains it: neither key is there.
+        assert!(
+            body.get("hint").is_none() && body.get("guide").is_none(),
+            "{body}"
+        );
+    }
+
+    async fn body(error: RestError) -> serde_json::Value {
+        let response = error.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_guided_code_carries_hint_and_guide() {
+        let error =
+            skilj_core::Error::from(skilj_core::event_store::Error::PayloadDoesNotMatchSchema);
+        let body = body(RestError::Core(error)).await;
+        assert_eq!(body["code"], "payload_does_not_match_schema");
+        assert!(body["hint"].is_string(), "{body}");
+        assert_eq!(
+            body["guide"],
+            "skilj#if-a-registration-or-a-submission-gets-rejected"
+        );
+        // This crate's own codes, from the same table.
+        let body = self::body(RestError::UploadNotAllowed).await;
+        assert_eq!(
+            body["guide"],
+            "skilj-large-payloads#when-something-is-refused"
+        );
+        let body = self::body(RestError::MissingCredential).await;
+        assert!(
+            body.get("hint").is_none() && body.get("guide").is_none(),
+            "{body}"
+        );
+    }
+
+    /// A `decide()`'s kind is the application's: never skilj's advice.
+    #[tokio::test]
+    async fn a_business_rejection_spelled_like_a_skilj_code_gets_no_advice() {
+        let error = skilj_core::Error::CommandRejected {
+            reason: "over this account's limit".to_string(),
+            kind: "payload_too_large".to_string(),
+        };
+        let body = body(RestError::Core(error)).await;
+        assert_eq!(body["code"], "payload_too_large");
+        assert!(
+            body.get("hint").is_none() && body.get("guide").is_none(),
+            "{body}"
+        );
+    }
+
+    /// A batch item says what the same request alone would have.
+    #[test]
+    fn a_batch_item_carries_the_same_hint_and_guide() {
+        let item = RestError::Core(skilj_core::Error::from(
+            skilj_core::event_store::Error::PayloadDoesNotMatchSchema,
+        ))
+        .into_item_error();
+        assert_eq!(item.status, 400);
+        assert_eq!(item.code, "payload_does_not_match_schema");
+        let guidance = skilj_core::error::guidance("payload_does_not_match_schema").unwrap();
+        assert_eq!(item.hint.as_deref(), Some(guidance.hint));
+        assert_eq!(item.guide.as_deref(), Some(guidance.guide));
+        let json =
+            serde_json::to_value(RestError::BatchTooLarge { max: 1, items: 2 }.into_item_error())
+                .unwrap();
+        assert!(
+            json.get("hint").is_none() && json.get("guide").is_none(),
+            "{json}"
+        );
     }
 
     #[test]

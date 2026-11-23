@@ -59,7 +59,7 @@
 //! all this module ever has.
 
 use async_graphql::dynamic::{Enum, Field, FieldFuture, FieldValue, Object, TypeRef, Union};
-use async_graphql::{ErrorExtensions, Name, Value};
+use async_graphql::{Name, Value};
 use serde_json::Map;
 use skilj_core::db::{self, Pool};
 
@@ -131,11 +131,13 @@ impl AdmittedProjections {
         {
             return Ok(());
         }
-        Err(async_graphql::Error::new(format!(
-            "projection {bounded_context:?}/{projection:?} has no GraphQL type in this schema \
+        Err(crate::error::coded(
+            "projection_not_in_schema",
+            format!(
+                "projection {bounded_context:?}/{projection:?} has no GraphQL type in this schema \
              (see the server log for why it was excluded)"
+            ),
         ))
-        .extend_with(|_, ext| ext.set("code", "projection_not_in_schema")))
     }
 }
 

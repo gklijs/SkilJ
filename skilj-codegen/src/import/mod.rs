@@ -111,8 +111,13 @@ pub struct Import {
 /// wouldn't generate (two commands with one name, say).
 pub fn import(source: Source, input: &str, bounded_context: &str) -> Result<Import, Error> {
     if !spec::is_bounded_context_name(bounded_context) {
-        return Err(Error::Invalid(vec![format!(
-            "`{bounded_context}` is not a skilj bounded context name: a lowercase letter, then lowercase letters, digits or `_`, at most 40 characters"
+        return Err(Error::Invalid(vec![crate::problem(
+            "invalid_bounded_context_name",
+            "bounded_context".to_string(),
+            format!(
+                "`{bounded_context}` is not a skilj bounded context name: a lowercase letter, then lowercase letters, digits or `_`, at most 40 characters"
+            ),
+            None,
         )]));
     }
     let model = match source {
@@ -122,7 +127,7 @@ pub fn import(source: Source, input: &str, bounded_context: &str) -> Result<Impo
     };
     let skilj_toml = write_toml(source.header(), bounded_context, &model);
     let parsed: BoundedContextSpec = toml::from_str(&skilj_toml).map_err(Error::Toml)?;
-    let problems = spec::validate(&parsed);
+    let problems = spec::validate_detailed(&parsed);
     if !problems.is_empty() {
         return Err(Error::Invalid(problems));
     }
@@ -142,13 +147,18 @@ struct Model {
 /// The error for a bounded context the model has no events of.
 fn no_events(bounded_context: &str, found: BTreeSet<String>) -> Error {
     let found: Vec<_> = found.into_iter().collect();
-    Error::Invalid(vec![format!(
-        "the model has no events of bounded context `{bounded_context}`; it has events of: {}",
-        if found.is_empty() {
-            "none".to_string()
-        } else {
-            found.join(", ")
-        }
+    Error::Invalid(vec![crate::problem(
+        "no_events_for_bounded_context",
+        "bounded_context".to_string(),
+        format!(
+            "the model has no events of bounded context `{bounded_context}`; it has events of: {}",
+            if found.is_empty() {
+                "none".to_string()
+            } else {
+                found.join(", ")
+            }
+        ),
+        None,
     )])
 }
 

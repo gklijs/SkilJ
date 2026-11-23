@@ -459,13 +459,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.graphql_federation(options);
     }
     let (skilj, report) = builder.build().await?;
+    // build() logs each skipped registration itself (skipped_no_access).
     tracing::info!(registered = ?report.registered, "reconciliation complete");
-    if !report.skipped_no_access.is_empty() {
-        tracing::warn!(
-            skipped = ?report.skipped_no_access,
-            "reconciliation: skipped, no access yet"
-        );
-    }
 
     println!(
         "\nGraphQL Role credential (send as `authorization: Bearer <jwt>`, or in a \

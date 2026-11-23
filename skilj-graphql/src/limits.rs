@@ -133,7 +133,13 @@ impl Extension for ExpensiveFieldBudgetExtension {
 fn budget_error(code: &str, message: String) -> ServerError {
     let mut error = ServerError::new(message, None);
     let mut extensions = async_graphql::ErrorExtensionValues::default();
-    extensions.set("code", code);
+    let guidance = skilj_core::error::guidance(code);
+    crate::error::set_code(
+        &mut extensions,
+        code,
+        guidance.map(|guidance| guidance.hint),
+        guidance.map(|guidance| guidance.guide),
+    );
     error.extensions = Some(extensions);
     error
 }
@@ -214,7 +220,6 @@ pub(crate) fn acquire_subscription_slot(
     ctx: &async_graphql::dynamic::ResolverContext<'_>,
     max: usize,
 ) -> async_graphql::Result<Option<SubscriptionSlot>> {
-    use async_graphql::ErrorExtensions;
     use std::sync::atomic::Ordering;
 
     let Ok(connection) = ctx.data::<ConnectionSubscriptions>() else {
@@ -226,11 +231,13 @@ pub(crate) fn acquire_subscription_slot(
             (running < max).then_some(running + 1)
         })
         .map_err(|running| {
-            async_graphql::Error::new(format!(
-                "this connection already has {running} subscriptions running; at most {max} \
+            crate::error::coded(
+                "too_many_subscriptions",
+                format!(
+                    "this connection already has {running} subscriptions running; at most {max} \
                  are allowed - complete one first"
-            ))
-            .extend_with(|_, ext| ext.set("code", "too_many_subscriptions"))
+                ),
+            )
         })?;
     Ok(Some(SubscriptionSlot(connection.0.clone())))
 }

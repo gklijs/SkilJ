@@ -138,7 +138,10 @@ fn a_typo_d_field_name_is_a_real_error_not_silently_dropped() {
 
 fn invalid(toml: &str) -> Vec<String> {
     match skilj_codegen::generate(toml) {
-        Err(skilj_codegen::Error::Invalid(problems)) => problems,
+        Err(skilj_codegen::Error::Invalid(problems)) => problems
+            .into_iter()
+            .map(|problem| problem.message)
+            .collect(),
         other => panic!("expected Error::Invalid, got {other:?}"),
     }
 }

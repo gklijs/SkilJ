@@ -24,7 +24,6 @@ use crate::error::to_graphql_error;
 use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
-use async_graphql::ErrorExtensions;
 use jiff::Timestamp;
 use serde::Deserialize;
 use skilj_core::db::{self, ParkedDelivery, ParkedDeliveryKind};
@@ -344,10 +343,10 @@ pub fn parked_deliveries_field(n: &Naming) -> Field {
                     Some(value) => {
                         let raw = value.string()?;
                         Some(db::ParkedDeliveryCursor::decode(raw).ok_or_else(|| {
-                            async_graphql::Error::new(format!(
-                                "{raw:?} is not a parkedDeliveries cursor"
-                            ))
-                            .extend_with(|_, ext| ext.set("code", "invalid_cursor"))
+                            crate::error::coded(
+                                "invalid_cursor",
+                                format!("{raw:?} is not a parkedDeliveries cursor"),
+                            )
                         })?)
                     }
                     None => None,
@@ -445,12 +444,10 @@ pub fn retry_parked_delivery_field(n: &Naming) -> Field {
                         .await
                         .map_err(to_graphql_error)?
                         .ok_or_else(|| {
-                            async_graphql::Error::new(format!(
-                                "ParkedDelivery {id:?} is already being retried"
-                            ))
-                            .extend_with(|_, ext| {
-                                ext.set("code", "ParkedDelivery_retry_in_progress")
-                            })
+                            crate::error::coded(
+                                "ParkedDelivery_retry_in_progress",
+                                format!("ParkedDelivery {id:?} is already being retried"),
+                            )
                         })?;
                 let delivery = db::get_parked_delivery(&state.pool, &bounded_context_name, &id)
                     .await

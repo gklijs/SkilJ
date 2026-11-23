@@ -65,6 +65,7 @@
 // Every public item is documented; CI fails on a gap (`-D warnings`).
 #![warn(missing_docs)]
 
+mod codes;
 pub mod emhcl;
 mod emit;
 pub mod import;
@@ -85,9 +86,10 @@ pub enum Error {
     Toml(toml::de::Error),
     /// The `.skilj.toml` parses but can't produce working code - an
     /// invalid name, a duplicate, a tag naming an undeclared field, two
-    /// types generating the same Rust item. Every problem found, not just
-    /// the first.
-    Invalid(Vec<String>),
+    /// types generating the same Rust item, a field type this format
+    /// doesn't have. Every problem found, not just the first, each with
+    /// its stable [`ValidationProblem::code`].
+    Invalid(Vec<ValidationProblem>),
     /// The `TokenStream` this crate emitted doesn't parse as a valid
     /// `syn::File` - a bug in this crate's own `emit` module, never a
     /// user error; nothing about a well-formed `.skilj.toml` file
@@ -115,7 +117,7 @@ impl std::fmt::Display for Error {
             Error::Invalid(problems) => {
                 write!(f, "invalid .skilj.toml:")?;
                 for problem in problems {
-                    write!(f, "\n  - {problem}")?;
+                    write!(f, "\n  - {}", problem.message)?;
                 }
                 Ok(())
             }
@@ -138,8 +140,11 @@ impl std::error::Error for Error {}
 /// for debugging, not a minified one-liner. See this crate's own root
 /// doc comment for what the output covers.
 pub fn generate(toml_source: &str) -> Result<String, Error> {
-    let spec: BoundedContextSpec = toml::from_str(toml_source).map_err(Error::Toml)?;
-    let problems = spec::validate(&spec);
+    let spec = match spec::parse(toml_source).map_err(Error::Toml)? {
+        spec::Parsed::Spec(spec) => spec,
+        spec::Parsed::UnknownFieldTypes(problems) => return Err(Error::Invalid(problems)),
+    };
+    let problems = spec::validate_detailed(&spec);
     if !problems.is_empty() {
         return Err(Error::Invalid(problems));
     }
@@ -148,21 +153,70 @@ pub fn generate(toml_source: &str) -> Result<String, Error> {
     Ok(prettyplease::unparse(&file))
 }
 
-/// A semantic validation problem, with declaration or query context.
-/// Semantic validation does not currently retain source spans.
+/// A validation problem, with declaration or query context and a stable code
+/// (docs/codegen-cli.md lists every code, `skilj/src/error_codes.md` too).
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct ValidationProblem {
-    /// Declaration (and query item, where applicable) containing the problem.
+    /// The stable, specific code, e.g. `tag_on_sensitive_field`: a machine
+    /// interface, unlike [`message`](Self::message).
+    pub code: &'static str,
+    /// Declaration (and query item, where applicable) containing the
+    /// problem; empty for a shape error found next to an unknown field type.
     pub context: String,
     /// Human-readable explanation; wording is not a stable machine interface.
     pub message: String,
+    /// What to change, in one line, where an agent guide section explains
+    /// the code; `None` otherwise. Its wording is not stable either.
+    pub hint: Option<&'static str>,
+    /// The agent guide section that explains the code, `<skill>` or
+    /// `<skill>#<anchor>` (a skill under `skilj/agent-guides/`); `Some`
+    /// exactly when [`hint`](Self::hint) is.
+    pub guide: Option<&'static str>,
+    /// Byte offsets into the source, where the problem has a position (an
+    /// unknown field type, a shape error found next to one); `None` for
+    /// semantic problems.
+    pub span: Option<std::ops::Range<usize>>,
+}
+
+impl ValidationProblem {
+    /// The coarse category of [`code`](Self::code): `semantic` for a rule
+    /// about what the model declares, `parse` for a value or shape the
+    /// format doesn't accept.
+    pub fn category(&self) -> &'static str {
+        codes::lookup(self.code).map_or("semantic", |entry| entry.category)
+    }
+}
+
+/// The one way a [`ValidationProblem`] is built: its hint and guide come from
+/// the code table.
+pub(crate) fn problem(
+    code: &'static str,
+    context: String,
+    message: String,
+    span: Option<std::ops::Range<usize>>,
+) -> ValidationProblem {
+    let entry = codes::lookup(code);
+    debug_assert!(entry.is_some(), "{code} is not in codes::CODES");
+    ValidationProblem {
+        code,
+        context,
+        message,
+        hint: entry.and_then(|entry| entry.hint),
+        guide: entry.and_then(|entry| entry.guide),
+        span,
+    }
 }
 
 /// Parses and validates a model using the same validator as [`generate`].
 /// Parse errors are returned as [`Error::Toml`]; semantic problems are collected
-/// together. An empty vector means generation may proceed, not that domain
-/// decisions or the complete application have been verified.
+/// together. A field type this format doesn't have is a problem too
+/// (`unknown_field_type`, with its position), next to any other shape error
+/// in the same file (`parse`). An empty vector means generation may proceed,
+/// not that domain decisions or the complete application have been verified.
 pub fn validate(toml_source: &str) -> Result<Vec<ValidationProblem>, Error> {
-    let spec: BoundedContextSpec = toml::from_str(toml_source).map_err(Error::Toml)?;
-    Ok(spec::validate_detailed(&spec))
+    match spec::parse(toml_source).map_err(Error::Toml)? {
+        spec::Parsed::Spec(spec) => Ok(spec::validate_detailed(&spec)),
+        spec::Parsed::UnknownFieldTypes(problems) => Ok(problems),
+    }
 }
