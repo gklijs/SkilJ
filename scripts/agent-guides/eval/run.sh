@@ -14,6 +14,12 @@
 #
 # Agents:
 #   claude, codex  the CLI, signed in; --model is required and recorded
+#   skilj-agent    `skilj-agent task` with a local model (Ollama, or
+#                  llama-server through SKILJ_AGENT_LLAMA_SERVER); --model is
+#                  required. It builds its proposals under CARGO_TARGET_DIR,
+#                  the shared build directory, and writes a change only when
+#                  it is verified. Its log ends with one JSON record of the
+#                  run: outcome, settings, executable SHA-256, commit, tokens
 #   none           does nothing: a baseline, and the check failing on the
 #                  untouched project shows the task's checks test the task
 #   reference      applies solutions/<task>.patch: the pipeline end to end
@@ -33,7 +39,7 @@
 # for a failed run too, with the phase that failed in `failure` and the
 # steps it didn't reach `unrun`. The exit code is 0 when the run passed.
 #
-# Usage: scripts/agent-guides/eval/run.sh <claude|codex|none|reference> <task> [--link] [--model MODEL]
+# Usage: scripts/agent-guides/eval/run.sh <claude|codex|skilj-agent|none|reference> <task> [--link] [--model MODEL]
 #        <task>: a name in tasks/ (ls scripts/agent-guides/eval/tasks)
 #        --link: run scripts/skilj-guides.sh --link first, so the guides
 #                are skills the agent loads by itself
@@ -41,7 +47,10 @@
 #        SKILJ_EVAL_BUILD_DIR: the build directory ($SKILJ_EVAL_DIR/build);
 #                one of its own lets a run go in parallel with another
 #        SKILJ_EVAL_RESULTS: where the record goes (results/)
-#        SKILJ_EVAL_CLAUDE, SKILJ_EVAL_CODEX: the CLI to run (claude, codex)
+#        SKILJ_EVAL_CLAUDE, SKILJ_EVAL_CODEX, SKILJ_EVAL_SKILJ_AGENT: the CLI
+#                to run (claude, codex, skilj-agent)
+#        SKILJ_EVAL_DEADLINE: seconds skilj-agent may take before it stops
+#                and records a timeout; a local model can take an hour
 #
 # claude and codex cost what a session of that agent costs, so nothing
 # runs them automatically.
@@ -52,7 +61,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 source "$here/lib.sh"
 root="$eval_root"
 
-usage='eval-run: usage: run.sh <claude|codex|none|reference> <task> [--link] [--model MODEL]'
+usage='eval-run: usage: run.sh <claude|codex|skilj-agent|none|reference> <task> [--link] [--model MODEL]'
 agent="${1:-}"
 task="${2:-}"
 link=false
@@ -69,7 +78,7 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 case "$agent" in
-    claude | codex)
+    claude | codex | skilj-agent)
         [[ -n "$model" ]] || { echo "eval-run: $agent needs --model, so the record says which model ran" >&2; exit 2; } ;;
     none | reference) ;;
     *) echo "$usage" >&2; exit 2 ;;
@@ -138,6 +147,17 @@ run_agent() {
             tool="${SKILJ_EVAL_CODEX:-codex}"
             agent_version="$("$tool" --version 2>/dev/null | head -n 1)"
             without_lock "$tool" exec -m "$model" --json --sandbox workspace-write --add-dir "$CARGO_TARGET_DIR" - \
+                < "$here/tasks/$task.md" > "$log" 2>&1
+            ;;
+        skilj-agent)
+            tool="${SKILJ_EVAL_SKILJ_AGENT:-skilj-agent}"
+            # The executable's hash with its version: what it knows about
+            # skilj is compiled in, so the guides hash doesn't cover it.
+            agent_version="$("$tool" --version 2>/dev/null | head -n 1)"
+            agent_version="$agent_version sha256:$(sha256sum "$(command -v "$tool")" 2>/dev/null | cut -c1-12)"
+            local deadline=()
+            [[ -n "${SKILJ_EVAL_DEADLINE:-}" ]] && deadline=(--deadline "$SKILJ_EVAL_DEADLINE")
+            without_lock "$tool" task --task-file - --path . --model "$model" --apply --json "${deadline[@]}" \
                 < "$here/tasks/$task.md" > "$log" 2>&1
             ;;
         none)

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { render, readRecords, replaceScoreboard, main, START, END } from './summarize.mjs';
-import { parseClaude, parseCodex, parseUsage, buildRecord, STEPS } from './record.mjs';
+import { parseClaude, parseCodex, parseSkiljAgent, parseUsage, buildRecord, STEPS } from './record.mjs';
 
 function record(overrides) {
   return {
@@ -126,8 +126,18 @@ test('codex JSONL: usage summed over turns, no cost', () => {
   assert.deepEqual(parseCodex(log), { costUsd: null, tokens: { input: 12, output: 6, cacheRead: 4, cacheWrite: null } });
 });
 
+test('skilj-agent: tokens from the last record line, no cost', () => {
+  const log = [
+    'Trying a test and implementation for wallet.Withdraw...',
+    '{"record":"other","tokens":{"input":99,"output":99}}',
+    '{"record":"skilj-agent-task","outcome":"gave_up","tokens":{"input":1200,"output":340}}',
+  ].join('\n');
+  assert.deepEqual(parseSkiljAgent(log), { costUsd: null, tokens: { input: 1200, output: 340, cacheRead: null, cacheWrite: null } });
+  assert.deepEqual(parseSkiljAgent('{"record":"skilj-agent-task","tokens":"none"}'), { costUsd: null, tokens: null });
+});
+
 test('a log with no usable line gives nulls, never an error', () => {
-  for (const agent of ['claude', 'codex', 'none', 'reference', 'other']) {
+  for (const agent of ['claude', 'codex', 'skilj-agent', 'none', 'reference', 'other']) {
     assert.deepEqual(parseUsage(agent, 'Error: rate limited\n{"type":"result"'), { costUsd: null, tokens: null });
     assert.deepEqual(parseUsage(agent, ''), { costUsd: null, tokens: null });
   }

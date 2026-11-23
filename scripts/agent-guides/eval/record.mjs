@@ -71,7 +71,20 @@ export function parseCodex(text) {
   return { costUsd: null, tokens: known ? tokens : null };
 }
 
-const PARSERS = { claude: parseClaude, codex: parseCodex };
+// skilj-agent's `task --json` ends with one record line
+// ("record":"skilj-agent-task") holding the tokens its model server reported.
+// A local model has no cost.
+export function parseSkiljAgent(text) {
+  const last = jsonLines(text)
+    .filter((event) => event && event.record === 'skilj-agent-task')
+    .at(-1);
+  if (!last || !last.tokens || typeof last.tokens !== 'object') return { costUsd: null, tokens: null };
+  const tokens = { input: number(last.tokens.input), output: number(last.tokens.output), cacheRead: null, cacheWrite: null };
+  const known = tokens.input !== null || tokens.output !== null;
+  return { costUsd: null, tokens: known ? tokens : null };
+}
+
+const PARSERS = { claude: parseClaude, codex: parseCodex, 'skilj-agent': parseSkiljAgent };
 
 export function parseUsage(agent, text) {
   const parse = PARSERS[agent];

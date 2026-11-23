@@ -6,18 +6,19 @@
 # Then `node scripts/agent-guides/eval/summarize.mjs --write` puts the
 # records in docs/agent-guidance.md's scoreboard.
 #
-# Usage: scripts/agent-guides/eval/suite.sh <claude|codex|none|reference> [--link] [--model MODEL]
+# Usage: scripts/agent-guides/eval/suite.sh <claude|codex|skilj-agent|none|reference> [--link] [--model MODEL]
 #        [--only TASK,TASK...]
 #        The environment run.sh reads applies (SKILJ_EVAL_DIR, SKILJ_EVAL_RESULTS, ...).
 #
-# With claude or codex it costs an agent session per task.
+# With claude or codex it costs an agent session per task; skilj-agent runs a
+# local model.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib.sh
 source "$here/lib.sh"
 
-usage='eval-suite: usage: suite.sh <claude|codex|none|reference> [--link] [--model MODEL] [--only TASK,TASK...]'
+usage='eval-suite: usage: suite.sh <claude|codex|skilj-agent|none|reference> [--link] [--model MODEL] [--only TASK,TASK...]'
 agent="${1:-}"
 shift || { echo "$usage" >&2; exit 2; }
 args=()

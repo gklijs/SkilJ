@@ -201,6 +201,12 @@ workspace's `skilj-codegen` is first on the agent's `PATH`, so
 
 - `claude` and `codex`: the CLI, signed in, with `--model` (required, and
   recorded). `SKILJ_EVAL_CLAUDE` and `SKILJ_EVAL_CODEX` name another binary.
+- `skilj-agent`: `skilj-agent task` with a local model, with `--model`
+  (required, and recorded). It writes a change only when its verifier
+  passed it, builds under the shared build directory, and its log ends with
+  one JSON record of its settings, executable and outcome.
+  `SKILJ_EVAL_SKILJ_AGENT` names another binary; `SKILJ_EVAL_DEADLINE`
+  stops it after that many seconds.
 - `none`: does nothing. Its run fails, and shows which steps a task's
   checks fail on an untouched project.
 - `reference`: applies the task's reference solution. Its run passes, and
