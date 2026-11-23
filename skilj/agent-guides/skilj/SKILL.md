@@ -162,6 +162,11 @@ a lift. It's only a marker: the event still counts, snapshots don't change, and 
 decision that cares lists `DOUBT_EVENT_TYPES` in its query and reads `open_doubts`.
 `build()` refuses `CommandType::snapshot()` next to it. Design: §236.
 
+`EventRetracted`, `EventDoubted` and `DoubtLifted` are skilj's built-in event
+types: a type of your own by one of those names is refused
+(`reserved_event_type_name`). Rename yours, or remove its declaration and enable
+retractions/doubts so skilj registers the built-in.
+
 In a `.skilj.toml`: `retractions = true`, `doubts = true`, and `retractable = true`
 on the command, which hands its `decide_*` `Retractable` events (see
 `skilj-demo/tests/seats.rs`). `inspectEvent` answers `retractedBy` and `doubtedBy`
@@ -202,6 +207,12 @@ lists every real error variant this can produce (`InvalidTagMapping`,
 `InvalidSensitiveField`, `PayloadDoesNotMatchSchema`, and the rest),
 each with what actually causes it and the fix, taken directly from
 `skilj-core`'s own source rather than guessed.
+
+A rejection's `hint` and `guide`, next to its `code` (GraphQL `extensions`,
+the REST error body), say what to change and which guide section explains
+it; `skilj/src/error_codes.md` lists every code. For a `.skilj.toml`,
+`skilj-codegen check --diagnostic-format json` gives each problem a code,
+and the same hint and guide.
 
 ## What this skill does not cover
 

@@ -5,8 +5,8 @@ description: >
   where a process's own reconciliation loop can actually register
   EventType/CommandType/Projection types onto it - superadmin bootstrap,
   addBoundedContext, granting the reconciliation Role Admin access, and
-  the #1 gotcha (a bounded context with no grant is silently skipped,
-  not an error). Triggers on "create a new bounded context", "set up
+  the #1 gotcha (a bounded context with no grant is skipped with a
+  warning, not an error). Triggers on "create a new bounded context", "set up
   skilj from scratch", "bootstrap the superadmin", "why is my
   bounded context/type not being registered", or "ReconciliationReport
   shows skipped_no_access". Do NOT use for adding a type to a bounded
@@ -34,11 +34,20 @@ JWT - this is an internal process, not a request). It then calls
 as if that Role's own `RoleAccessMapping` were being used by a human
 admin over GraphQL - because it is the same rule, the same grant, just
 automated. **A bounded context that Role has no `Admin`-level grant on
-is silently skipped for that pass, not an error** - it shows up in
-`ReconciliationReport.skipped_no_access`, and `.build()` still succeeds.
-If your types "aren't registering" and nothing looks wrong in your
+is skipped for that pass, not an error** - it shows up in
+`ReconciliationReport.skipped_no_access`, skilj logs a warning per
+skipped registration (`code=skipped_no_access`, with a `hint` and this
+section as its `guide`), and `.build()` still succeeds. If your types
+"aren't registering" and nothing looks wrong in your
 `EventType`/`CommandType` code, check that list first, before anything
-else.
+else. A registration is skipped when:
+
+- the bounded context doesn't exist (yet);
+- the reconciliation role has no active, unscoped `Admin` grant on it -
+  an owner-scoped grant (`scope` set) is skipped too. For a blind-index
+  key rotation, an `Admin` grant on the tenant's template works as well;
+- for a projection, an event type it consumes isn't registered in the
+  bounded context.
 
 ## Two paths - pick based on what you're building
 

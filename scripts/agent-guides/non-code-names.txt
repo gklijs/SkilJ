@@ -1,0 +1,82 @@
+# Code-shaped names a guide puts in backticks (or a SKILL.md's frontmatter in
+# double quotes) that occur in the workspace's code but are no code in
+# skilj/src/error_codes.md (scripts/agent-guides/check.mjs, the `codes` rule).
+# A name that occurs nowhere in the code goes in illustrative-names.txt.
+
+# A decide()'s own rejection kind (skilj-demo's), not one skilj gives: those
+# are in skilj/src/error_codes.md.
+insufficient_funds
+
+# Trait items, builder methods, functions and their parameters.
+all_races
+claim_query
+consumed_event_types
+create_command_token
+decide_from_snapshot
+decide_with
+decide_withdraw_money
+direct_creation_allowed
+event_read_allowed
+external_creation_allowed
+identity_provider
+matching_events
+open_doubts
+owner_tag_key
+poll_interval
+poll_once
+private_fields
+blob_fields
+reconciliation_role
+requires_role
+requiring_target_tags
+run_until_with_retry
+run_with_retry
+seed_admin
+sensitive_fields
+serve_local_jwks
+sign_jwt
+signal_with_start_workflow
+system_triggered_allowed
+tag_mappings
+try_from_event
+under_lock
+with_subject
+
+# Configuration and declaration keys.
+application_version
+blind_index_key
+blob_orphan_grace
+bootstrap_secret
+can_read_sensitive
+correlation_tag_key
+max_blob_bytes
+payload_limits
+previous_blind_index_keys
+reads_nothing
+schema_version
+subject_field
+subject_key
+subject_tag
+tag_key
+addressee_field
+
+# Payload fields, columns and tables.
+account_id
+causation_id
+consistency_tags
+course_id
+deadline_at
+event_tags
+events_decided_on
+events_read
+expires_at
+field_type
+old_email
+role_access_mappings
+scheduled_at
+state_change
+student_id
+user_id
+
+# Words about names.
+snake_case

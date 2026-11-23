@@ -401,6 +401,9 @@ pub use inventory;
 /// Seeding a development database with an admin role and command tokens
 /// (docs/architecture.md §220) - see `dev`'s own module docs.
 pub mod dev;
+/// The one table of codes (docs/architecture.md §258).
+#[doc = include_str!("error_codes.md")]
+pub mod error_codes {}
 /// issue #100: the supported single-user local mode, behind the
 /// `local` feature. See `local`'s own module docs.
 #[cfg(feature = "local")]
@@ -1442,6 +1445,34 @@ async fn warn_unpublishable(
     Ok(())
 }
 
+/// Logs what kept a type from registering at startup (docs/architecture.md
+/// §258): a warning per registration reconciliation skipped, and an error
+/// for whatever ended reconciliation that `build()` is about to return (a
+/// refused registration, the role lookup, a database error), each with its
+/// code and, where a guide section explains it, hint and guide.
+fn log_reconciliation(report: &ReconciliationReport, failed: Option<&skilj_core::Error>) {
+    use skilj_core::error::SkiljRejection;
+    let skipped = skilj_core::error::guidance("skipped_no_access");
+    for key in &report.skipped_no_access {
+        tracing::warn!(
+            code = %"skipped_no_access",
+            hint = skipped.map(|guidance| guidance.hint),
+            guide = skipped.map(|guidance| guidance.guide),
+            registration = %key,
+            "reconciliation skipped a registration"
+        );
+    }
+    if let Some(e) = failed {
+        tracing::error!(
+            code = %e.code(),
+            error = %e.message(),
+            hint = e.hint(),
+            guide = e.guide(),
+            "startup reconciliation failed"
+        );
+    }
+}
+
 /// What `Skilj::builder().build()` did on this startup: which bounded
 /// contexts' types registered successfully, which were skipped because
 /// the reconciliation Role has no admin access to them yet (expected,
@@ -1452,7 +1483,8 @@ pub struct ReconciliationReport {
     /// Types registered, or already registered in this shape.
     pub registered: Vec<String>,
     /// Types in a bounded context the reconciliation Role has no admin
-    /// grant on yet - skipped, not an error.
+    /// grant on yet - skipped, not an error. `build()` logs a warning per
+    /// entry, with code `skipped_no_access`, a hint and a guide.
     pub skipped_no_access: Vec<String>,
     /// `EventType`s/`CommandType`s/`Projection`s this process declares in
     /// an *older* shape than the one already stored - a newer version of the
@@ -4691,40 +4723,51 @@ impl SkiljBuilder {
                 .await?;
         let mut report = ReconciliationReport::default();
         if let Some(external_subject) = &self.reconciliation_role {
-            let role = skilj_core::access_control::resolve_role_by_external_subject(
-                external_subject,
-                &roles,
-            )?
-            .clone();
+            let reconciled: Result<(), skilj_core::Error> = async {
+                let role = skilj_core::access_control::resolve_role_by_external_subject(
+                    external_subject,
+                    &roles,
+                )?
+                .clone();
 
-            // Before the types, which map the blind keys (docs/architecture.md §205).
-            reconcile_blind_tags(&pool, &role, &self.blind_tags, &blind_index, &mut report).await?;
-            rotate_blind_tags(&pool, &role, pending_rotations, &blind_index, &mut report).await?;
-            let version = RegistrationVersion::new(self.application_version);
-            reconcile_event_types(
-                &pool,
-                &role,
-                &self.event_types,
-                &mut report,
-                jiff::Timestamp::now(),
-                &version,
-            )
-            .await?;
-            reconcile_command_types(&pool, &role, &command_types, &mut report, &version).await?;
-            let reconciliation_dispatcher = ProjectionDispatcherImpl {
-                projections: projections.clone(),
-                template_cache: template_cache.clone(),
-                payload_limits,
-            };
-            reconcile_projections(
-                &pool,
-                &role,
-                &projections,
-                &mut report,
-                &reconciliation_dispatcher,
-                &version,
-            )
-            .await?;
+                // Before the types, which map the blind keys (docs/architecture.md §205).
+                reconcile_blind_tags(&pool, &role, &self.blind_tags, &blind_index, &mut report)
+                    .await?;
+                rotate_blind_tags(&pool, &role, pending_rotations, &blind_index, &mut report)
+                    .await?;
+                let version = RegistrationVersion::new(self.application_version);
+                reconcile_event_types(
+                    &pool,
+                    &role,
+                    &self.event_types,
+                    &mut report,
+                    jiff::Timestamp::now(),
+                    &version,
+                )
+                .await?;
+                reconcile_command_types(&pool, &role, &command_types, &mut report, &version)
+                    .await?;
+                let reconciliation_dispatcher = ProjectionDispatcherImpl {
+                    projections: projections.clone(),
+                    template_cache: template_cache.clone(),
+                    payload_limits,
+                };
+                reconcile_projections(
+                    &pool,
+                    &role,
+                    &projections,
+                    &mut report,
+                    &reconciliation_dispatcher,
+                    &version,
+                )
+                .await
+            }
+            .await;
+            // docs/architecture.md §258: skilj logs what blocked a type with
+            // its code, hint and guide itself, the skips recorded before a
+            // refusal included.
+            log_reconciliation(&report, reconciled.as_ref().err());
+            reconciled?;
         } else {
             // docs/architecture.md §209: hashing at the stored generation
             // meanwhile, which `check_stored_blind_tags` loaded.

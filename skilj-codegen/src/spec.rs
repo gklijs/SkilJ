@@ -286,71 +286,71 @@ fn validate_blind_tags(
         let what = format!("blind_tag {:?}", blind.name);
         problems.context = what.clone();
         if !is_identifier(&blind.name) || is_keyword(&blind.name) {
-            problems.push(format!(
-                "{what}: the name must be a Rust identifier and not a keyword"
-            ));
+            problems.push(
+                "invalid_blind_tag_name",
+                format!("{what}: the name must be a Rust identifier and not a keyword"),
+            );
         } else {
             claim(blind.name.clone(), what.clone(), problems);
         }
         if let Some(normalize) = &blind.normalize {
             let path = normalize.contains("::") && syn::parse_str::<syn::Path>(normalize).is_ok();
             if !NORMALIZERS.contains(&normalize.as_str()) && !path {
-                problems.push(format!(
+                problems.push(
+                    "unknown_normalizer",
+                    format!(
                     "{what}: normalize {normalize:?} is neither one of {NORMALIZERS:?} nor the \
                      path of a function (e.g. \"crate::customers::normalize_handle\")"
-                ));
+                ),
+                );
             }
         }
         let subject_tag = match blind.erasure {
             ErasureSpec::Keep => {
                 if blind.subject.is_some() || blind.subject_tag.is_some() {
-                    problems.push(format!(
-                        "{what}: erasure = \"keep\" takes no subject or subject_tag"
-                    ));
+                    problems.push(
+                        "blind_tag_keep_with_subject",
+                        format!("{what}: erasure = \"keep\" takes no subject or subject_tag"),
+                    );
                 }
                 None
             }
             ErasureSpec::WithSubject => match &blind.subject {
                 Some(subject) => Some(blind.subject_tag.clone().unwrap_or_else(|| subject.clone())),
                 None => {
-                    problems.push(format!(
-                        "{what}: erasure = \"with_subject\" needs subject, the subject_key \
+                    problems.push(
+                        "blind_tag_subject_missing",
+                        format!(
+                            "{what}: erasure = \"with_subject\" needs subject, the subject_key \
                          whose forgetSubject removes the hashes"
-                    ));
+                        ),
+                    );
                     None
                 }
             },
         };
         if keys.insert(blind.key.clone(), subject_tag).is_some() {
-            problems.push(format!(
-                "{what}: tag key {:?} has another [[blind_tag]]",
-                blind.key
-            ));
+            problems.push(
+                "duplicate_blind_tag_key",
+                format!("{what}: tag key {:?} has another [[blind_tag]]", blind.key),
+            );
         }
     }
     for blind in &spec.blind_tags {
         problems.context = format!("blind_tag {:?}", blind.name);
         if let Some(Some(subject_tag)) = keys.get(&blind.key) {
             if keys.contains_key(subject_tag) {
-                problems.push(format!(
-                    "blind_tag {:?}: its subject_tag {subject_tag:?} is itself a blind tag",
-                    blind.name
-                ));
+                problems.push(
+                    "blind_subject_tag_is_blind",
+                    format!(
+                        "blind_tag {:?}: its subject_tag {subject_tag:?} is itself a blind tag",
+                        blind.name
+                    ),
+                );
             }
         }
     }
     keys
-}
-
-/// Every problem with `spec` that would otherwise surface as a panic in
-/// `build.rs`, a compile error inside generated code, or a registration
-/// failure at startup - all of them, not just the first, so one build
-/// shows everything to fix. Empty when `spec` is sound.
-pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
-    validate_detailed(spec)
-        .into_iter()
-        .map(|p| p.message)
-        .collect()
 }
 
 #[derive(Default)]
@@ -360,25 +360,32 @@ struct Problems {
 }
 
 impl Problems {
-    fn push(&mut self, message: String) {
-        self.items.push(crate::ValidationProblem {
-            context: self.context.clone(),
-            message,
-        });
+    /// A problem with the declaration in `context`; `code` is a row of
+    /// `codes::CODES`, written out at every call so the code check finds it.
+    fn push(&mut self, code: &'static str, message: String) {
+        self.items
+            .push(crate::problem(code, self.context.clone(), message, None));
     }
 }
 
+/// Every problem with `spec` that would otherwise surface as a panic in
+/// `build.rs`, a compile error inside generated code, or a registration
+/// failure at startup - all of them, not just the first, so one build
+/// shows everything to fix. Empty when `spec` is sound.
 pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::ValidationProblem> {
     let mut problems = Problems {
         context: "bounded_context".into(),
         ..Problems::default()
     };
     if !is_bounded_context_name(&spec.bounded_context) {
-        problems.push(format!(
-            "bounded_context {:?} must start with a lowercase letter and contain only \
+        problems.push(
+            "invalid_bounded_context_name",
+            format!(
+                "bounded_context {:?} must start with a lowercase letter and contain only \
              lowercase letters, digits and `_` (at most 40 characters)",
-            spec.bounded_context
-        ));
+                spec.bounded_context
+            ),
+        );
     }
 
     // Everything `emit` names, in one set: marker types are unit structs,
@@ -388,9 +395,10 @@ pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::Validat
     let mut claim = |name: String, what: String, problems: &mut Problems| {
         if let Some(earlier) = generated.get(&name) {
             problems.context = what.clone();
-            problems.push(format!(
-                "{what} generates `{name}`, which {earlier} already generates"
-            ));
+            problems.push(
+                "duplicate_generated_item",
+                format!("{what} generates `{name}`, which {earlier} already generates"),
+            );
         } else {
             generated.insert(name, what);
         }
@@ -452,21 +460,27 @@ pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::Validat
         };
         for blob in blobs {
             if !is_blob(&blob.field) {
-                problems.push(format!(
-                    "{kind} {name:?}: blobs names {:?}, which is no field of type blob",
-                    blob.field
-                ));
+                problems.push(
+                    "blob_field_not_blob",
+                    format!(
+                        "{kind} {name:?}: blobs names {:?}, which is no field of type blob",
+                        blob.field
+                    ),
+                );
             }
             if !fields.iter().any(|f| f.name == blob.subject_field) {
-                problems.push(format!(
-                    "{kind} {name:?}: blob subject field {:?} is no field of this type",
-                    blob.subject_field
-                ));
+                problems.push(
+                    "blob_subject_field_not_declared",
+                    format!(
+                        "{kind} {name:?}: blob subject field {:?} is no field of this type",
+                        blob.subject_field
+                    ),
+                );
             }
         }
         for sensitive in sensitive {
             if is_blob(&sensitive.field) {
-                problems.push(format!(
+                problems.push("sensitive_blob_field", format!(
                     "{kind} {name:?}: blob field {:?} can't be sensitive; give it a subject in blobs",
                     sensitive.field
                 ));
@@ -474,9 +488,10 @@ pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::Validat
         }
         for (tag_key, field) in tags {
             if is_blob(field) {
-                problems.push(format!(
-                    "{kind} {name:?}: tag {tag_key:?} can't map blob field {field:?}"
-                ));
+                problems.push(
+                    "tag_on_blob_field",
+                    format!("{kind} {name:?}: tag {tag_key:?} can't map blob field {field:?}"),
+                );
             }
         }
     }
@@ -494,10 +509,13 @@ pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::Validat
         let what = format!("{kind} {name:?}");
         problems.context = what.clone();
         if !is_identifier(name) || is_keyword(name) {
-            problems.push(format!(
-                "{what}: the name must be a Rust identifier (a letter or `_`, then letters, \
+            problems.push(
+                "invalid_type_name",
+                format!(
+                    "{what}: the name must be a Rust identifier (a letter or `_`, then letters, \
                  digits or `_`) and not a keyword"
-            ));
+                ),
+            );
             continue;
         }
         claim(name.clone(), what.clone(), &mut problems);
@@ -513,19 +531,25 @@ pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::Validat
         let mut field_names = std::collections::BTreeSet::new();
         for field in fields {
             if !is_identifier(&field.name) || NOT_RAW_IDENTIFIERS.contains(&field.name.as_str()) {
-                problems.push(format!(
-                    "{what}: field {:?} must be a Rust identifier (a letter or `_`, then \
+                problems.push(
+                    "invalid_field_name",
+                    format!(
+                        "{what}: field {:?} must be a Rust identifier (a letter or `_`, then \
                      letters, digits or `_`; keywords are fine except self/Self/super/crate)",
-                    field.name
-                ));
+                        field.name
+                    ),
+                );
             }
             if !field_names.insert(field.name.as_str()) {
-                problems.push(format!("{what}: field {:?} is declared twice", field.name));
+                problems.push(
+                    "duplicate_field",
+                    format!("{what}: field {:?} is declared twice", field.name),
+                );
             }
         }
         for (tag_key, field) in tags {
             if !field_names.contains(field.as_str()) {
-                problems.push(format!(
+                problems.push("tag_field_not_declared", format!(
                     "{what}: tag {tag_key:?} maps to field {field:?}, which this type doesn't declare"
                 ));
             }
@@ -533,31 +557,40 @@ pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::Validat
         for sensitive in sensitive {
             for field in [&sensitive.field, &sensitive.subject_field] {
                 if !field_names.contains(field.as_str()) {
-                    problems.push(format!(
-                        "{what}: sensitive field {:?} names field {field:?}, which this type \
+                    problems.push(
+                        "sensitive_field_not_declared",
+                        format!(
+                            "{what}: sensitive field {:?} names field {field:?}, which this type \
                          doesn't declare",
-                        sensitive.field
-                    ));
+                            sensitive.field
+                        ),
+                    );
                 }
             }
             if let Some((tag_key, _)) = tags
                 .iter()
                 .find(|(key, field)| **field == sensitive.field && !blind_keys.contains_key(*key))
             {
-                problems.push(format!(
-                    "{what}: tag {tag_key:?} stores sensitive field {:?} in the clear; make \
+                problems.push(
+                    "tag_on_sensitive_field",
+                    format!(
+                        "{what}: tag {tag_key:?} stores sensitive field {:?} in the clear; make \
                      {tag_key:?} a [[blind_tag]] to tag it as a keyed hash",
-                    sensitive.field
-                ));
+                        sensitive.field
+                    ),
+                );
             }
         }
         for tag_key in tags.keys() {
             if let Some(Some(subject_tag)) = blind_keys.get(tag_key) {
                 if !tags.contains_key(subject_tag) {
-                    problems.push(format!(
+                    problems.push(
+                        "blind_subject_tag_missing",
+                        format!(
                         "{what}: blind tag {tag_key:?} is erased with its subject, so the type \
                          must also tag {subject_tag:?}"
-                    ));
+                    ),
+                    );
                 }
             }
         }
@@ -566,11 +599,14 @@ pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::Validat
     for event in &spec.event_types {
         problems.context = format!("event_type {:?}", event.name);
         if crate::emit::BUILT_IN_EVENT_TYPES.contains(&event.name.as_str()) {
-            problems.push(format!(
-                "event_type {:?}: this name is reserved for a built-in event type; set \
+            problems.push(
+                "reserved_event_type_name",
+                format!(
+                    "event_type {:?}: this name is reserved for a built-in event type; set \
                  retractions = true or doubts = true to register it",
-                event.name
-            ));
+                    event.name
+                ),
+            );
         }
     }
     let mut event_type_names: std::collections::BTreeSet<&str> =
@@ -580,50 +616,355 @@ pub(crate) fn validate_detailed(spec: &BoundedContextSpec) -> Vec<crate::Validat
         let what = format!("command_type {:?}", command.name);
         problems.context = what.clone();
         if command.retractable && !spec.retractions {
-            problems.push(format!(
-                "{what}: retractable needs retractions = true at the top of the file"
-            ));
+            problems.push(
+                "retractable_without_retractions",
+                format!("{what}: retractable needs retractions = true at the top of the file"),
+            );
         }
         if command.retractable && command.query.iter().any(|item| item.latest.is_some()) {
-            problems.push(format!(
-                "{what}: a retractable command folds around retractions, which needs every \
+            problems.push(
+                "retractable_query_latest",
+                format!(
+                    "{what}: a retractable command folds around retractions, which needs every \
                  match read, so its query items can't have latest"
-            ));
+                ),
+            );
         }
         if command.reads_nothing && !command.query.is_empty() {
-            problems.push(format!(
-                "{what}: reads_nothing reads no events, so it can't have query items too"
-            ));
+            problems.push(
+                "reads_nothing_with_query",
+                format!("{what}: reads_nothing reads no events, so it can't have query items too"),
+            );
         }
         for (index, item) in command.query.iter().enumerate() {
             let item_what = format!("{what}: query item {}", index + 1);
             problems.context = item_what.clone();
             if item.event_types.is_empty() && item.tags.is_empty() {
-                problems.push(format!(
-                    "{item_what} names neither event types nor tags, so it matches nothing; \
+                problems.push(
+                    "empty_query_item",
+                    format!(
+                        "{item_what} names neither event types nor tags, so it matches nothing; \
                      for a command that needs no history, set reads_nothing = true instead"
-                ));
+                    ),
+                );
             }
             if item.latest == Some(0) {
-                problems.push(format!(
-                    "{item_what} keeps the last 0 matches; leave latest out for every match"
-                ));
+                problems.push(
+                    "query_latest_zero",
+                    format!(
+                        "{item_what} keeps the last 0 matches; leave latest out for every match"
+                    ),
+                );
             }
             for event_type in &item.event_types {
                 if !event_type_names.contains(event_type.as_str()) {
-                    problems.push(format!(
+                    problems.push("query_event_type_not_declared", format!(
                         "{item_what} names event type {event_type:?}, which this file doesn't declare"
                     ));
                 }
             }
             for tag in &item.tags {
                 if !command.tags.contains_key(tag) {
-                    problems.push(format!(
+                    problems.push(
+                        "query_tag_not_declared",
+                        format!(
                         "{item_what} names tag {tag:?}, which isn't one of the command type's tags"
-                    ));
+                    ),
+                    );
                 }
             }
         }
     }
     problems.items
+}
+
+/// What [`parse`] read: the model, or the field types this format doesn't
+/// have, each a problem of its own (`unknown_field_type`) instead of a TOML
+/// error, next to any other shape error in the file (`parse`).
+pub(crate) enum Parsed {
+    Spec(BoundedContextSpec),
+    UnknownFieldTypes(Vec<crate::ValidationProblem>),
+}
+
+/// The lenient read of a model that only looks at field types: no
+/// `deny_unknown_fields`, every key optional, so it reads a file the strict
+/// parse refused.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Probe {
+    event_type: Vec<ProbeType>,
+    command_type: Vec<ProbeType>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ProbeType {
+    name: Option<toml::Value>,
+    fields: Vec<ProbeField>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ProbeField {
+    name: Option<toml::Value>,
+    #[serde(rename = "type")]
+    ty: Option<toml::Spanned<toml::Value>>,
+}
+
+/// Why `value` is no [`FieldType`], from `FieldType`'s own deserializer - the
+/// one the strict parse uses, so no list of names can drift from the enum.
+/// `None` when it is one.
+fn unknown_field_type(value: &str) -> Option<String> {
+    use serde::de::IntoDeserializer;
+    let deserializer: serde::de::value::StrDeserializer<'_, serde::de::value::Error> =
+        value.into_deserializer();
+    FieldType::deserialize(deserializer)
+        .err()
+        .map(|error| error.to_string())
+}
+
+/// Parses a `.skilj.toml`. A field type this format doesn't have is
+/// skilj-codegen's own problem, found with `FieldType`'s deserializer, never
+/// by reading the TOML error's text; every other syntax or shape error stays
+/// the TOML error, with its position.
+pub(crate) fn parse(source: &str) -> Result<Parsed, toml::de::Error> {
+    let error = match toml::from_str::<BoundedContextSpec>(source) {
+        Ok(spec) => return Ok(Parsed::Spec(spec)),
+        Err(error) => error,
+    };
+    let Ok(probe) = toml::from_str::<Probe>(source) else {
+        return Err(error);
+    };
+    let mut problems = Vec::new();
+    let types = probe
+        .event_type
+        .iter()
+        .map(|t| ("event_type", t))
+        .chain(probe.command_type.iter().map(|t| ("command_type", t)));
+    for (kind, declared) in types {
+        let type_name = declared
+            .name
+            .as_ref()
+            .and_then(|name| name.as_str())
+            .unwrap_or("?");
+        for field in &declared.fields {
+            let Some(ty) = &field.ty else { continue };
+            let Some(value) = ty.get_ref().as_str() else {
+                continue;
+            };
+            let Some(why) = unknown_field_type(value) else {
+                continue;
+            };
+            let field_name = field
+                .name
+                .as_ref()
+                .and_then(|name| name.as_str())
+                .unwrap_or("?");
+            problems.push(crate::problem(
+                "unknown_field_type",
+                format!("{kind} {type_name:?}"),
+                format!(
+                    "{kind} {type_name:?}: field {field_name:?} has type {value:?}, which this \
+                     format doesn't have ({why})"
+                ),
+                Some(ty.span()),
+            ));
+        }
+    }
+    if problems.is_empty() {
+        return Err(error);
+    }
+    // In file order: a `[[command_type]]` may come before an `[[event_type]]`.
+    problems.sort_by_key(|problem| problem.span.as_ref().map(|span| span.start));
+    // Anything else wrong with the file: the same text with every unknown
+    // type replaced by a known one, the whole literal with its quotes, from
+    // the last to the first so the earlier spans stay put.
+    const KNOWN: &str = "\"string\"";
+    let mut replaced = source.to_string();
+    for problem in problems.iter().rev() {
+        if let Some(span) = &problem.span {
+            replaced.replace_range(span.clone(), KNOWN);
+        }
+    }
+    if let Err(other) = toml::from_str::<BoundedContextSpec>(&replaced) {
+        let span = other.span().map(|span| {
+            let start = original_offset(&problems, KNOWN.len(), span.start);
+            let end = original_offset(&problems, KNOWN.len(), span.end).max(start);
+            start..end
+        });
+        problems.push(crate::problem(
+            "parse",
+            String::new(),
+            other.message().to_string(),
+            span,
+        ));
+    }
+    Ok(Parsed::UnknownFieldTypes(problems))
+}
+
+/// The offset in the original source of `offset` in the text where each
+/// problem's span was replaced by `replacement_len` bytes. An offset inside a
+/// replacement maps to the start of the value it replaced.
+fn original_offset(
+    problems: &[crate::ValidationProblem],
+    replacement_len: usize,
+    offset: usize,
+) -> usize {
+    let mut shift: isize = 0;
+    for span in problems.iter().filter_map(|problem| problem.span.as_ref()) {
+        let start = span.start.saturating_add_signed(shift);
+        if offset < start {
+            break;
+        }
+        if offset < start + replacement_len {
+            return span.start;
+        }
+        shift += replacement_len as isize - span.len() as isize;
+    }
+    offset.saturating_add_signed(-shift)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::codes::CODES;
+
+    const TYPE: &str = "[[event_type]]\nname = \"Placed\"\n";
+    const COMMAND: &str = "[[command_type]]\nname = \"Place\"\nfields = [{ name = \"id\", type = \"string\" }]\ntags = { id = \"id\" }\n";
+
+    /// One minimal model per rule: the code it must produce, and nothing else.
+    fn cases() -> Vec<(&'static str, String)> {
+        let model = |rest: &str| format!("bounded_context = \"shop\"\n{rest}");
+        vec![
+            ("invalid_bounded_context_name", "bounded_context = \"Shop\"\n".to_string()),
+            ("duplicate_generated_item", model("[[event_type]]\nname = \"Place\"\n[[command_type]]\nname = \"Place\"\n")),
+            ("invalid_blind_tag_name", model("[[blind_tag]]\nname = \"fn\"\nkey = \"email\"\nerasure = \"keep\"\n")),
+            ("unknown_normalizer", model("[[blind_tag]]\nname = \"Email\"\nkey = \"email\"\nnormalize = \"lowercase\"\nerasure = \"keep\"\n")),
+            ("blind_tag_keep_with_subject", model("[[blind_tag]]\nname = \"Email\"\nkey = \"email\"\nerasure = \"keep\"\nsubject = \"customer\"\n")),
+            ("blind_tag_subject_missing", model("[[blind_tag]]\nname = \"Email\"\nkey = \"email\"\nerasure = \"with_subject\"\n")),
+            ("duplicate_blind_tag_key", model("[[blind_tag]]\nname = \"Email\"\nkey = \"email\"\nerasure = \"keep\"\n[[blind_tag]]\nname = \"Mail\"\nkey = \"email\"\nerasure = \"keep\"\n")),
+            ("blind_subject_tag_is_blind", model("[[blind_tag]]\nname = \"Email\"\nkey = \"email\"\nerasure = \"with_subject\"\nsubject = \"customer\"\n[[blind_tag]]\nname = \"Customer\"\nkey = \"customer\"\nerasure = \"keep\"\n")),
+            ("blind_subject_tag_missing", model("[[blind_tag]]\nname = \"Email\"\nkey = \"email\"\nerasure = \"with_subject\"\nsubject = \"customer\"\n[[event_type]]\nname = \"Claimed\"\nfields = [{ name = \"email\", type = \"string\" }]\ntags = { email = \"email\" }\n")),
+            ("blob_field_not_blob", model(&format!("{TYPE}fields = [{{ name = \"doc\", type = \"string\" }}]\nblobs = [{{ field = \"doc\", subject_key = \"c\", subject_field = \"doc\" }}]\n"))),
+            ("blob_subject_field_not_declared", model(&format!("{TYPE}fields = [{{ name = \"doc\", type = \"blob\" }}]\nblobs = [{{ field = \"doc\", subject_key = \"c\", subject_field = \"owner\" }}]\n"))),
+            ("sensitive_blob_field", model(&format!("{TYPE}fields = [{{ name = \"doc\", type = \"blob\" }}, {{ name = \"id\", type = \"string\" }}]\nsensitive = [{{ field = \"doc\", subject_key = \"c\", subject_field = \"id\" }}]\n"))),
+            ("tag_on_blob_field", model(&format!("{TYPE}fields = [{{ name = \"doc\", type = \"blob\" }}]\ntags = {{ doc = \"doc\" }}\n"))),
+            ("invalid_type_name", model("[[event_type]]\nname = \"order-placed\"\n")),
+            ("invalid_field_name", model(&format!("{TYPE}fields = [{{ name = \"bad-name\", type = \"string\" }}]\n"))),
+            ("duplicate_field", model(&format!("{TYPE}fields = [{{ name = \"id\", type = \"string\" }}, {{ name = \"id\", type = \"i64\" }}]\n"))),
+            ("tag_field_not_declared", model(&format!("{TYPE}fields = [{{ name = \"id\", type = \"string\" }}]\ntags = {{ id = \"ident\" }}\n"))),
+            ("sensitive_field_not_declared", model(&format!("{TYPE}fields = [{{ name = \"id\", type = \"string\" }}]\nsensitive = [{{ field = \"email\", subject_key = \"c\", subject_field = \"id\" }}]\n"))),
+            ("tag_on_sensitive_field", model(&format!("{TYPE}fields = [{{ name = \"id\", type = \"string\" }}, {{ name = \"email\", type = \"string\" }}]\ntags = {{ email = \"email\" }}\nsensitive = [{{ field = \"email\", subject_key = \"c\", subject_field = \"id\" }}]\n"))),
+            ("reserved_event_type_name", model("[[event_type]]\nname = \"EventRetracted\"\n")),
+            ("retractable_without_retractions", model(&format!("{COMMAND}retractable = true\n"))),
+            ("retractable_query_latest", format!("bounded_context = \"shop\"\nretractions = true\n{COMMAND}retractable = true\n[[command_type.query]]\ntags = [\"id\"]\nlatest = 1\n")),
+            ("reads_nothing_with_query", model(&format!("{COMMAND}reads_nothing = true\n[[command_type.query]]\ntags = [\"id\"]\n"))),
+            ("empty_query_item", model(&format!("{COMMAND}[[command_type.query]]\n"))),
+            ("query_latest_zero", model(&format!("{COMMAND}[[command_type.query]]\ntags = [\"id\"]\nlatest = 0\n"))),
+            ("query_event_type_not_declared", model(&format!("{COMMAND}[[command_type.query]]\nevent_types = [\"Missing\"]\n"))),
+            ("query_tag_not_declared", model(&format!("{COMMAND}[[command_type.query]]\ntags = [\"order\"]\n"))),
+            ("unknown_field_type", model(&format!("{TYPE}fields = [{{ name = \"id\", type = \"uuid\" }}]\n"))),
+        ]
+    }
+
+    #[test]
+    fn each_rule_has_its_own_code() {
+        for (code, source) in cases() {
+            let problems = crate::validate(&source).unwrap();
+            assert!(!problems.is_empty(), "{code}: no problem");
+            for problem in &problems {
+                assert_eq!(problem.code, code, "{source}\n{problems:#?}");
+            }
+            // generate() refuses the same input with the same codes.
+            match crate::generate(&source) {
+                Err(crate::Error::Invalid(refused)) => {
+                    let codes: Vec<_> = refused.iter().map(|p| p.code).collect();
+                    assert_eq!(codes, vec![code; problems.len()], "{source}");
+                }
+                other => panic!("{code}: {other:?}"),
+            }
+        }
+    }
+
+    /// Every rule code the table lists is produced by one of the models above,
+    /// so a code whose rule was deleted can't stay in the table unnoticed.
+    #[test]
+    fn every_rule_code_is_tested() {
+        let tested: std::collections::BTreeSet<_> =
+            cases().into_iter().map(|(code, _)| code).collect();
+        let rules: std::collections::BTreeSet<_> = CODES
+            .iter()
+            .filter(|entry| entry.category == "semantic" || entry.code == "unknown_field_type")
+            // import's own rule, asserted in tests/cli.rs and tests/import.rs.
+            .filter(|entry| entry.code != "no_events_for_bounded_context")
+            .map(|entry| entry.code)
+            .collect();
+        assert_eq!(tested, rules);
+    }
+
+    #[test]
+    fn guided_problems_carry_the_table_s_hint_and_guide() {
+        let source = &cases()
+            .into_iter()
+            .find(|(code, _)| *code == "tag_on_sensitive_field")
+            .unwrap()
+            .1;
+        let problem = &crate::validate(source).unwrap()[0];
+        assert_eq!(
+            problem.guide,
+            Some("skilj-uniqueness#first-is-the-value-personal-data")
+        );
+        assert!(problem.hint.is_some());
+        assert_eq!(problem.category(), "semantic");
+        assert!(problem.span.is_none());
+        let source = "bounded_context = \"Shop\"";
+        let problem = &crate::validate(source).unwrap()[0];
+        assert!(problem.hint.is_none() && problem.guide.is_none());
+    }
+
+    /// The value's whole literal, quotes included, whatever its quoting, and
+    /// the other shape error mapped back to where it is in the original.
+    #[test]
+    fn unknown_types_in_any_quoting_and_a_shape_error_have_exact_positions() {
+        for literal in ["'uuid'", "\"uuid\"", "\"\"\"uuid\"\"\"", "'''uuid'''"] {
+            let source = format!(
+                "bounded_context = \"shop\"\n[[command_type]]\nname = \"Place\"\nfields = [{{ name = \"a\", type = {literal} }}, {{ name = \"b\", type = 'decimal' }}]\ntaggs = {{ a = \"a\" }}\n[[event_type]]\nname = \"Placed\"\nfields = [{{ name = \"id\", type = \"\"\"money\"\"\" }}]\n"
+            );
+            let problems = crate::validate(&source).unwrap();
+            let found: Vec<_> = problems
+                .iter()
+                .map(|p| (p.code, p.span.clone().map(|span| &source[span])))
+                .collect();
+            // The unknown types in file order, then the shape error, at
+            // `taggs` in the original text.
+            assert_eq!(
+                found,
+                [
+                    ("unknown_field_type", Some(literal)),
+                    ("unknown_field_type", Some("'decimal'")),
+                    ("unknown_field_type", Some("\"\"\"money\"\"\"")),
+                    ("parse", Some("taggs")),
+                ],
+                "{literal}"
+            );
+            assert_eq!(problems[0].context, "command_type \"Place\"");
+            assert_eq!(problems[2].context, "event_type \"Placed\"");
+            assert!(problems[3].context.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_non_string_type_and_a_syntax_error_stay_toml_errors_with_a_position() {
+        for source in [
+            "bounded_context = \"shop\"\n[[event_type]]\nname = \"Placed\"\nfields = [{ name = \"a\", type = 3 }]\n",
+            "bounded_context = \"shop\"\n[[event_type]\n",
+            // No unknown type: the TOML error as it is.
+            "bounded_context = \"shop\"\n[[event_type]]\nname = \"Placed\"\ntaggs = {}\n",
+        ] {
+            match crate::validate(source) {
+                Err(crate::Error::Toml(error)) => assert!(error.span().is_some(), "{source}"),
+                other => panic!("{source}: {other:?}"),
+            }
+            assert!(matches!(crate::generate(source), Err(crate::Error::Toml(_))));
+        }
+    }
 }

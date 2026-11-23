@@ -1042,3 +1042,277 @@ fn reconciliation_skips_owner_scoped_admin_grants() {
             .is_none());
     });
 }
+
+// --- docs/architecture.md §258: build() logs what kept a type from registering ---
+
+/// What `build()` logged on one test's thread, rendered the way the
+/// template's server renders it: `tracing_subscriber::fmt()` with an `info`
+/// filter (without color).
+#[derive(Clone, Default)]
+struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+
+    fn lines_with(&self, needle: &str) -> Vec<String> {
+        self.text()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+thread_local! {
+    static CAPTURING: std::cell::RefCell<Option<CapturedLog>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Writes to the log the current thread captures into, if any.
+struct ThreadLog;
+
+impl std::io::Write for ThreadLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        CAPTURING.with(|capturing| {
+            if let Some(log) = &*capturing.borrow() {
+                log.0.lock().unwrap().extend_from_slice(bytes);
+            }
+        });
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Stops the capture when dropped.
+struct Capturing;
+
+impl Drop for Capturing {
+    fn drop(&mut self) {
+        CAPTURING.with(|capturing| *capturing.borrow_mut() = None);
+    }
+}
+
+/// Captures what `build()` logs on this thread (it runs inside this thread's
+/// `block_on`). One global subscriber, routing by thread: per-thread
+/// subscribers next to each other let a callsite's cached interest miss
+/// events while the tests run in parallel.
+fn capture_log() -> (CapturedLog, Capturing) {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_ansi(false)
+            .with_writer(|| ThreadLog)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+    let log = CapturedLog::default();
+    CAPTURING.with(|capturing| *capturing.borrow_mut() = Some(log.clone()));
+    (log, Capturing)
+}
+
+/// The line names `code` as it is, and quotes its hint and guide.
+fn assert_guided(line: &str, code: &str) {
+    let guidance = skilj_core::error::guidance(code).unwrap();
+    assert!(line.contains(&format!(" code={code} ")), "{line}");
+    assert!(
+        line.contains(&format!(" hint={:?}", guidance.hint)),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!(" guide={:?}", guidance.guide)),
+        "{line}"
+    );
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct WithdrawIncompatiblePayload {
+    amount: String,
+}
+
+/// `WithdrawMoney` with `amount` retyped: a schema no version can evolve into.
+struct WithdrawMoneyIncompatible;
+
+impl CommandType for WithdrawMoneyIncompatible {
+    type Payload = WithdrawIncompatiblePayload;
+    type Event = BankingEvent;
+    const NAME: &'static str = "WithdrawMoney";
+    fn decide(_payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted { events: Vec::new() }
+    }
+}
+
+#[test]
+fn a_refused_registration_is_logged_with_its_code_hint_and_guide() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = seed_admin_context(&pool).await;
+        Skilj::builder(database_url.clone())
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .reconciliation_role(external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+
+        let (log, _guard) = capture_log();
+        let err = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name)
+            .event_type::<MoneyDepositedIncompatible>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .err()
+            .expect("an incompatible schema fails startup");
+        assert_eq!(
+            skilj_core::error::SkiljRejection::code(&err),
+            "schema_incompatible"
+        );
+        let refused = log.lines_with("startup reconciliation failed");
+        assert_eq!(refused.len(), 1, "{}", log.text());
+        assert!(refused[0].contains("ERROR"), "{}", refused[0]);
+        assert_guided(&refused[0], "schema_incompatible");
+        assert!(log.lines_with("skipped_no_access").is_empty());
+    });
+}
+
+/// The skips recorded before a refusal are logged too, each naming its
+/// registration, rendered as the template's server renders them.
+#[test]
+fn skips_before_a_refusal_are_logged_and_so_is_the_refusal() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = seed_admin_context(&pool).await;
+        let no_access = unique_name("ledger");
+        db::insert_bounded_context(
+            &pool,
+            &BoundedContext {
+                name: no_access.clone(),
+                status: BoundedContextStatus::Active,
+                created_at: test_now(),
+                created_by: ContextCreator::SystemCreator,
+                template: None,
+            },
+        )
+        .await
+        .unwrap();
+        Skilj::builder(database_url.clone())
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .command_type::<WithdrawMoney>()
+            .reconciliation_role(external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+
+        let (log, _guard) = capture_log();
+        let err = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(no_access.clone())
+            .event_type::<MoneyDeposited>()
+            .bounded_context(bc_name)
+            .command_type::<WithdrawMoneyIncompatible>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .err()
+            .expect("an incompatible command schema fails startup");
+        assert_eq!(
+            skilj_core::error::SkiljRejection::code(&err),
+            "schema_incompatible"
+        );
+        let skipped = log.lines_with("reconciliation skipped a registration");
+        assert_eq!(skipped.len(), 1, "{}", log.text());
+        assert!(skipped[0].contains("WARN"), "{}", skipped[0]);
+        assert!(
+            skipped[0].contains(&format!("registration={no_access}/MoneyDeposited")),
+            "{}",
+            skipped[0]
+        );
+        assert_guided(&skipped[0], "skipped_no_access");
+        let refused = log.lines_with("startup reconciliation failed");
+        assert_eq!(refused.len(), 1, "{}", log.text());
+        assert_guided(&refused[0], "schema_incompatible");
+    });
+}
+
+/// An older registration startup tolerates (kept_newer) is no refusal.
+#[test]
+fn a_kept_newer_registration_logs_no_refusal() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = seed_admin_context(&pool).await;
+        Skilj::builder(database_url.clone())
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDepositedV2>()
+            .reconciliation_role(external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+
+        let (log, _guard) = capture_log();
+        let (_older, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.kept_newer, vec![format!("{bc_name}/MoneyDeposited")]);
+        assert!(
+            log.lines_with("startup reconciliation failed").is_empty(),
+            "{}",
+            log.text()
+        );
+        assert!(log.lines_with("ERROR").is_empty(), "{}", log.text());
+        assert!(
+            log.lines_with("skipped_no_access").is_empty(),
+            "{}",
+            log.text()
+        );
+    });
+}
+
+/// A projection whose consumed event type isn't registered is skipped, and
+/// logged as a skip, though the role has access.
+#[test]
+fn a_projection_skipped_for_an_unregistered_event_type_is_logged() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = seed_admin_context(&pool).await;
+        let (log, _guard) = capture_log();
+        let (_skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .projection::<AccountBalance>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        let key = format!("{bc_name}/AccountBalance");
+        assert_eq!(report.skipped_no_access, vec![key.clone()]);
+        let skipped = log.lines_with("reconciliation skipped a registration");
+        assert_eq!(skipped.len(), 1, "{}", log.text());
+        assert!(
+            skipped[0].contains(&format!("registration={key}")),
+            "{}",
+            skipped[0]
+        );
+        assert_guided(&skipped[0], "skipped_no_access");
+    });
+}

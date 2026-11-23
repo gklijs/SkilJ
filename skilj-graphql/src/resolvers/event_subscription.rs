@@ -57,31 +57,32 @@ use crate::GraphqlState;
 use async_graphql::dynamic::{
     FieldValue, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
 };
-use async_graphql::ErrorExtensions;
 use skilj_core::event_store::{self, Subscription};
 use tokio::sync::broadcast::error::RecvError;
 
 fn subscription_lagged_error(skipped: u64) -> async_graphql::Error {
-    async_graphql::Error::new(format!(
-        "this subscription fell {skipped} event(s) behind and cannot resume without a gap - \
+    crate::error::coded(
+        "subscription_lagged",
+        format!(
+            "this subscription fell {skipped} event(s) behind and cannot resume without a gap - \
          DeliveryIsAtMostOnce forbids silently skipping ahead, so the subscription is closed; \
          resubscribe with fromSequence set to the last sequence received to get the missed \
          events first"
-    ))
-    .extend_with(|_, ext| ext.set("code", "subscription_lagged"))
+        ),
+    )
 }
 
 /// `EventBroadcaster::signal_gap`: events from another instance may have
 /// been missed (docs/architecture.md §83) - the same outcome as lagging,
 /// so the same code.
 fn subscription_gap_error() -> async_graphql::Error {
-    async_graphql::Error::new(
+    crate::error::coded(
+        "subscription_lagged",
         "this instance may have missed events committed by another instance \
          (its cross-instance connection dropped) and cannot resume without a gap - \
          resubscribe with fromSequence set to the last sequence received to get the missed \
          events first",
     )
-    .extend_with(|_, ext| ext.set("code", "subscription_lagged"))
 }
 
 /// `RevocationClosesTheConnection`'s push half (drift audit finding #4,
@@ -562,11 +563,13 @@ async fn resolve_start(
     // processed: silently empty until the bounded context caught up
     // (docs/architecture.md §148, §88's reasoning for `waitForSequence`).
     if let Some(from) = from_sequence.filter(|from| *from > latest) {
-        return Err(async_graphql::Error::new(format!(
-            "fromSequence {from} is past the latest committed sequence {latest} of \
+        return Err(crate::error::coded(
+            "from_sequence_not_committed",
+            format!(
+                "fromSequence {from} is past the latest committed sequence {latest} of \
              {bounded_context:?} - pass a sequence already read, or omit it to start from now"
-        ))
-        .extend_with(|_, ext| ext.set("code", "from_sequence_not_committed")));
+            ),
+        ));
     }
     let start = from_sequence.unwrap_or(latest);
     Ok((start, latest, latest))

@@ -1,6 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use std::{io::Write, path::PathBuf, process::ExitCode};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 #[derive(Parser)]
 #[command(
@@ -74,43 +78,112 @@ impl SourceArg {
     }
 }
 
+/// One diagnostic of the JSON document `{"version":2,"diagnostics":[...]}`
+/// (docs/codegen-cli.md).
 #[derive(Serialize)]
 struct Diagnostic {
+    /// The stable, specific code (`tag_on_sensitive_field`, `parse`, ...).
     code: &'static str,
+    /// `parse`, `semantic`, `io`, `generation`, `drift` or `usage`; what
+    /// `code` was in version 1.
+    category: &'static str,
     path: String,
     context: Option<String>,
     message: String,
     /// One-based line and Unicode character column; absent for semantic errors.
     line: Option<usize>,
     column: Option<usize>,
+    /// What to change, where a guide section explains the code.
+    hint: Option<&'static str>,
+    /// That guide section, `<skill>` or `<skill>#<anchor>`.
+    guide: Option<&'static str>,
 }
 
 impl Diagnostic {
-    fn new(code: &'static str, path: &std::path::Path, message: impl ToString) -> Self {
+    /// A whole-run diagnostic (`parse`, `io`, `generation`, `drift`,
+    /// `usage`), whose category is its code.
+    fn new(code: &'static str, path: &Path, message: impl ToString) -> Self {
         Self {
             code,
+            category: code,
             path: path.to_string_lossy().into_owned(),
             context: None,
             message: message.to_string(),
             line: None,
             column: None,
+            hint: None,
+            guide: None,
         }
+    }
+
+    /// Sets `line` and `column` to where `offset` is in the source.
+    fn at(mut self, lines: &LineIndex<'_>, offset: usize) -> Self {
+        let (line, column) = lines.position(offset);
+        self.line = Some(line);
+        self.column = Some(column);
+        self
+    }
+}
+
+/// The one conversion of a library problem: its code, category, hint and
+/// guide forwarded as they are.
+impl From<(&Path, &skilj_codegen::ValidationProblem)> for Diagnostic {
+    fn from((path, problem): (&Path, &skilj_codegen::ValidationProblem)) -> Self {
+        Self {
+            code: problem.code,
+            category: problem.category(),
+            path: path.to_string_lossy().into_owned(),
+            context: (!problem.context.is_empty()).then(|| problem.context.clone()),
+            message: problem.message.clone(),
+            line: None,
+            column: None,
+            hint: problem.hint,
+            guide: problem.guide,
+        }
+    }
+}
+
+/// Where each line of a source starts, built once per source, so every
+/// diagnostic's position is a binary search rather than a scan.
+struct LineIndex<'a> {
+    source: &'a str,
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    fn new(source: &'a str) -> Self {
+        let starts = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(at, _)| at + 1))
+            .collect();
+        Self { source, starts }
+    }
+
+    /// The one-based line and Unicode character column of a byte offset,
+    /// the convention of toml's own error positions.
+    fn position(&self, offset: usize) -> (usize, usize) {
+        let mut offset = offset.min(self.source.len());
+        while !self.source.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let line = self.starts.partition_point(|&start| start <= offset);
+        let start = self.starts[line - 1];
+        (line, self.source[start..offset].chars().count() + 1)
     }
 }
 
 type Failure = (u8, Vec<Diagnostic>);
 
-fn io_error(path: &std::path::Path, error: std::io::Error) -> Failure {
+fn io_error(path: &Path, error: std::io::Error) -> Failure {
     (3, vec![Diagnostic::new("io", path, error)])
 }
 
 /// Writes beside the destination and renames only after the complete
 /// artifact has been written. Failure leaves existing output intact.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), Failure> {
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| io_error(path, e))?;
     temporary.write_all(bytes).map_err(|e| io_error(path, e))?;
     temporary
@@ -123,36 +196,27 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), Failure>
 fn run_import(
     format: Format,
     from: SourceArg,
-    input: &std::path::Path,
+    input: &Path,
     bounded_context: &str,
-    output: Option<&std::path::Path>,
+    output: Option<&Path>,
 ) -> Result<(), Failure> {
     let source = std::fs::read_to_string(input).map_err(|e| io_error(input, e))?;
     let import = skilj_codegen::import::import(from.source(), &source, bounded_context).map_err(
-        |error| {
-            let mut diagnostic = Diagnostic::new("generation", input, &error);
-            let status = match &error {
-                skilj_codegen::Error::Json(_) => {
-                    diagnostic.code = "parse";
-                    1
-                }
-                skilj_codegen::Error::Evml { line, .. } => {
-                    diagnostic.code = "parse";
-                    diagnostic.line = Some(*line);
-                    1
-                }
-                skilj_codegen::Error::Invalid(problems) => {
-                    return (
-                        1,
-                        problems
-                            .iter()
-                            .map(|problem| Diagnostic::new("semantic", input, problem))
-                            .collect(),
-                    );
-                }
-                _ => 3,
-            };
-            (status, vec![diagnostic])
+        |error| match &error {
+            skilj_codegen::Error::Json(_) => (1, vec![Diagnostic::new("parse", input, &error)]),
+            skilj_codegen::Error::Evml { line, .. } => {
+                let mut diagnostic = Diagnostic::new("parse", input, &error);
+                diagnostic.line = Some(*line);
+                (1, vec![diagnostic])
+            }
+            skilj_codegen::Error::Invalid(problems) => (
+                1,
+                problems
+                    .iter()
+                    .map(|problem| Diagnostic::from((input, problem)))
+                    .collect(),
+            ),
+            _ => (3, vec![Diagnostic::new("generation", input, &error)]),
         },
     )?;
     match output {
@@ -178,6 +242,43 @@ fn run_import(
     Ok(())
 }
 
+/// A library error that ends the run: a TOML error is `parse` with its
+/// position, exit 1; anything else is a bug in skilj-codegen (`generation`,
+/// exit 3).
+fn generation_failure(input: &Path, lines: &LineIndex<'_>, error: skilj_codegen::Error) -> Failure {
+    match &error {
+        skilj_codegen::Error::Toml(toml) => {
+            let diagnostic = Diagnostic::new("parse", input, &error);
+            let diagnostic = match toml.span() {
+                Some(span) => diagnostic.at(lines, span.start),
+                None => diagnostic,
+            };
+            (1, vec![diagnostic])
+        }
+        skilj_codegen::Error::Invalid(problems) => (1, positioned(input, lines, problems)),
+        _ => (3, vec![Diagnostic::new("generation", input, &error)]),
+    }
+}
+
+/// The problems of `input`'s model as diagnostics, each with its position
+/// where it has a span.
+fn positioned(
+    input: &Path,
+    lines: &LineIndex<'_>,
+    problems: &[skilj_codegen::ValidationProblem],
+) -> Vec<Diagnostic> {
+    problems
+        .iter()
+        .map(|problem| {
+            let diagnostic = Diagnostic::from((input, problem));
+            match &problem.span {
+                Some(span) => diagnostic.at(lines, span.start),
+                None => diagnostic,
+            }
+        })
+        .collect()
+}
+
 fn run(cli: &Cli) -> Result<(), Failure> {
     let input = match &cli.command {
         Command::Check { input } | Command::Generate { input, .. } => input,
@@ -197,37 +298,14 @@ fn run(cli: &Cli) -> Result<(), Failure> {
         }
     };
     let source = std::fs::read_to_string(input).map_err(|e| io_error(input, e))?;
-    let generation_error = |error: skilj_codegen::Error| {
-        let mut diagnostic = Diagnostic::new("generation", input, &error);
-        let status = if let skilj_codegen::Error::Toml(error) = error {
-            diagnostic.code = "parse";
-            if let Some(span) = error.span() {
-                let prefix = &source[..span.start];
-                diagnostic.line = Some(prefix.bytes().filter(|&b| b == b'\n').count() + 1);
-                diagnostic.column =
-                    Some(prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1);
-            }
-            1
-        } else {
-            3
-        };
-        (status, vec![diagnostic])
-    };
-    let problems = skilj_codegen::validate(&source).map_err(generation_error)?;
+    let lines = LineIndex::new(&source);
+    let problems = skilj_codegen::validate(&source)
+        .map_err(|error| generation_failure(input, &lines, error))?;
     if !problems.is_empty() {
-        return Err((
-            1,
-            problems
-                .into_iter()
-                .map(|problem| {
-                    let mut diagnostic = Diagnostic::new("semantic", input, problem.message);
-                    diagnostic.context = Some(problem.context);
-                    diagnostic
-                })
-                .collect(),
-        ));
+        return Err((1, positioned(input, &lines, &problems)));
     }
-    let generated = skilj_codegen::generate(&source).map_err(generation_error)?;
+    let generated = skilj_codegen::generate(&source)
+        .map_err(|error| generation_failure(input, &lines, error))?;
     if let Command::Generate { output, check, .. } = &cli.command {
         if let Some(path) = check {
             let recorded = std::fs::read(path).map_err(|e| io_error(path, e))?;
@@ -253,6 +331,36 @@ fn run(cli: &Cli) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Prints the diagnostics to stderr: one JSON document, or per diagnostic
+/// `<path>: <code>: <message>` (`<code>: <message>` without a path), then its
+/// hint and guide lines where it has them.
+fn report(format: Format, diagnostics: &[Diagnostic]) {
+    match format {
+        Format::Json => eprintln!(
+            "{}",
+            serde_json::json!({"version": 2, "diagnostics": diagnostics})
+        ),
+        Format::Text => {
+            for diagnostic in diagnostics {
+                if diagnostic.path.is_empty() {
+                    eprintln!("{}: {}", diagnostic.code, diagnostic.message);
+                } else {
+                    eprintln!(
+                        "{}: {}: {}",
+                        diagnostic.path, diagnostic.code, diagnostic.message
+                    );
+                }
+                if let Some(hint) = diagnostic.hint {
+                    eprintln!("  hint: {hint}");
+                }
+                if let Some(guide) = diagnostic.guide {
+                    eprintln!("  guide: {guide}");
+                }
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     // Handle clap failures here too, so JSON diagnostics remain parseable for
     // invalid invocations. Help/version retain clap's usual stdout behavior.
@@ -264,14 +372,17 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) if error.use_stderr() => {
-            if json_requested {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"version": 1, "diagnostics": [Diagnostic::new("usage", std::path::Path::new(""), &error)]})
-                );
+            let format = if json_requested {
+                Format::Json
             } else {
-                let _ = error.print();
-            }
+                Format::Text
+            };
+            // `render()` without color: the same text a terminal would show.
+            let message = error.render().to_string();
+            report(
+                format,
+                &[Diagnostic::new("usage", Path::new(""), message.trim_end())],
+            );
             return ExitCode::from(2);
         }
         Err(error) => {
@@ -282,21 +393,44 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err((status, diagnostics)) => {
-            match cli.diagnostic_format {
-                Format::Json => eprintln!(
-                    "{}",
-                    serde_json::json!({"version": 1, "diagnostics": diagnostics})
-                ),
-                Format::Text => {
-                    for diagnostic in diagnostics {
-                        eprintln!(
-                            "{}: {}: {}",
-                            diagnostic.path, diagnostic.code, diagnostic.message
-                        );
-                    }
-                }
-            }
+            report(cli.diagnostic_format, &diagnostics);
             ExitCode::from(status)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// generated code that doesn't parse is skilj-codegen's bug: `generation`,
+    /// exit 3, whatever the input.
+    #[test]
+    fn generated_code_that_does_not_parse_is_a_generation_failure() {
+        let error = skilj_codegen::Error::Generated(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "expected an item",
+        ));
+        let (status, diagnostics) =
+            generation_failure(Path::new("model.skilj.toml"), &LineIndex::new(""), error);
+        assert_eq!(status, 3);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "generation");
+        assert_eq!(diagnostics[0].category, "generation");
+        assert!(diagnostics[0].hint.is_none() && diagnostics[0].guide.is_none());
+    }
+
+    #[test]
+    fn positions_are_one_based_lines_and_character_columns() {
+        let source = "a = 1\nnäme = 'x'\n\nlast";
+        let lines = LineIndex::new(source);
+        assert_eq!(lines.position(0), (1, 1));
+        assert_eq!(lines.position(4), (1, 5));
+        assert_eq!(lines.position(6), (2, 1));
+        assert_eq!(lines.position(source.find('=').unwrap()), (1, 3));
+        // After the two-byte `ä`: the column counts characters, not bytes.
+        assert_eq!(source.rfind('=').unwrap(), 12);
+        assert_eq!(lines.position(source.rfind('=').unwrap()), (2, 6));
+        assert_eq!(lines.position(source.len()), (4, 5));
     }
 }

@@ -40,6 +40,16 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // skilj logs what it skipped or refused at startup, with a code, a hint
+    // and a guide. `RUST_LOG` overrides the default: `info`, without sqlx's
+    // notices. Colored on a terminal only, so a log file stays plain text.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,sqlx=warn")),
+        )
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .init();
     #[cfg(feature = "local")]
     let local_postgres = match std::env::var("DATABASE_URL") {
         Ok(_) => None,
@@ -76,9 +86,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
     println!("reconciliation: registered {:?}", report.registered);
-    if !report.skipped_no_access.is_empty() {
-        println!("reconciliation: skipped, no access yet: {:?}", report.skipped_no_access);
-    }
 
     println!("\ncommand tokens (send as `authorization: Bearer <id>.<secret>`):");
     let mut tokens = Vec::new();

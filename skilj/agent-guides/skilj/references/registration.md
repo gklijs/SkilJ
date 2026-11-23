@@ -95,7 +95,9 @@ reconciliation loop runs as) holding an admin-level grant on it. A
 context created but never granted to anyone registers nothing on any
 deploy, however often the process restarts - `report.skipped_no_access`
 (returned alongside `skilj` from `.build()`) names anything that hit
-this, so check it rather than assuming registration silently succeeded.
+this, and skilj logs a warning for each (`code=skipped_no_access`, with a
+hint and a guide), so check it rather than assuming registration
+succeeded.
 Creating the bounded context itself and granting that first access is
 the `skilj-bootstrap` guide (`../../skilj-bootstrap/SKILL.md`). A project
 generated from skilj-template does both in `src/bin/server.rs`, with the

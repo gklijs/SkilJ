@@ -747,14 +747,27 @@ async fn run(deployment: &Deployment, surface: Surface, op: &Op) -> Option<(u16,
     Some((status, outcome(surface, op, status, &body)))
 }
 
-/// The observable outcome of one response: the error `code`, or the
-/// fields both surfaces answer the operation with.
+/// An error as the transcript records it: its code, and its hint and guide
+/// when it has them (docs/architecture.md §258), GraphQL's from `extensions`,
+/// REST's from the body.
+fn error_outcome(error: &Value) -> Value {
+    let mut outcome = json!({ "error": error["code"] });
+    for field in ["hint", "guide"] {
+        if let Some(value) = error.get(field) {
+            outcome[field] = value.clone();
+        }
+    }
+    outcome
+}
+
+/// The observable outcome of one response: the error `code` (with its hint
+/// and guide), or the fields both surfaces answer the operation with.
 fn outcome(surface: Surface, op: &Op, status: u16, body: &Value) -> Value {
     let reading = matches!(op, Op::Read { .. } | Op::ReadWithoutCredential);
     let data = match surface {
         Surface::Graphql => {
             if let Some(errors) = body.get("errors") {
-                return json!({ "error": errors[0]["extensions"]["code"] });
+                return error_outcome(&errors[0]["extensions"]);
             }
             let field = match op {
                 Op::SearchTags { .. } => "searchUsedTags",
@@ -766,7 +779,7 @@ fn outcome(surface: Surface, op: &Op, status: u16, body: &Value) -> Value {
         }
         Surface::Rest => {
             if !(200..300).contains(&status) {
-                return json!({ "error": body["code"] });
+                return error_outcome(body);
             }
             if matches!(op, Op::SearchTags { .. }) {
                 body["tags"].clone()

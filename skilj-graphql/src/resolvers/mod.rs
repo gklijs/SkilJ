@@ -101,11 +101,11 @@ use skilj_core::shared::{
 /// needs exactly the `None` case to stay reachable at all.
 pub fn require_caller(ctx: &ResolverContext) -> async_graphql::Result<Role> {
     ctx.data::<Option<Role>>()?.clone().ok_or_else(|| {
-        async_graphql::Error::new(
+        crate::error::coded(
+            "unauthenticated",
             "this mutation needs a caller identity - present a bearer JWT that resolves to an \
              active Role",
         )
-        .extend_with(|_, ext| ext.set("code", "unauthenticated"))
     })
 }
 
@@ -454,8 +454,16 @@ pub(crate) fn parse_rfc3339(value: &str) -> async_graphql::Result<jiff::Timestam
 /// a `RoleAccessMapping` by its `(role, bounded_context)` pair) uses this
 /// for the "doesn't exist" case.
 pub fn not_found(entity: &str, key: &str) -> async_graphql::Error {
-    async_graphql::Error::new(format!("no {entity} matches {key:?}"))
-        .extend_with(|_, ext| ext.set("code", format!("{entity}_not_found")))
+    let code = format!("{entity}_not_found");
+    let guidance = skilj_core::error::guidance(&code);
+    async_graphql::Error::new(format!("no {entity} matches {key:?}")).extend_with(|_, ext| {
+        crate::error::set_code(
+            ext,
+            &code,
+            guidance.map(|guidance| guidance.hint),
+            guidance.map(|guidance| guidance.guide),
+        )
+    })
 }
 
 /// Shared by `event_type_admin_operations`/`command_type_admin_operations` -

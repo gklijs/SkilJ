@@ -55,7 +55,9 @@ fn blob_fields() -> Vec<BlobField> {
 - **A subject can't change or be removed later.** One can be added to a field
   without one; earlier references stay plaintext.
 - Registered like `sensitive_fields`: `blobFields` over GraphQL,
-  `type = "blob"` and `blobs = [...]` in `.skilj.toml`.
+  `type = "blob"` and `blobs = [...]` in `.skilj.toml`. There, each `blobs`
+  entry must name a field of the same type declared with `type = "blob"`,
+  and gives it its subject; a blob field never goes in `sensitive`.
 
 ## Upload first, append second
 

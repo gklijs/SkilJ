@@ -75,6 +75,11 @@ Read `README.md` there first, then only the guide the task needs:
 | A file, a document, a payload over the limit | `skilj-large-payloads/SKILL.md` |
 | A long-running process, with Temporal | `skilj-temporal/SKILL.md` |
 
+An error's `hint` and `guide` next to its `code` (a GraphQL error's
+`extensions`, a REST error body, a warning the server logs at startup)
+say what to change and which section explains it: `skilj-bootstrap#...`
+is a heading of `skilj-bootstrap/SKILL.md`.
+
 `bash scripts/skilj-guides.sh --link` also makes them skills that Claude
 Code and Codex load by themselves. Run it again after changing the skilj
 version in `Cargo.toml`.

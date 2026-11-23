@@ -4,7 +4,6 @@
 //! crate's; this module only reads the bearer header, calls into that,
 //! and resolves the verified subject to a `Role`.
 
-use async_graphql::ErrorExtensions;
 use skilj_core::access_control::{IdpConfig, JwksCache, Role};
 use skilj_core::db::Pool;
 use std::sync::Arc;
@@ -111,10 +110,10 @@ async fn verify_jwt_to_role(
     pool: &Pool,
 ) -> Result<(Role, std::time::SystemTime), async_graphql::Error> {
     let Some(identity) = identity else {
-        return Err(async_graphql::Error::new(
+        return Err(crate::error::coded(
+            "no_identity_provider_configured",
             "this deployment has no identity_provider configured - no bearer JWT can ever verify",
-        )
-        .extend_with(|_, ext| ext.set("code", "no_identity_provider_configured")));
+        ));
     };
 
     let skilj_core::access_control::VerifiedJwt {
@@ -137,5 +136,5 @@ async fn verify_jwt_to_role(
 }
 
 fn malformed_credential(message: &str) -> async_graphql::Error {
-    async_graphql::Error::new(message).extend_with(|_, ext| ext.set("code", "malformed_credential"))
+    crate::error::coded("malformed_credential", message)
 }
