@@ -257,7 +257,23 @@ async fn setup_with_pool(
     let (database_url, pool) = test_db()
         .await
         .expect("test_db() must be Some - caller already checked");
+    setup_in(database_url, pool, pool_options).await
+}
 
+/// [`setup_with_pool`] on the database `database_url` addresses, which
+/// `pool` connects to.
+async fn setup_in(
+    database_url: String,
+    pool: Pool,
+    pool_options: skilj_core::db::PgPoolOptions,
+) -> (
+    Skilj,
+    String,
+    Pool,
+    String,
+    RoleAccessMapping,
+    skilj_core::event_store::CommandType,
+) {
     let external_subject = unique_name("subject");
     let role = Role {
         id: generate_token_id(),
@@ -335,10 +351,24 @@ async fn setup_with_pool(
 #[test]
 fn an_approval_required_trigger_creates_a_pending_proposal() {
     runtime().block_on(async {
-        if test_db().await.is_none() {
+        // A database of its own: the renamed `event_types` table below
+        // would otherwise fail any other test's `build()` meanwhile, which
+        // patches every bounded context.
+        let Some(database_url) =
+            skilj_test_support::database_url("skilj_command_trigger_approval_retry").await
+        else {
             return;
-        }
-        let (skilj, _credential, pool, bc_name, mapping, _) = setup().await;
+        };
+        let Some(pool) = connect_and_migrate(&database_url, "the exclusive test database").await
+        else {
+            return;
+        };
+        let (skilj, _credential, pool, bc_name, mapping, _) = setup_in(
+            database_url,
+            pool,
+            skilj_core::db::PgPoolOptions::new().max_connections(4),
+        )
+        .await;
         let command_type = db::get_command_type(&pool, &bc_name, "TransferMoney")
             .await
             .unwrap()

@@ -658,10 +658,17 @@ const APPROVE_MUTATION: &str = "mutation($bc: String!, $id: ID!) { \
 #[test]
 fn forgetting_a_subject_forgets_its_pending_proposals() {
     runtime().block_on(async {
-        if test_database_url().await.is_none() {
+        // A database of its own: the renamed `encryption_keys` table below
+        // would otherwise fail any other test's `build()` meanwhile, which
+        // patches every bounded context.
+        let Some(database_url) =
+            skilj_test_support::database_url("skilj_subject_erasure_forgotten_proposals").await
+        else {
+            return;
+        };
+        if !check_reachable(&database_url, "the exclusive test database").await {
             return;
         }
-        let database_url = test_database_url().await.unwrap();
         let jwks_url = serve_jwks().await;
         let pool = skilj_core::db::connect(&database_url).await.unwrap();
 
