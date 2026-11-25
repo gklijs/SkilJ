@@ -28,6 +28,9 @@ Cargo.lock
 # (issue #204).
 skilj/tests/*.regressions
 *.proptest-regressions
+# Ephyra's failure seeds (skilj/tests/ephyra_batch_of_one.rs), local for the
+# same reason.
+.ephyra/
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
