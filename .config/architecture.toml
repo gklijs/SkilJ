@@ -1,0 +1,129 @@
+# skilj's architecture rules, checked by Atlas (https://github.com/flowerornament/atlas)
+# with `scripts/check-architecture.sh`, on every pull request (the
+# `architecture` job in .github/workflows/ci.yml). See docs/checks.md in
+# Atlas for every field.
+#
+# Most numbers below are ratchets: they record what the code has today and
+# may only go down. A change that fixes one should lower it in the same diff;
+# Atlas prints a `hint:` when a row can be lowered. Raising one is a decision,
+# so say in the change why.
+#
+# Atlas reads source as written: it expands no macro and evaluates no
+# #[cfg]. What it can't place it reports as unavailable, never as a pass.
+
+schema = 1
+provenance = "authored"
+
+# Each fact has one home. Atlas checks the home still exists. Add an
+# `allowed_readers` list to pin which files may read a home, or
+# `forbid_new_pattern` (needs ast-grep) to stop a spelling from spreading.
+authority = [
+  { fact = "the schema level", home = "skilj-core/src/preflight.rs::SCHEMA_LEVEL" },
+]
+
+# The published library crates. The size and surface rules cover these;
+# the tools, the demo and the test helpers are left out.
+[population]
+core = [
+  "skilj", "skilj-core", "skilj-graphql", "skilj-rest", "skilj-macros", "skilj-retry",
+  "skilj-codegen", "skilj-bridge", "skilj-kafka", "skilj-amqp", "skilj-nats",
+  "skilj-temporal", "skilj-blob-s3",
+]
+
+# No stored size limits: the check reports each crate that grew, and by how
+# much, without failing on it.
+[size]
+approve_growth = true
+
+# The most public declarations per crate. Today's count plus headroom, so an
+# ordinary feature doesn't trip it; `cargo semver-checks` already guards
+# what the public API means. Today: skilj 148, skilj-core 1096,
+# skilj-graphql 254, skilj-bridge 44, skilj-codegen 38, skilj-nats 22,
+# skilj-kafka 21, skilj-amqp 20, skilj-rest 14, skilj-retry 14,
+# skilj-temporal 13, skilj-blob-s3 3, skilj-macros 3.
+[surface]
+skilj = 175
+skilj-core = 1200
+skilj-graphql = 290
+skilj-rest = 25
+skilj-macros = 10
+skilj-retry = 25
+skilj-codegen = 50
+skilj-bridge = 55
+skilj-kafka = 30
+skilj-amqp = 30
+skilj-nats = 30
+skilj-temporal = 25
+skilj-blob-s3 = 10
+
+# Which workspace crates each crate may depend on (normal dependencies;
+# dev-dependencies aren't judged). An allowance a crate doesn't use is
+# refused too, so this is exactly today's graph. A new crate needs a row.
+[crate_graph]
+rule = [
+  { name = "skilj", allowed = ["skilj-core", "skilj-graphql", "skilj-rest", "skilj-macros", "skilj-retry"], law = "the facade over core and the two API surfaces" },
+  { name = "skilj-core", allowed = ["skilj-macros", "skilj-retry"], law = "the domain engine has no web dependency (docs/architecture.md)" },
+  { name = "skilj-graphql", allowed = ["skilj-core", "skilj-macros"], law = "an application on skilj-core + skilj-graphql never pulls in REST" },
+  { name = "skilj-rest", allowed = ["skilj-core"], law = "REST is a surface over skilj-core alone" },
+  { name = "skilj-bridge", allowed = ["skilj-retry"], law = "the bridges speak skilj's wire protocol; they never link skilj-core" },
+  { name = "skilj-kafka", allowed = ["skilj-bridge", "skilj-retry"], law = "the bridges speak skilj's wire protocol; they never link skilj-core" },
+  { name = "skilj-amqp", allowed = ["skilj-bridge", "skilj-retry"], law = "the bridges speak skilj's wire protocol; they never link skilj-core" },
+  { name = "skilj-nats", allowed = ["skilj-bridge", "skilj-retry"], law = "the bridges speak skilj's wire protocol; they never link skilj-core" },
+  { name = "skilj-temporal", allowed = ["skilj-bridge", "skilj-retry"], law = "the bridges speak skilj's wire protocol; they never link skilj-core" },
+  { name = "skilj-blob-s3", allowed = ["skilj-core"] },
+  { name = "skilj-codegen", allowed = [], law = "codegen mirrors what it needs from skilj-core instead of depending on it" },
+  { name = "skilj-macros", allowed = [] },
+  { name = "skilj-retry", allowed = [] },
+  { name = "skilj-test-fixture", allowed = ["skilj-core"] },
+  { name = "skilj-test-support", allowed = [] },
+  { name = "skilj-inspector", allowed = ["skilj-core"] },
+  { name = "skilj-tui", allowed = [], law = "the TUI talks to skilj over the network" },
+]
+# Nothing may depend on the example application.
+terminal = ["skilj-demo"]
+
+[concentration]
+population = [
+  "skilj", "skilj-core", "skilj-graphql", "skilj-rest", "skilj-macros", "skilj-retry",
+  "skilj-codegen", "skilj-bridge", "skilj-kafka", "skilj-amqp", "skilj-nats",
+  "skilj-temporal", "skilj-blob-s3",
+]
+# Lines of code: an entry file (one that declares modules, like lib.rs)
+# reads as a table of contents, so it stays short; any other file stays
+# under file_lines.
+entry_lines = 300
+file_lines = 2000
+conventional_names = ["error"]
+# Module roots whose //! header cites no document (`docs/…` or `§N`, the
+# script's --citation-markers).
+header_uncited = { skilj-codegen = 1 }
+# Files over the limits today. Each may only shrink; a split file's pieces
+# each have to fit the limit.
+entry = [
+  { path = "skilj/src/lib.rs", lines = 4586 },
+  { path = "skilj-graphql/src/lib.rs", lines = 342 },
+  { path = "skilj-graphql/src/resolvers/mod.rs", lines = 308 },
+  { path = "skilj-codegen/src/main.rs", lines = 324 },
+]
+file = [
+  { path = "skilj/src/lib.rs", lines = 4586 },
+  { path = "skilj-core/src/event_store/mod.rs", lines = 3411 },
+  { path = "skilj-core/src/db/commands.rs", lines = 2719 },
+  { path = "skilj-core/src/db/events.rs", lines = 2195 },
+  { path = "skilj-core/src/db/schema.rs", lines = 2018 },
+]
+# Module names used in more than one place. `facet`: one idea seen from
+# several places. `collision`: two ideas sharing a name, owed a rename.
+name = [
+  { name = "approvals", ruling = "facet", why = "approval rules and their table", homes = ["skilj-core::approvals", "skilj-core::db::approvals"] },
+  { name = "auth", ruling = "facet", why = "authentication on each API surface", homes = ["skilj-graphql::auth", "skilj-rest::auth"] },
+  { name = "blobs", ruling = "facet", why = "blob storage and its REST endpoints", homes = ["skilj-core::db::blobs", "skilj-rest::blobs"] },
+  { name = "payload_limits", ruling = "facet", why = "payload limits and their GraphQL resolvers", homes = ["skilj-core::payload_limits", "skilj-graphql::resolvers::payload_limits"] },
+  { name = "preflight", ruling = "facet", why = "the preflight check and the queries it runs", homes = ["skilj-core::db::preflight", "skilj-core::preflight"] },
+  { name = "routes", ruling = "collision", why = "cross-context routes' persistence and the REST routes", homes = ["skilj-core::db::routes", "skilj-rest::routes"] },
+  { name = "schema", ruling = "collision", why = "the database schema and the GraphQL schema", homes = ["skilj-core::db::schema", "skilj-graphql::schema"] },
+]
+# Re-exports that give an item a second name. Rows may only be removed.
+alias = [
+  { module = "skilj-core::db", kind = "rename", binding = "inspect_for_preflight", source = "preflight::inspect" },
+]
